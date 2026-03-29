@@ -8,6 +8,10 @@ probe_subprop
 SDK_Output.h
 SDK_Output.txt
 dump_*.txt
+vtable_map.md
+
+# IDE / MCP config
+.mcp.json
 
 # Kernel module build artifacts
 kernel_module/src/*.ko

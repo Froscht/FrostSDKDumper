@@ -207,6 +207,7 @@ public:
         std::cout << "[+] FName decryptor initialized\n";
 
         // Init GObjectArray (decrypt base, count, probe chunk ptr)
+        m_gobj.SetPid(m_pid);
         if (!m_gobj.Init()) {
             std::cerr << "[-] GObjectArray init failed. Check PID and game state.\n";
             m_gobj.PrintDiagnostics();
@@ -526,6 +527,7 @@ public:
 
         SDKGen::Generator gen(m_reader, m_fname, MODULE_BASE);
         auto sdk = gen.BuildSDK(object_ptrs, addr_to_name, addr_to_fullname);
+        gen.DumpVTableMap("vtable_map.md");
         std::cout << "[+] Classes/Structs found: " << sdk.structs.size() << "\n";
         std::cout << "[+] Enums found:           " << sdk.enums.size()   << "\n";
 

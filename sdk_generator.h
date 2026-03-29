@@ -110,24 +110,8 @@ public:
     Generator(IMemoryReader& reader, FNameDecryptor& fname, uint64_t mod_base = ArcDecrypt::MODULE_BASE)
         : MODULE_BASE(mod_base), m_reader(reader), m_fname(fname)
     {
-        // RVAs from global vtable sweep + manual identification (March 2026 patch)
-        // These are seeded; bootstrap + sweep will discover all others at runtime.
-        m_vtable_to_type = {
-            // Confirmed from reference SDK / known property names:
-            { 0x0AB25100ULL, "FUInt32Property"  },   // SkeletalMeshComponent+0xDD8 → uint32_t
-            { 0x0AB36150ULL, "FObjectProperty"  },   // Widget+0xE0 → Widget* (TObjectPtr variant)
-            // Likely types from element size (80=Map/Set):
-            { 0x0AB1F030ULL, "FMapProperty"     },   // elem=80, TMap
-            { 0x0AB27290ULL, "FSetProperty"     },   // elem=80, TSet
-            // Remaining elem=8 types (best guess, may need IDA verification):
-            { 0x0AB24CA0ULL, "FStrProperty"     },   // elem=8 (FString internal)
-            { 0x0AB25330ULL, "FDoubleProperty"  },   // elem=8
-            { 0x0AB37270ULL, "FInt64Property"   },   // elem=8
-            // elem=64: likely MulticastInlineDelegate variant
-            { 0x0AB25A20ULL, "FMulticastInlineDelegateProperty" }, // elem=64
-            // Discovered via global sweep:
-            { 0x0AB35060ULL, "FEnumProperty"    },   // elem=4, 4-byte enum underlying
-        };
+        // Seed vtable map is populated at runtime by AutoDiscoverVTables().
+        // No hardcoded RVAs — the discovery pass handles everything.
     }
 
     // ── Generic typed read ───────────────────────────────────────────────
@@ -163,20 +147,14 @@ public:
         }
     }
 
-    // ── Bootstrap type maps from known Actor properties ──────────────
-    // Maps BOTH FFieldClass pointer → type name AND vtable RVA → type name
-    std::unordered_map<uint64_t, std::string> m_fclass_name_cache;
-    // vtable RVA → type name (primary type identification method)
-    // Populated by bootstrap AND used by IdentifyPropertyType
-    bool m_bootstrapped = false;
-
-    void BootstrapFFieldClassMap(uint64_t actor_addr) {
-        if (!actor_addr) return;
-
-        struct KP { const char* name; const char* type; };
-        static const KP known[] = {
+    // ── Known property name → FProperty type lookup table ──────────────
+    // Used by auto-discovery: when we see a property with a known UE5 name,
+    // we can infer its FProperty subtype and map the vtable RVA automatically.
+    static const std::unordered_map<std::string, std::string>& KnownPropertyTypes() {
+        static const std::unordered_map<std::string, std::string> table = {
+            // ── AActor ──
             {"PrimaryActorTick","StructProperty"},{"AttachmentReplication","StructProperty"},
-            {"ReplicatedMovement","StructProperty"},
+            {"ReplicatedMovement","StructProperty"},{"BasedMovement","StructProperty"},
             {"bNetTemporary","BoolProperty"},{"bReplicateMovement","BoolProperty"},
             {"bAlwaysRelevant","BoolProperty"},{"bHidden","BoolProperty"},
             {"bTearOff","BoolProperty"},{"bCanBeDamaged","BoolProperty"},
@@ -194,7 +172,8 @@ public:
             {"bAllowTickBeforeBeginPlay","BoolProperty"},{"bReplayRewindable","BoolProperty"},
             {"bCanBeInCluster","BoolProperty"},{"bActorSeamlessTraveled","BoolProperty"},
             {"bIsEditorOnlyActor","BoolProperty"},{"bEnableAutoLODGeneration","BoolProperty"},
-            {"bIgnoresOriginShifting","BoolProperty"},
+            {"bIgnoresOriginShifting","BoolProperty"},{"bUseControllerRotationPitch","BoolProperty"},
+            {"bIsInterface","BoolProperty"},
             {"UpdateOverlapsMethodDuringLevelStreaming","ByteProperty"},
             {"DefaultUpdateOverlapsMethodDuringLevelStreaming","ByteProperty"},
             {"RemoteRole","ByteProperty"},{"Role","ByteProperty"},{"NetDormancy","ByteProperty"},
@@ -203,10 +182,16 @@ public:
             {"InitialLifeSpan","FloatProperty"},{"CustomTimeDilation","FloatProperty"},
             {"NetCullDistanceSquared","FloatProperty"},{"NetUpdateFrequency","FloatProperty"},
             {"MinNetUpdateFrequency","FloatProperty"},{"NetPriority","FloatProperty"},
+            {"RenderOpacity","FloatProperty"},
             {"RayTracingGroupId","IntProperty"},{"NetTag","IntProperty"},{"InputPriority","IntProperty"},
             {"Owner","ObjectProperty"},{"InputComponent","ObjectProperty"},
             {"Instigator","ObjectProperty"},{"RootComponent","ObjectProperty"},
-            {"NetDriverName","NameProperty"},{"ParentComponent","WeakObjectProperty"},
+            {"PlayerState","ObjectProperty"},{"Controller","ObjectProperty"},
+            {"LastHitBy","ObjectProperty"},{"Slot","ObjectProperty"},
+            {"ClassWithin","ObjectProperty"},{"ClassDefaultObject","ObjectProperty"},
+            {"MetaClass","ObjectProperty"},{"InterfaceClass","ObjectProperty"},
+            {"NetDriverName","NameProperty"},{"RepNotifyFunc","NameProperty"},
+            {"ParentComponent","WeakObjectProperty"},
             {"Children","ArrayProperty"},{"Layers","ArrayProperty"},{"Tags","ArrayProperty"},
             {"InstanceComponents","ArrayProperty"},{"BlueprintCreatedComponents","ArrayProperty"},
             {"OnTakeAnyDamage","MulticastSparseDelegateProperty"},
@@ -214,86 +199,201 @@ public:
             {"OnActorEndOverlap","MulticastSparseDelegateProperty"},
             {"OnDestroyed","MulticastSparseDelegateProperty"},
             {"OnEndPlay","MulticastSparseDelegateProperty"},
-            // Pawn/Character/Controller properties for additional types
-            {"BaseEyeHeight","DoubleProperty"},
-            {"AutoPossessPlayer","EnumProperty"},{"AutoPossessAI","EnumProperty"},
-            {"AIControllerClass","ClassProperty"},
-            {"PlayerState","ObjectProperty"},{"Controller","ObjectProperty"},
-            {"LastHitBy","ObjectProperty"},
-            {"BasedMovement","StructProperty"},{"BlendedReplayViewPitch","DoubleProperty"},
-            {"CrouchedEyeHeight","DoubleProperty"},
             {"MovementModeChangedDelegate","MulticastInlineDelegateProperty"},
-            {"bUseControllerRotationPitch","BoolProperty"},
-            // Widget / UMG types
-            {"Slot","ObjectProperty"},{"RenderTransform","StructProperty"},
-            {"bIsEnabled","BoolProperty"},{"Visibility","EnumProperty"},
+            {"OnComponentBeginOverlap","MulticastInlineDelegateProperty"},
+            {"OnComponentEndOverlap","MulticastInlineDelegateProperty"},
+            {"OnComponentHit","MulticastInlineDelegateProperty"},
+            {"OnClicked","MulticastInlineDelegateProperty"},
+            {"OnReleased","MulticastInlineDelegateProperty"},
+            {"OnInputTouchBegin","MulticastInlineDelegateProperty"},
+            // ── APawn / ACharacter ──
+            {"BaseEyeHeight","DoubleProperty"},{"BlendedReplayViewPitch","DoubleProperty"},
+            {"CrouchedEyeHeight","DoubleProperty"},
+            {"AutoPossessPlayer","EnumProperty"},{"AutoPossessAI","EnumProperty"},
+            {"Visibility","EnumProperty"},
+            {"AIControllerClass","ClassProperty"},
+            // ── UWidget / UMG ──
+            {"RenderTransform","StructProperty"},{"Guid","StructProperty"},
             {"ToolTipText","TextProperty"},{"AccessibleText","TextProperty"},
-            {"RenderOpacity","FloatProperty"},
-            // Common string/text/int64 types from various classes
-            {"PathName","StrProperty"},{"FriendlyName","StrProperty"},
             {"Description","TextProperty"},{"DisplayName","TextProperty"},
-            {"Guid","StructProperty"},
-            {"ClassFlags","UInt32Property"},
-            {"ClassWithin","ObjectProperty"},
-            {"ClassDefaultObject","ObjectProperty"},
-            {"bIsInterface","BoolProperty"},
-            {"FunctionFlags","UInt32Property"},
-            {"RepNotifyFunc","NameProperty"},
-            {"MetaClass","ObjectProperty"},
-            {"InterfaceClass","ObjectProperty"},
+            // ── Common types from various engine classes ──
+            {"PathName","StrProperty"},{"FriendlyName","StrProperty"},
+            {"NodeComment","StrProperty"},{"Category","StrProperty"},
+            {"ClassFlags","UInt32Property"},{"FunctionFlags","UInt32Property"},
+            {"PropertyFlags","UInt64Property"},
+            // ── Containers ──
+            {"RowMap","MapProperty"},
+            // ── Soft references ──
+            {"SoftObjectPath","SoftObjectProperty"},
+            // ── FText ──
+            {"ToolTipDescription","TextProperty"},{"ErrorMessage","TextProperty"},
+            // ── Int8/Int16/UInt16 ──
+            {"BlueprintSystemVersion","Int16Property"},
+            // ── FSet ──
+            {"OnStateLeaveGameplayEffects","SetProperty"},
         };
-        int n_known = sizeof(known) / sizeof(known[0]);
-        std::unordered_map<std::string, std::string> name_to_type;
-        for (int i = 0; i < n_known; ++i)
-            name_to_type[known[i].name] = known[i].type;
-
-        // Walk ChildProperties chain — record both FFieldClass AND vtable mappings
-        uint64_t ff = Read<uint64_t>(actor_addr + ArcDecrypt::Offsets::UStruct::ChildProperties);
-        std::unordered_set<uint64_t> visited;
-        for (int c = 0; ff && c < 2048; ++c) {
-            if (visited.count(ff)) break;
-            visited.insert(ff);
-            std::string pname = m_fname.GetFFieldName(ff);
-            if (!pname.empty()) {
-                auto it = name_to_type.find(pname);
-                if (it != name_to_type.end()) {
-                    // FFieldClass mapping (may be 0 for some properties)
-                    uint64_t fc = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
-                    if (fc && m_fclass_name_cache.find(fc) == m_fclass_name_cache.end())
-                        m_fclass_name_cache[fc] = it->second;
-                    // Vtable-based mapping (always available)
-                    uint64_t vtbl = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::VTable);
-                    uint64_t vtbl_rva = vtbl - MODULE_BASE;
-                    if (vtbl_rva > 0x1000 && vtbl_rva < 0xF000000ULL) {
-                        if (m_vtable_to_type.find(vtbl_rva) == m_vtable_to_type.end())
-                            m_vtable_to_type[vtbl_rva] = "F" + it->second;
-                    }
-                }
-            }
-            ff = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
-        }
-
-        m_bootstrapped = true;
+        return table;
     }
 
-    // ── Resolve FFieldClass* → type name ─────────────────────────────────
-    // Uses bootstrapped map first, falls back to live decrypt
+    // ── VTable auto-discovery state ──────────────────────────────────────
+    std::unordered_map<uint64_t, std::string> m_fclass_name_cache;
+    bool m_vtables_discovered = false;
+
+    // ── Auto-discover ALL vtable-to-type mappings at runtime ─────────────
+    // 3-tier strategy (highest reliability first):
+    //   Tier 1: Walk ALL type ChildProperties, match property names to known types
+    //   Tier 2: Resolve FFieldClass name (plain FName + SIMD fallback)
+    //   Tier 3: Element-size heuristic for truly unknown vtables
+    void AutoDiscoverVTables(
+            const std::vector<std::pair<int32_t, uint64_t>>& object_ptrs,
+            const std::unordered_map<uint64_t, std::string>& addr_to_name,
+            const std::unordered_set<uint64_t>& allTypeAddrs,
+            uint64_t ssAddr)
+    {
+        if (m_vtables_discovered) return;
+
+        const auto& known = KnownPropertyTypes();
+
+        // Per-vtable observation for Tier 2/3: (fclass_ptr, elem_size)
+        struct VTObs { uint64_t fclass; uint32_t elem; };
+        std::unordered_map<uint64_t, VTObs> unresolved_vtbls;
+
+        // ── Tier 1: Walk ALL type ChildProperties and reverse-map names ──
+        int scanned = 0;
+        for (const auto& [idx, obj_ptr] : object_ptrs) {
+            bool is_type = allTypeAddrs.count(obj_ptr) > 0;
+            if (!is_type) {
+                uint64_t cls = m_fname.GetClassPrivate(obj_ptr);
+                if (cls != ssAddr && !allTypeAddrs.count(obj_ptr)) continue;
+            }
+            ++scanned;
+
+            uint64_t ff = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UStruct::ChildProperties);
+            std::unordered_set<uint64_t> vis;
+            for (int c = 0; ff && c < 512; ++c) {
+                if (vis.count(ff)) break;
+                vis.insert(ff);
+
+                uint64_t vtbl = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::VTable);
+                uint64_t vtbl_rva = vtbl - MODULE_BASE;
+                if (vtbl_rva < 0x1000 || vtbl_rva >= 0xF000000ULL) {
+                    ff = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
+                    continue;
+                }
+
+                if (m_vtable_to_type.count(vtbl_rva)) {
+                    ff = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
+                    continue;
+                }
+
+                // Tier 1: name-based identification
+                std::string pname = m_fname.GetFFieldName(ff);
+                if (!pname.empty()) {
+                    auto kit = known.find(pname);
+                    if (kit != known.end()) {
+                        m_vtable_to_type[vtbl_rva] = "F" + kit->second;
+                        uint64_t fc = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
+                        if (fc) m_fclass_name_cache[fc] = kit->second;
+                        ff = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
+                        continue;
+                    }
+                }
+
+                // Record for Tier 2/3
+                uint64_t fc = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
+                uint32_t elem = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::ElementSize);
+                if (!unresolved_vtbls.count(vtbl_rva))
+                    unresolved_vtbls[vtbl_rva] = {fc, elem};
+
+                ff = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
+            }
+        }
+
+        size_t tier1_count = m_vtable_to_type.size();
+        std::printf("[vtbl] Tier 1 (name-based): scanned %d types, resolved %zu vtables\n",
+            scanned, tier1_count);
+
+        // ── Tier 2: FFieldClass name resolution ─────────────────────────
+        size_t tier2_resolved = 0;
+        for (auto it = unresolved_vtbls.begin(); it != unresolved_vtbls.end(); ) {
+            uint64_t rva = it->first;
+            uint64_t fc  = it->second.fclass;
+            if (m_vtable_to_type.count(rva)) { it = unresolved_vtbls.erase(it); continue; }
+
+            if (fc) {
+                auto fc_it = m_fclass_name_cache.find(fc);
+                if (fc_it != m_fclass_name_cache.end()) {
+                    m_vtable_to_type[rva] = "F" + fc_it->second;
+                    ++tier2_resolved;
+                    it = unresolved_vtbls.erase(it);
+                    continue;
+                }
+                // Live decrypt (now with plain FName fallback in fname_decrypt.h)
+                std::string fcn = m_fname.GetFFieldClassName(fc);
+                if (!fcn.empty()) {
+                    m_fclass_name_cache[fc] = fcn;
+                    m_vtable_to_type[rva] = "F" + fcn;
+                    ++tier2_resolved;
+                    it = unresolved_vtbls.erase(it);
+                    continue;
+                }
+            }
+            ++it;
+        }
+        std::printf("[vtbl] Tier 2 (FFieldClass): resolved %zu more vtables\n", tier2_resolved);
+
+        // ── Tier 3: Element-size heuristic ──────────────────────────────
+        size_t tier3_resolved = 0;
+        for (auto& [rva, obs] : unresolved_vtbls) {
+            if (m_vtable_to_type.count(rva)) continue;
+            switch (obs.elem) {
+                case 1:  m_vtable_to_type[rva] = "FBoolProperty"; break;
+                case 2:  m_vtable_to_type[rva] = "FUInt16Property"; break;
+                case 16: m_vtable_to_type[rva] = "FStructProperty"; break;
+                case 24: m_vtable_to_type[rva] = "FTextProperty"; break;
+                case 32: m_vtable_to_type[rva] = "FDelegateProperty"; break;
+                case 80: m_vtable_to_type[rva] = "FMapProperty"; break;
+                default: continue;
+            }
+            ++tier3_resolved;
+        }
+        std::printf("[vtbl] Tier 3 (heuristic): resolved %zu more vtables\n", tier3_resolved);
+        std::printf("[vtbl] Total vtable mappings: %zu\n", m_vtable_to_type.size());
+
+        m_vtables_discovered = true;
+    }
+
+    // ── Dump discovered vtable map to file (for SIGNATURES.md updates) ──
+    void DumpVTableMap(const std::string& path) const {
+        std::FILE* f = std::fopen(path.c_str(), "w");
+        if (!f) return;
+        std::fprintf(f, "# Auto-discovered FProperty VTable RVAs\n");
+        std::fprintf(f, "# Generated at runtime — paste into SIGNATURES.md section 5\n\n");
+        std::fprintf(f, "| RVA | Type |\n|---|---|\n");
+        // Sort by RVA for stable output
+        std::vector<std::pair<uint64_t, std::string>> sorted(m_vtable_to_type.begin(), m_vtable_to_type.end());
+        std::sort(sorted.begin(), sorted.end());
+        for (const auto& [rva, type] : sorted)
+            std::fprintf(f, "| `0x%07llX` | %s |\n", (unsigned long long)rva, type.c_str());
+        std::fprintf(f, "\nTotal: %zu vtable mappings\n", sorted.size());
+        std::fclose(f);
+        std::printf("[vtbl] Wrote vtable map to %s\n", path.c_str());
+    }
+
+    // ── Resolve FFieldClass* -> type name ────────────────────────────────
     std::string FieldClassToTypeName(uint64_t fclass_ptr) {
         if (!fclass_ptr) return "None";
         auto cached = m_fclass_name_cache.find(fclass_ptr);
         if (cached != m_fclass_name_cache.end())
             return cached->second;
-        // Fallback: try live decryption of FFieldClass::NamePrivate
         std::string name = m_fname.GetFFieldClassName(fclass_ptr);
-        if (name.empty()) {
-            // Size-based heuristic as last resort
+        if (name.empty())
             name = "FProperty_Unknown";
-        }
         m_fclass_name_cache[fclass_ptr] = name;
         return name;
     }
 
-    // ── Read FField name via new SIMD pipeline ─────────────────────────
+    // ── Read FField name via SIMD pipeline ──────────────────────────────
     std::string ReadFFieldName(uint64_t ff) {
         return m_fname.GetFFieldName(ff);
     }
@@ -732,103 +832,8 @@ public:
         }
         std::printf("[sdk] allTypeAddrs (addresses used as Class ptrs): %zu\n", allTypeAddrs.size());
 
-        // ── Bootstrap vtable+FFieldClass maps from well-known classes ────
-        // Walk multiple classes to discover as many vtable→type mappings as possible
-        static const char* bootstrap_classes[] = {
-            "Actor", "Pawn", "Character", "PlayerController", "GameModeBase",
-            "ActorComponent", "SceneComponent", "PrimitiveComponent",
-            "Widget", "UserWidget", "Image", "TextBlock", "RichTextBlock",
-            "DataAsset", "BlueprintFunctionLibrary", "AnimInstance",
-            "CameraComponent", "MovementComponent",
-            nullptr
-        };
-        for (const char** bc = bootstrap_classes; *bc; ++bc) {
-            for (const auto& [idx, obj_ptr] : object_ptrs) {
-                auto it = addr_to_name.find(obj_ptr);
-                if (it != addr_to_name.end() && it->second == *bc && allTypeAddrs.count(obj_ptr)) {
-                    BootstrapFFieldClassMap(obj_ptr);
-                    break;
-                }
-            }
-        }
-
-        // ── Global vtable sweep: scan ALL type objects for vtable discovery ──
-        // Walk every type's ChildProperties. For each FField:
-        // 1. Record (vtable_rva → fclass_ptr) mapping
-        // 2. If fclass_ptr is in cache, directly map vtable_rva → type name
-        // 3. After sweep: for unmapped vtables, use elem_size heuristic
-        {
-            size_t vt_before = m_vtable_to_type.size();
-            int scanned = 0;
-            // vtable_rva → set of (fclass_ptr, elem_size) observed
-            std::unordered_map<uint64_t, std::pair<uint64_t, uint32_t>> vtbl_observations;
-
-            for (const auto& [idx, obj_ptr] : object_ptrs) {
-                bool is_type = allTypeAddrs.count(obj_ptr) > 0;
-                if (!is_type) {
-                    uint64_t cls = m_fname.GetClassPrivate(obj_ptr);
-                    if (cls != ssAddr) continue;
-                }
-                ++scanned;
-                uint64_t ff = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UStruct::ChildProperties);
-                std::unordered_set<uint64_t> vis;
-                for (int c = 0; ff && c < 512; ++c) {
-                    if (vis.count(ff)) break;
-                    vis.insert(ff);
-                    uint64_t vtbl = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::VTable);
-                    uint64_t vtbl_rva = vtbl - MODULE_BASE;
-                    if (vtbl_rva < 0x1000 || vtbl_rva >= 0xF000000ULL) {
-                        ff = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
-                        continue;
-                    }
-                    // Already mapped? skip
-                    if (m_vtable_to_type.count(vtbl_rva)) {
-                        ff = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
-                        continue;
-                    }
-                    uint64_t fc = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
-                    uint32_t elem = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::ElementSize);
-                    // Try FFieldClass cache first
-                    if (fc) {
-                        auto fc_it = m_fclass_name_cache.find(fc);
-                        if (fc_it != m_fclass_name_cache.end()) {
-                            m_vtable_to_type[vtbl_rva] = "F" + fc_it->second;
-                            ff = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
-                            continue;
-                        }
-                        // Try live decrypt of FFieldClass name
-                        std::string fcn = m_fname.GetFFieldClassName(fc);
-                        if (!fcn.empty()) {
-                            m_fclass_name_cache[fc] = fcn;
-                            m_vtable_to_type[vtbl_rva] = "F" + fcn;
-                            ff = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
-                            continue;
-                        }
-                    }
-                    // Record observation for heuristic pass
-                    if (!vtbl_observations.count(vtbl_rva))
-                        vtbl_observations[vtbl_rva] = {fc, elem};
-
-                    ff = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
-                }
-            }
-            // Heuristic pass: for remaining unmapped vtables, use element size
-            // Also probe type-specific fields to disambiguate
-            for (auto& [rva, obs] : vtbl_observations) {
-                if (m_vtable_to_type.count(rva)) continue;
-                uint32_t elem = obs.second;
-                switch (elem) {
-                    case 1:  m_vtable_to_type[rva] = "FBoolProperty"; break;
-                    case 2:  m_vtable_to_type[rva] = "FUInt16Property"; break;
-                    case 16: m_vtable_to_type[rva] = "FStructProperty"; break;
-                    case 24: m_vtable_to_type[rva] = "FTextProperty"; break;
-                    case 32: m_vtable_to_type[rva] = "FDelegateProperty"; break;
-                    default: break;
-                }
-            }
-            std::printf("[sdk] Vtable sweep: scanned %d types, %zu vtable mappings total\n",
-                scanned, m_vtable_to_type.size());
-        }
+        // ── Auto-discover vtable-to-type mappings (replaces bootstrap + sweep) ──
+        AutoDiscoverVTables(object_ptrs, addr_to_name, allTypeAddrs, ssAddr);
 
         // ── Helper: resolve package name for any obj ptr ──────────────────────
         auto resolvePackage = [&](uint64_t obj_ptr) -> std::string {

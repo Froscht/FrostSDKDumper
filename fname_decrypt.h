@@ -271,27 +271,50 @@ public:
     }
 
     // ── Decrypt FFieldClass::NamePrivate → comp_index ────────────────────
+    // FFieldClass stores an FName at +0x50.  Unlike FField::NamePrivate
+    // (which is SIMD-encrypted), FFieldClass may store a plain FName
+    // (ComparisonIndex at +0x00, Number at +0x04).  We try both paths:
+    //   1. Plain FName read (raw uint32 comparison index)
+    //   2. FField-style SIMD decrypt (fallback)
     int32_t DecryptFFieldClassNameCI(uint64_t fclass_addr) {
         if (!fclass_addr) return 0;
 
-        alignas(16) uint8_t enc[16] = {};
-        if (!m_reader.Read(fclass_addr + ArcDecrypt::Offsets::FFieldClass::NamePrivate, enc, 16))
-            return 0;
+        // ── Path 1: Plain FName (unencrypted comparison index) ───────────
+        {
+            uint32_t raw_ci = 0;
+            if (m_reader.Read(fclass_addr + ArcDecrypt::Offsets::FFieldClass::NamePrivate, &raw_ci, 4)
+                && raw_ci > 0 && raw_ci < 0x200000) {
+                // Sanity: valid comp_index for type names is typically < 2M.
+                // Resolve and accept if it looks like a property type name.
+                std::string test = CompIndexToName(static_cast<int32_t>(raw_ci));
+                if (!test.empty() && (test.find("Property") != std::string::npos || test == "Field"))
+                    return static_cast<int32_t>(raw_ci);
+            }
+        }
 
-        __m128i data = _mm_load_si128(reinterpret_cast<const __m128i*>(enc));
+        // ── Path 2: SIMD decrypt (same pipeline as FField::NamePrivate) ──
+        {
+            alignas(16) uint8_t enc[16] = {};
+            if (!m_reader.Read(fclass_addr + ArcDecrypt::Offsets::FFieldClass::NamePrivate, enc, 16))
+                return 0;
 
-        // Same pipeline as FField name (TODO: verify)
-        __m128i shuf = _mm_shuffle_epi8(data,
-            _mm_load_si128(reinterpret_cast<const __m128i*>(m_ffieldShufTable)));
-        __m128i rot = _mm_or_si128(
-            _mm_slli_epi64(shuf, 15),
-            _mm_srli_epi64(shuf, 49));
-        __m128i shuflo = _mm_shufflelo_epi16(rot, 30);
+            __m128i data = _mm_load_si128(reinterpret_cast<const __m128i*>(enc));
 
-        uint64_t packed = u64_lo_xmm(shuflo);
-        packed = fn_rotl64(packed, 32);
+            __m128i shuf = _mm_shuffle_epi8(data,
+                _mm_load_si128(reinterpret_cast<const __m128i*>(m_ffieldShufTable)));
+            __m128i rot = _mm_or_si128(
+                _mm_slli_epi64(shuf, 15),
+                _mm_srli_epi64(shuf, 49));
+            __m128i shuflo = _mm_shufflelo_epi16(rot, 30);
 
-        return static_cast<int32_t>(packed & 0xFFFFFFFF);
+            uint64_t packed = u64_lo_xmm(shuflo);
+            packed = fn_rotl64(packed, 32);
+
+            int32_t ci = static_cast<int32_t>(packed & 0xFFFFFFFF);
+            if (ci > 0 && ci < 0x200000) return ci;
+        }
+
+        return 0;
     }
 
     // ── Step 3: block index for a chunk address (FNamePool) ──────────────
