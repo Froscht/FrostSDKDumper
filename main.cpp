@@ -19,6 +19,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <set>
 #include <algorithm>
 #include <cstdint>
@@ -209,12 +210,199 @@ public:
         // Init GObjectArray (decrypt base, count, probe chunk ptr)
         m_gobj.SetPid(m_pid);
         if (!m_gobj.Init()) {
-            std::cerr << "[-] GObjectArray init failed. Check PID and game state.\n";
+            std::cerr << "[-] GObjectArray direct init failed, trying world traversal...\n";
             m_gobj.PrintDiagnostics();
+            if (!CollectWorldObjects()) {
+                std::cerr << "[-] World traversal also failed. Aborting.\n";
+                return false;
+            }
+        }
+        std::cout << "[+] GObjectArray initialized (" << m_gobj.GetNumElements() << " objects)\n";
+        return true;
+    }
+
+    // ── World traversal: GWorld → Levels → actors + BFS UClass expansion ─────
+    // Used as fallback when GUObjectArray direct init fails (e.g. ObjObjects
+    // decrypt params unknown). Mirrors the auto-discovery SDK dumper's
+    // "Levels + BFS" path.  Discovered offsets from arc_config_cache.txt:
+    //   gworldRVA=0xDEDF078 (double-deref), persistentLevelOffset=0xE0,
+    //   actorsListOffset=0x108, actorsCountOffset=0x110,
+    //   streaming levels TArray at GWorld+0x200 (hardcoded stable offset)
+    bool CollectWorldObjects() {
+        static auto isValidPtr = [](uint64_t p) {
+            return p > 0x10000ULL && p < 0x7FFFFFFFFFFFULL;
+        };
+        auto isLikelyUObject = [&](uint64_t p) {
+            if (!isValidPtr(p)) return false;
+            uint64_t vtbl = 0;
+            if (!m_reader.Read(p + ArcDecrypt::Offsets::UObject::VTable, &vtbl, 8))
+                return false;
+            return vtbl >= MODULE_BASE && vtbl < MODULE_BASE + 0x10000000ULL;
+        };
+
+        // ── Step 1: Get GWorld (single-deref) ────────────────────────────
+        uint64_t gworld = 0;
+        if (!m_reader.Read(MODULE_BASE + ArcDecrypt::RVA_GWORLD, &gworld, 8) || !isValidPtr(gworld)) {
+            std::printf("[-] WorldTraversal: GWorld invalid (0x%llX)\n",
+                (unsigned long long)gworld);
             return false;
         }
-        std::cout << "[+] GObjectArray initialized\n";
-        return true;
+        std::printf("[+] WorldTraversal: GWorld = 0x%llX\n", (unsigned long long)gworld);
+
+        // ── Step 2: Collect levels ────────────────────────────────────────
+        std::vector<uint64_t> levels;
+
+        // Persistent level at GWorld+PersistentLevel
+        uint64_t plev = 0;
+        m_reader.Read(gworld + ArcDecrypt::Offsets::UWorld::PersistentLevel, &plev, 8);
+        if (isValidPtr(plev)) {
+            levels.push_back(plev);
+            std::printf("[+] WorldTraversal: PersistentLevel = 0x%llX\n",
+                (unsigned long long)plev);
+        } else {
+            std::printf("[!] WorldTraversal: PersistentLevel at GWorld+0x%llX invalid\n",
+                (unsigned long long)ArcDecrypt::Offsets::UWorld::PersistentLevel);
+            // Probe alternate offsets
+            for (uint64_t off = 0x80; off <= 0x180; off += 8) {
+                if (off == ArcDecrypt::Offsets::UWorld::PersistentLevel) continue;
+                uint64_t cand = 0;
+                m_reader.Read(gworld + off, &cand, 8);
+                if (!isValidPtr(cand)) continue;
+                // Quick validation: actors TArray at cand+0x108 should look valid
+                uint64_t adata = 0; int32_t acount = 0;
+                m_reader.Read(cand + 0x108, &adata, 8);
+                m_reader.Read(cand + 0x110, &acount, 4);
+                if (isValidPtr(adata) && acount > 0 && acount < 500000) {
+                    levels.push_back(cand);
+                    std::printf("[+] WorldTraversal: PersistentLevel found at GWorld+0x%llX = 0x%llX\n",
+                        (unsigned long long)off, (unsigned long long)cand);
+                    break;
+                }
+            }
+        }
+
+        // Streaming levels TArray at GWorld+0x200
+        {
+            uint64_t levData = 0; int32_t levCount = 0;
+            m_reader.Read(gworld + 0x200, &levData, 8);
+            m_reader.Read(gworld + 0x208, &levCount, 4);
+            if (isValidPtr(levData) && levCount > 0 && levCount < 2000) {
+                std::printf("[+] WorldTraversal: StreamingLevels[%d] at GWorld+0x200\n", levCount);
+                for (int i = 0; i < levCount; ++i) {
+                    uint64_t lev = 0;
+                    if (!m_reader.Read(levData + 8ULL * i, &lev, 8)) continue;
+                    if (!isValidPtr(lev)) continue;
+                    // lev is a ULevelStreaming* — get its LoadedLevel
+                    // Try common offsets for ULevelStreaming::LoadedLevel
+                    bool added = false;
+                    for (uint64_t off : {0xF8ULL, 0x100ULL, 0x108ULL, 0x110ULL}) {
+                        uint64_t loaded = 0;
+                        if (!m_reader.Read(lev + off, &loaded, 8)) continue;
+                        if (!isValidPtr(loaded)) continue;
+                        uint64_t adata = 0; int32_t acount = 0;
+                        m_reader.Read(loaded + 0x108, &adata, 8);
+                        m_reader.Read(loaded + 0x110, &acount, 4);
+                        if (isValidPtr(adata) && acount > 0 && acount < 500000) {
+                            bool dup = false;
+                            for (auto& ex : levels) if (ex == loaded) { dup = true; break; }
+                            if (!dup) levels.push_back(loaded);
+                            added = true;
+                            break;
+                        }
+                    }
+                    (void)added;
+                }
+            } else {
+                // Probe alternate streaming levels offsets
+                for (uint64_t off = 0x180; off <= 0x300; off += 8) {
+                    if (off == 0x200) continue;
+                    uint64_t ld = 0; int32_t lc = 0;
+                    m_reader.Read(gworld + off, &ld, 8);
+                    m_reader.Read(gworld + off + 8, &lc, 4);
+                    if (isValidPtr(ld) && lc > 0 && lc < 2000) {
+                        std::printf("[+] WorldTraversal: StreamingLevels[%d] at GWorld+0x%llX\n",
+                            lc, (unsigned long long)off);
+                        for (int i = 0; i < lc; ++i) {
+                            uint64_t lev = 0;
+                            if (!m_reader.Read(ld + 8ULL * i, &lev, 8)) continue;
+                            if (!isValidPtr(lev)) continue;
+                            bool dup = false;
+                            for (auto& ex : levels) if (ex == lev) { dup = true; break; }
+                            if (!dup) levels.push_back(lev);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        std::printf("[+] WorldTraversal: %zu levels total\n", levels.size());
+        if (levels.empty()) return false;
+
+        // ── Step 3: Collect actors from all levels ────────────────────────
+        std::vector<uint64_t> seed_objects;
+        int total_actors = 0;
+        for (uint64_t level : levels) {
+            uint64_t adata = 0; int32_t acount = 0;
+            if (!m_reader.Read(level + 0x108, &adata, 8)) continue;
+            if (!m_reader.Read(level + 0x110, &acount, 4)) continue;
+            if (!isValidPtr(adata) || acount <= 0 || acount > 500000) continue;
+
+            for (int32_t i = 0; i < acount; ++i) {
+                uint64_t actor = 0;
+                if (!m_reader.Read(adata + 8ULL * i, &actor, 8)) continue;
+                if (!isLikelyUObject(actor)) continue;
+                seed_objects.push_back(actor);
+                ++total_actors;
+            }
+        }
+        std::printf("[+] WorldTraversal: %d actors collected\n", total_actors);
+        if (seed_objects.empty()) return false;
+
+        // ── Step 4: BFS UClass expansion ─────────────────────────────────
+        // From each actor → GetClassPrivate → UClass → SuperStruct chain
+        // This expands the ~1500 actors to ~17K objects (matching auto-discovery)
+        std::unordered_set<uint64_t> seen(seed_objects.begin(), seed_objects.end());
+        std::vector<uint64_t> bfs_queue;
+
+        // Seed with UClass pointers of all actors
+        for (uint64_t actor : seed_objects) {
+            uint64_t uclass = m_fname.GetClassPrivate(actor);
+            if (isLikelyUObject(uclass) && seen.find(uclass) == seen.end()) {
+                seen.insert(uclass);
+                bfs_queue.push_back(uclass);
+            }
+        }
+
+        // BFS: from each UClass, follow GetClassPrivate (metaclass) and SuperStruct chain
+        constexpr int MAX_BFS_ROUNDS = 8;
+        for (int round = 0; round < MAX_BFS_ROUNDS && !bfs_queue.empty(); ++round) {
+            std::vector<uint64_t> next_queue;
+            for (uint64_t obj : bfs_queue) {
+                // Follow GetClassPrivate (gets the metaclass, e.g. "Class")
+                uint64_t metaclass = m_fname.GetClassPrivate(obj);
+                if (isLikelyUObject(metaclass) && seen.find(metaclass) == seen.end()) {
+                    seen.insert(metaclass);
+                    next_queue.push_back(metaclass);
+                }
+                // Follow SuperStruct at UStruct+0xB0
+                uint64_t super = 0;
+                m_reader.Read(obj + ArcDecrypt::Offsets::UStruct::SuperStruct, &super, 8);
+                if (isLikelyUObject(super) && seen.find(super) == seen.end()) {
+                    seen.insert(super);
+                    next_queue.push_back(super);
+                }
+            }
+            std::printf("[+] WorldTraversal: BFS round %d: +%zu objects (total %zu)\n",
+                round + 1, next_queue.size(), seen.size());
+            if (next_queue.empty()) break;
+            bfs_queue = std::move(next_queue);
+        }
+
+        // Flatten all discovered objects into the result vector
+        std::vector<uint64_t> all_objects(seen.begin(), seen.end());
+        std::printf("[+] WorldTraversal: Total objects collected: %zu\n", all_objects.size());
+
+        return m_gobj.InitWithSeedObjects(std::move(all_objects));
     }
 
     // ── CompIndex → string test + FField chain probe ─────────────────────
@@ -224,18 +412,16 @@ public:
         // Debug: dump first 8 key table values
         m_fname.DumpKeyTable(8);
 
-        // Test ci=21521 (should yield "/Script/Engine")
-        {
-            std::string n = m_fname.CompIndexToName(21521);
-            std::cout << "  CompIndexToName(21521) = '"
-                      << (n.empty() ? "<empty>" : n) << "'\n";
-        }
+        // Always debug CI=505 (known "Object") and CI=21521
+        m_fname.DebugResolve(505);
+        m_fname.DebugResolve(21521);
 
         // 1. Resolve known comp_indices
         for (int32_t ci : {244478, 245193}) {
             std::string name = m_fname.CompIndexToName(ci);
             std::cout << "  CompIndexToName(" << ci << ") = '"
                       << (name.empty() ? "<empty>" : name) << "'\n";
+            if (name.empty()) m_fname.DebugResolve(ci);
         }
 
         // 2. Probe FField chain at known AbilitySystemComponent UClass
@@ -401,7 +587,8 @@ public:
                 m_reader.Read(chain + ArcDecrypt::Offsets::FField::VTable,   &vtbl,      8);
                 m_reader.Read(chain + ArcDecrypt::Offsets::FField::Next,     &next_c,    8);
                 m_reader.Read(chain + ArcDecrypt::Offsets::FProperty::Offset_Internal, &raw_off, 4);
-                m_reader.Read(chain + ArcDecrypt::Offsets::FProperty::ElementSize, &elem_size, 4);
+                { uint64_t pfc = 0; m_reader.Read(chain + ArcDecrypt::Offsets::FField::ClassPrivate, &pfc, 8);
+                  if (pfc) m_reader.Read(pfc + ArcDecrypt::Offsets::FFieldClass::ElementSize, &elem_size, 4); }
                 m_reader.Read(chain + ArcDecrypt::Offsets::FProperty::ArrayDim, &array_dim, 4);
 
                 uint8_t np[16] = {};
@@ -534,18 +721,33 @@ public:
         // ── Compute detailed stats ────────────────────────────────────────
         uint32_t n_classes = 0, n_structs = 0;
         uint64_t n_functions = 0, n_properties = 0, n_named = 0;
+        uint64_t n_struct_props = 0, n_param_props = 0;
+        uint64_t fn_0p = 0, fn_1p = 0, fn_2p = 0, fn_3p = 0;
         for (const auto& rec : sdk.structs) {
             if (rec.is_class) ++n_classes; else ++n_structs;
-            n_functions  += rec.functions.size();
             n_properties += rec.properties.size();
-            // Count ALL properties as named (UnknownProp_0xXXXX fallback guarantees a name)
+            n_struct_props += rec.properties.size();
             n_named += rec.properties.size();
-            // Also count UFunction parameter properties
             for (const auto& fn : rec.functions) {
                 n_properties += fn.params.size();
+                n_param_props += fn.params.size();
                 n_named      += fn.params.size();
+                if (fn.params.empty()) ++fn_0p;
+                else if (fn.params.size() == 1) ++fn_1p;
+                else if (fn.params.size() == 2) ++fn_2p;
+                else ++fn_3p;
             }
         }
+        // n_functions = total UFunction objects discovered (across all owners),
+        // not just those attached to a struct in our output.
+        for (const auto& [owner, fns] : gen.GetOwnerFuncMap())
+            n_functions += fns.size();
+        std::printf("[stats] struct_props=%llu param_props=%llu total=%llu\n",
+            (unsigned long long)n_struct_props, (unsigned long long)n_param_props,
+            (unsigned long long)n_properties);
+        std::printf("[stats] fn_params: 0p=%llu 1p=%llu 2p=%llu 3+p=%llu\n",
+            (unsigned long long)fn_0p, (unsigned long long)fn_1p,
+            (unsigned long long)fn_2p, (unsigned long long)fn_3p);
 
         // ── Write SDK output  ─────────────────────────────────────────────
         std::ofstream sdk_file("SDK_Output.txt");
@@ -580,12 +782,34 @@ public:
         if (!sdk.structs.empty()) {
             sdk_file << "namespace Types {\n\n";
             uint32_t written = 0;
+            // Track which class addresses had functions written
+            std::unordered_set<uint64_t> seen_owners;
             for (const auto& rec : sdk.structs) {
                 sdk_file << gen.DumpStruct(rec);
+                seen_owners.insert(rec.addr);
                 ++written;
                 if (written % 500 == 0)
                     std::cout << "\r[*] Written " << written << "/" << sdk.structs.size() << "  " << std::flush;
             }
+            // Write orphan functions (functions whose owner wasn't dumped as a type)
+            sdk_file << "\n// === Orphan Functions ===\n";
+            sdk_file << "namespace Globals {\n";
+            int orphan_count = 0;
+            for (const auto& [owner, fn_list] : gen.GetOwnerFuncMap()) {
+                if (seen_owners.count(owner)) continue;
+                std::string owner_name = "Owner_0x";
+                char buf[32]; std::snprintf(buf, sizeof(buf), "%llX", (unsigned long long)owner);
+                owner_name += buf;
+                sdk_file << "// Orphan owner @ 0x" << std::hex << owner << " (" << fn_list.size() << " functions)\n";
+                for (uint64_t fn_addr : fn_list) {
+                    std::string fn_name = m_fname.GetName(fn_addr);
+                    if (fn_name.empty()) fn_name = "<unnamed>";
+                    sdk_file << "// fn 0x" << std::hex << fn_addr << " " << owner_name << "::" << fn_name << "\n";
+                    ++orphan_count;
+                }
+            }
+            sdk_file << "// Total orphan functions: " << std::dec << orphan_count << "\n";
+            sdk_file << "} // namespace Globals\n";
             sdk_file << "} // namespace Types\n\n";
         }
 
@@ -669,8 +893,24 @@ public:
             uniqueNames.insert(name);
             nameCount[name]++;
 
-            if (name.rfind("/Script/", 0) == 0 || name.find("/Script/") != std::string::npos)
-                fClasses << "[" << i << "] " << Hex(obj_ptr) << " | " << name << "\n";
+            // Build a richer class/package record even when names are short.
+            uint64_t cls_ptr = m_fname.GetClassPrivate(obj_ptr);
+            std::string cls_name = m_fname.GetName(cls_ptr);
+            uint64_t pkg_ptr = m_fname.GetPackagePtr(obj_ptr);
+            std::string pkg_name = m_fname.GetName(pkg_ptr);
+
+            if (!cls_name.empty() || !pkg_name.empty() ||
+                name.rfind("/Script/", 0) == 0 || name.find("/Script/") != std::string::npos)
+            {
+                std::string qualified = name;
+                if (!pkg_name.empty())
+                    qualified = pkg_name + "." + qualified;
+
+                fClasses << "[" << i << "] " << Hex(obj_ptr) << " | ";
+                if (!cls_name.empty())
+                    fClasses << cls_name << " ";
+                fClasses << qualified << "\n";
+            }
 
             ++valid;
         }

@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <string>
 #include <vector>
 #include <utility>
 #include <immintrin.h>
@@ -41,13 +42,30 @@ namespace gobjects
     constexpr uint32_t FUOBJECTITEM_OBJ  = 0;   // Object* at +0x00
     constexpr uint32_t CHUNK_ITEM_COUNT   = 65536; // items per chunk
 
-    // ChunkPtr decrypt constants (from SIGNATURES.md section 3.7)
-    constexpr uint64_t RVA_CHUNKPTR_KEY1  = 0xAB2DE50;  // pxor key1 (SIMD runtime table)
-    constexpr uint64_t RVA_CHUNKPTR_KEY2  = 0xAB2DE60;  // pxor key2 (SIMD runtime table)
-    constexpr uint32_t CHUNKPTR_PEB_ADD   = 0x72AC9D29;  // addend for PEB cookie
-    constexpr uint8_t  CHUNKPTR_SHUFLO    = 0x72;         // pshuflw immediate
-    constexpr int      CHUNKPTR_DATA_OFF  = 0x70;         // encrypted data at struct+0x70
-    constexpr int      CHUNKPTR_ROL       = 43;           // ROL64 amount
+    // ChunkPtr decrypt constants (patch 20260414, probed from vtable[5] at base+96)
+    // Pipeline: load 8B @ base+0x90 → ROL16(13) → PSHUFLW(0x8D) → PEB XOR → PSHUFD(0x44) → PXOR
+    constexpr uint32_t CHUNKPTR_PEB_ADD   = 0x996E6F1D;  // mov eax, imm32 (was 0x72AC9D29)
+    constexpr uint64_t CHUNKPTR_XOR_CONST = 0x725BFAF9AE494AF3ULL; // mov rcx, imm64
+    constexpr uint8_t  CHUNKPTR_SHUFLO    = 0x8D;         // pshuflw immediate (was 0x72)
+    constexpr uint8_t  CHUNKPTR_PSHUFD    = 0x44;         // pshufd immediate
+    constexpr int      CHUNKPTR_ROL16     = 13;           // ROL16 amount (psllw 13, psrlw 3)
+    constexpr int      CHUNKPTR_DATA_OFF  = 0x90;         // encrypted data at base+0x90 (was 0xE0)
+    constexpr int      CHUNKPTR_VTABLE_OFF = 96;          // vtable struct at base+96 (0x60)
+    constexpr int      CHUNKPTR_VFUNC_OFF  = 40;          // function at vtable+40
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Helper Functions
+    // ─────────────────────────────────────────────────────────────────────
+    inline std::string FormatHex(const uint8_t* data, size_t len) {
+        std::string result;
+        for (size_t i = 0; i < len; ++i) {
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%02X ", data[i]);
+            result += buf;
+        }
+        if (!result.empty()) result.pop_back();  // Remove trailing space
+        return result;
+    }
 
     // ─────────────────────────────────────────────────────────────────────
     // GObjectArray – runtime context for FChunkedFixedUObjectArray access
@@ -57,13 +75,14 @@ namespace gobjects
         GObjectArray(uint64_t module_base, IMemoryReader& reader)
             : m_base(module_base), m_reader(reader),
               m_arrayBase(0), m_chunkPtr(0), m_numElements(0),
-              m_pebAddr(0), m_pid(0), m_initialized(false)
+              m_pebAddr(0), m_pid(0), m_initialized(false),
+                            m_useWorldFallback(false),
+                            m_chunkEntriesIndirect(false), m_itemStride(FUOBJECTITEM_SIZE)
         {
-            memset(m_xorKey,   0, 16);
-            memset(m_shufMask, 0, 16);
-            memset(m_numMask1, 0, 16);
-            memset(m_numMask2, 0, 16);
-            memset(m_numShuf,  0, 16);
+            memset(m_objXorKey,  0, 16);
+            memset(m_elemMaskA, 0, 16);
+            memset(m_elemMaskB, 0, 16);
+            memset(m_elemXorKey,0, 16);
             memset(m_chunkKey1, 0, 16);
             memset(m_chunkKey2, 0, 16);
         }
@@ -74,43 +93,46 @@ namespace gobjects
         bool Init() {
             if (m_initialized) return true;
 
-            // Load SIMD tables from process memory
-            if (!m_reader.Read(m_base + ArcDecrypt::RVA_SIMD_OBJARRAY_XOR,  m_xorKey,   16)) return false;
-            if (!m_reader.Read(m_base + ArcDecrypt::RVA_SIMD_OBJARRAY_SHUF, m_shufMask, 16)) return false;
-            if (!m_reader.Read(m_base + ArcDecrypt::RVA_SIMD_NUMELEM_MASK1, m_numMask1, 16)) return false;
-            if (!m_reader.Read(m_base + ArcDecrypt::RVA_SIMD_NUMELEM_MASK2, m_numMask2, 16)) return false;
-            if (!m_reader.Read(m_base + ArcDecrypt::RVA_SIMD_NUMELEM_SHUF,  m_numShuf,  16)) return false;
+            // Load SIMD tables for GUObjectArray decrypt (ROL32(20)→XOR→ROL16(12)) — patch 20260414
+            const bool haveSimdTables =
+                m_reader.Read(m_base + ArcDecrypt::RVA_SIMD_OBJARRAY_XOR,  m_objXorKey,  16) &&
+                m_reader.Read(m_base + ArcDecrypt::RVA_ELEM_MASK_A,        m_elemMaskA,  16) &&
+                m_reader.Read(m_base + ArcDecrypt::RVA_ELEM_MASK_B,        m_elemMaskB,  16) &&
+                m_reader.Read(m_base + ArcDecrypt::RVA_ELEM_XOR_KEY,       m_elemXorKey, 16);
 
-            // Validate SIMD tables (detect uninitialized game state)
-            if (!ValidateSIMDTables()) {
-                std::printf("[-] SIMD tables are invalid (game may not be fully loaded)\n");
-                return false;
+            bool simdReady = haveSimdTables;
+            if (simdReady && !ValidateSIMDTables()) {
+                std::printf("[!] SIMD tables are invalid (game may not be fully loaded)\n");
+                simdReady = false;
             }
 
-            // Load ChunkPtr SIMD XOR keys
-            if (!m_reader.Read(m_base + RVA_CHUNKPTR_KEY1, m_chunkKey1, 16)) return false;
-            if (!m_reader.Read(m_base + RVA_CHUNKPTR_KEY2, m_chunkKey2, 16)) return false;
+            // ChunkPtr keys no longer needed — decrypt is PEB-based (patch 20260414)
 
-            // ── Stage 1: Find GObjectArray base ──────────────────────────
-            m_arrayBase = DecryptObjectArray();
-            m_numElements = DecryptNumElements(m_arrayBase);
+            // ── GUObjectArray Access (patch 20260414) ────────────────────
+            // Struct at RVA_GOBJECT_ARRAY_BASE; encrypted qword at struct+0x30
+            // Pipeline: ROL32(20) → XOR(key) → ROL16(12) → extract lo64 = base ptr
+            m_arrayBase = m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE;
+            std::printf("[+] GUObjectArray struct at 0x%llX\n",
+                (unsigned long long)m_arrayBase);
 
-            if (!m_arrayBase || m_numElements < 1000 || m_numElements > 2000000) {
-                std::printf("[!] SIMD decrypt for ObjectArray failed (base=0x%llX count=%d), "
-                    "trying XOR probe...\n",
-                    (unsigned long long)m_arrayBase, m_numElements);
-
-                // Try to find the XOR constant dynamically
-                m_arrayBase = ProbeObjectArrayXOR();
-                if (m_arrayBase)
-                    m_numElements = DecryptNumElements(m_arrayBase);
+            uint64_t decrypted_base = 0;
+            bool directValid = false;
+            if (simdReady) {
+                decrypted_base = DecryptObjectArray();
+                if (decrypted_base) {
+                    m_numElements = DecryptNumElements(decrypted_base);
+                    std::printf("[+] SIMD decrypt: base=0x%llX count=%d\n",
+                        (unsigned long long)decrypted_base, m_numElements);
+                    directValid = (m_numElements >= 1000 && m_numElements <= 2000000);
+                    if (directValid) m_arrayBase = decrypted_base;
+                }
             }
 
-            if (!m_arrayBase || m_numElements < 1000 || m_numElements > 2000000) {
-                std::printf("[!] XOR probe failed, trying heap scan...\n");
-                m_arrayBase = ScanHeapForObjectArray();
-                if (m_arrayBase)
-                    m_numElements = DecryptNumElements(m_arrayBase);
+            if (!directValid) {
+                std::printf("[!] SIMD decrypt for ObjectArray failed (base=0x%llX count=%d)\n",
+                    (unsigned long long)decrypted_base, m_numElements);
+                m_arrayBase = 0;
+                m_numElements = 0;
             }
 
             if (!m_arrayBase || m_numElements < 1000) {
@@ -126,6 +148,7 @@ namespace gobjects
             m_pebAddr = FindPEB();
             if (m_pebAddr) {
                 std::printf("[+] PEB address: 0x%llX\n", (unsigned long long)m_pebAddr);
+                std::printf("[+] Attempting PEB-based chunk decrypt...\n");
                 m_chunkPtr = DecryptChunkPtr();
             }
 
@@ -133,6 +156,10 @@ namespace gobjects
                 std::printf("[!] SIMD decrypt chunk ptr failed (got 0x%llX), trying brute-force PEB...\n",
                     (unsigned long long)m_chunkPtr);
                 m_chunkPtr = BruteForceChunkPtr();
+            }
+
+            if (!m_chunkPtr) {
+                m_chunkPtr = TryDirectChunkPtrFromStruct();
             }
 
             if (!m_chunkPtr) {
@@ -160,13 +187,30 @@ namespace gobjects
                 m_initialized = true;
         }
 
+        // ── World-traversal fallback: accept a pre-built flat object list ─────
+        // Called by SDKDumper when GUObjectArray init fails. The list is built
+        // by walking GWorld → Levels → actors and BFS-expanding UClass chains.
+        bool InitWithSeedObjects(std::vector<uint64_t>&& objs) {
+            if (objs.empty()) return false;
+            m_worldFallbackObjects = std::move(objs);
+            m_useWorldFallback = true;
+            m_numElements = static_cast<int32_t>(m_worldFallbackObjects.size());
+            m_initialized = true;
+            std::printf("[+] GObjectArray (world fallback): %d objects\n", m_numElements);
+            return true;
+        }
+
         uint64_t GetArrayBase()   const { return m_arrayBase; }
         int32_t  GetNumElements() const { return m_numElements; }
         uint64_t GetChunkPtr()    const { return m_chunkPtr; }
 
         uint64_t GetObjectPtr(int32_t index) const {
-            if (!m_chunkPtr || index < 0 || index >= m_numElements)
-                return 0;
+            if (index < 0 || index >= m_numElements) return 0;
+
+            if (m_useWorldFallback)
+                return m_worldFallbackObjects[static_cast<size_t>(index)];
+
+            if (!m_chunkPtr) return 0;
 
             uint32_t chunk_idx = static_cast<uint32_t>(index) >> 16;
             uint32_t item_idx  = static_cast<uint16_t>(index);
@@ -176,8 +220,15 @@ namespace gobjects
                 return 0;
             if (!chunk) return 0;
 
+            if (m_chunkEntriesIndirect) {
+                uint64_t chunk_data = 0;
+                if (!m_reader.Read(chunk, &chunk_data, 8) || !chunk_data)
+                    return 0;
+                chunk = chunk_data;
+            }
+
             uint64_t obj = 0;
-            m_reader.Read(chunk + (uint64_t)FUOBJECTITEM_SIZE * item_idx + FUOBJECTITEM_OBJ, &obj, 8);
+            m_reader.Read(chunk + (uint64_t)m_itemStride * item_idx + FUOBJECTITEM_OBJ, &obj, 8);
             return obj;
         }
 
@@ -228,10 +279,10 @@ namespace gobjects
                 m_reader.Read(m_arrayBase + 0x40, &vtbl_ptr, 8);
                 if (vtbl_ptr) {
                     uint64_t func_ptr = 0;
-                    m_reader.Read(vtbl_ptr + 48, &func_ptr, 8);
+                    m_reader.Read(vtbl_ptr + 32, &func_ptr, 8); // vtable[4]
                     std::printf("[diag] GetChunkPtr virtual call:\n");
                     std::printf("  vtable @ base+0x40 = 0x%llX\n", (unsigned long long)vtbl_ptr);
-                    std::printf("  func   @ vtbl+48   = 0x%llX (RVA=0x%llX)\n",
+                    std::printf("  func   @ vtbl+32   = 0x%llX (RVA=0x%llX)\n",
                         (unsigned long long)func_ptr,
                         (unsigned long long)(func_ptr >= m_base ? func_ptr - m_base : func_ptr));
                 }
@@ -247,13 +298,16 @@ namespace gobjects
         uint64_t       m_pebAddr;
         int            m_pid;
         bool           m_initialized;
+        bool           m_useWorldFallback;
+        bool           m_chunkEntriesIndirect;
+        int            m_itemStride;
+        std::vector<uint64_t> m_worldFallbackObjects;
 
         // SIMD tables (loaded during Init)
-        alignas(16) uint8_t m_xorKey[16];
-        alignas(16) uint8_t m_shufMask[16];
-        alignas(16) uint8_t m_numMask1[16];
-        alignas(16) uint8_t m_numMask2[16];
-        alignas(16) uint8_t m_numShuf[16];
+        alignas(16) uint8_t m_objXorKey[16];  // GUObjectArray XOR key (AD2FC50) — patch 20260414
+        alignas(16) uint8_t m_elemMaskA[16]; // Element count ANDNOT mask (AD8EE10)
+        alignas(16) uint8_t m_elemMaskB[16]; // Element count AND mask (AD8EE20)
+        alignas(16) uint8_t m_elemXorKey[16];// Element count XOR key (AD8EE30)
         alignas(16) uint8_t m_chunkKey1[16];
         alignas(16) uint8_t m_chunkKey2[16];
 
@@ -264,44 +318,43 @@ namespace gobjects
                     if (buf[i] != 0) return false;
                 return true;
             };
-            if (isAllZero(m_xorKey, 16) && isAllZero(m_shufMask, 16)) {
+            if (isAllZero(m_objXorKey, 16) && isAllZero(m_elemMaskA, 16)) {
                 std::printf("[dbg] ObjectArray SIMD tables are all zeros\n");
-                return false;
-            }
-            if (isAllZero(m_numMask1, 16) && isAllZero(m_numMask2, 16) && isAllZero(m_numShuf, 16)) {
-                std::printf("[dbg] NumElements SIMD tables are all zeros\n");
                 return false;
             }
             return true;
         }
 
-        // ── Compute SIMD intermediate for ObjectArray (before final XOR) ─
+        // ── Decrypt GUObjectArray pointer (patch 20260414) ───────────────
+        // Pipeline: ROL32(20) → XOR(key) → ROL16(12) → extract lo64 = heap ptr
         uint64_t ComputeObjectArrayIntermediate() {
+            // Read encrypted xmmword from struct + GOBJ_ENCRYPTED_OFF
             alignas(16) uint8_t data[16] = {};
-            if (!m_reader.Read(m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_DATA + 32, data, 16))
+            uint64_t enc_addr = m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE + ArcDecrypt::GOBJ_ENCRYPTED_OFF;
+            if (!m_reader.Read(enc_addr, data, 16))
                 return 0;
 
-            __m128i v3 = _mm_xor_si128(
-                _mm_load_si128((const __m128i*)data),
-                _mm_load_si128((const __m128i*)m_xorKey));
+            // Pipeline: ROL32(20) → XOR(key) → ROL16(12)
+            __m128i v = _mm_load_si128((const __m128i*)data);
+            // Step 1: ROL32(20) = PSLLD(20) | PSRLD(12)
+            __m128i rol = _mm_or_si128(
+                _mm_slli_epi32(v, ArcDecrypt::OBJARRAY_ROL32),
+                _mm_srli_epi32(v, 32 - ArcDecrypt::OBJARRAY_ROL32));
+            // Step 2: XOR with key
+            __m128i xored = _mm_xor_si128(rol, _mm_load_si128((const __m128i*)m_objXorKey));
+            // Step 3: ROL16(12) = PSLLW(12) | PSRLW(4)
+            __m128i result = _mm_or_si128(
+                _mm_slli_epi16(xored, ArcDecrypt::OBJARRAY_ROL16),
+                _mm_srli_epi16(xored, 16 - ArcDecrypt::OBJARRAY_ROL16));
 
-            __m128i rotated = _mm_or_si128(
-                _mm_slli_epi64(v3, 0x22),
-                _mm_srli_epi64(v3, 0x1E));
-
-            __m128i shuffled = _mm_shuffle_epi8(rotated,
-                _mm_load_si128((const __m128i*)m_shufMask));
-
-            uint64_t result;
-            _mm_storel_epi64((__m128i*)&result, shuffled);
-            return result;
+            uint64_t r;
+            _mm_storel_epi64((__m128i*)&r, result);
+            return r;
         }
 
         // ── Decrypt FChunkedFixedUObjectArray pointer ────────────────────
         uint64_t DecryptObjectArray() {
-            uint64_t intermediate = ComputeObjectArrayIntermediate();
-            if (!intermediate) return 0;
-            return intermediate ^ ArcDecrypt::GOBJECT_ARRAY_XOR;
+            return ComputeObjectArrayIntermediate();
         }
 
         // ── Probe for ObjectArray XOR constant ───────────────────────────
@@ -339,7 +392,7 @@ namespace gobjects
             for (int off = -64; off <= 128; off += 8) {
                 if (off == 32) continue; // skip the data itself
                 uint64_t candidate_xor = 0;
-                if (!m_reader.Read(m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_DATA + off, &candidate_xor, 8))
+                if (!m_reader.Read(m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE + off, &candidate_xor, 8))
                     continue;
                 if (!candidate_xor) continue;
                 uint64_t candidate = intermediate ^ candidate_xor;
@@ -418,50 +471,52 @@ namespace gobjects
             return 0;
         }
 
-        // ── Decrypt NumElements from FChunkedFixedUObjectArray ──────────
-        // Uses ONLY dynamic SIMD tables — no hardcoded constants.
+        // ── Decrypt NumElements (patch 20260414) ─────────────────────────
+        // Read 8 bytes at base+0x50, AND/ANDNOT blend → XOR → ROL16(12) → PSHUFB(0x05040607) → extract i32
         int32_t DecryptNumElements(uint64_t array_base) {
             if (!array_base) return 0;
 
             alignas(16) uint8_t data[16] = {};
-            if (!m_reader.Read(array_base + 9 * 16, data, 16))
+            if (!m_reader.Read(array_base + 5 * 16, data, 16))
                 return 0;
 
-            __m128i si = _mm_load_si128((const __m128i*)data);
-
-            __m128i blended = _mm_or_si128(
-                _mm_and_si128(si,    _mm_load_si128((const __m128i*)m_numMask1)),
-                _mm_andnot_si128(si, _mm_load_si128((const __m128i*)m_numMask2)));
-
-            __m128i shuffled = _mm_shuffle_epi8(blended,
-                _mm_load_si128((const __m128i*)m_numShuf));
-
-            __m128i shifted = _mm_srli_epi64(shuffled, 5);
-
-            return _mm_cvtsi128_si32(shifted);
+            __m128i v = _mm_loadl_epi64((const __m128i*)data);
+            __m128i mA = _mm_load_si128((const __m128i*)m_elemMaskA);
+            __m128i mB = _mm_load_si128((const __m128i*)m_elemMaskB);
+            __m128i xk = _mm_loadl_epi64((const __m128i*)m_elemXorKey);
+            __m128i bl = _mm_or_si128(_mm_and_si128(v, mB), _mm_andnot_si128(v, mA));
+            __m128i xo = _mm_xor_si128(bl, xk);
+            __m128i r16 = _mm_or_si128(_mm_slli_epi16(xo, 12), _mm_srli_epi16(xo, 4));
+            return _mm_cvtsi128_si32(_mm_shuffle_epi8(r16, _mm_cvtsi32_si128(0x05040607)));
         }
 
         // ── Find PEB address (Wine: search for ImageBaseAddress in low mem) ──
+        // Validate a candidate PEB address by checking PEB_LDR_DATA.Length == 0x58.
+        // Anti-cheat (EAC) zeroes PEB.ImageBaseAddress so we cannot use that field.
+        bool IsPEBValid(uint64_t peb_addr) {
+            uint64_t ldr = 0;
+            if (!m_reader.Read(peb_addr + 0x18, &ldr, 8) || !ldr) return false;
+            // Must be a canonical user-space address
+            if (ldr < 0x10000ULL || ldr > 0x7FFFFFFFFFFFULL) return false;
+            uint32_t ldr_len = 0;
+            if (!m_reader.Read(ldr, &ldr_len, 4)) return false;
+            return ldr_len == 0x58;
+        }
+
         uint64_t FindPEB() {
-            // PEB+0x10 = ImageBaseAddress = module base (0x140000000)
+            // Note: PEB.ImageBaseAddress is zeroed by anti-cheat; validate via PEB_LDR_DATA.Length.
             const uint64_t candidates[] = {
                 0x7FFD0000, 0x7FFC0000, 0x7FFB0000, 0x7FFA0000,
                 0x00060000, 0x00050000, 0x00040000, 0x00030000,
             };
             for (uint64_t addr : candidates) {
-                uint64_t img_base = 0;
-                if (m_reader.Read(addr + 0x10, &img_base, 8) && img_base == m_base)
-                    return addr;
+                if (IsPEBValid(addr)) return addr;
             }
             for (uint64_t addr = 0x7FF00000; addr < 0x7FFE0000; addr += 0x1000) {
-                uint64_t img_base = 0;
-                if (m_reader.Read(addr + 0x10, &img_base, 8) && img_base == m_base)
-                    return addr;
+                if (IsPEBValid(addr)) return addr;
             }
             for (uint64_t addr = 0x00010000; addr < 0x00200000; addr += 0x1000) {
-                uint64_t img_base = 0;
-                if (m_reader.Read(addr + 0x10, &img_base, 8) && img_base == m_base)
-                    return addr;
+                if (IsPEBValid(addr)) return addr;
             }
             return 0;
         }
@@ -944,15 +999,307 @@ namespace gobjects
             return result;
         }
 
-        // ── Decrypt ChunkPtr via SIMD emulation ─────────────────────────
-        uint64_t DecryptChunkPtr() {
+        // ── Validate indirect chunk table candidate ─────────────────────
+        bool ValidateChunkTableIndirect(uint64_t candidate, int stride) {
+            if (candidate < 0x10000ULL || candidate > 0x7FFFFFFFFFFFULL)
+                return false;
+            if (candidate >= m_base && candidate < m_base + 0x10000000ULL)
+                return false;
+
+            int good = 0;
+            int chunks_to_probe = (m_numElements > 65536) ? 2 : 1;
+            for (int c = 0; c < chunks_to_probe; ++c) {
+                uint64_t entry = 0;
+                if (!m_reader.Read(candidate + 8ULL * c, &entry, 8))
+                    continue;
+                if (entry < 0x10000ULL || entry > 0x7FFFFFFFFFFFULL)
+                    continue;
+                if (entry >= m_base && entry < m_base + 0x10000000ULL)
+                    continue;
+
+                uint64_t chunk = 0;
+                if (!m_reader.Read(entry, &chunk, 8))
+                    continue;
+                if (chunk < 0x10000ULL || chunk > 0x7FFFFFFFFFFFULL)
+                    continue;
+                if (chunk >= m_base && chunk < m_base + 0x10000000ULL)
+                    continue;
+
+                for (int i = 0; i < 64; ++i) {
+                    uint64_t obj = 0;
+                    if (!m_reader.Read(chunk + (uint64_t)stride * i + FUOBJECTITEM_OBJ, &obj, 8))
+                        continue;
+                    if (obj < 0x10000ULL || obj > 0x7FFFFFFFFFFFULL)
+                        continue;
+                    uint64_t vtbl = 0;
+                    if (!m_reader.Read(obj, &vtbl, 8))
+                        continue;
+                    if (vtbl >= m_base && vtbl < m_base + 0x10000000ULL)
+                        ++good;
+                    if (good >= 6)
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        // ── Direct ChunkPtr Decryption (patch 20260409, vtable[5]) ──────
+        // Pipeline (from sub_1404A7F40):
+        //   1. Load 8B from base+0xB0 → xmm0
+        //   2. PSHUFLW(xmm0, 0x8D) → xmm1
+        //   3. PXOR(xmm1, table@0x14ACB8690)
+        //   4. ROL64(46): PSLLQ(0x2E) | PSRLQ(0x12)
+        //   5. PEB key: (0xB2DA4299DB155ED3 ^ (0x0D7DC434 + PEB)) → broadcast → PXOR
+        //   6. lo64 = chunk table pointer
+        uint64_t DecryptChunkPtrDirect() {
             if (!m_arrayBase || !m_pebAddr) return 0;
 
-            // Get function address from vtable at base+0x40
+            // Dynamic probe: read vtable[5] function and extract constants per-session
+            uint64_t vt_ptr = 0;
+            if (!m_reader.Read(m_arrayBase + 0x60, &vt_ptr, 8) || !vt_ptr) return 0;
+            uint64_t fn_addr = 0;
+            if (!m_reader.Read(vt_ptr + 40, &fn_addr, 8) || !fn_addr) return 0;
+
+            uint8_t code[128] = {};
+            if (!m_reader.Read(fn_addr, code, sizeof(code))) return 0;
+
+            // Parse the function sequentially:
+            // Pipeline variants:
+            //  a) movq xmm0,[rdx] → PSHUFLW → [pre-PXOR] → ROL16 → PEB XOR
+            //  b) movq xmm0,[rdx] → ROL16 → PSHUFLW → [pre-PXOR] → PEB XOR
+            uint32_t peb_add = 0;
+            uint64_t xor_const = 0;
+            uint8_t pshuflw_imm = 0;
+            int rol16_right = 0, rol16_left = 0;
+            uint64_t prexor_addr = 0;
+            // Record order of operations to apply them correctly
+            enum StepType { STEP_NONE, STEP_PSHUFLW, STEP_ROL16, STEP_PREXOR };
+            StepType steps[8] = {};
+            int step_count = 0;
+
+            for (int i = 0; i < 100; i++) {
+                if (code[i] == 0xB8 && i+14 <= 128 &&
+                    code[i+5] == 0x65 && code[i+6] == 0x48 && code[i+7] == 0x03) {
+                    peb_add = *(uint32_t*)(code + i + 1);
+                }
+                if (code[i] == 0x48 && code[i+1] == 0xB9) {
+                    xor_const = *(uint64_t*)(code + i + 2);
+                }
+                if (code[i] == 0xF2 && code[i+1] == 0x0F && code[i+2] == 0x70) {
+                    if (pshuflw_imm == 0) {
+                        pshuflw_imm = code[i+4];
+                        if (step_count < 8) steps[step_count++] = STEP_PSHUFLW;
+                    }
+                }
+                if (code[i] == 0x66 && code[i+1] == 0x0F && code[i+2] == 0x71) {
+                    uint8_t sub = code[i+3]; uint8_t imm = code[i+4];
+                    if ((sub & 0xF0) == 0xD0 && !rol16_right) {
+                        rol16_right = imm;
+                        if (step_count < 8) steps[step_count++] = STEP_ROL16;
+                    }
+                    if ((sub & 0xF0) == 0xF0 && !rol16_left) rol16_left = imm;
+                }
+                if (code[i] == 0x66 && code[i+1] == 0x0F && code[i+2] == 0xEF &&
+                    (code[i+3] & 0xC7) == 0x05 && !prexor_addr) {
+                    int32_t disp = *(int32_t*)(code + i + 4);
+                    prexor_addr = fn_addr + i + 8 + disp;
+                    if (step_count < 8) steps[step_count++] = STEP_PREXOR;
+                }
+                if (code[i] == 0xC3) break;  // ret
+            }
+
+            if (!peb_add || !rol16_left) {
+                std::printf("[!] Chunk probe failed: peb=0x%X xor=0x%llX rol=%d/%d pshuflw=0x%02X\n",
+                    peb_add, (unsigned long long)xor_const, rol16_left, rol16_right, pshuflw_imm);
+                return 0;
+            }
+
+            std::printf("[+] Chunk probe @ fn=0x%llX: PEB_ADD=0x%X XOR=0x%llX PSHUFLW=0x%02X ROL16=%d prexor=0x%llX\n",
+                (unsigned long long)fn_addr, peb_add, (unsigned long long)xor_const,
+                pshuflw_imm, rol16_left, (unsigned long long)prexor_addr);
+
+            alignas(16) uint8_t enc[16] = {};
+            if (!m_reader.Read(m_arrayBase + 0x90, enc, 16)) return 0;
+
+            __m128i v = _mm_loadl_epi64((const __m128i*)enc);
+
+            // Apply steps in the order they appeared in the function
+            for (int s = 0; s < step_count; s++) {
+                if (steps[s] == STEP_PSHUFLW) {
+                    alignas(16) uint16_t w_in[8], w_out[8];
+                    _mm_store_si128((__m128i*)w_in, v);
+                    w_out[0] = w_in[(pshuflw_imm >> 0) & 3];
+                    w_out[1] = w_in[(pshuflw_imm >> 2) & 3];
+                    w_out[2] = w_in[(pshuflw_imm >> 4) & 3];
+                    w_out[3] = w_in[(pshuflw_imm >> 6) & 3];
+                    for (int j = 4; j < 8; j++) w_out[j] = w_in[j];
+                    v = _mm_load_si128((const __m128i*)w_out);
+                }
+                else if (steps[s] == STEP_ROL16) {
+                    v = _mm_or_si128(
+                        _mm_slli_epi16(v, rol16_left),
+                        _mm_srli_epi16(v, rol16_right));
+                }
+                else if (steps[s] == STEP_PREXOR && prexor_addr) {
+                    alignas(16) uint8_t pxk[16] = {};
+                    if (m_reader.Read(prexor_addr, pxk, 16))
+                        v = _mm_xor_si128(v, _mm_load_si128((const __m128i*)pxk));
+                }
+            }
+
+            // Final: PEB XOR (broadcast)
+            uint64_t peb_val = static_cast<uint64_t>(peb_add) + m_pebAddr;
+            uint64_t peb_key = peb_val ^ xor_const;  // xor_const may be 0
+            __m128i k = _mm_set1_epi64x(static_cast<int64_t>(peb_key));
+            __m128i result = _mm_xor_si128(k, v);
+
+            uint64_t table_ptr;
+            _mm_storel_epi64((__m128i*)&table_ptr, result);
+
+            std::printf("[+] ChunkPtr vtable[5] decrypt: table=0x%llX (PEB=0x%llX)\n",
+                (unsigned long long)table_ptr, (unsigned long long)m_pebAddr);
+
+            // Validate: the table should contain pointers to chunk arrays
+            if (table_ptr < 0x10000ULL || table_ptr > 0x7FFFFFFFFFFFULL)
+                return 0;
+
+            // Check if this is a direct chunk table (array of chunk pointers)
+            if (ValidateChunkPtr(table_ptr))
+                return table_ptr;
+
+            // Try indirect: table_ptr might point to a struct with the actual chunk table
+            for (int off = 0; off <= 0x40; off += 8) {
+                uint64_t inner = 0;
+                if (!m_reader.Read(table_ptr + off, &inner, 8)) continue;
+                if (inner < 0x10000ULL || inner > 0x7FFFFFFFFFFFULL) continue;
+                if (ValidateChunkPtr(inner)) {
+                    std::printf("[+] Indirect chunk table at table+0x%X = 0x%llX\n",
+                        off, (unsigned long long)inner);
+                    return inner;
+                }
+            }
+
+            return 0;
+
+            /* Original code disabled:
+
+            // Stage 1: decrypt manager pointer from array+0xE0
+            alignas(16) uint8_t enc_mgr[16] = {};
+            if (!m_reader.Read(m_arrayBase + CHUNKPTR_DATA_OFF, enc_mgr, 16))
+                return 0;
+
+            __m128i data = _mm_load_si128(reinterpret_cast<const __m128i*>(enc_mgr));
+            __m128i rol_step = _mm_or_si128(
+                _mm_slli_epi32(data, 21),
+                _mm_srli_epi32(data, 11)
+            );
+
+            // Use m_shufMask as best-effort (TODO: confirm correct table for ChunkPtr)
+            __m128i shuffled = _mm_shuffle_epi8(
+                rol_step,
+                _mm_load_si128(reinterpret_cast<const __m128i*>(m_shufMask)));
+            uint64_t manager = _mm_cvtsi128_si64(shuffled) ^ ArcDecrypt::CHUNK_PTR_XOR_KEY;
+            if (manager < 0x10000ULL || manager > 0x7FFFFFFFFFFFULL)
+                return 0;
+
+            // Stage 2: emulate vtable+56 transform on manager+0x30 block.
+            alignas(16) uint8_t blk[16] = {};
+            if (!m_reader.Read(manager + 0x30, blk, 16))
+                return 0;
+
+            alignas(16) uint8_t mask1[16] = {};
+            alignas(16) uint8_t mask2[16] = {};
+            if (!m_reader.Read(m_base + RVA_CHUNKPTR_V56_SHUF, mask1, 16)) return 0;
+            if (!m_reader.Read(m_base + RVA_CHUNKPTR_V56_XOR,  mask2, 16)) return 0;
+
+            __m128i s = _mm_shuffle_epi8(
+                _mm_load_si128(reinterpret_cast<const __m128i*>(blk)),
+                _mm_load_si128(reinterpret_cast<const __m128i*>(mask1)));
+            __m128i x = _mm_xor_si128(s, _mm_load_si128(reinterpret_cast<const __m128i*>(mask2)));
+            __m128i r = _mm_or_si128(_mm_srli_epi32(x, 3), _mm_slli_epi32(x, 29)); // ror32(3)
+
+            uint64_t key64 = (m_pebAddr + 0xE5814B12ULL) ^ 0x99D23C9DF3E47D2DULL;
+            __m128i k = _mm_set_epi64x((long long)key64, (long long)key64);
+            __m128i out = _mm_xor_si128(r, k);
+            uint64_t table = _mm_cvtsi128_si64(out);
+
+            if (ValidateChunkTableIndirect(table, 16)) {
+                m_chunkEntriesIndirect = true;
+                m_itemStride = 16;
+                std::printf("[+] Chunk table (v56) = 0x%llX (indirect, stride=16)\n",
+                    (unsigned long long)table);
+                return table;
+            }
+
+            if (ValidateChunkTableIndirect(table, 24)) {
+                m_chunkEntriesIndirect = true;
+                m_itemStride = 24;
+                std::printf("[+] Chunk table (v56) = 0x%llX (indirect, stride=24)\n",
+                    (unsigned long long)table);
+                return table;
+            }
+
+            return 0;
+            */ // end disabled DecryptChunkPtrDirect code
+        }
+
+        // ── ChunkPtr Decryption – vtable[4] ROL32 algorithm (patch 20260402) ──
+        // Confirmed by live memory analysis: vtable[4]=0x14049C4D0 uses
+        //   ROL32(23) per dword → PSHUFB(mask@RVA 0xAC6F950) → ROL32(13) → XOR key
+        // where key = broadcast(PEB + 0x8974FAB4) as {lo32,hi32,lo32,hi32}.
+        // Encrypted xmmword (lo64==hi64) is at GObjectArray+0x70.
+        uint64_t DecryptChunkPtrV4() {
+            if (!m_arrayBase || !m_pebAddr) return 0;
+
+            alignas(16) uint8_t enc[16] = {};
+            if (!m_reader.Read(m_arrayBase + 0x70, enc, 16))
+                return 0;
+
+            // PSHUFB mask lives in .rdata at RVA 0xAC6F950
+            alignas(16) uint8_t shuf[16] = {};
+            if (!m_reader.Read(m_base + 0x0AC6F950ULL, shuf, 16))
+                return 0;
+
+            uint64_t key64 = m_pebAddr + 0x8974FAB4ULL;
+
+            __m128i v      = _mm_load_si128((const __m128i*)enc);
+            __m128i rol23  = _mm_or_si128(_mm_slli_epi32(v, 23), _mm_srli_epi32(v, 9));
+            __m128i shufv  = _mm_shuffle_epi8(rol23, _mm_load_si128((const __m128i*)shuf));
+            __m128i rol13  = _mm_or_si128(_mm_slli_epi32(shufv, 13), _mm_srli_epi32(shufv, 19));
+            // movq xmm0,rax + pshufd xmm0,xmm0,0x44  → {lo32,hi32,lo32,hi32}
+            __m128i k      = _mm_shuffle_epi32(_mm_cvtsi64_si128((long long)key64), 0x44);
+            __m128i result = _mm_xor_si128(k, rol13);
+
+            uint64_t out = 0;
+            _mm_storel_epi64((__m128i*)&out, result);
+            return out;
+        }
+
+        // ── Decrypt ChunkPtr via SIMD emulation ─────────────────────────
+        uint64_t DecryptChunkPtr() {
+            // Primary: vtable[4] ROL32 algorithm (verified patch 20260402)
+            uint64_t v4 = DecryptChunkPtrV4();
+            if (v4 && ValidateChunkPtr(v4)) {
+                std::printf("[+] ChunkPtr (ROL32/vtable[4]) = 0x%llX\n",
+                    (unsigned long long)v4);
+                return v4;
+            }
+            if (v4) std::printf("[!] ROL32 result 0x%llX failed validation\n",
+                (unsigned long long)v4);
+
+            // Try direct decryption first (from sub_4999C0)
+            uint64_t direct = DecryptChunkPtrDirect();
+            if (direct) return direct;
+
+            // Fallback to emulation if direct fails
+            if (!m_arrayBase || !m_pebAddr) return 0;
+
+            // Get function address from vtable at base+0x40  (vtable[4] = offset 32)
             uint64_t vtbl_ptr = 0;
             if (!m_reader.Read(m_arrayBase + 0x40, &vtbl_ptr, 8) || !vtbl_ptr) return 0;
             uint64_t func_addr = 0;
-            if (!m_reader.Read(vtbl_ptr + 48, &func_addr, 8) || !func_addr) return 0;
+            if (!m_reader.Read(vtbl_ptr + 32, &func_addr, 8) || !func_addr) return 0;
 
             // Read function code (only need up to first ret, typically < 128 bytes)
             uint8_t code[256] = {};
@@ -987,12 +1334,27 @@ namespace gobjects
             uint64_t chunk0 = 0;
             if (!m_reader.Read(candidate, &chunk0, 8)) return false;
             if (chunk0 < 0x10000ULL || chunk0 > 0x7FFFFFFFFFFFULL) return false;
-            uint64_t obj0 = 0;
-            if (!m_reader.Read(chunk0, &obj0, 8)) return false;
-            if (obj0 < 0x10000ULL || obj0 > 0x7FFFFFFFFFFFULL) return false;
-            uint64_t vtbl = 0;
-            if (!m_reader.Read(obj0, &vtbl, 8)) return false;
-            return (vtbl >= m_base && vtbl < m_base + 0x10000000ULL);
+            if (chunk0 >= m_base && chunk0 < m_base + 0x10000000ULL) return false;
+
+            // Some chunks start with null/stale items. Sample a window and
+            // accept when at least one UObject has an in-module vtable.
+            int valid_samples = 0;
+            const int max_samples = (m_numElements > 0 && m_numElements < 64) ? m_numElements : 64;
+            for (int i = 0; i < max_samples; ++i) {
+                uint64_t obj = 0;
+                if (!m_reader.Read(chunk0 + (uint64_t)FUOBJECTITEM_SIZE * i + FUOBJECTITEM_OBJ, &obj, 8))
+                    continue;
+                if (obj < 0x10000ULL || obj > 0x7FFFFFFFFFFFULL)
+                    continue;
+                uint64_t vtbl = 0;
+                if (!m_reader.Read(obj, &vtbl, 8))
+                    continue;
+                if (vtbl >= m_base && vtbl < m_base + 0x10000000ULL)
+                    ++valid_samples;
+                if (valid_samples >= 3)
+                    return true;
+            }
+            return false;
         }
 
         // ── Compute ChunkPtr intermediate (for brute-force PEB scan) ────
@@ -1007,7 +1369,7 @@ namespace gobjects
             uint64_t vtbl_ptr = 0;
             if (!m_reader.Read(m_arrayBase + 0x40, &vtbl_ptr, 8) || !vtbl_ptr) return 0;
             uint64_t func_addr = 0;
-            if (!m_reader.Read(vtbl_ptr + 48, &func_addr, 8) || !func_addr) return 0;
+            if (!m_reader.Read(vtbl_ptr + 32, &func_addr, 8) || !func_addr) return 0; // vtable[4]
 
             uint8_t code[256] = {};
             if (!m_reader.Read(func_addr, code, 256)) return 0;
@@ -1017,19 +1379,18 @@ namespace gobjects
             }
 
             alignas(16) uint8_t data[16] = {};
-            if (!m_reader.Read(m_arrayBase + CHUNKPTR_DATA_OFF, data, 16))
+            if (!m_reader.Read(m_arrayBase + 0x70, data, 16)) // vtable[4] reads from +0x70
                 return 0;
 
             // Try PEB candidates in typical Wine ranges
+            // Note: anti-cheat zeroes PEB.ImageBaseAddress so we use IsPEBValid() instead
             static const uint64_t ranges[][2] = {
                 {0x7FF00000, 0x7FFE0000},
                 {0x00010000, 0x00200000},
             };
             for (const auto& range : ranges) {
                 for (uint64_t peb = range[0]; peb < range[1]; peb += 0x1000) {
-                    // Quick check: PEB+0x10 should be module base
-                    uint64_t img = 0;
-                    if (!m_reader.Read(peb + 0x10, &img, 8) || img != m_base) continue;
+                    if (!IsPEBValid(peb)) continue;
 
                     uint64_t candidate = EmulateChunkPtrDecrypt(code, path_len, data, peb, func_addr);
                     if (candidate && ValidateChunkPtr(candidate)) {
@@ -1095,6 +1456,26 @@ namespace gobjects
                 }
             }
 
+            return 0;
+        }
+
+        // ── Direct struct-field extraction for chunk pointer ────────────
+        uint64_t TryDirectChunkPtrFromStruct() {
+            if (!m_arrayBase) return 0;
+
+            // Observed stable candidates in latest patch: +0x70 is primary.
+            static const int kOffsets[] = {0x70, 0x68, 0x78, 0xB0};
+            for (int off : kOffsets) {
+                uint64_t candidate = 0;
+                if (!m_reader.Read(m_arrayBase + (uint64_t)off, &candidate, 8))
+                    continue;
+                if (!ValidateChunkPtr(candidate))
+                    continue;
+
+                std::printf("[+] Direct chunk ptr from array+0x%02X = 0x%llX\n",
+                    off, (unsigned long long)candidate);
+                return candidate;
+            }
             return 0;
         }
     };

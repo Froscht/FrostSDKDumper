@@ -1,338 +1,346 @@
-# ARC Raiders – Signatures & Decrypt Reference (March 2026 Patch)
+# ARC Raiders – Signatures & Xref Guide (Patch 20260409)
 
-Module Base: `0x140000000`
-
----
-
-## 1. Global Addresses (RVAs)
-
-### GWorld
-| RVA | Description |
-|---|---|
-| `0xDCB9AB8` | GWorld pointer |
-| `0xDCB9AC0` | GWorld hash count |
-| `0xDCB9AEC` | GWorld hash capacity |
-| `0xDCB9AF8` | GWorld alt bucket |
-| `0xDCB9B00` | GWorld bucket mask |
-
-### GObjects (FChunkedFixedUObjectArray)
-| RVA | Description |
-|---|---|
-| `0xDB4DD20` | GObjectArray encrypted data |
-| `0xDB4DD24` | GObjectArray MaxChunks |
-| XOR constant | `0xAB8F9C79978619C2` |
-
-### FNamePool
-| RVA | Description |
-|---|---|
-| `0xD8FD870` | GNames base (old, used in arc_decrypt.h) |
-| `0xD892880` | GNames base (actual, used in fname_decrypt.h) |
-| `0xD841864` | FName key table (old) |
-| `0xD7D6804` | FName key table (actual) |
-
-### SIMD Runtime Tables
-| RVA | Description |
-|---|---|
-| `0xAAF4770` | UObject name/class shuffle_epi8 mask |
-| `0xAAF74B0` | FField name shuffle_epi8 mask |
-| `0xAAF4740` | NumElements andnot mask |
-| `0xAAF4750` | NumElements and mask |
-| `0xAAF4760` | NumElements shuffle_epi8 mask |
-| `0xAAA18A0` | ObjectArray XOR key |
-| `0xAAA18B0` | ObjectArray shuffle_epi8 mask |
-| `0xAAF47C0` | GetClassSlot XOR mask |
-| `0xAB2DE50` | ChunkPtr pxor key1 |
-| `0xAB2DE60` | ChunkPtr pxor key2 |
+> **Lesson learned from 20260402→20260409**: Pure opcode-pattern signatures broke 100%.
+> What survived: **string references** (`UObjectHash.cpp`), **FNV prime immediate** (`0x01000193`),
+> and **structural patterns** (byte-copy loops, SIMD pipeline shapes).
+> This guide prioritizes **resilient anchors** over fragile byte sequences.
 
 ---
 
-## 2. Structure Offsets
+## Strategy: How to Find Everything After a Patch
 
-### UObject (0xA0 total, 4 encrypted slots)
-| Offset | Field | Notes |
-|---|---|---|
-| `+0x00` | VTable | |
-| `+0x08` | InternalIndex | |
-| `+0x20` | FieldsSlots[0..3] | 4 slots × 0x20 bytes (0x20–0x9F) |
+### Tier 1 — Anchors (survive across patches)
 
-Slot selection: FNV hash of (obj_base + 0x10), constants:
-- HASH_PRIME = `16777619` (0x01000193)
-- HASH_ADD = `1668103848` (0x636F6E28)
-- SLOT_XOR = `0x2C158`
-- Name slot: `(hash & 3) ^ 2`
-- Class slot: `(hash & 3)` (no XOR)
-- Outer slot: `(name_slot + 3) & 3`
+| Anchor | How to find | What it gives you |
+|--------|------------|-------------------|
+| `UObjectHash.cpp` string | `find_regex("UObjectHash")` | Xrefs land in **UObj_SlotAccess** — extract FNV, sentinel, slot pipeline |
+| FNV prime `0x01000193` | `find(type="immediate", targets=[16777619])` | All FNV hash call sites — slot hash, FName block hash |
+| 16× `movzx+mov` byte-copy | `41 0F B6 40 01 88 41 01 41 0F B6 40 02 88 41 02` | **FName_DecryptBlockAddr** — the block resolution function |
+| `FNamePool` init guard | `find(type="data_ref", targets=[pool_base_rva])` | FNamePool base address |
+| `GetTransientPackage` string | `find_regex("GetTransientPackage")` | Leads to GWorld/GEngine area |
 
-### FField
-| Offset | Field |
-|---|---|
-| `+0x00` | VTable |
-| `+0x90` | Next (FField*) |
-| `+0xB0` | NamePrivate (encrypted, 16 bytes) |
-| `+0x130` | ClassPrivate (FFieldClass*) |
+### Tier 2 — Structural patterns (usually survive)
 
-### FFieldClass
-| Offset | Field |
-|---|---|
-| `+0x50` | NamePrivate |
+| Pattern | Description |
+|---------|-------------|
+| `PSHUFB + ROL32 + PSHUFLW` near a `.data` xmmword load | GObjectArray base decrypt |
+| `PSHUFLW + ROL64 + PXOR` triple chain (3 levels) | CIdx decode pipeline |
+| `AND/ANDNOT blend + PSHUFB + PXOR` | Block header decode |
+| `SHLD + IMUL 0x01000193 + ADD + ROL` repeated 4× | FNV-32 slot hash |
+| `IMUL 0x100000001B3 + ADD + ROL` repeated 2× | FNV-64 entry chain |
+| `ROL64 + PSHUFLW + XOR(sentinel) + CMP(sentinel)` | UObject slot decrypt |
 
-### FProperty
-| Offset | Field | Notes |
-|---|---|---|
-| `+0xC4` | Offset_Internal | Encrypted: `bswap32(raw ^ 0x46F1DEE5)` |
-| `+0xC8` | ElementSize | |
-| `+0xCC` | ArrayDim | |
+### Tier 3 — Exact signatures (patch-specific, break on update)
 
-### FBoolProperty (extends FProperty)
-| Offset | Field | Notes |
-|---|---|---|
-| `+0x130` | FieldSize (u8) | 1=bitfield, 4=native bool |
-| `+0x131` | ByteOffset (u8) | Offset within property byte |
-| `+0x132` | ByteMask (u8) | Bitmask 0x01..0x80 |
-| `+0x133` | FieldMask (u8) | = ByteMask for bitfields |
-
-### FProperty Sub-Types (all shifted from old +0xD8 to +0x130/+0x138)
-| Type | Offset | Field | Verified With |
-|---|---|---|---|
-| FStructProperty | `+0x130` | Struct (UScriptStruct*) | PrimaryActorTick→ActorTickFunction |
-| FObjectProperty | `+0x130` | PropertyClass (UClass*) | Owner→Actor, Mesh→SkeletalMeshComponent |
-| FEnumProperty | `+0x130` | Enum (UEnum*) | AutoPossessPlayer→EAutoReceiveInput |
-| FArrayProperty | `+0x138` | Inner (FProperty*) | Children→ObjectProperty, Tags→NameProperty |
-| FSetProperty | `+0x130` | ElementProp (FProperty*) | OnStateLeaveGameplayEffects |
-| FSoftObjectProperty | `+0x130` | PropertyClass (UClass*) | |
-| FMapProperty | `+0x130` | KeyProp (FProperty*) | Annotations TMap |
-| FMapProperty | `+0x138` | ValueProp (FProperty*) | Labels TMap |
-| FClassProperty | `+0x130` | PropertyClass + `+0x138` MetaClass | AIControllerClass→TSubclassOf |
-| FInterfaceProperty | `+0x130` | InterfaceClass (UClass*) | |
-
-### UStruct
-| Offset | Field | Verified |
-|---|---|---|
-| `+0x0B0` | SuperStruct | |
-| `+0x0C0` | MinAlignment | |
-| `+0x0D0` | Children (UField* linked list) | |
-| `+0x0D8` | ChildProperties (FField* chain) | |
-| `+0x0E8` | PropertiesSize | Actor=0x3B0, ActorComponent=0x190 |
-
-### UEnum
-| Offset | Field |
-|---|---|
-| `+0xB0` | Names (TArray<TPair<FName,int64>>) |
-| `+0xB8` | Names.Num (count) |
-
-### UFunction
-| Offset | Field |
-|---|---|
-| `+0x000` | VTable |
-| `+0x098` | UField::Next |
-| `+0x128` | FunctionFlags (TODO: verify) |
-| `+0x1C8` | NativeFunc (TODO: verify) |
+See sections below.
 
 ---
 
-## 3. Decrypt Pipelines
+## 1. UObj_SlotAccess — UObject encrypted slot decrypt
+**RVA**: `0x4E8610` (patch 20260409) | Size: `0x825`
 
-### 3.1 UObject Slot Hash → Slot Index
+**How to find**: Search for xrefs to the `UObjectHash.cpp` string. All 5 xrefs land here.
+
+### Pipeline (patch 20260409 — REVERSED from 20260402):
 ```
-addr = obj_base + 0x10
-lo = (uint32_t)addr, hi = (uint32_t)(addr >> 32)
-s0 = HASH_PRIME * ROL32(lo, 26) - HASH_ADD
-s1 = ROL32(s0, 19)
-s2 = hi + HASH_PRIME * s1 - HASH_ADD
-s3 = ROL32(s2, 26)
-s4 = HASH_PRIME * s3 - HASH_ADD
-v  = HASH_PRIME * (s4 >> 13)
-name_slot  = ((v & 0xFF) ^ ((SLOT_XOR + v) >> 16) & 0xFF) & 3) ^ 2
-class_slot = ((v & 0xFF) ^ ((SLOT_XOR + v) >> 16) & 0xFF) & 3)
-outer_slot = (name_slot + 3) & 3
+load 16B from obj + 0x20 + slot*32
+  → ROL64(45):  PSLLQ(0x2D) | PSRLQ(0x13)
+  → PSHUFLW(0x1E)
+  → extract lo64
+  → XOR(sentinel)
+  → result: pointer (class/outer) or ROL64(32) for FName CI
 ```
 
-### 3.2 UObject Name/Class Slot Decrypt → value
-```
-data = Read128(obj_base + 0x20 + slot * 0x20)
-step1 = shufflelo_epi16(data, 27)        // pshuflw imm=0x1B
-step2 = ROL16(step1, 13)                 // slli16(13) | srli16(3)
-step3 = shuffle_epi8(step2, RUNTIME_ACTOR_SHUF_TABLE)
-// For FName: ROL64(result, 32) → lo32 = comp_index
-// For ClassPrivate: lo64 = UClass pointer
-```
+Old pipeline was: `PSHUFLW(0x93) → XOR → ROL64(15/47)`. If it changes again, look for
+the sentinel comparison (`cmp reg, sentinel; jz null_path`) — that's the anchor.
 
-### 3.3 FField::NamePrivate Decrypt → comp_index
+### Sig: Function prologue + sentinel load (wildcarded)
 ```
-data = Read128(ff_addr + 0xB0)
-step1 = shuffle_epi8(data, RUNTIME_FFIELD_SHUF_TABLE)
-step2 = ROL64(step1, 15)                 // slli64(15) | srli64(49)
-step3 = shufflelo_epi16(step2, 30)       // pshuflw imm=0x1E
-result = ROL64(lo64(step3), 32) → lo32 = comp_index
+41 57 41 56 56 57 53 48 81 EC ? ? ? ? 48 89 CE 48 8B 05 ? ? ? ? 48 31 E0 48 89 84 24 ? ? ? ? 48 BF ? ? ? ? ? ? ? ?
 ```
+**After match**: bytes at `+0x21..+0x28` (after `48 BF`) = little-endian **sentinel** value.
 
-### 3.4 FProperty Offset Decrypt
+### FNV Hash (inside this function)
+```asm
+rol     ecx, 18h          ; ROL32(lo, 24)
+imul    ecx, 1000193h     ; * FNV_PRIME
+add     ecx, 295812B1h    ; + FNV_ADD
 ```
-decrypted = bswap32(raw_u32 ^ 0x46F1DEE5)
-```
+**Extraction**: `imul ?, 01000193h` → FNV_PRIME (stable); `add ?, ????????h` → FNV_ADD (changes per patch).
+**ROL amounts**: scan for `C1 ?? 18` (ROL 24) and `C1 ?? 0E` (ROL 14) near the IMUL.
 
-### 3.5 GObjectArray Decrypt
+### Slot index
+```asm
+and     ebx, 3            ; class_slot = base_idx & 3
+shl     ebx, 5            ; stride = 32
 ```
-data = Read128(MODULE_BASE + 0xDB4DD20 + 32)
-step1 = XOR(data, SIMD_TABLE_0xAAA18A0)
-step2 = ROL64(step1, 34)                 // per qword
-step3 = shuffle_epi8(step2, SIMD_TABLE_0xAAA18B0)
-result = lo64(step3) ^ 0xAB8F9C79978619C2
-```
+`xor edx, 2` = FName slot; `inc r8d; and r8d, 3` = Outer slot.
 
-### 3.6 GObjectArray NumElements Decrypt
-```
-data = Read128(array_base + 9*16)        // offset 0x90
-blended = (data & MASK1) | (~data & MASK2)  // SIMD and/andnot
-shuffled = shuffle_epi8(blended, NUM_SHUF_MASK)
-result = lo32(srli_epi64(shuffled, 5))
-```
+### Constants (patch 20260409)
 
-### 3.7 GObjectArray ChunkPtr Decrypt
-```
-data = Read64(array_base + 0x70)
-step1 = XOR(data, KEY1_0xAB2DE50)
-step2 = ROL64(step1, 43)
-step3 = pshuflw(step2, 0x72)
-step4 = XOR(step3, KEY2_0xAB2DE60)
-step5 = XOR(step4, broadcast(PEB_ADDR + 0x72AC9D29))
-// PEB: Wine PEB with ImageBaseAddress at +0x10 = 0x140000000
-```
-
-### 3.8 FNamePool → Name String
-
-#### 3.8.1 comp_index → GNames Location (3-stage SIMD)
-```
-// Stage 1: shuffle_epi8(cvtsi32(ci), GIDX_SHUF1) → XOR(GIDX_XOR1) → ROL32(11)
-// Stage 2: ROL32(21) → shuffle_epi32(0x44) → ROL32(11)
-// Stage 3: ROL32(21) → shuffle_epi8(GIDX_EXTRACT_SHUF) → XOR(0x4689054B)
-v5 = result
-name_offset = 2 * (uint16_t)v5
-chunk_off   = (v5 >> 8) & 0xFFFF00
-```
-
-SIMD constants:
-```
-GIDX_SHUF1 = 02 00 00 00 00 00 01 03 02 00 00 00 00 00 01 03
-GIDX_XOR1  = 89 00 00 00 4B 00 05 46 89 00 00 00 4B 00 05 46
-GIDX_EXTRACT_SHUF = 04 06 00 07 00 00 00 00 00 00 00 00 00 00 00 00
-GIDX_EXTRACT_XOR  = 0x4689054B
-```
-
-#### 3.8.2 Block Index (FNV hash of chunk address)
-```
-seed = chunk_addr + 9472
-lo = (uint32_t)seed, hi = (uint32_t)(seed >> 32)
-h = lo >> 4
-h = HASH_PRIME * h + 1133438190 (0x438FB4EE)
-h = ROL32(h, 16)
-h = HASH_PRIME * h + hi + 1133438190
-h = ROL32(h, 28)
-h = HASH_PRIME * h + 1133438190
-v8 = ROL32(h, 16)
-block_idx = (uint8_t)(-109 * v8 - 18) ^ (uint8_t)((HASH_PRIME * v8 + 1133438190) >> 16)
-```
-
-#### 3.8.3 Block Decrypt (per 128-bit block)
-```
-step1 = shufflelo_epi16(data, 57)        // pshuflw imm=0x39
-step2 = ROL64(step1, 51)
-step3 = shuffle_epi8(step2, BLOCK_SHUF)
-step4 = XOR(step3, BLOCK_XOR_KEY)
-result = lo64(step4)
-```
-
-Constants:
-```
-BLOCK_SHUF   = 01 04 06 07 05 02 03 00 (+ 8 zero bytes)
-BLOCK_XOR    = A4 5B A9 EB 21 AE 9A 4F (+ 8 zero bytes)
-```
-
-#### 3.8.4 FNV Fold + Pointer Fixup
-```
-fnv = FNV_PRIME * ROL64(block1_dec, 38) + 0x5BD41B159509682E
-fnv = FNV_PRIME * ROL64(fnv, 31) + 0x5BD41B159509682E
-R = block1_dec + (block2_dec ^ fnv) + name_offset
-
-// Pointer fixup:
-a = bswap64(R ^ 0x9B7E4246)
-b = a ^ 0x5C76BDF000000000
-name_ptr = bswap64(b ^ 0x1A34C36B00000000)
-```
-
-FNV_PRIME = `0x100000001B3`
-
-#### 3.8.5 Name String Decrypt
-```
-header = Read16(name_ptr)
-isWide = header & 1
-length = (header >> 1) & 0x3FF
-buf = Read(name_ptr + 2, length)
-
-key = length - 81
-for i in 0..length step 2:
-    if narrow: buf[i] ^= key_table[key & 0x3F] >> 3
-               buf[i+1] ^= key_table[(81*key + 124) & 0x3F] >> 3
-    if wide:   buf[i] ^= key_table[key & 0x3F]
-               buf[i+1] ^= key_table[(81*key + 124) & 0x3F]
-    key = -95 * key - 72
-```
-
-Key table: 64 × uint16_t at RVA `0xD7D6804`
+| Constant | Value | Extraction |
+|----------|-------|------------|
+| FNV Prime | `0x01000193` | `69 ?? 93 01 00 01` (unchanged across patches) |
+| FNV Add | `0x295812B1` | 32-bit imm after IMUL in hash function |
+| Sentinel | `0x0B982F16865A5F21` | `48 BF` or `48 B8` movabs in slot decrypt |
+| Slot ROL64 | 45 (0x2D) | PSLLQ immediate |
+| Slot PSHUFLW | 0x1E | byte after `F2 0F 70` or `pshuflw` |
+| FName final ROL | 32 (0x20) | `rol rax, 20h` after XOR sentinel |
 
 ---
 
-## 4. FUObjectItem Layout
+## 2. GObj_Decrypt — GUObjectArray SIMD decrypt
+**RVA**: `0x2D0784` (first xref to encrypted xmmword)
+
+**How to find**: The encrypted GObjectArray xmmword is in `.data`. Search for
+`movdqa xmm0, cs:[.data_addr]` followed by `pshufb xmm0, cs:[.rdata_addr]`.
+The `.data` address changes; the `.rdata` PSHUFB table is stable within a patch.
+
+### Pipeline (patch 20260409 — NO PXOR step):
 ```
-+0x00 [8]  Object (UObject*)     — NOT encrypted
-+0x08 [4]  Flags
-+0x0C [4]  ClusterRootIndex
-+0x10 [4]  SerialNumber
-Total: 20 bytes per item, 65536 items per chunk
-chunk_index = index >> 16
-item_index  = index & 0xFFFF
+PSHUFB(shuf_table)  →  ROL32(9): PSLLD(9)|PSRLD(23)  →  PSHUFLW(0x4B)  →  lo64 = base_ptr
+```
+
+### Sig: GObj decrypt inline (wildcarded)
+```
+66 0F 6F 05 ? ? ? ? 66 0F 38 00 05 ? ? ? ? 66 0F 6F C8 66 0F 72 D1 ? 66 0F 72 F0 ? 66 0F EB C1 F2 0F 70 C0 ? 66 48 0F 7E C0
+```
+**After match**:
+- `+4..+7` = RIP-offset → encrypted xmmword (`.data` global)
+- `+13..+16` = RIP-offset → PSHUFB table
+- `+24` = PSRLD amount (23 = 32 - ROL)
+- `+29` = PSLLD amount (9 = ROL)
+- `+35` = PSHUFLW immediate (0x4B)
+
+### Element count (at decrypted_base + 0x50)
+```
+PSHUFB(cnt_table) → PSLLQ(15) → pextrd dword[1]
+```
+Sig (inline after GObj decrypt):
+```
+66 0F 38 00 05 ? ? ? ? 66 0F 73 F0 ? 66 0F 3A 16 ? ?
+```
+
+### Chunk table (vtable[5] at decrypted_base + 0x80)
+The chunk decrypt uses PEB:
+```asm
+movq    xmm0, [rdx]           ; load from base+0xB0
+mov     eax, IMM32             ; PEB addend
+add     rax, gs:[60h]          ; + PEB
+pshuflw xmm1, xmm0, IMM8      ; shuffle
+pxor    xmm1, [rip+off]        ; XOR table
+ROL64(IMM) via psllq|psrlq
+mov     rcx, IMM64             ; PEB XOR key
+xor     rcx, rax               ; XOR with PEB-derived value
+```
+**Constants** (patch 20260409):
+- PEB addend: `0x0D7DC434`
+- PEB XOR key: `0xB2DA4299DB155ED3`
+- PSHUFLW: `0x8D`
+- ROL64: 46
+
+### Constants (patch 20260409)
+
+| Constant | Value | Location |
+|----------|-------|----------|
+| GObj struct RVA | `0xDD0B5A0` | `.data` section |
+| Encrypted xmmword | struct + `0x30` | |
+| PSHUFB table RVA | `0xAC2BC00` | `.rdata` |
+| Count PSHUFB RVA | `0xAC7E9D0` | `.rdata` |
+| ROL32 amount | 9 | PSLLD imm |
+| PSHUFLW imm | `0x4B` | |
+
+---
+
+## 3. FName_ToString — CIdx 3-level decode → entry
+**RVA**: `0x23D410` (patch 20260409)
+
+**How to find**: Search for `pshufb xmm0, [rip+off]` followed immediately by `pxor xmm0, [rip+off]`
+then `psrlq`/`psllq`/`por` (ROL64) then `pshuflw`. This pattern is the Level-1 CIdx decode.
+
+### Pipeline: 3 levels of SIMD → pool lookup → FNV → entry
+
+**Level 1** (in FName_ToString):
+```
+CI → cvtsi32_si128 → PSHUFB(cidxShuf) → PXOR(cidxXor1) → ROL64(13) → PSHUFLW(0x93)
+```
+
+**Level 2** (in FName_ResolveCIdx / sub_14023C150):
+```
+L1.lo64 → PSHUFLW(57) → ROL64(51) → PSHUFD(0x44) → PXOR(cidxXor3) → PXOR(cidxXor1) → ROL64(13) → PSHUFLW(0x93)
+```
+
+**Level 3 / Block Header** (in FName_DecryptBlockAddr / sub_140237CD0):
+```
+L2.lo64 → PSHUFLW(0x39) → ROL64(51) → AND(0x1E)/ANDNOT(0xE1) → PSHUFB(hdrShuf) → PXOR(hdrXor)
+→ extract u32 = raw_hdr
+pool_off = (raw_hdr >> 8) & 0xFFFF00
+word_off = (uint16)raw_hdr
+```
+
+**NOTE**: For this patch, the 3-level decode produces **identity** (raw_hdr = CI).
+This may change in future patches.
+
+### Sig: FName_ToString prologue
+```
+41 56 41 55 56 57 53 48 83 EC ? 49 89 CE 48 8B 05 ? ? ? ? 48 31 E0 48 89 44 24 ? 66 0F 6E 01 66 0F 38 00 05 ? ? ? ?
+```
+**After match**: `+33..+36` = RIP-offset to CIdx PSHUFB table.
+
+### Sig: FName_DecryptBlockAddr (16× byte-copy, survives across patches)
+```
+41 0F B6 40 01 88 41 01 41 0F B6 40 02 88 41 02 41 0F B6 40 03 88 41 03
 ```
 
 ---
 
-## 5. VTable RVAs (Runtime, March 2026)
+## 4. FName Block Slot + FNV → Entry Pointer
 
-Known FProperty sub-type vtable RVAs:
-| RVA | Type |
-|---|---|
-| `0x0AB25100` | FUInt32Property |
-| `0x0AB36150` | FObjectProperty |
-| `0x0AB1F030` | FMapProperty |
-| `0x0AB27290` | FSetProperty |
-| `0x0AB24CA0` | FStrProperty |
-| `0x0AB25330` | FDoubleProperty |
-| `0x0AB37270` | FInt64Property |
-| `0x0AB25A20` | FMulticastInlineDelegateProperty |
-| `0x0AB35060` | FEnumProperty |
+### FNV-32 Slot Hash (in FName_DecryptBlockAddr)
+```asm
+; hash_addr = pool + pool_off + 0x90
+; SHLD(16, hash_lo, 27) → IMUL(P) → ADD(K) → ROL(19) → IMUL(P) → +hi → +K → ROL(27) → IMUL(P) → +K → SHR(13) → IMUL(P) → +K
+; slot_idx = (lo8 ^ byte2) & 7
+```
 
-Note: These are **runtime** vtable addresses (VMProtect decrypted). They will NOT appear in static IDA analysis.
+### Slot Data Decrypt
+```
+load 8B from pool + pool_off + 0xA0 + 32*slot
+  → PSHUFB(slotShuf)
+  → ROL32(26): PSLLD(0x1A) | PSRLD(6)
+  → XOR(0x1DB6DE4B85F51BC2) = v11
+```
+
+### FNV-64 Chain → Entry Pointer
+```
+fnv1  = P64 * ROL64(v11, 31) + ADD64
+fnv2  = P64 * ROL64(fnv1, 44) + ADD64
+raw   = v11 + (fnv2 ^ second_slot_decrypted) + 2*word_off
+
+; Three-layer unwinding:
+inner = bswap64(raw ^ 0x021DCE2C)
+mid   = inner ^ 0x3040EF0C00000000
+entry = bswap64(mid ^ 0x1C8EF20E00000000)
+```
+
+### Constants (patch 20260409)
+
+| Constant | Value | How to extract |
+|----------|-------|---------------|
+| FNV-32 Prime | `0x01000193` | `69 ?? 93 01 00 01` |
+| FNV-32 K | `0x8FD97DFC` | `ADD` imm32 after `IMUL P` in block hash |
+| FNV-32 hash offset | `+0x90` | `add rdx, 90h` in DecryptBlockAddr |
+| FNV-32 slot offset | `+0xA0` | `movdqa [rdx+rax+0A0h]` |
+| FNV-64 Prime | `0x100000001B3` | `mov r10, imm64` near `imul r8, r10` |
+| FNV-64 Add | `0xB6379560F2A0707C` | `mov r11, imm64` near `add r8, r11` |
+| Slot PSHUFB | `{04,00,06,01,05,03,07,02}` | 8B at RIP target of `pshufb` in slot decrypt |
+| Slot ROL32 | 26 (0x1A) | PSLLD immediate |
+| Slot XOR key | `0x1DB6DE4B85F51BC2` | `mov r9, imm64` before `xor rdx, r9` |
+| FNV-64 ROL1 | 31 (0x1F) | `rol r8, 1Fh` |
+| FNV-64 ROL2 | 44 (0x2C) | `rol r8, 2Ch` |
+| Final XOR | `0x021DCE2C` | `xor rax, imm32` before `bswap` |
+| Entry XOR2 | `0x3040EF0C00000000` | In sub_14023C150: `xor result, imm64` |
+| Entry XOR1 | `0x1C8EF20E00000000` | In FName_ToString: `mov rcx, imm64; xor rcx, [rsp+...]` |
 
 ---
 
-## 6. Key Functions (IDA RVAs)
+## 5. FName String Decrypt
 
-| RVA | Function |
-|---|---|
-| `0x2C9515` | UObject::GetNamePrivate (SIMD) |
-| `0x343D00` | UObject::GetClassAndName |
-| `0x33B310` | FProperty::ExportTextItem |
-| `0x33FC6B` | FField::GetNamePrivate |
-| `0x367C40` | UStruct::FindPropertyByFName |
-| `0x3595A0` | UStruct::CompareScriptStruct |
-| `0x35CF10` | UStruct::Link |
-| `0x3652C0` | FUObjectArray::CreateObjectIterator |
-| `0x4B5640` | FUObjectArray::FreeObjectAtIndex |
-| `0x229680` | FName::ToString |
-| `0x4B93F0` | FName::AppendString |
-| `0x374B10` | FField_or_UObject::GetName |
-| `0x37C7C0` | FField_or_UObject::GetFName |
-| `0x3F12C9` | UObject::ConditionalBeginDestroy |
-| `0x4CC6F0` | UObject::Destructor |
-| `0x2E65AC5` | UWorld::FindActorByHash |
-| `0x2E71FC9` | GWorld::ResetHashTable |
-| `0x2E883D0` | GWorld::LookupByAddress |
+### Entry format
+```
+uint16 header   — length = ROL16(hdr, 2) & 0x3FF;  wide = (hdr & 0x100)
+byte[] string   — encrypted with key table
+```
+
+### Key schedule (narrow)
+```
+key = (uint32)(4*header + (header >> 14) + 11)
+byte[i]   ^= keyTable[(key & 0x3F) + 36] >> 3
+byte[i+1] ^= keyTable[((key+7) & 0x3F) + 36] >> 3
+key += 14   (per pair)
+```
+
+### Key schedule (wide)
+```
+key = length + 62731
+word[i]   ^= keyTable[(key & 0x3F) + 36]
+word[i+1] ^= keyTable[((key+7) & 0x3F) + 36]
+key += 14
+```
+
+### Constants
+
+| Constant | Value |
+|----------|-------|
+| Key table RVA | `0xD9947F4` |
+| Key table offset | `+36` (was +60) |
+| Key step | `+7` per char |
+| Narrow key init | `4*hdr + (hdr>>14) + 11` |
+| Wide key init | `length + 62731` |
+| Header ROL | 2 (was 3) |
+
+---
+
+## 6. SIMD Data Tables (patch 20260409)
+
+| Name | RVA | Bytes | Used by |
+|------|-----|-------|---------|
+| `CIDX_SHUF` | `0xAC64930` | `00 00 00 00 01 00 02 03 00 00 00 00 01 00 02 03` | CIdx Level 1 |
+| `CIDX_XOR1` | `0xAC64940` | `4F A4 AE 9A 5B 21 A9 EB 4F A4 AE 9A 5B 21 A9 EB` | CIdx Level 1+2 |
+| `CIDX_XOR3` | `0xAC64CE0` | `00 A4 00 00 5B 00 A9 EB 00 A4 00 00 5B 00 A9 EB` | CIdx Level 2 |
+| `BLK_HDR_AND` | `0xAC64AE0` | `1E` × 16 | Block header |
+| `BLK_HDR_ANDNOT` | `0xAC64AD0` | `E1` × 16 | Block header |
+| `BLK_HDR_SHUF` | `0xAC64AF0` | `01 04 06 07 00 00 00 00 00 00 00 00 00 00 00 00` | Block header |
+| `BLK_HDR_XOR` | `0xAC64B00` | `45 BA 48 0A 00 00 00 00 00 00 00 00 00 00 00 00` | Block header |
+| `BLK_SLOT_SHUF` | `0xAC64950` | `04 00 06 01 05 03 07 02 00 00 00 00 00 00 00 00` | Slot decrypt |
+| `GOBJ_SHUF` | `0xAC2BC00` | `04 05 03 06 07 01 00 02 00 00 00 00 00 00 00 00` | GObj base |
+| `GOBJ_CNT_SHUF` | `0xAC7E9D0` | `00 00 05 01 07 04 03 00 00 00 00 00 00 00 00 00` | Element count |
+| `CHUNK_XOR` | `0xACB8690` | `60 18 3E C6 37 76 A0 D2 37 76 60 18 A0 D2 3E C6` | Chunk decrypt |
+
+---
+
+## 7. Global Addresses (patch 20260409)
+
+| Name | RVA | Purpose |
+|------|-----|---------|
+| `GNAMES_BASE` | `0xDA4FE00` | FNamePool (block count at +0x88) |
+| `FNAME_KEY_TABLE` | `0xD9947F4` | uint16[256] XOR key table |
+| `GOBJECT_ARRAY` | `0xDD0B5A0` | GUObjectArray struct (encrypted xmm at +0x30) |
+
+---
+
+## 8. Struct Offsets (patch 20260409)
+
+| Struct | Field | Offset | Notes |
+|--------|-------|--------|-------|
+| **UObject** | VTable | +0x00 | |
+| | InternalIndex | +0x0C | **plain uint32** (was +0x90 encrypted) |
+| | Slot 0..3 | +0x20, stride 0x20 | 16B encrypted, 4 slots |
+| **UStruct** | SuperStruct | +0xB0 | plain ptr |
+| | Children (UProperty) | +0xD0 | legacy chain |
+| | ChildProperties (FField) | +0xD8 | new system chain |
+| | PropertiesSize | +0xE0 | uint32 |
+| **FField** | VTable | +0x00 | |
+| | NamePrivate (CI) | +0x90 | plain uint32 |
+| | Next | +0x98 | plain FField* |
+| | ClassPrivate | +0xC8 | FFieldClass* |
+| | Offset_Internal | +0xD8 | plain uint32 |
+| | ArrayDim | +0xDC | uint32 |
+| **UProperty** | Next | +0x30 | UField::Next |
+| | FName | +0x50 | PSHUFB+ROR32+XOR decrypt |
+| | Offset_Internal | +0x64 | bswap32 ^ 0xC43565C9 |
+| **FFieldClass** | ElementSize | +0x70 | uint32 |
+
+---
+
+## 9. Update Procedure (resilient)
+
+1. **Find UObjectHash.cpp string** → xrefs give UObj_SlotAccess function
+2. **Extract from UObj_SlotAccess**: sentinel (`mov r??, imm64`), FNV constants (`imul + add`), ROL amounts, PSHUFLW imm, slot stride
+3. **Find GObj encrypted xmmword**: search for `movdqa xmm0, cs:[.data]` + `pshufb` pattern. Extract PSHUFB table RVA, ROL amount, PSHUFLW imm
+4. **Find 16× byte-copy** (`41 0F B6 40 01 88 41 01`) → FName_DecryptBlockAddr. Extract FNV-32 K, FNV-64 prime/add/ROL amounts, slot PSHUFB, XOR keys
+5. **Walk callers** of DecryptBlockAddr → find FName_ToString. Extract CIdx tables, entry XOR constants
+6. **Find GNAMES_BASE**: `lea r??, unk_????` in DecryptBlockAddr → pool RVA
+7. **Find FNAME_KEY_TABLE**: nearby `lea` in string decrypt function → key table RVA
+8. **Verify struct offsets**: read a known UClass, check Children/PropertiesSize make sense
+9. **Verify GWorld** (optional): scan `.data` near old RVA for heap ptrs with valid vtables
