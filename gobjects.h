@@ -1071,10 +1071,11 @@ namespace gobjects
             uint32_t peb_add = 0;
             uint64_t xor_const = 0;
             uint8_t pshuflw_imm = 0;
-            int rol16_right = 0, rol16_left = 0;
+            int rot_right = 0, rot_left = 0;
+            int rot_width = 0;   // 16, 32, or 64 — tracked alongside rot_left
             uint64_t prexor_addr = 0;
             // Record order of operations to apply them correctly
-            enum StepType { STEP_NONE, STEP_PSHUFLW, STEP_ROL16, STEP_PREXOR };
+            enum StepType { STEP_NONE, STEP_PSHUFLW, STEP_ROL, STEP_PREXOR };
             StepType steps[8] = {};
             int step_count = 0;
 
@@ -1092,13 +1093,20 @@ namespace gobjects
                         if (step_count < 8) steps[step_count++] = STEP_PSHUFLW;
                     }
                 }
-                if (code[i] == 0x66 && code[i+1] == 0x0F && code[i+2] == 0x71) {
+                // 66 0F 71 = word (16-bit), 66 0F 72 = dword (32-bit), 66 0F 73 = qword (64-bit)
+                if (code[i] == 0x66 && code[i+1] == 0x0F &&
+                    (code[i+2] == 0x71 || code[i+2] == 0x72 || code[i+2] == 0x73)) {
+                    int w = (code[i+2] == 0x71) ? 16 : (code[i+2] == 0x72) ? 32 : 64;
                     uint8_t sub = code[i+3]; uint8_t imm = code[i+4];
-                    if ((sub & 0xF0) == 0xD0 && !rol16_right) {
-                        rol16_right = imm;
-                        if (step_count < 8) steps[step_count++] = STEP_ROL16;
+                    // /2=psrl*, /6=psll* (reg-encoded in ModRM middle field)
+                    if ((sub & 0xF8) == 0xD0 && !rot_right) {
+                        rot_right = imm;
+                        if (step_count < 8) steps[step_count++] = STEP_ROL;
                     }
-                    if ((sub & 0xF0) == 0xF0 && !rol16_left) rol16_left = imm;
+                    if ((sub & 0xF8) == 0xF0 && !rot_left) {
+                        rot_left = imm;
+                        rot_width = w;
+                    }
                 }
                 if (code[i] == 0x66 && code[i+1] == 0x0F && code[i+2] == 0xEF &&
                     (code[i+3] & 0xC7) == 0x05 && !prexor_addr) {
@@ -1109,15 +1117,47 @@ namespace gobjects
                 if (code[i] == 0xC3) break;  // ret
             }
 
-            if (!peb_add || !rol16_left) {
-                std::printf("[!] Chunk probe failed: peb=0x%X xor=0x%llX rol=%d/%d pshuflw=0x%02X\n",
-                    peb_add, (unsigned long long)xor_const, rol16_left, rol16_right, pshuflw_imm);
+            if (!peb_add || !rot_left) {
+                std::printf("[!] Chunk probe failed: peb=0x%X xor=0x%llX rol=%d/%d w=%d pshuflw=0x%02X\n",
+                    peb_add, (unsigned long long)xor_const, rot_left, rot_right, rot_width, pshuflw_imm);
+                // Pattern parser failed (e.g. function uses PSLLD/PSLLQ instead of
+                // PSLLW). Fall back to the full x86 emulator which understands all
+                // three shift widths. Try several known encrypted-data offsets.
+                int path_len = 128;
+                for (int i = 4; i < 128; i++) if (code[i] == 0xC3) { path_len = i + 1; break; }
+
+                static const int kDataOffs[] = {0x90, 0x30, 0x70, 0xB0};
+                for (int doff : kDataOffs) {
+                    alignas(16) uint8_t data[16] = {};
+                    if (!m_reader.Read(m_arrayBase + (uint64_t)doff, data, 16))
+                        continue;
+                    uint64_t candidate = EmulateChunkPtrDecrypt(
+                        code, path_len, data, m_pebAddr, fn_addr);
+                    if (!candidate || candidate < 0x10000ULL || candidate > 0x7FFFFFFFFFFFULL)
+                        continue;
+                    if (ValidateChunkPtr(candidate)) {
+                        std::printf("[+] ChunkPtr (emulator/data+0x%X) = 0x%llX\n",
+                            doff, (unsigned long long)candidate);
+                        return candidate;
+                    }
+                    // Indirect: candidate might be a struct containing the table
+                    for (int off = 0; off <= 0x40; off += 8) {
+                        uint64_t inner = 0;
+                        if (!m_reader.Read(candidate + off, &inner, 8)) continue;
+                        if (inner < 0x10000ULL || inner > 0x7FFFFFFFFFFFULL) continue;
+                        if (ValidateChunkPtr(inner)) {
+                            std::printf("[+] ChunkPtr (emulator/data+0x%X, indirect+0x%X) = 0x%llX\n",
+                                doff, off, (unsigned long long)inner);
+                            return inner;
+                        }
+                    }
+                }
                 return 0;
             }
 
-            std::printf("[+] Chunk probe @ fn=0x%llX: PEB_ADD=0x%X XOR=0x%llX PSHUFLW=0x%02X ROL16=%d prexor=0x%llX\n",
+            std::printf("[+] Chunk probe @ fn=0x%llX: PEB_ADD=0x%X XOR=0x%llX PSHUFLW=0x%02X ROL%d=%d prexor=0x%llX\n",
                 (unsigned long long)fn_addr, peb_add, (unsigned long long)xor_const,
-                pshuflw_imm, rol16_left, (unsigned long long)prexor_addr);
+                pshuflw_imm, rot_width, rot_left, (unsigned long long)prexor_addr);
 
             alignas(16) uint8_t enc[16] = {};
             if (!m_reader.Read(m_arrayBase + 0x90, enc, 16)) return 0;
@@ -1136,10 +1176,17 @@ namespace gobjects
                     for (int j = 4; j < 8; j++) w_out[j] = w_in[j];
                     v = _mm_load_si128((const __m128i*)w_out);
                 }
-                else if (steps[s] == STEP_ROL16) {
-                    v = _mm_or_si128(
-                        _mm_slli_epi16(v, rol16_left),
-                        _mm_srli_epi16(v, rol16_right));
+                else if (steps[s] == STEP_ROL) {
+                    if (rot_width == 16) {
+                        v = _mm_or_si128(_mm_slli_epi16(v, rot_left),
+                                         _mm_srli_epi16(v, rot_right));
+                    } else if (rot_width == 32) {
+                        v = _mm_or_si128(_mm_slli_epi32(v, rot_left),
+                                         _mm_srli_epi32(v, rot_right));
+                    } else if (rot_width == 64) {
+                        v = _mm_or_si128(_mm_slli_epi64(v, rot_left),
+                                         _mm_srli_epi64(v, rot_right));
+                    }
                 }
                 else if (steps[s] == STEP_PREXOR && prexor_addr) {
                     alignas(16) uint8_t pxk[16] = {};
