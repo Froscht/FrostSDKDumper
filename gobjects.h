@@ -698,17 +698,40 @@ namespace gobjects
 
                         // F3 0F 7E /r — movq xmm, [mem]/xmm (load 8, zero hi)
                         if (op2 == 0x7E) {
-                            if ((modrm & 0xC7) == 0x02) // [rdx]
-                                { memcpy(xmm[reg], input_data, 8); memset(xmm[reg]+8,0,8); }
-                            else if ((modrm & 0xC0) == 0xC0) // reg
-                                { memcpy(xmm[reg], xmm[rm], 8); memset(xmm[reg]+8,0,8); }
-                            ip = off+3; continue;
+                            int mod = (modrm >> 6) & 3;
+                            int insn_end = off + 3;
+                            if (mod == 3) {
+                                // reg-reg
+                                memcpy(xmm[reg], xmm[rm], 8); memset(xmm[reg]+8,0,8);
+                            } else {
+                                // Any memory form — treat as a load from input_data.
+                                // Advance past disp8/disp32/SIB for correct IP.
+                                bool has_sib = (rm == 4);
+                                int sib_len = has_sib ? 1 : 0;
+                                if      (mod == 0 && rm == 5) insn_end = off + 3 + 4;  // [rip+disp32]
+                                else if (mod == 0)             insn_end = off + 3 + sib_len;
+                                else if (mod == 1)             insn_end = off + 3 + sib_len + 1;
+                                else if (mod == 2)             insn_end = off + 3 + sib_len + 4;
+                                memcpy(xmm[reg], input_data, 8); memset(xmm[reg]+8,0,8);
+                            }
+                            ip = insn_end; continue;
                         }
                         // F3 0F 6F /r — movdqu xmm, [mem]/xmm
                         if (op2 == 0x6F) {
-                            if ((modrm & 0xC7) == 0x02) memcpy(xmm[reg], input_data, 16);
-                            else if ((modrm & 0xC0) == 0xC0) memcpy(xmm[reg], xmm[rm], 16);
-                            ip = off+3; continue;
+                            int mod = (modrm >> 6) & 3;
+                            int insn_end = off + 3;
+                            if (mod == 3) {
+                                memcpy(xmm[reg], xmm[rm], 16);
+                            } else {
+                                bool has_sib = (rm == 4);
+                                int sib_len = has_sib ? 1 : 0;
+                                if      (mod == 0 && rm == 5) insn_end = off + 3 + 4;
+                                else if (mod == 0)             insn_end = off + 3 + sib_len;
+                                else if (mod == 1)             insn_end = off + 3 + sib_len + 1;
+                                else if (mod == 2)             insn_end = off + 3 + sib_len + 4;
+                                memcpy(xmm[reg], input_data, 16);
+                            }
+                            ip = insn_end; continue;
                         }
                         // F3 0F 70 /r imm — pshufhw
                         if (op2 == 0x70 && off+3 < len) {
@@ -777,9 +800,27 @@ namespace gobjects
                     if (op2 == 0x6F && off+2 < len) {
                         uint8_t modrm = c[off+2];
                         int reg, rm; decodeModRM(modrm, rex_r, rex_b, reg, rm);
-                        if ((modrm & 0xC0) == 0xC0) memcpy(xmm[reg&7], xmm[rm&7], 16);
-                        else if ((modrm & 0xC7) == 0x02) memcpy(xmm[reg&7], input_data, 16);
-                        ip = off+3; continue;
+                        int mod = (modrm >> 6) & 3;
+                        int insn_end = off + 3;
+                        if (mod == 3) {
+                            memcpy(xmm[reg&7], xmm[rm&7], 16);
+                        } else if ((modrm & 0xC7) == 0x05) {
+                            // [rip+disp32] — load from module memory
+                            int32_t disp; memcpy(&disp, c+off+3, 4);
+                            insn_end = off + 7;
+                            m_reader.Read(func_addr + (off+7) + disp, xmm[reg&7], 16);
+                        } else {
+                            // Any GP-register memory form → input_data
+                            int rm_field = modrm & 7;
+                            bool has_sib = (rm_field == 4);
+                            int sib_len = has_sib ? 1 : 0;
+                            if      (mod == 0 && rm_field == 5) insn_end = off + 3 + 4;
+                            else if (mod == 0)                  insn_end = off + 3 + sib_len;
+                            else if (mod == 1)                  insn_end = off + 3 + sib_len + 1;
+                            else if (mod == 2)                  insn_end = off + 3 + sib_len + 4;
+                            memcpy(xmm[reg&7], input_data, 16);
+                        }
+                        ip = insn_end; continue;
                     }
                     // ── 66 [W] 0F 6E — movd/movq xmm, r32/r64 ──────────
                     if (op2 == 0x6E && off+2 < len) {
@@ -839,13 +880,22 @@ namespace gobjects
                     }
 
                     // ── Two-operand reg-reg SSE ops: 66 0F xx modrm ──────
-                    // Handle all reg-reg and [rip+disp32] forms
+                    // Handle reg-reg, [rip+disp32], and any [GPReg] / [GPReg+disp]
+                    // memory form. Any memory load from a general-purpose
+                    // register is treated as a load from `input_data` — the
+                    // assumption is that the caller pointed that register at
+                    // the encrypted struct block we're trying to decrypt.
+                    // This fixes the class of bug where the real function
+                    // reads encrypted bytes via `[rcx+N]` or `[rax]` etc.,
+                    // which previously fell through as "unsupported" and
+                    // left xmm0=0 → constant decrypt output regardless of
+                    // which data offset the caller passed in.
                     if (off+2 < len) {
                         uint8_t modrm = c[off+2];
                         int dst = (modrm>>3)&7, src = modrm&7;
-                        bool is_rr  = (modrm & 0xC0) == 0xC0;
+                        int mod = (modrm >> 6) & 3;
+                        bool is_rr  = mod == 3;
                         bool is_rip = (modrm & 0xC7) == 0x05;
-                        bool is_rdx = (modrm & 0xC7) == 0x02;
 
                         // Load src operand
                         alignas(16) uint8_t src_data[16] = {};
@@ -855,16 +905,19 @@ namespace gobjects
                         } else if (is_rip && off+6 < len) {
                             int32_t disp; memcpy(&disp, c+off+3, 4);
                             next_ip = off + 7;
-                            readMem128(next_ip, disp - (next_ip - (off+7)), src_data);
-                            // Correct: target = func_addr + next_ip_of_insn + disp
-                            // The readMem128 helper already does this
-                            uint64_t target = func_addr + next_ip + disp;
-                            // Re-read with correct offset
                             m_reader.Read(func_addr + (off+7) + disp, src_data, 16);
-                        } else if (is_rdx) {
-                            memcpy(src_data, input_data, 16);
                         } else if (op2 != 0x38 && op2 != 0x3A) {
-                            ip++; continue; // unsupported addressing (two-byte ops only)
+                            // Memory form via a GP register: [reg], [reg+disp8],
+                            // [reg+disp32], possibly with SIB (rm==4). Advance
+                            // `next_ip` correctly, then feed `input_data`.
+                            bool has_sib = (modrm & 7) == 4 && mod != 3;
+                            int sib_len  = has_sib ? 1 : 0;
+                            if      (mod == 0 && (modrm & 7) == 5) next_ip = off + 3 + 4;    // [rip+disp] handled above, but also [r13] (mod=0 rm=5) has disp32
+                            else if (mod == 0) next_ip = off + 3 + sib_len;                   // [reg] or [reg+SIB]
+                            else if (mod == 1) next_ip = off + 3 + sib_len + 1;               // +disp8
+                            else if (mod == 2) next_ip = off + 3 + sib_len + 4;               // +disp32
+                            if (next_ip > len) { ip++; continue; }
+                            memcpy(src_data, input_data, 16);
                         }
                         // For 0x38/0x3A three-byte opcodes, fall through —
                         // they handle their own src loading below.

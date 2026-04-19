@@ -38,6 +38,10 @@
 #include "kernel_module/include/memreader_ioctl.h"
 #include "kernel_module/include/memreader_iface.h"
 #include "arc_decrypt.h"
+#include "sig_scan.h"
+#include "emu_engine.h"
+#include "emu_fname.h"
+#include "find_fname_func.h"
 #include "gobjects.h"
 #include "fname_decrypt.h"
 using FNameDecryptor = FName::FNameDecryptor;
@@ -55,14 +59,14 @@ public:
     ~KernelReader() { if (fd >= 0) close(fd); }
 
     bool Open(int target_pid) {
+        if (fd >= 0 && pid == target_pid) return true;
         pid = target_pid;
         fd  = open("/dev/memreader", O_RDWR);
-        if (fd < 0) {
-            perror("[-] open /dev/memreader");
-            return false;
-        }
+        if (fd < 0) { perror("[-] open /dev/memreader"); return false; }
         return true;
     }
+
+    bool IsOpen() const { return fd >= 0; }
 
     bool Read(uint64_t address, void* buffer, size_t size) override {
         if (!buffer || !size) return false;
@@ -199,6 +203,50 @@ public:
     bool Init() {
         if (!m_reader.Open(m_pid)) return false;
         std::cout << "[+] Opened /dev/memreader for PID " << m_pid << "\n";
+
+        // ── Signature scan — patch-resilient RVA auto-discovery ─────────
+        // Hardcoded RVAs in arc_decrypt.h are the primary source and remain
+        // correct for the current patch. The scanner runs alongside and
+        // overwrites any RVA it resolves to a different value (i.e. after
+        // a future patch). Scan failures fall back to the hardcoded value.
+        {
+            SigScan::Scanner<KernelReader> scan(m_reader, MODULE_BASE, 0xE900000);
+            static SigScan::PEFileReader s_pe;
+            static const char* pe_path =
+                "/media/frost/Coding Stuf/ArcBinaryDumps/Steam/Arc_Raiders_Binary_Steam_2026_04_14.exe";
+            if (s_pe.Open(pe_path)) {
+                scan.SetPEFallback(&s_pe);
+                std::printf("[sig] PE fallback enabled: %s\n", pe_path);
+            }
+
+            auto apply = [](const char* name, uint64_t& slot, uint64_t dyn) {
+                if (!dyn) {
+                    std::printf("[sig] %-14s scan failed; using constant 0x%llX\n",
+                        name, (unsigned long long)slot);
+                    return;
+                }
+                if (dyn == slot) {
+                    std::printf("[sig] %-14s 0x%llX (matches constant)\n",
+                        name, (unsigned long long)dyn);
+                } else {
+                    std::printf("[sig] %-14s 0x%llX → 0x%llX (patch drift — auto-fixed)\n",
+                        name, (unsigned long long)slot, (unsigned long long)dyn);
+                    slot = dyn;
+                }
+            };
+            apply("GObjectArray", ArcDecrypt::RVA_GOBJECT_ARRAY_BASE, scan.FindGObjectArrayRVA());
+            apply("GWorld",       ArcDecrypt::RVA_GWORLD,             scan.FindGWorldRVA());
+            apply("GNames",       ArcDecrypt::RVA_GNAMES_BASE,        scan.FindGNamesRVA());
+            apply("FNameKeyTbl",  ArcDecrypt::RVA_FNAME_KEY_TABLE,
+                  scan.FindFNameKeyTableRVA(ArcDecrypt::RVA_FNAME_KEY_TABLE,
+                                            ArcDecrypt::RVA_GNAMES_BASE));
+            auto st = scan.FindObjArraySimdTables();
+            apply("SimdObjXor",   ArcDecrypt::RVA_SIMD_OBJARRAY_XOR, st.decrypt_key);
+            apply("ElemMaskA",    ArcDecrypt::RVA_ELEM_MASK_A,       st.elem_mask_a);
+            apply("ElemMaskB",    ArcDecrypt::RVA_ELEM_MASK_B,       st.elem_mask_b);
+            apply("ElemXorKey",   ArcDecrypt::RVA_ELEM_XOR_KEY,      st.elem_xor_key);
+            apply("CIdxXor1",     ArcDecrypt::RVA_CIDX_XOR1,         scan.FindCIdxXor1RVA());
+        }
 
         // Init FName key table + SIMD tables
         if (!m_fname.Init()) {
@@ -953,22 +1001,45 @@ int main(int argc, char* argv[]) {
     std::cout << "======================================\n\n";
 
     int pid = 0;
-    bool do_sdk   = false;
-    bool do_test  = false;
-    bool do_dump  = false;
-    bool do_probe = false;
+    bool do_sdk   = false, do_test = false, do_dump = false, do_probe = false;
+    bool do_emu_smoke = false, do_emu_fname = false, want_help = false;
+    uint32_t emu_fname_ci = 505;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--sdk")   { do_sdk   = true; continue; }
-        if (arg == "--test")  { do_test  = true; continue; }
-        if (arg == "--dump")  { do_dump  = true; continue; }
-        if (arg == "--probe") { do_probe = true; continue; }
+        if (arg == "--help" || arg == "-h") { want_help = true; continue; }
+        if (arg == "--sdk")       { do_sdk   = true; continue; }
+        if (arg == "--test")      { do_test  = true; continue; }
+        if (arg == "--dump")      { do_dump  = true; continue; }
+        if (arg == "--probe")     { do_probe = true; continue; }
+        if (arg == "--emu-smoke") { do_emu_smoke = true; continue; }
+        if (arg == "--emu-fname") {
+            do_emu_fname = true;
+            if (i + 1 < argc && argv[i+1][0] != '-')
+                emu_fname_ci = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
+            continue;
+        }
         if (pid == 0) pid = atoi(argv[i]);
     }
 
-    // Default: if no mode flags given, run test + dump (original behaviour)
-    if (!do_sdk && !do_test && !do_dump && !do_probe) {
+    auto print_help = []() {
+        std::cerr <<
+            "Usage: sudo ./FrostDumper [<pid>] [mode flags]\n"
+            "Mode flags (one or more; no flag → --test + --dump):\n"
+            "  --test       Sample known FName CIs to verify decryptor.\n"
+            "  --dump       Enumerate GObjects → dump_*.txt.\n"
+            "  --sdk        Full C++ SDK → SDK_Output.txt.\n"
+            "  --probe      FField / property CI probes.\n"
+            "  --emu-smoke  Boot Unicorn engine + PE fallback; map a VMProtect-cold page.\n"
+            "               Runs before dumper.Init() — works from any game state.\n"
+            "  --emu-fname [CI]\n"
+            "               Find FName decrypt by signature, call game's code inside\n"
+            "               Unicorn for CI (default 505 = \"Object\"), print result.\n"
+            "  --help, -h   This message.\n";
+    };
+    if (want_help) { print_help(); return 0; }
+
+    if (!do_sdk && !do_test && !do_dump && !do_probe && !do_emu_smoke && !do_emu_fname) {
         do_test = true;
         do_dump = true;
     }
@@ -979,17 +1050,60 @@ int main(int argc, char* argv[]) {
         if (pid > 0)
             std::cout << "[+] Found ARC Raiders PID: " << pid << "\n";
     }
-
-    if (pid <= 0) {
-        std::cerr << "Usage: sudo ./FrostDumper <pid> [--sdk] [--test] [--dump]\n";
-        std::cerr << "       sudo ./FrostDumper          (auto-detect)\n";
-        std::cerr << "  --sdk   Generate full SDK struct output -> SDK_Output.txt\n";
-        std::cerr << "  --test  Run property name/offset test\n";
-        std::cerr << "  --dump  Dump all GObjects to dump_objects.txt / dump_names.txt\n";
-        return 1;
-    }
+    if (pid <= 0) { print_help(); return 1; }
 
     SDKDumper dumper(pid);
+
+    // --emu-smoke / --emu-fname run before the heavy dumper Init() so they
+    // work even when the game is mid-loading (chunk-ptr decrypt unavailable).
+    if (do_emu_smoke) {
+        std::printf("\n=== emu smoke test ===\n");
+        if (!dumper.m_reader.Open(pid)) {
+            std::printf("[emu-smoke] /dev/memreader open failed\n"); return 1;
+        }
+        EmuEngine eng;
+        if (!eng.Initialize(&dumper.m_reader, dumper.MODULE_BASE, 0xE9AF000,
+                "/media/frost/Coding Stuf/ArcBinaryDumps/Steam/Arc_Raiders_Binary_Steam_2026_04_14.exe")) {
+            std::printf("[emu-smoke] init failed\n"); return 1;
+        }
+        uint64_t probe = dumper.MODULE_BASE + 0x22F9A4;
+        bool ok = eng.MapGamePage(probe);
+        std::printf("[emu-smoke] MapGamePage(0x%llX) → %s\n",
+            (unsigned long long)probe, ok ? "mapped" : "FAILED");
+        uint8_t bytes[16] = {};
+        if (ok && eng.EmuRead(probe, bytes, 16)) {
+            std::printf("[emu-smoke] first 16 bytes:");
+            for (int i = 0; i < 16; ++i) std::printf(" %02X", bytes[i]);
+            std::printf("\n");
+        }
+        if (!do_test && !do_dump && !do_sdk && !do_probe && !do_emu_fname) return 0;
+    }
+
+    if (do_emu_fname) {
+        std::printf("\n=== emu FName decrypt (CI=%u) ===\n", emu_fname_ci);
+        if (!dumper.m_reader.IsOpen() && !dumper.m_reader.Open(pid)) {
+            std::printf("[emu-fname] /dev/memreader open failed\n"); return 1;
+        }
+        auto findRes = FNameFuncFinder::Find(dumper.m_reader, dumper.MODULE_BASE);
+        if (!findRes.found) {
+            std::printf("[emu-fname] couldn't locate FName decrypt in .text\n"); return 1;
+        }
+        EmuEngine eng;
+        if (!eng.Initialize(&dumper.m_reader, dumper.MODULE_BASE, 0xE9AF000,
+                "/media/frost/Coding Stuf/ArcBinaryDumps/Steam/Arc_Raiders_Binary_Steam_2026_04_14.exe")) {
+            std::printf("[emu-fname] engine init failed\n"); return 1;
+        }
+        EmuFName fn;
+        if (!fn.Init(&eng, dumper.MODULE_BASE, findRes.best_target_rva)) {
+            std::printf("[emu-fname] EmuFName init failed\n"); return 1;
+        }
+        fn.SetGamePeb(0x7FFD0000ULL);
+        eng.MapGamePage(0x7FFD0000ULL);
+        std::string s = fn.DecryptByIndex(emu_fname_ci);
+        std::printf("[emu-fname] CI %u → \"%s\"\n", emu_fname_ci, s.c_str());
+        if (!do_test && !do_dump && !do_sdk && !do_probe) return 0;
+    }
+
     if (!dumper.Init()) {
         std::cerr << "[-] Initialization failed. Check:\n";
         std::cerr << "    * Is memreader.ko loaded?  (sudo insmod kernel_module/src/memreader.ko)\n";

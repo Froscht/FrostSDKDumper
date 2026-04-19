@@ -58,11 +58,11 @@ static inline uint32_t u32_lo_xmm(__m128i v) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Pool base and key table (patch 20260409)
-static constexpr uint64_t FNAME_GNAMES_BASE_OFF     = ArcDecrypt::RVA_GNAMES_BASE;
-static constexpr uint64_t FNAME_KEY_TABLE_OFF       = ArcDecrypt::RVA_FNAME_KEY_TABLE;
+static uint64_t& FNAME_GNAMES_BASE_OFF              = ArcDecrypt::RVA_GNAMES_BASE;
+static uint64_t& FNAME_KEY_TABLE_OFF                = ArcDecrypt::RVA_FNAME_KEY_TABLE;
 
 // CIdx / FName SIMD tables (patch 20260414)
-static constexpr uint64_t RVA_CIDX_XOR1_OFF          = ArcDecrypt::RVA_CIDX_XOR1;
+static uint64_t& RVA_CIDX_XOR1_OFF                   = ArcDecrypt::RVA_CIDX_XOR1;
 static constexpr uint64_t RVA_CIDX_XOR3_OFF          = ArcDecrypt::RVA_CIDX_XOR3;
 static constexpr uint64_t RVA_BLOCK_HDR_AND_OFF      = ArcDecrypt::RVA_BLOCK_HDR_AND;
 static constexpr uint64_t RVA_BLOCK_HDR_ANDNOT_OFF   = ArcDecrypt::RVA_BLOCK_HDR_ANDNOT;

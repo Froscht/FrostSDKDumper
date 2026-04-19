@@ -184,30 +184,25 @@ namespace Offsets {
 // =============================================================================
 constexpr uint64_t MODULE_BASE = 0x140000000;
 
-// GWorld (single-deref: *(uint64_t*)(MODULE_BASE + RVA_GWORLD) = UWorld* heap ptr)
-constexpr uint64_t RVA_GWORLD  = 0xE011D18;   // patch 20260414 (was 0xE8C28A0)
-
-// FNamePool + XOR key table (patch 20260409)
-constexpr uint64_t RVA_GNAMES_BASE     = 0xDB48E80;   // FNamePool global (was 0xDAF5070 cipher state)
-constexpr uint64_t RVA_FNAME_KEY_TABLE = 0xDA8D854;   // FNameXorKey base (64 uint16 entries, was 0xD9947F4)
-                                                        // Access: key_table[key+36]
-
-// GUObjectArray struct base (patch 20260414)
-// Struct at this RVA; encrypted qword at struct+0x30 decrypts to chunk array ptr
-constexpr uint64_t RVA_GOBJECT_ARRAY_BASE = 0xDE04650;   // struct base (was 0xDD0B5A0)
-constexpr uint64_t GOBJ_ENCRYPTED_OFF     = 0x30;         // encrypted xmmword within struct
+// Runtime-overridable anchors (sig-scan may rewrite these at Init; hardcoded
+// values are the fallback and the "known good for current patch" default).
+inline uint64_t RVA_GWORLD              = 0xE011D18;
+inline uint64_t RVA_GNAMES_BASE         = 0xDB48E80;
+inline uint64_t RVA_FNAME_KEY_TABLE     = 0xDA8D854;   // access: key_table[key+36]
+inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xDE04650;   // struct base; enc qword at +0x30
+constexpr uint64_t GOBJ_ENCRYPTED_OFF   = 0x30;
 
 // SIMD runtime tables (GUObjectArray decrypt — patch 20260414)
-// Pipeline CHANGED: ROL32(20) → XOR(key) → ROL16(12) [no PSHUFB step]
-constexpr uint64_t RVA_SIMD_OBJARRAY_XOR  = 0xAD2FC50;  // XOR key (replaces old PSHUFB mask)
+// Pipeline: ROL32(20) → XOR(key) → ROL16(12) [no PSHUFB step]
+inline uint64_t RVA_SIMD_OBJARRAY_XOR   = 0xAD2FC50;
 // Element count: AND/ANDNOT blend → XOR → ROL16(12) → PSHUFB(constant)
-constexpr uint64_t RVA_ELEM_MASK_A        = 0xAD8EE10;  // ANDNOT mask (0x00E4 repeating)
-constexpr uint64_t RVA_ELEM_MASK_B        = 0xAD8EE20;  // AND mask (0xFF1B repeating)
-constexpr uint64_t RVA_ELEM_XOR_KEY       = 0xAD8EE30;  // XOR key
+inline uint64_t RVA_ELEM_MASK_A         = 0xAD8EE10;
+inline uint64_t RVA_ELEM_MASK_B         = 0xAD8EE20;
+inline uint64_t RVA_ELEM_XOR_KEY        = 0xAD8EE30;
 
 // SIMD runtime tables (CIdx → FName address resolve — patch 20260414)
 // Level 1 CIdx decode CHANGED: CI → ROL16(14) → PSHUFLW(0x93) → PXOR(cidxXor1)  [no PSHUFB]
-constexpr uint64_t RVA_CIDX_XOR1         = 0xAD30540;  // CIdx pxor key (was 0xAC64940)
+inline uint64_t    RVA_CIDX_XOR1         = 0xAD30540;  // CIdx pxor key (was 0xAC64940)
 // Level 2 CIdx decode
 constexpr uint64_t RVA_CIDX_XOR3         = 0xAD30590;  // second-level XOR (was 0xAC64CE0)
 // Block header decrypt tables (patch 20260414)
