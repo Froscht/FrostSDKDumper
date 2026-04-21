@@ -287,4 +287,116 @@ constexpr int      FNAME_WIDE_KEY_BASE    = 40352;        // cc + this = startin
 constexpr uint64_t UPROP_FNAME_OFFSET    = 0x50;
 constexpr uint64_t UPROP_FNAME_XOR_KEY   = 0x19AE9873B7A3AC48ULL;     // same key as FNAME_BLOCK2_XOR (patch 20260414)
 
+// =============================================================================
+// 5. Patch 20260421 additions (from IDA instance 0dpx / 3sw0 rename pass)
+//    Binary: Arc_Raiders_Binary_20260421_213315.exe (100% coverage dump)
+//    Keep prior constants intact for cross-patch fallback.
+// =============================================================================
+namespace Patch20260421 {
+    // FName_ToString @ RVA 0x24C8130 recovers the entry pointer from the
+    // public FName handle via:
+    //     entry_ptr = bswap64(handle_qword ^ ENTRY_HANDLE_XOR)
+    constexpr uint64_t ENTRY_HANDLE_XOR      = 0x59B07C3D00000000ULL;
+
+    // Secondary XOR seen on (entry + 192) field in FName_ToString:
+    //     field_dec = bswap32(*(u32*)(entry+0xC0) ^ ENTRY_FIELD_XOR)
+    constexpr uint32_t ENTRY_FIELD_XOR       = 0x01C4B859u;
+
+    // FNamePool base moved from RVA_GNAMES_BASE (0xDB48E80) to 0xDB0FE00
+    // (verify with probe_live_rvas before trusting for live sessions).
+    constexpr uint64_t RVA_GNAMES_BASE_NEW   = 0xDB0FE00;
+
+    // Per-byte XOR keystream for FNameEntry content encryption.
+    constexpr uint64_t RVA_FNAME_KEYSTREAM   = 0xDA547F4;
+
+    // FField NamePrivate decrypt SIMD constants moved:
+    //   PSHUFB mask (`07 02 03 06 05 00 01 04`) — was 0xAD85670
+    //   XOR const  (`31 7E 97 77 56 27 31 31`) — was 0xAD85690
+    constexpr uint64_t RVA_FFIELD_PSHUFB_MASK = 0xB59FDF0;
+    constexpr uint64_t RVA_FFIELD_XOR_CONST   = 0xB59FE00;
+
+    // GUObjectArray moved from 0xDE04650 → 0xDDCB420.
+    // The 16-byte xmmword at this address IS the encrypted chunks-manager
+    // pointer (NOT at +0x30 as in the older patch).
+    //
+    // Pipeline (verified on live PID, patch 20260421):
+    //     a = ROL32(xmmword_DDCB420, 23)
+    //     b = PSHUFB(a, xmmword_ACBFCA0_lo64)        (loadl_epi64 → low 8 bytes)
+    //     c = ROL32(b, 13)
+    //     chunks_manager_ptr = lo64(c)
+    //
+    // NumElements/MaxElements — at chunks_manager + 0x70 (encrypted xmmword):
+    //     a2 = PSHUFLW(enc, 0xA3)                   (lane permute 3,0,2,2)
+    //     b2 = PXOR(a2, xmmword_AD12960_lo64)
+    //     num = lo32(ROL64(b2, 15))
+    //
+    // FUObjectItem stride = **20 bytes** (not 24). ObjectsPerChunk = 65536.
+    //   chunk_idx = iter >> 16;  in_chunk = iter & 0xFFFF
+    //   slot = chunks_array[chunk_idx] + 20 * in_chunk
+    constexpr uint64_t RVA_GUOBJECT_ARRAY_NEW   = 0xDDCB420;
+    constexpr uint64_t RVA_GOBJ_PSHUFB_MASK     = 0xACBFCA0;
+    constexpr uint64_t RVA_GOBJ_MAX_XOR_KEY     = 0xAD12960;
+    constexpr int      GOBJ_PIPELINE_ROL32_A    = 23;
+    constexpr int      GOBJ_PIPELINE_ROL32_B    = 13;
+    constexpr int      GOBJ_MAX_PSHUFLW_IMM     = 0xA3;
+    constexpr int      GOBJ_MAX_ROL64           = 15;
+    constexpr uint64_t GOBJ_MANAGER_MAX_OFFSET  = 0x70;
+    constexpr int      FUOBJECTITEM_STRIDE      = 20;
+    constexpr int      OBJECTS_PER_CHUNK        = 0x10000;
+
+    // FName CityHash64 entry point (moved from 0xC0C80).
+    constexpr uint64_t RVA_FNAME_CITYHASH64   = 0xC1960;
+
+    // FName_ToString entry.
+    constexpr uint64_t RVA_FNAME_TOSTRING     = 0x24C8130;
+
+    // Decrypt the public FName handle (the 64-bit value stored in any
+    // FName-typed field) to recover a pointer to the FNameEntry.
+    inline uint64_t DecryptEntryHandle(uint64_t handle) {
+        return __builtin_bswap64(handle ^ ENTRY_HANDLE_XOR);
+    }
+
+    // Decrypt the GUObjectArray encrypted chunks-manager pointer.
+    // Reads 16 bytes from the global and returns the lo64 of the pipeline.
+    // Verified on live PID: gave 0x183E1110 from xmmword `0000110101E00182`.
+    inline uint64_t DecryptGObjChunksManager(const uint8_t* enc16,
+                                             const uint8_t* pshufb_mask_lo8)
+    {
+        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc16));
+        // ROL32(23) = PSLLD(23) | PSRLD(9)
+        __m128i a = _mm_or_si128(_mm_slli_epi32(v, 23),
+                                 _mm_srli_epi32(v, 9));
+        // PSHUFB with the 8-byte mask loaded via loadl_epi64 (high 8 bytes zero)
+        alignas(16) uint8_t mask_full[16] = {};
+        std::memcpy(mask_full, pshufb_mask_lo8, 8);
+        __m128i m = _mm_load_si128(reinterpret_cast<const __m128i*>(mask_full));
+        __m128i b = _mm_shuffle_epi8(a, m);
+        // ROL32(13)
+        __m128i c = _mm_or_si128(_mm_slli_epi32(b, 13),
+                                 _mm_srli_epi32(b, 19));
+        uint64_t lo;
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo), c);
+        return lo;
+    }
+
+    // Decrypt the NumElements/MaxElements stored at chunks_manager + 0x70.
+    // Reads 16 bytes from chunks_manager+0x70 and returns the i32 in lo32
+    // of ROL64(15)(PSHUFLW(0xA3)(enc) XOR xor_key_lo64).
+    // Verified on live PID: 0x443E1 (279521) from sample chunks_manager.
+    inline int32_t DecryptGObjMaxElements(const uint8_t* enc16,
+                                          uint64_t xor_key_lo64)
+    {
+        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc16));
+        // PSHUFLW imm=0xA3 = {3,0,2,2}
+        __m128i a = _mm_shufflelo_epi16(v, 0xA3);
+        // XOR with key (only low 64 bits matter; high 8 bytes of key are zero)
+        __m128i key = _mm_set_epi64x(0, (long long)xor_key_lo64);
+        __m128i b = _mm_xor_si128(a, key);
+        // ROL64(15) = PSLLQ(15) | PSRLQ(49)
+        __m128i c = _mm_or_si128(_mm_slli_epi64(b, 15),
+                                 _mm_srli_epi64(b, 49));
+        return _mm_cvtsi128_si32(c);
+    }
+}
+
 } // namespace ArcDecrypt

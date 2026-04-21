@@ -61,6 +61,11 @@ public:
         std::fseek(m_file, optHeaderStart + 56, SEEK_SET);
         std::fread(&m_sizeOfImage, 4, 1, m_file);
 
+        // DataDirectory[5] = BASE_RELOC (offset +112 into opt header for PE32+)
+        std::fseek(m_file, optHeaderStart + 24 + 112, SEEK_SET);
+        std::fread(&m_relocDirRVA,  4, 1, m_file);
+        std::fread(&m_relocDirSize, 4, 1, m_file);
+
         std::fseek(m_file, optHeaderStart + optHeaderSize, SEEK_SET);
         m_sections.clear();
         for (uint16_t i = 0; i < numSections; ++i) {
@@ -122,20 +127,55 @@ private:
     uint64_t m_imageBase = 0;
     uint32_t m_sizeOfImage = 0;
     uint32_t m_totalRelocEntries = 0;
+    uint32_t m_relocDirRVA = 0;
+    uint32_t m_relocDirSize = 0;
 
     struct RelocEntry { uint8_t type; uint16_t offset; };
     std::unordered_map<uint32_t, std::vector<RelocEntry>> m_relocs;
 
-    void ParseRelocations() {
-        PESection* relocSec = nullptr;
+    // Reloc-free raw read by RVA — used while parsing relocations themselves
+    // to avoid recursion (ApplyRelocations needs the table that ReadAtRVA
+    // would apply). Copy of ReadAtRVA with relocDelta forced to 0.
+    bool ReadAtRVARaw(uint32_t rva, void* buf, size_t size) {
+        if (!m_file) return false;
         for (auto& sec : m_sections) {
-            if (std::strncmp(sec.name, ".reloc", 6) == 0) { relocSec = &sec; break; }
+            if (rva >= sec.virtualAddress &&
+                rva <  sec.virtualAddress + sec.rawDataSize) {
+                uint32_t offsetInSection = rva - sec.virtualAddress;
+                uint32_t fileOffset = sec.rawDataOffset + offsetInSection;
+                size_t available = sec.rawDataSize - offsetInSection;
+                size_t toRead = (size < available) ? size : available;
+                std::fseek(m_file, fileOffset, SEEK_SET);
+                size_t got = std::fread(buf, 1, toRead, m_file);
+                if (got < size)
+                    std::memset((uint8_t*)buf + got, 0, size - got);
+                return got > 0;
+            }
         }
-        if (!relocSec) return;
+        return false;
+    }
 
-        std::vector<uint8_t> relocData(relocSec->rawDataSize);
-        std::fseek(m_file, relocSec->rawDataOffset, SEEK_SET);
-        std::fread(relocData.data(), 1, relocSec->rawDataSize, m_file);
+    void ParseRelocations() {
+        // Prefer the `.reloc` section — some dumpers (e.g. our Apr-21 dump)
+        // leave the BASE_RELOC data-directory pointing into .rdata garbage
+        // while the real reloc table lives in the named section. Fall back
+        // to the data-dir RVA when no named section exists.
+        uint32_t relocRVA = 0, relocSize = 0;
+        for (auto& sec : m_sections) {
+            if (std::strncmp(sec.name, ".reloc", 6) == 0) {
+                relocRVA = sec.virtualAddress;
+                relocSize = sec.rawDataSize;
+                break;
+            }
+        }
+        if ((!relocRVA || !relocSize) && m_relocDirRVA && m_relocDirSize) {
+            relocRVA = m_relocDirRVA;
+            relocSize = m_relocDirSize;
+        }
+        if (!relocRVA || !relocSize) return;
+
+        std::vector<uint8_t> relocData(relocSize);
+        if (!ReadAtRVARaw(relocRVA, relocData.data(), relocSize)) return;
 
         size_t offset = 0;
         while (offset + 8 <= relocData.size()) {

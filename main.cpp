@@ -121,6 +121,10 @@ static int FindARCPid() {
             size_t n = fread(cmd, 1, sizeof(cmd) - 1, cf);
             (void)n;
             fclose(cf);
+            // Reject UE's CrashReportClient.exe — it names its own thread
+            // "GameThread" and references "PioneerGame" in the crash-dump
+            // path, so a naive substring match picks it over the real game.
+            if (strstr(cmd, "CrashReportClient")) continue;
             if (strstr(cmd, "ARC") || strstr(cmd, "GameThread") || strstr(cmd, "PioneerGame") || strstr(cmd, "Arc Raiders")) {
                 closedir(d);
                 return pid;
@@ -213,7 +217,7 @@ public:
             SigScan::Scanner<KernelReader> scan(m_reader, MODULE_BASE, 0xE900000);
             static SigScan::PEFileReader s_pe;
             static const char* pe_path =
-                "/media/frost/Coding Stuf/ArcBinaryDumps/Steam/Arc_Raiders_Binary_Steam_2026_04_14.exe";
+                "/media/frost/Coding Stuf/Linux/FrostBinaryDumper/Arc_Raiders_Binary_20260421_160408.exe";
             if (s_pe.Open(pe_path)) {
                 scan.SetPEFallback(&s_pe);
                 std::printf("[sig] PE fallback enabled: %s\n", pe_path);
@@ -1003,7 +1007,10 @@ int main(int argc, char* argv[]) {
     int pid = 0;
     bool do_sdk   = false, do_test = false, do_dump = false, do_probe = false;
     bool do_emu_smoke = false, do_emu_fname = false, want_help = false;
+    bool do_decrypt_handle = false, do_test_gobj = false, do_dump_gobj_chunks = false;
+    bool do_scan_chunks = false, do_list_uobjects = false;
     uint32_t emu_fname_ci = 505;
+    uint64_t decrypt_handle_val = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1017,6 +1024,18 @@ int main(int argc, char* argv[]) {
             do_emu_fname = true;
             if (i + 1 < argc && argv[i+1][0] != '-')
                 emu_fname_ci = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
+            continue;
+        }
+        if (arg == "--test-gobj")  { do_test_gobj = true; continue; }
+        if (arg == "--dump-gobj-chunks") { do_dump_gobj_chunks = true; continue; }
+        if (arg == "--scan-chunks") { do_scan_chunks = true; continue; }
+        if (arg == "--list-uobjects") { do_list_uobjects = true; continue; }
+        if (arg == "--decrypt-handle") {
+            // Patch 20260421: apply bswap64(handle ^ 0x59B07C3D00000000)
+            // to the raw FName handle qword and print the resulting pointer.
+            do_decrypt_handle = true;
+            if (i + 1 < argc && argv[i+1][0] != '-')
+                decrypt_handle_val = std::strtoull(argv[++i], nullptr, 0);
             continue;
         }
         if (pid == 0) pid = atoi(argv[i]);
@@ -1035,9 +1054,398 @@ int main(int argc, char* argv[]) {
             "  --emu-fname [CI]\n"
             "               Find FName decrypt by signature, call game's code inside\n"
             "               Unicorn for CI (default 505 = \"Object\"), print result.\n"
+            "  --decrypt-handle <hex>\n"
+            "               Patch 20260421 test: apply bswap64(X ^ 0x59B07C3D00000000)\n"
+            "               to the given raw FName handle and print the entry pointer.\n"
+            "  --test-gobj  Patch 20260421: read live GUObjectArray (0xDDCB420),\n"
+            "               apply new decrypt pipeline, print chunks_manager + max.\n"
+            "  --dump-gobj-chunks\n"
+            "               Emulate VMProtected vtable[7] via Unicorn to fetch\n"
+            "               the chunk-ptr-array. BROKEN: VMP anti-emu defeats us;\n"
+            "               left as a probe for further analysis.\n"
             "  --help, -h   This message.\n";
     };
     if (want_help) { print_help(); return 0; }
+
+    // --decrypt-handle is pure computation, no PID needed.
+    if (do_decrypt_handle) {
+        uint64_t entry = ArcDecrypt::Patch20260421::DecryptEntryHandle(decrypt_handle_val);
+        std::printf("[decrypt-handle] handle=0x%016llX\n",
+            (unsigned long long)decrypt_handle_val);
+        std::printf("[decrypt-handle] entry =0x%016llX   (sentinel-xor → bswap64)\n",
+            (unsigned long long)entry);
+        if (decrypt_handle_val == ArcDecrypt::Patch20260421::ENTRY_HANDLE_XOR)
+            std::printf("[decrypt-handle] NOTE: handle == sentinel → represents NAME_None (null)\n");
+        return 0;
+    }
+
+    // --list-uobjects: after --scan-chunks finds the array, print each UObject
+    // with its vtable and decrypted NamePrivate (FName handle at +0x18).
+    if (do_list_uobjects) {
+        if (pid == 0) { pid = FindARCPid(); if (pid <= 0) { std::cerr << "[list] no PID\n"; return 1; } }
+        KernelReader r;
+        if (!r.Open(pid)) { std::cerr << "[list] reader open failed\n"; return 1; }
+        const uint64_t base = 0x140000000ULL;
+        const uint64_t vt_lo = base + 0x1000;
+        const uint64_t vt_hi = base + 0xAD2B448;
+
+        // Find the FUObjectItem array (reuse scan logic condensed).
+        auto is_heap = [&](uint64_t p){ return p >= 0x100000 && p < 0x800000000000ULL; };
+        auto is_vt   = [&](uint64_t p){ return p >= vt_lo && p < vt_hi; };
+        const uint64_t WIN = 0x10000ULL;
+        const uint32_t STRIDE = 20;
+        std::vector<uint8_t> buf(WIN);
+        uint64_t array_start = 0;
+        uint32_t array_count = 0;
+        uint64_t cur_start = 0;
+        uint32_t cur_count = 0;
+        auto flush_best = [&]() {
+            if (cur_count > array_count) { array_start = cur_start; array_count = cur_count; }
+            cur_start = 0; cur_count = 0;
+        };
+        std::printf("[list] scanning for UObject array ...\n");
+        for (uint64_t page = 0x10000000ULL; page + WIN <= 0x80000000ULL; page += WIN) {
+            if (!r.Read(page, buf.data(), WIN)) { flush_best(); continue; }
+            for (size_t off = 0; off + STRIDE <= WIN; off += STRIDE) {
+                uint64_t op = 0;
+                std::memcpy(&op, buf.data() + off, 8);
+                bool ok = is_heap(op);
+                if (ok) { uint64_t vt = 0; ok = r.Read(op, &vt, 8) && is_vt(vt); }
+                if (!ok) { flush_best(); continue; }
+                if (cur_count == 0) cur_start = page + off;
+                cur_count++;
+            }
+        }
+        flush_best();
+        if (!array_count) { std::cerr << "[list] no UObject array found\n"; return 1; }
+        std::printf("[list] UObject array @ 0x%llX  items=%u\n",
+            (unsigned long long)array_start, array_count);
+
+        // Enumerate and decrypt names. The UObject NamePrivate (16B) is at
+        // some offset we need to probe; prior-patch used +0x90 (UObject FName
+        // at +0x18, the raw handle qword is inside that 16B field).
+        // Per patch 20260421, the second qword of the 16B FName IS the
+        // encrypted entry-pointer handle → decrypt via DecryptEntryHandle.
+        // Common UObjectBase layout offsets to try for NamePrivate: +0x18.
+        int limit = 30;
+        std::printf("[list] first %d UObjects (obj, vtable, handle→entry):\n", limit);
+        int listed = 0, valid_names = 0;
+        for (uint32_t i = 0; i < array_count && listed < limit; ++i) {
+            uint64_t item = array_start + (uint64_t)STRIDE * i;
+            uint64_t obj = 0;
+            if (!r.Read(item, &obj, 8) || !obj) continue;
+            uint64_t vt = 0;
+            r.Read(obj, &vt, 8);
+            // NamePrivate is stored as an inline 16-byte FName at obj+0x28
+            // (UObjectBase layout for patch 20260421, confirmed by reading
+            // live UObject: +0x18/+0x20 are zero, first 16-byte encrypted
+            // FName block starts at +0x28).
+            uint8_t name_bytes[16] = {};
+            r.Read(obj + 0x28, name_bytes, 16);
+            uint64_t handle_lo = 0, handle_hi = 0;
+            std::memcpy(&handle_lo, name_bytes + 0, 8);
+            std::memcpy(&handle_hi, name_bytes + 8, 8);
+            uint64_t entry1 = ArcDecrypt::Patch20260421::DecryptEntryHandle(handle_lo);
+            uint64_t entry2 = ArcDecrypt::Patch20260421::DecryptEntryHandle(handle_hi);
+            bool v1 = entry1 >= 0x10000 && entry1 < 0x800000000000ULL;
+            bool v2 = entry2 >= 0x10000 && entry2 < 0x800000000000ULL;
+            if (v1 || v2) valid_names++;
+            std::printf("[list] [%5u] obj=0x%012llX vt=0x%09llX  h_lo→0x%016llX %s  h_hi→0x%016llX %s\n",
+                i, (unsigned long long)obj, (unsigned long long)vt,
+                (unsigned long long)entry1, v1 ? "✓" : " ",
+                (unsigned long long)entry2, v2 ? "✓" : " ");
+            listed++;
+        }
+        std::printf("[list] %d listed, %d with candidate name pointers\n", listed, valid_names);
+        return 0;
+    }
+
+    // --scan-chunks: structural scan for FUObjectItem chunks in live memory.
+    // Looks for regions of 20-byte-stride entries whose first qword is a
+    // plausible UObject pointer (first qword of pointed-to is a vtable in
+    // .text/.rdata range). Reports regions with ≥500 consecutive valid items.
+    if (do_scan_chunks) {
+        if (pid == 0) { pid = FindARCPid(); if (pid <= 0) { std::cerr << "[scan] no PID\n"; return 1; } }
+        KernelReader r;
+        if (!r.Open(pid)) { std::cerr << "[scan] reader open failed\n"; return 1; }
+        const uint64_t base = 0x140000000ULL;
+        const uint64_t vt_lo = base + 0x1000;          // .text start
+        const uint64_t vt_hi = base + 0xAD2B448;       // .rdata end (vtables live there too)
+
+        auto is_vtable_ptr = [&](uint64_t p) {
+            return p >= vt_lo && p < vt_hi;
+        };
+        auto is_heap_ptr = [&](uint64_t p) {
+            // Wine heap: 0x10000..0x800000000000
+            return p >= 0x100000 && p < 0x800000000000ULL;
+        };
+
+        // Scan candidate heap regions. UE's tagged allocator may place
+        // FUObjectItem chunks anywhere in process address space, so we cover
+        // a wide range. Wine pointers we've seen: 0x14x (module), 0x18x..0x2x
+        // (chunks_manager area), 0x1E3x (chunks_manager internal), and higher.
+        struct Region { uint64_t start; uint32_t count; };
+        std::vector<Region> regions;
+        const std::pair<uint64_t,uint64_t> scan_ranges[] = {
+            {0x10000000ULL, 0x80000000ULL},     // 2 GB: 0x10000000..0x80000000
+            {0x100000000ULL, 0x400000000ULL},   // 12 GB: 0x100000000..0x400000000
+        };
+        const uint64_t WIN     = 0x10000ULL;           // 64 KB per read
+        const uint32_t STRIDE  = 20;
+
+        std::vector<uint8_t> buf(WIN);
+        uint64_t total_pages = 0, ok_pages = 0;
+        uint64_t current_start = 0;
+        uint32_t current_count = 0;
+
+        auto flush_region = [&]() {
+            if (current_count >= 500) {
+                regions.push_back({current_start, current_count});
+                std::printf("[scan]   region @ 0x%llX  count=%u\n",
+                    (unsigned long long)current_start, current_count);
+            }
+            current_start = 0;
+            current_count = 0;
+        };
+
+        for (auto [lo, hi] : scan_ranges) {
+            std::printf("[scan] range 0x%llX..0x%llX (stride %u)\n",
+                (unsigned long long)lo, (unsigned long long)hi, STRIDE);
+            // Continuous sweep: carry an in-progress region across pages.
+            // Mark current_count=0 only on a concrete invalid entry, not on
+            // page-boundary read failure.
+            for (uint64_t page = lo; page + WIN <= hi; page += WIN) {
+                total_pages++;
+                if (!r.Read(page, buf.data(), WIN)) { flush_region(); continue; }
+                ok_pages++;
+                // Start at the residue of previous window: if current region
+                // was in progress at the LAST stride-aligned position of prev
+                // window, its tail is at page+0 minus the remainder.
+                size_t start_off = 0;
+                if (current_count && (page % STRIDE)) {
+                    // realign to stride boundary relative to region start
+                    start_off = (STRIDE - (page - current_start) % STRIDE) % STRIDE;
+                }
+                for (size_t off = start_off; off + STRIDE <= WIN; off += STRIDE) {
+                    uint64_t obj_ptr = 0;
+                    std::memcpy(&obj_ptr, buf.data() + off, 8);
+                    bool ok = is_heap_ptr(obj_ptr);
+                    if (ok) {
+                        uint64_t vt = 0;
+                        ok = r.Read(obj_ptr, &vt, 8) && is_vtable_ptr(vt);
+                    }
+                    if (!ok) { flush_region(); continue; }
+                    if (current_count == 0) current_start = page + off;
+                    current_count++;
+                }
+            }
+            flush_region();
+        }
+        std::printf("[scan] done. pages_read=%llu/%llu  regions_found=%zu\n",
+            (unsigned long long)ok_pages, (unsigned long long)total_pages, regions.size());
+        if (regions.empty()) {
+            std::printf("[scan] no large chunk-array candidates found\n");
+            return 1;
+        }
+        // Dump the best region's first 10 FUObjectItems to verify
+        auto& best = *std::max_element(regions.begin(), regions.end(),
+            [](const Region& a, const Region& b){ return a.count < b.count; });
+        std::printf("[scan] best region: 0x%llX (count=%u → %u objects approx)\n",
+            (unsigned long long)best.start, best.count, best.count);
+        for (uint32_t i = 0; i < 10 && i < best.count; ++i) {
+            uint64_t item = best.start + (uint64_t)STRIDE * i;
+            uint64_t obj = 0; uint32_t a = 0, b = 0, c = 0;
+            r.Read(item,      &obj, 8);
+            r.Read(item + 8,  &a, 4);
+            r.Read(item + 12, &b, 4);
+            r.Read(item + 16, &c, 4);
+            std::printf("[scan]   item[%2u] @ 0x%llX: obj=0x%llX  %08X %08X %08X\n",
+                i, (unsigned long long)item, (unsigned long long)obj, a, b, c);
+        }
+        return 0;
+    }
+
+    // --dump-gobj-chunks: emulate the VMProtected vtable[7] of chunks_manager
+    // to obtain the chunk-pointer-array, then walk FUObjectItems.
+    if (do_dump_gobj_chunks) {
+        if (pid == 0) { pid = FindARCPid(); if (pid <= 0) { std::cerr << "[gobj] no PID\n"; return 1; } }
+        KernelReader r;
+        if (!r.Open(pid)) { std::cerr << "[gobj] reader open failed\n"; return 1; }
+        using namespace ArcDecrypt::Patch20260421;
+        const uint64_t base = 0x140000000ULL;
+
+        uint8_t enc[16] = {}, mask[8] = {};
+        uint64_t xor_key = 0;
+        if (!r.Read(base + RVA_GUOBJECT_ARRAY_NEW, enc, 16) ||
+            !r.Read(base + RVA_GOBJ_PSHUFB_MASK,   mask, 8) ||
+            !r.Read(base + RVA_GOBJ_MAX_XOR_KEY,   &xor_key, 8)) {
+            std::cerr << "[gobj] read constants failed\n"; return 1;
+        }
+        uint64_t chunks_mgr = ArcDecrypt::Patch20260421::DecryptGObjChunksManager(enc, mask);
+        std::printf("[gobj] chunks_manager = 0x%llX\n", (unsigned long long)chunks_mgr);
+
+        // Read chunks_manager's vtable[7] target (offset +0x38 in vtable at [chunks_mgr])
+        uint64_t vtable = 0;
+        if (!r.Read(chunks_mgr, &vtable, 8) || !vtable) {
+            std::cerr << "[gobj] failed reading chunks_manager vtable\n"; return 1;
+        }
+        uint64_t vt7 = 0;
+        if (!r.Read(vtable + 0x38, &vt7, 8) || !vt7) {
+            std::cerr << "[gobj] failed reading vtable[7]\n"; return 1;
+        }
+        std::printf("[gobj] vtable=0x%llX  vtable[7]=0x%llX\n",
+            (unsigned long long)vtable, (unsigned long long)vt7);
+
+        // Read the xmmword at chunks_manager+0x30 (scratch input passed to vt7)
+        uint8_t scratch_in[16] = {};
+        if (!r.Read(chunks_mgr + 0x30, scratch_in, 16)) {
+            std::cerr << "[gobj] failed reading chunks_manager+0x30\n"; return 1;
+        }
+
+        // Boot Unicorn, map live memory on demand.
+        EmuEngine eng;
+        if (!eng.Initialize(&r, base, 0xE9AF000,
+                "/media/frost/Coding Stuf/Linux/FrostSDKDumper/Arc_Raiders_Binary_20260421_213315.exe")) {
+            std::cerr << "[gobj] emu init failed\n"; return 1;
+        }
+        // Pre-map chunks_manager pages + vt7 pages
+        eng.PreMapRange(chunks_mgr & ~0xFFFULL, 0x4000);
+        eng.PreMapRange(vt7 & ~0xFFFULL, 0x4000);
+
+        // Set up fake TEB at 0x7FFFFFFE0000 so GS:[0x60] → PEB works.
+        constexpr uint64_t FAKE_TEB = 0x00007FFFFFFE0000ULL;
+        constexpr uint64_t FAKE_PEB = 0x7FFD0000ULL;
+        uc_mem_map(eng.UC(), FAKE_TEB, 0x1000, UC_PROT_ALL);
+        uint8_t teb_zero[0x1000] = {};
+        uc_mem_write(eng.UC(), FAKE_TEB, teb_zero, sizeof(teb_zero));
+        uint64_t self = FAKE_TEB, stack_b = 0x200000 + 0x100000, stack_l = 0x200000;
+        uc_mem_write(eng.UC(), FAKE_TEB + 0x08, &stack_b, 8);
+        uc_mem_write(eng.UC(), FAKE_TEB + 0x10, &stack_l, 8);
+        uc_mem_write(eng.UC(), FAKE_TEB + 0x30, &self, 8);
+        uc_mem_write(eng.UC(), FAKE_TEB + 0x60, &FAKE_PEB, 8);
+        eng.SetGSBase(FAKE_TEB);
+        eng.MapGamePage(FAKE_PEB);  // PEB page (may be read)
+
+        // Layout a scratch struct in INPUT region. The VMProtected dispatcher
+        // at vtable[7] interprets a bytecode stream whose pointer is at
+        // [rdx+0x20]. In the original caller's stack, that slot held a pointer
+        // to an adjacent __int128 zero buffer. Reproduce that layout:
+        //   scratch+0x00..+0x1F: undefined stack data (zero is fine)
+        //   scratch+0x20: pointer to bytecode stream (set to scratch+0x40)
+        //   scratch+0x30: the xmmword copied from chunks_manager+0x30
+        //   scratch+0x40: bytecode (start with 0 = opcode 0 = "return" in
+        //                 most VMP dispatchers we've seen)
+        const uint64_t SCRATCH_ADDR = 0x10000ULL;      // EmuEngine::INPUT_BASE
+        uint8_t scratch[0x200] = {};
+        uint64_t bc_stream = SCRATCH_ADDR + 0x40;
+        std::memcpy(scratch + 0x20, &bc_stream, 8);    // [rdx+0x20] = bytecode ptr
+        std::memcpy(scratch + 0x30, scratch_in, 16);   // [rdx+0x30] = xmmword from chunks_mgr+0x30
+        // scratch+0x40..+0x1FF = bytecode; all zeros (opcode 0 repeated)
+        eng.EmuWrite(SCRATCH_ADDR, scratch, sizeof(scratch));
+
+        // Call vtable[7](chunks_mgr, scratch)
+        eng.ResetCPU();
+        eng.WriteReg(UC_X86_REG_RCX, chunks_mgr);
+        eng.WriteReg(UC_X86_REG_RDX, SCRATCH_ADDR);
+        // Set up return address = SENTINEL_RIP (EmuEngine provides an implicit
+        // sentinel page mapped at 0xDEAD0000 / 0x1000 filled with CCs).
+        uint64_t sentinel = 0xDEAD0000ULL;
+        uint64_t rsp = eng.ReadReg(UC_X86_REG_RSP);
+        rsp -= 8;
+        eng.EmuWrite(rsp, &sentinel, 8);
+        eng.WriteReg(UC_X86_REG_RSP, rsp);
+
+        std::printf("[gobj] running vtable[7] emulation...\n");
+        uc_err er = eng.Run(vt7, sentinel, /*timeout_us*/2'000'000, /*max*/500000);
+        uint64_t rax = eng.ReadReg(UC_X86_REG_RAX);
+        std::printf("[gobj] run status: %d (%s)  rax=0x%llX\n",
+            (int)er, uc_strerror(er), (unsigned long long)rax);
+
+        if (!rax || rax < 0x10000 || rax >= 0x800000000000) {
+            std::printf("[gobj] emu returned implausible rax=0x%llX\n",
+                (unsigned long long)rax);
+            std::printf("[gobj] (VMProtect anti-emulation is likely defeating Unicorn here)\n");
+            std::printf("[gobj] TODO: implement bytecode interpreter, or find a non-VMP\n");
+            std::printf("[gobj]       path to the chunks-ptr-array inside chunks_manager.\n");
+            return 1;
+        }
+
+        // rax should point to the chunk-ptr-array
+        uint64_t chunks_array = rax;
+        std::printf("[gobj] chunk-ptr-array @ 0x%llX\n",
+            (unsigned long long)chunks_array);
+        for (int ci = 0; ci < 8; ++ci) {
+            uint64_t cp = 0;
+            if (!r.Read(chunks_array + 8 * ci, &cp, 8)) break;
+            std::printf("[gobj]   chunk[%d] = 0x%llX\n", ci, (unsigned long long)cp);
+            if (!cp) break;
+            // Probe first FUObjectItem
+            uint64_t obj_ptr = 0;
+            r.Read(cp, &obj_ptr, 8);
+            std::printf("[gobj]     item[0].obj = 0x%llX\n", (unsigned long long)obj_ptr);
+        }
+        return 0;
+    }
+
+    // --test-gobj: read live GUObjectArray, apply patch-20260421 decrypt.
+    if (do_test_gobj) {
+        if (pid == 0) {
+            std::cout << "[test-gobj] No PID — scanning /proc ...\n";
+            pid = FindARCPid();
+            if (pid <= 0) { std::cerr << "[test-gobj] game not found\n"; return 1; }
+            std::cout << "[test-gobj] PID: " << pid << "\n";
+        }
+        KernelReader r;
+        if (!r.Open(pid)) { std::cerr << "[test-gobj] reader open failed\n"; return 1; }
+
+        using namespace ArcDecrypt::Patch20260421;
+        const uint64_t base = 0x140000000ULL;
+
+        uint8_t enc[16] = {}, mask[8] = {}, max_enc[16] = {};
+        uint64_t xor_key = 0;
+
+        if (!r.Read(base + RVA_GUOBJECT_ARRAY_NEW, enc, 16)) {
+            std::cerr << "[test-gobj] failed to read GUObjectArray\n"; return 1;
+        }
+        if (!r.Read(base + RVA_GOBJ_PSHUFB_MASK, mask, 8)) {
+            std::cerr << "[test-gobj] failed to read PSHUFB mask\n"; return 1;
+        }
+        if (!r.Read(base + RVA_GOBJ_MAX_XOR_KEY, &xor_key, 8)) {
+            std::cerr << "[test-gobj] failed to read XOR key\n"; return 1;
+        }
+
+        std::printf("[test-gobj] GUObjectArray @ 0x%llX\n",
+            (unsigned long long)(base + RVA_GUOBJECT_ARRAY_NEW));
+        std::printf("[test-gobj]   enc xmmword : ");
+        for (int i = 0; i < 16; ++i) std::printf("%02x", enc[i]);
+        std::printf("\n[test-gobj]   pshufb mask: ");
+        for (int i = 0; i < 8;  ++i) std::printf("%02x", mask[i]);
+        std::printf("\n[test-gobj]   xor_key_lo8: 0x%016llX\n",
+            (unsigned long long)xor_key);
+
+        uint64_t chunks_mgr = ArcDecrypt::Patch20260421::DecryptGObjChunksManager(enc, mask);
+        std::printf("[test-gobj] chunks_manager = 0x%llX\n",
+            (unsigned long long)chunks_mgr);
+
+        if (!r.Read(chunks_mgr + GOBJ_MANAGER_MAX_OFFSET, max_enc, 16)) {
+            std::cerr << "[test-gobj] failed to read chunks_manager+0x70\n";
+            std::cerr << "[test-gobj] (decrypt produced bad pointer?)\n";
+            return 1;
+        }
+        std::printf("[test-gobj]   +0x70 enc : ");
+        for (int i = 0; i < 16; ++i) std::printf("%02x", max_enc[i]);
+        int32_t max_elem = ArcDecrypt::Patch20260421::DecryptGObjMaxElements(max_enc, xor_key);
+        std::printf("\n[test-gobj] max_elements = %d (0x%X)\n", max_elem, max_elem);
+
+        if (chunks_mgr && max_elem > 0 && max_elem < 2000000) {
+            std::printf("[test-gobj] PIPELINE OK — chunks_manager and max look valid\n");
+        } else {
+            std::printf("[test-gobj] pipeline gave implausible values; review constants\n");
+        }
+        std::printf("[test-gobj] TODO: chunk-ptr-array access requires emulating\n");
+        std::printf("[test-gobj]       VMProtected vtable[7] @ chunks_manager[0x38]\n");
+        return 0;
+    }
 
     if (!do_sdk && !do_test && !do_dump && !do_probe && !do_emu_smoke && !do_emu_fname) {
         do_test = true;
@@ -1063,7 +1471,7 @@ int main(int argc, char* argv[]) {
         }
         EmuEngine eng;
         if (!eng.Initialize(&dumper.m_reader, dumper.MODULE_BASE, 0xE9AF000,
-                "/media/frost/Coding Stuf/ArcBinaryDumps/Steam/Arc_Raiders_Binary_Steam_2026_04_14.exe")) {
+                "/media/frost/Coding Stuf/Linux/FrostBinaryDumper/Arc_Raiders_Binary_20260421_160408.exe")) {
             std::printf("[emu-smoke] init failed\n"); return 1;
         }
         uint64_t probe = dumper.MODULE_BASE + 0x22F9A4;
@@ -1090,7 +1498,7 @@ int main(int argc, char* argv[]) {
         }
         EmuEngine eng;
         if (!eng.Initialize(&dumper.m_reader, dumper.MODULE_BASE, 0xE9AF000,
-                "/media/frost/Coding Stuf/ArcBinaryDumps/Steam/Arc_Raiders_Binary_Steam_2026_04_14.exe")) {
+                "/media/frost/Coding Stuf/Linux/FrostBinaryDumper/Arc_Raiders_Binary_20260421_160408.exe")) {
             std::printf("[emu-fname] engine init failed\n"); return 1;
         }
         EmuFName fn;

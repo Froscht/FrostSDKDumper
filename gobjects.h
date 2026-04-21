@@ -38,6 +38,7 @@
 
 namespace gobjects
 {
+    // FUObjectItem: {ObjectPtr, InternalIndex, ClassSerialNumber, WeakPtrSerial} = 20 bytes (confirmed in IDA 3sw0)
     constexpr uint32_t FUOBJECTITEM_SIZE  = 20;
     constexpr uint32_t FUOBJECTITEM_OBJ  = 0;   // Object* at +0x00
     constexpr uint32_t CHUNK_ITEM_COUNT   = 65536; // items per chunk
@@ -138,6 +139,9 @@ namespace gobjects
             if (!m_arrayBase || m_numElements < 1000) {
                 std::printf("[-] GObjectArray init failed: base=0x%llX count=%d\n",
                     (unsigned long long)m_arrayBase, m_numElements);
+                // Aggressive diagnostic dump on failure so next session can see
+                // exactly where the pipeline went wrong.
+                SelfTestDecryptStages();
                 return false;
             }
 
@@ -327,12 +331,25 @@ namespace gobjects
 
         // ── Decrypt GUObjectArray pointer (patch 20260414) ───────────────
         // Pipeline: ROL32(20) → XOR(key) → ROL16(12) → extract lo64 = heap ptr
+        //
+        // NOTE: every intermediate stage is dumped to stdout so the next
+        // session can diagnose where the decrypt diverges when live runs
+        // produce garbage (e.g. base=0x40071006B4569106 count=0).
         uint64_t ComputeObjectArrayIntermediate() {
             // Read encrypted xmmword from struct + GOBJ_ENCRYPTED_OFF
             alignas(16) uint8_t data[16] = {};
             uint64_t enc_addr = m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE + ArcDecrypt::GOBJ_ENCRYPTED_OFF;
-            if (!m_reader.Read(enc_addr, data, 16))
+            if (!m_reader.Read(enc_addr, data, 16)) {
+                std::printf("[decrypt][objarr] FAILED to read encrypted qword @ 0x%llX\n",
+                    (unsigned long long)enc_addr);
                 return 0;
+            }
+
+            auto hex16 = [](const __m128i& v) -> std::string {
+                alignas(16) uint8_t buf[16];
+                _mm_store_si128((__m128i*)buf, v);
+                return FormatHex(buf, 16);
+            };
 
             // Pipeline: ROL32(20) → XOR(key) → ROL16(12)
             __m128i v = _mm_load_si128((const __m128i*)data);
@@ -347,8 +364,20 @@ namespace gobjects
                 _mm_slli_epi16(xored, ArcDecrypt::OBJARRAY_ROL16),
                 _mm_srli_epi16(xored, 16 - ArcDecrypt::OBJARRAY_ROL16));
 
+            std::printf("[decrypt][objarr] enc_addr = 0x%llX (base+0x%llX)\n",
+                (unsigned long long)enc_addr,
+                (unsigned long long)(ArcDecrypt::RVA_GOBJECT_ARRAY_BASE + ArcDecrypt::GOBJ_ENCRYPTED_OFF));
+            std::printf("[decrypt][objarr] xorkey  = %s\n", FormatHex(m_objXorKey, 16).c_str());
+            std::printf("[decrypt][objarr] enc     = %s\n", hex16(v).c_str());
+            std::printf("[decrypt][objarr] rol32   = %s  (shift=%d)\n",
+                hex16(rol).c_str(), ArcDecrypt::OBJARRAY_ROL32);
+            std::printf("[decrypt][objarr] xored   = %s\n", hex16(xored).c_str());
+            std::printf("[decrypt][objarr] rol16   = %s  (shift=%d)\n",
+                hex16(result).c_str(), ArcDecrypt::OBJARRAY_ROL16);
+
             uint64_t r;
             _mm_storel_epi64((__m128i*)&r, result);
+            std::printf("[decrypt][objarr] lo64    = 0x%016llX\n", (unsigned long long)r);
             return r;
         }
 
@@ -473,12 +502,26 @@ namespace gobjects
 
         // ── Decrypt NumElements (patch 20260414) ─────────────────────────
         // Read 8 bytes at base+0x50, AND/ANDNOT blend → XOR → ROL16(12) → PSHUFB(0x05040607) → extract i32
+        //
+        // Always-on diagnostics: dump raw bytes + every intermediate so we
+        // can see at a glance whether the masks, XOR key, or base address
+        // are wrong.
         int32_t DecryptNumElements(uint64_t array_base) {
             if (!array_base) return 0;
 
             alignas(16) uint8_t data[16] = {};
-            if (!m_reader.Read(array_base + 5 * 16, data, 16))
+            uint64_t read_addr = array_base + 5 * 16;
+            if (!m_reader.Read(read_addr, data, 16)) {
+                std::printf("[decrypt][count] FAILED to read @ 0x%llX\n",
+                    (unsigned long long)read_addr);
                 return 0;
+            }
+
+            auto hex16 = [](const __m128i& v) -> std::string {
+                alignas(16) uint8_t buf[16];
+                _mm_store_si128((__m128i*)buf, v);
+                return FormatHex(buf, 16);
+            };
 
             __m128i v = _mm_loadl_epi64((const __m128i*)data);
             __m128i mA = _mm_load_si128((const __m128i*)m_elemMaskA);
@@ -487,7 +530,55 @@ namespace gobjects
             __m128i bl = _mm_or_si128(_mm_and_si128(v, mB), _mm_andnot_si128(v, mA));
             __m128i xo = _mm_xor_si128(bl, xk);
             __m128i r16 = _mm_or_si128(_mm_slli_epi16(xo, 12), _mm_srli_epi16(xo, 4));
-            return _mm_cvtsi128_si32(_mm_shuffle_epi8(r16, _mm_cvtsi32_si128(0x05040607)));
+            __m128i final_v = _mm_shuffle_epi8(r16, _mm_cvtsi32_si128(0x05040607));
+            int32_t result = _mm_cvtsi128_si32(final_v);
+
+            std::printf("[decrypt][count] read @ 0x%llX = %s\n",
+                (unsigned long long)read_addr, FormatHex(data, 16).c_str());
+            std::printf("[decrypt][count] maskA  = %s\n", FormatHex(m_elemMaskA, 16).c_str());
+            std::printf("[decrypt][count] maskB  = %s\n", FormatHex(m_elemMaskB, 16).c_str());
+            std::printf("[decrypt][count] xorKey = %s\n", FormatHex(m_elemXorKey, 16).c_str());
+            std::printf("[decrypt][count] v      = %s\n", hex16(v).c_str());
+            std::printf("[decrypt][count] blend  = %s\n", hex16(bl).c_str());
+            std::printf("[decrypt][count] xored  = %s\n", hex16(xo).c_str());
+            std::printf("[decrypt][count] rol16  = %s\n", hex16(r16).c_str());
+            std::printf("[decrypt][count] pshufb = %s\n", hex16(final_v).c_str());
+            std::printf("[decrypt][count] result = %d (0x%08X)\n", result, (uint32_t)result);
+
+            return result;
+        }
+
+        // ── Self-test: dump all decrypt stages with current state ────────
+        // Runs ComputeObjectArrayIntermediate (which already logs every
+        // pipeline stage), then DecryptNumElements on the produced base.
+        // Wired into Init() right before the "GObjectArray init failed"
+        // bail-out so the diagnostic is always visible when decrypt fails.
+        void SelfTestDecryptStages() {
+            std::printf("\n[selftest] ==== Decrypt stage dump ====\n");
+            std::printf("[selftest] module_base      = 0x%llX\n",
+                (unsigned long long)m_base);
+            std::printf("[selftest] RVA_GOBJECT_BASE = 0x%llX\n",
+                (unsigned long long)ArcDecrypt::RVA_GOBJECT_ARRAY_BASE);
+            std::printf("[selftest] GOBJ_ENC_OFF     = 0x%llX\n",
+                (unsigned long long)ArcDecrypt::GOBJ_ENCRYPTED_OFF);
+            std::printf("[selftest] OBJARRAY_ROL32   = %d\n", ArcDecrypt::OBJARRAY_ROL32);
+            std::printf("[selftest] OBJARRAY_ROL16   = %d\n", ArcDecrypt::OBJARRAY_ROL16);
+            std::printf("[selftest] item_stride      = %d (FUOBJECTITEM_SIZE=%u)\n",
+                m_itemStride, FUOBJECTITEM_SIZE);
+
+            // Dump ObjectArray pipeline
+            uint64_t base_candidate = ComputeObjectArrayIntermediate();
+            std::printf("[selftest] ObjectArray candidate base = 0x%016llX\n",
+                (unsigned long long)base_candidate);
+
+            // Dump NumElements pipeline against the candidate
+            if (base_candidate) {
+                int32_t n = DecryptNumElements(base_candidate);
+                std::printf("[selftest] NumElements @ candidate = %d\n", n);
+            } else {
+                std::printf("[selftest] skipping NumElements (no candidate)\n");
+            }
+            std::printf("[selftest] ==== End dump ====\n\n");
         }
 
         // ── Find PEB address (Wine: search for ImageBaseAddress in low mem) ──

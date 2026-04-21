@@ -7,7 +7,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KMOD_DIR="$SCRIPT_DIR/kernel_module/src"
 KMOD_NAME="memreader"
 BINARY="$SCRIPT_DIR/FrostDumper"
-TARGET_PID="${1:-}"
+
+# Split argv into a numeric PID (if any) + pass-through flags forwarded to the binary.
+TARGET_PID=""
+PASSTHROUGH_ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" =~ ^[0-9]+$ ]] && [[ -z "$TARGET_PID" ]]; then
+        TARGET_PID="$arg"
+    else
+        PASSTHROUGH_ARGS+=("$arg")
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -61,7 +71,7 @@ build_dumper() {
         -I"$SCRIPT_DIR" \
         -o "$BINARY" \
         "$SCRIPT_DIR/main.cpp" \
-        -lm
+        -lcapstone -lunicorn -lm
     info "Binary built: $BINARY"
 
     # Also build probe tools (best-effort, not fatal)
@@ -79,6 +89,13 @@ build_dumper() {
             "$SCRIPT_DIR/probe_next.cpp" -lm 2>/dev/null \
             && info "Probe tool built: probe_next" || warn "probe_next build skipped"
     fi
+    if [[ -f "$SCRIPT_DIR/probe_live_rvas.cpp" ]]; then
+        g++ -std=c++17 -O2 -march=native \
+            -I"$SCRIPT_DIR" \
+            -o "$SCRIPT_DIR/probe_live_rvas" \
+            "$SCRIPT_DIR/probe_live_rvas.cpp" -lm 2>/dev/null \
+            && info "Probe tool built: probe_live_rvas" || warn "probe_live_rvas build skipped"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -90,22 +107,28 @@ resolve_pid() {
         return
     fi
 
-    # Try to find the ARC Raiders Wine process automatically.
-    # Unreal Engine names its main thread "GameThread" via prctl, so search by
-    # comm first (avoids matching wrapper shell scripts with the game exe in argv).
+    # Try to find the ARC Raiders Wine process automatically. The binary does
+    # its own /proc scan, but we resolve here too so the banner below shows a
+    # concrete PID. Unreal Engine names its main thread "GameThread" via prctl.
     local found
-    found=$(pgrep "GameThread" 2>/dev/null | head -1 || true)
+    # GameThread-named PIDs can include CrashReportClient.exe (UE's crash
+    # uploader — same thread name, wrong binary). Filter those out by
+    # rejecting any PID whose /proc/pid/cmdline contains CrashReportClient.
+    found=""
+    for pid in $(pgrep "GameThread" 2>/dev/null); do
+        if ! grep -q CrashReportClient "/proc/$pid/cmdline" 2>/dev/null; then
+            found="$pid"
+            break
+        fi
+    done
     if [[ -z "$found" ]]; then
-        # Fallback for other naming conventions (older builds, custom runners)
         found=$(pgrep -f "PioneerGame.*Binaries|ARC-Win64-Ship|ARC-WinGDK-Ship|ARC-WinGDK" 2>/dev/null | head -1 || true)
     fi
     if [[ -n "$found" ]]; then
         TARGET_PID="$found"
         info "Auto-detected game PID: $TARGET_PID"
     else
-        warn "Could not auto-detect game PID."
-        warn "Run as: sudo $0 <PID> to specify manually."
-        error "Could not find ARC Raiders process. Is the game running?"
+        warn "Could not auto-detect game PID. Binary will self-detect or exit."
     fi
 }
 
@@ -121,9 +144,13 @@ resolve_pid
 echo ""
 echo "======================================"
 echo "  FrostDumper – ARC Raiders SDK Dump"
-echo "  March 2026 patch"
-echo "  Target PID : $TARGET_PID"
+echo "  Target PID : ${TARGET_PID:-<auto>}"
+echo "  Flags      : ${PASSTHROUGH_ARGS[*]:-<none>}"
 echo "======================================"
 echo ""
 
-exec "$BINARY" "$TARGET_PID"
+if [[ -n "$TARGET_PID" ]]; then
+    exec "$BINARY" "$TARGET_PID" "${PASSTHROUGH_ARGS[@]}"
+else
+    exec "$BINARY" "${PASSTHROUGH_ARGS[@]}"
+fi

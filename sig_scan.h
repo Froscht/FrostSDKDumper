@@ -119,7 +119,10 @@ public:
         uint64_t hit = Find(pat);
         if (!hit) return 0;
         uint64_t t = ResolveRipDisp(hit, 7, 3);
-        return InRange(t) ? (t - m_base) : 0;
+        if (!InRange(t)) return 0;
+        uint64_t rva = t - m_base;
+        // GObjectArray is a .data global; .text hits indicate signature drift.
+        return InDataRVA(rva) ? rva : 0;
     }
 
     // GWorld. Cross-patch verified.
@@ -130,7 +133,10 @@ public:
         uint64_t hit = Find(pat);
         if (!hit) return 0;
         uint64_t t = ResolveRipDisp(hit, 7, 3);
-        return InRange(t) ? (t - m_base) : 0;
+        if (!InRange(t)) return 0;
+        uint64_t rva = t - m_base;
+        // GWorld is a .data global; reject matches resolving into .text/.rdata.
+        return InDataRVA(rva) ? rva : 0;
     }
 
     // FNamePool base (GNames). Apr 14 only — older patches lack `add rdi, 0xC0`.
@@ -140,21 +146,27 @@ public:
         uint64_t hit = Find(pat);
         if (!hit) return 0;
         uint64_t t = ResolveRipDisp(hit, 7, 3);
-        return InRange(t) ? (t - m_base) : 0;
+        if (!InRange(t)) return 0;
+        uint64_t rva = t - m_base;
+        // FNamePool base is a .data global; non-.data hit ⇒ false positive.
+        return InDataRVA(rva) ? rva : 0;
     }
 
     // FName XOR key table. Only xref lives in a VMProtect-encrypted function,
     // so we go two-stage: try the hint, then scan near GNames for a region
     // with key-table shape (64 uint16, ≥50 non-zero, no value repeats > 6×).
     uint64_t FindFNameKeyTableRVA(uint64_t hint_rva, uint64_t gnames_rva) {
-        if (hint_rva && LooksLikeKeyTable(m_base + hint_rva)) return hint_rva;
+        // FName XOR key table lives in .data alongside GNames; gate both paths.
+        if (hint_rva && InDataRVA(hint_rva) && LooksLikeKeyTable(m_base + hint_rva)) return hint_rva;
         if (!gnames_rva) return 0;
         const uint64_t radius = 4 * 0x100000ULL;
         uint64_t gn = m_base + gnames_rva;
         uint64_t lo = (gn > m_base + radius) ? gn - radius : m_base;
         uint64_t hi = std::min<uint64_t>(gn + radius, m_base + m_size);
-        for (uint64_t va = (lo + 15) & ~15ULL; va < hi; va += 16)
-            if (LooksLikeKeyTable(va)) return va - m_base;
+        for (uint64_t va = (lo + 15) & ~15ULL; va < hi; va += 16) {
+            uint64_t rva = va - m_base;
+            if (InDataRVA(rva) && LooksLikeKeyTable(va)) return rva;
+        }
         return 0;
     }
 
@@ -184,6 +196,21 @@ public:
             else if (sidx == 3) t.elem_xor_key = rva;
             if (++sidx >= 4) break;
         }
+        // Sanity: ElemMaskA/B/XorKey are 3 consecutive xmmwords at stride 0x10
+        // in .rdata. If extractor picked non-contiguous LEAs (false-positive
+        // function match or shifted prologue), the match is untrustworthy —
+        // reject all 4 tables so apply() falls back to the hardcoded constants.
+        bool triplet_ok = t.elem_mask_a && t.elem_mask_b && t.elem_xor_key &&
+                          t.elem_mask_b == t.elem_mask_a + 0x10 &&
+                          t.elem_xor_key == t.elem_mask_a + 0x20;
+        // SIMD constant tables are read-only data; all 4 LEAs must land in .rdata.
+        bool section_ok = InRDataRVA(t.decrypt_key) &&
+                          InRDataRVA(t.elem_mask_a) &&
+                          InRDataRVA(t.elem_mask_b) &&
+                          InRDataRVA(t.elem_xor_key);
+        if (!triplet_ok || !section_ok) {
+            t = {};
+        }
         return t;
     }
 
@@ -199,12 +226,24 @@ public:
         uint64_t scan_va = hit + 25;
         if (!ReadPage(scan_va, scan, 128)) return 0;
         auto hits = m_decoder.ScanRipLoads(scan, sizeof(scan), scan_va, 32);
-        for (const auto& h : hits)
-            if (h.mem_size >= 8 && InRange(h.target_va)) return h.target_va - m_base;
+        for (const auto& h : hits) {
+            if (h.mem_size < 8 || !InRange(h.target_va)) continue;
+            uint64_t rva = h.target_va - m_base;
+            // CIdx xor keys live in .rdata; skip LEAs that drift into .text/.data.
+            if (InRDataRVA(rva)) return rva;
+        }
         return 0;
     }
 
 private:
+    // Section RVA ranges (stable across 2026 builds; update if PE layout shifts).
+    // Used to sanity-check LEA displacements — a .data global resolving into
+    // .text means the signature drifted and the match is poisoned, so we zero
+    // the RVA and let the caller fall back to the hardcoded constant.
+    bool InTextRVA(uint64_t rva)  const { return rva >= 0x1000      && rva < 0xACB4000; }
+    bool InRDataRVA(uint64_t rva) const { return rva >= 0xACB9000   && rva < 0xDA4F000; }
+    bool InDataRVA(uint64_t rva)  const { return rva >= 0xDA4F000   && rva < 0xE1B4000; }
+
     static bool MatchAt(const uint8_t* buf, const Pattern& pat) {
         const size_t n = pat.bytes.size();
         for (size_t i = 0; i < n; ++i)

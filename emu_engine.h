@@ -97,6 +97,10 @@ public:
             std::fread(&m_imageBase, 8, 1, m_file);
             std::fseek(m_file, optHeaderStart + 56, SEEK_SET);
             std::fread(&m_sizeOfImage, 4, 1, m_file);
+            // DataDirectory[5] = BASE_RELOC (offset +112 into opt header for PE32+)
+            std::fseek(m_file, optHeaderStart + 24 + 112, SEEK_SET);
+            std::fread(&m_relocDirRVA,  4, 1, m_file);
+            std::fread(&m_relocDirSize, 4, 1, m_file);
         }
 
         std::fseek(m_file, optHeaderStart + optHeaderSize, SEEK_SET);
@@ -168,23 +172,42 @@ private:
     uint64_t m_imageBase = 0;
     uint32_t m_sizeOfImage = 0;
     uint32_t m_totalRelocEntries = 0;
+    uint32_t m_relocDirRVA = 0;
+    uint32_t m_relocDirSize = 0;
 
     struct RelocEntry { uint8_t type; uint16_t offset; };
     std::unordered_map<uint32_t, std::vector<RelocEntry>> m_relocs;
 
     void ParseRelocations() {
-        PESection* relocSec = nullptr;
+        // Prefer `.reloc` section — some dumpers leave BASE_RELOC data-dir
+        // pointing into .rdata garbage while real reloc table is in the
+        // named section. Data-dir is the fallback.
+        uint32_t relocRVA = 0, relocSize = 0;
         for (auto& sec : m_sections) {
             if (std::strncmp(sec.name, ".reloc", 6) == 0) {
-                relocSec = &sec;
+                relocRVA = sec.virtualAddress;
+                relocSize = sec.rawDataSize;
                 break;
             }
         }
-        if (!relocSec) return;
+        if ((!relocRVA || !relocSize) && m_relocDirRVA && m_relocDirSize) {
+            relocRVA = m_relocDirRVA;
+            relocSize = m_relocDirSize;
+        }
+        if (!relocRVA || !relocSize) return;
 
-        std::vector<uint8_t> relocData(relocSec->rawDataSize);
-        std::fseek(m_file, relocSec->rawDataOffset, SEEK_SET);
-        std::fread(relocData.data(), 1, relocSec->rawDataSize, m_file);
+        std::vector<uint8_t> relocData(relocSize);
+        // Resolve RVA → file offset without going through ReadAtRVA (which
+        // would try to apply relocations that we haven't parsed yet).
+        for (auto& sec : m_sections) {
+            if (relocRVA >= sec.virtualAddress &&
+                relocRVA <  sec.virtualAddress + sec.rawDataSize) {
+                uint32_t fileOff = sec.rawDataOffset + (relocRVA - sec.virtualAddress);
+                std::fseek(m_file, fileOff, SEEK_SET);
+                std::fread(relocData.data(), 1, relocSize, m_file);
+                break;
+            }
+        }
 
         size_t offset = 0;
         while (offset + 8 <= relocData.size()) {
