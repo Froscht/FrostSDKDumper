@@ -45,19 +45,37 @@ ensure_kmod() {
         return
     fi
 
+    # The Linux kernel build system (Kbuild) does not handle spaces in module
+    # source paths. Detect that and skip the kmod — the dumper falls back to
+    # process_vm_readv which works for all non-VMProtect pages.
+    if [[ "$KMOD_DIR" == *" "* ]]; then
+        warn "KMOD_DIR contains spaces ('$KMOD_DIR'); Kbuild rejects such paths."
+        warn "Skipping kernel module — falling back to process_vm_readv-only reads."
+        warn "(Encrypted/VMProtect pages may be unreadable without the module.)"
+        return
+    fi
+
     if ! $mod_loaded; then
         info "Building kernel module in $KMOD_DIR ..."
-        make -C "$KMOD_DIR" all
+        if ! make -C "$KMOD_DIR" all; then
+            warn "Kernel module build failed — continuing without it."
+            warn "The dumper will use process_vm_readv only."
+            return
+        fi
         info "Kernel module built: $KMOD_DIR/$KMOD_NAME.ko"
 
         info "Loading kernel module ..."
-        insmod "$KMOD_DIR/$KMOD_NAME.ko"
+        if ! insmod "$KMOD_DIR/$KMOD_NAME.ko"; then
+            warn "insmod failed — continuing without kernel module."
+            return
+        fi
     else
         warn "/sys/module/$KMOD_NAME exists but /dev/$KMOD_NAME missing – skipping insmod."
     fi
 
     if [[ ! -e "/dev/$KMOD_NAME" ]]; then
-        error "/dev/$KMOD_NAME does not exist after insmod. Check dmesg."
+        warn "/dev/$KMOD_NAME does not exist after insmod — continuing without it."
+        return
     fi
     info "Module ready – /dev/$KMOD_NAME OK."
 }

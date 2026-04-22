@@ -386,11 +386,29 @@ namespace gobjects
         // ── Structural heap scan for FUObjectItem chunks ─────────────────
         // Sweeps mapped rw- regions for runs of 20-byte entries whose +0
         // points to a valid UObject (first qword is a module-range vtable).
-        // Concatenates all runs of ≥MIN_RUN items; caller caps at max_elements.
+        // Runs two passes and unions the results:
+        //   Pass A (MIN_RUN=500, MAX_GAP=0): reliable UObject chunks; no
+        //     gap tolerance so noise fragments don't chain together.
+        //   Pass B (MIN_RUN=32,  MAX_GAP=64): picks up the tiny-chunk case
+        //     where engine metaclasses ("Class", "ScriptStruct", ...) live;
+        //     filtered after the fact against max_elements so noise can't
+        //     dominate.
         bool StructuralScanFUObjectItems(int32_t max_elements,
                                          std::vector<uint64_t>& out_objects) {
-            constexpr uint32_t STRIDE  = ArcDecrypt::Patch20260421::FUOBJECTITEM_STRIDE;
-            constexpr uint32_t MIN_RUN = 32;
+            std::unordered_set<uint64_t> seen;
+            ScanPass(max_elements, seen, out_objects, /*MIN_RUN=*/500, /*MAX_GAP=*/0);
+            size_t after_a = out_objects.size();
+            ScanPass(max_elements, seen, out_objects, /*MIN_RUN=*/32,  /*MAX_GAP=*/64);
+            std::printf("[p21] scan pass A: %zu objs, pass B added %zu (total %zu)\n",
+                after_a, out_objects.size() - after_a, out_objects.size());
+            return !out_objects.empty();
+        }
+
+        void ScanPass(int32_t max_elements,
+                      std::unordered_set<uint64_t>& seen,
+                      std::vector<uint64_t>& out_objects,
+                      uint32_t MIN_RUN, uint32_t MAX_GAP) {
+            const uint32_t STRIDE = ArcDecrypt::Patch20260421::FUOBJECTITEM_STRIDE;
             const uint64_t vt_lo = m_base + 0x1000;
             const uint64_t vt_hi = m_base + 0x10000000ULL;
 
@@ -429,10 +447,6 @@ namespace gobjects
             }
 
             const uint64_t WIN = 0x10000ULL;
-            // UE allows GC'd/null entries inside a chunk; allow up to
-            // MAX_GAP consecutive nulls before flushing a run, so a partially-
-            // cleared chunk still reports as one contiguous run.
-            constexpr uint32_t MAX_GAP = 64;
             std::vector<uint8_t> buf(WIN);
             uint64_t cur_start = 0;
             uint32_t cur_count = 0;
@@ -479,7 +493,7 @@ namespace gobjects
                 flush();
             }
 
-            if (run_starts.empty()) return false;
+            if (run_starts.empty()) return;
 
             // Sort runs by size desc — the actual chunks dominate, tiny
             // lookalike runs (heap fragments with occasional vtable ptrs)
@@ -499,13 +513,14 @@ namespace gobjects
                     uint64_t item = start + (uint64_t)STRIDE * k;
                     uint64_t obj = 0;
                     if (!m_reader.Read(item, &obj, 8) || !obj) continue;
+                    if (!seen.insert(obj).second) continue;  // dedup across passes
                     out_objects.push_back(obj);
                 }
                 if (out_objects.size() >= cap) break;
             }
-            std::printf("[p21] structural runs: %zu (largest=%u); collected %zu objs\n",
-                run_starts.size(), run_counts[idx[0]], out_objects.size());
-            return !out_objects.empty();
+            std::printf("[p21] scan (MIN_RUN=%u,MAX_GAP=%u): %zu runs (largest=%u); total %zu objs\n",
+                MIN_RUN, MAX_GAP, run_starts.size(),
+                run_starts.empty() ? 0 : run_counts[idx[0]], out_objects.size());
         }
 
         // ── Validate SIMD tables are populated (not all zeros) ───────────
