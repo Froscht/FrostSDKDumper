@@ -30,3 +30,4 @@ __pycache__/
 # Research notes (session artifacts)
 arc-*.md
 Findings.md
+*.exe
