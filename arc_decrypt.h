@@ -141,17 +141,34 @@ namespace Offsets {
         constexpr uint64_t ByteMask   = 0x132;
         constexpr uint64_t FieldMask  = 0x133;
     }
-    // Sub-property offsets for inner type resolution: TODO re-verify for 20260402
-    namespace FStructProperty  { constexpr uint64_t Struct        = 0x130; }
-    namespace FObjectProperty  { constexpr uint64_t PropertyClass = 0x130; }
-    namespace FEnumProperty    { constexpr uint64_t Enum          = 0x130; }
-    namespace FArrayProperty   { constexpr uint64_t Inner         = 0x138; }
-    namespace FSetProperty     { constexpr uint64_t ElementProp   = 0x130; }
-    namespace FSoftObjectProperty { constexpr uint64_t PropertyClass = 0x130; }
-    namespace FMapProperty {
-        constexpr uint64_t KeyProp   = 0x130;
-        constexpr uint64_t ValueProp = 0x138;
+    // Sub-property offsets for inner type resolution.
+    // Patch 20260421 (verified via LinkInternal decomp + live probe on Arc_Raiders_Binary_20260421).
+    // Each subclass reads its inner pointer at +0xE8 or +0xF0. Sources:
+    //   FArrayProperty::LinkInternal    @ 0x428210 reads a1+0xF0 (Inner)
+    //   FMapProperty::LinkInternal      @ 0x456A40 reads a1+0xE8 (Key), a1+0xF0 (Value)
+    //   FSetProperty::LinkInternal      @ 0x46B880 reads a1+0xE8 (ElementProp)
+    //   FStructProperty::LinkInternal   @ 0x45C6C0 reads a1+0xE8 (Struct)
+    //   FObjectProperty::ARO            @ 0x4250F0 passes a1+0xE8 (PropertyClass)
+    //   FEnumProperty::LinkInternal     @ 0x3E5850 reads a1+0xE8 (UnderlyingProp); Enum at +0xF0 (ARO sub_3AFDE0)
+    namespace FStructProperty  { constexpr uint64_t Struct        = 0xE8; }
+    namespace FObjectProperty  { constexpr uint64_t PropertyClass = 0xE8; }
+    namespace FEnumProperty    {
+        constexpr uint64_t UnderlyingProp = 0xE8;  // FField*
+        constexpr uint64_t Enum           = 0xF0;  // UEnum*
     }
+    namespace FArrayProperty   { constexpr uint64_t Inner         = 0xF0; }
+    namespace FSetProperty     { constexpr uint64_t ElementProp   = 0xE8; }
+    namespace FSoftObjectProperty { constexpr uint64_t PropertyClass = 0xE8; }
+    namespace FMapProperty {
+        constexpr uint64_t KeyProp   = 0xE8;
+        constexpr uint64_t ValueProp = 0xF0;
+    }
+    // Additional subclasses identified in IDA (shared parent FObjectPropertyBase):
+    // FWeakObjectProperty, FLazyObjectProperty, FInterfaceProperty → PropertyClass at +0xE8 (inherited).
+    // FDelegateProperty: SignatureFunction at +0xE8 (FName+UFunction* pair, ElementSize=40).
+    // FByteProperty: Enum (UEnum*) at +0xE8 (LinkInternal sub_47B4BC reads +0xE8).
+    // FSoftClassProperty: MetaClass offset needs separate verification (inherits SoftObjectProperty).
+    // FClassProperty: MetaClass offset needs separate verification (inherits ObjectProperty).
     // Old UField/UProperty system (UObject subclasses, in GUObjectArray).
     // Used by legacy structs: FVector, FRotator, FLinearColor, etc.
     // Name: use GetCompIndex(obj)/GetName(obj) via UObject SIMD slot decrypt.
