@@ -33,6 +33,7 @@
 #include <vector>
 #include <utility>
 #include <algorithm>
+#include <unordered_set>
 #include <immintrin.h>
 #include "kernel_module/include/memreader_iface.h"
 #include "arc_decrypt.h"
@@ -213,6 +214,53 @@ namespace gobjects
             m_initialized = true;
             std::printf("[+] GObjectArray (world fallback): %d objects\n", m_numElements);
             return true;
+        }
+
+        // ── Canonical chunks-array enumeration (patch 20260421 vtable[7] path) ─
+        // Given the chunks-array base (as returned by emulating vtable[7] of
+        // chunks_manager) and the chunk count, iterate 65536 * 20 bytes per
+        // chunk, collecting every non-null Object pointer into the flat list.
+        // Drops duplicates so the object count reflects unique UObjects.
+        bool InitFromChunksCanonical(uint64_t chunks_array, int num_chunks,
+                                     int32_t max_expected = 0) {
+            if (!chunks_array || num_chunks <= 0) return false;
+            constexpr uint32_t ITEMS_PER_CHUNK = 65536;
+            constexpr uint32_t STRIDE = 20;
+            const uint64_t vt_lo = m_base + 0x1000;
+            const uint64_t vt_hi = m_base + 0x10000000ULL;
+
+            std::vector<uint64_t> objs;
+            objs.reserve(static_cast<size_t>(num_chunks) * ITEMS_PER_CHUNK);
+            std::unordered_set<uint64_t> seen;
+
+            for (int ci = 0; ci < num_chunks; ++ci) {
+                uint64_t chunk_ptr = 0;
+                if (!m_reader.Read(chunks_array + 8ULL * ci, &chunk_ptr, 8)) break;
+                if (!chunk_ptr) break;
+                if (chunk_ptr < 0x100000ULL || chunk_ptr >= 0x800000000000ULL) break;
+
+                std::vector<uint8_t> buf(ITEMS_PER_CHUNK * STRIDE);
+                if (!m_reader.Read(chunk_ptr, buf.data(), buf.size())) continue;
+                uint32_t non_null = 0, valid = 0;
+                for (uint32_t i = 0; i < ITEMS_PER_CHUNK; ++i) {
+                    uint64_t obj = 0;
+                    std::memcpy(&obj, buf.data() + i * STRIDE, 8);
+                    if (!obj) continue;
+                    ++non_null;
+                    uint64_t vt = 0;
+                    if (!m_reader.Read(obj, &vt, 8)) continue;
+                    if (vt < vt_lo || vt >= vt_hi) continue;
+                    ++valid;
+                    if (seen.insert(obj).second) objs.push_back(obj);
+                }
+                std::printf("[canon] chunk[%d] @ 0x%llX: %u non-null, %u valid-vtable\n",
+                    ci, (unsigned long long)chunk_ptr, non_null, valid);
+            }
+
+            std::printf("[canon] canonical enumeration: %zu unique UObjects (expected ~%d)\n",
+                objs.size(), max_expected);
+            if (objs.empty()) return false;
+            return InitWithSeedObjects(std::move(objs));
         }
 
         uint64_t GetArrayBase()   const { return m_arrayBase; }

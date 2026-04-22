@@ -264,8 +264,18 @@ public:
         }
         std::cout << "[+] FName decryptor initialized\n";
 
-        // Init GObjectArray (decrypt base, count, probe chunk ptr)
+        // Canonical path: emulate chunks_manager vtable[7] (NOT VMProtected on
+        // patch 20260421 despite earlier belief) to recover the real chunks-
+        // array pointer, then enumerate every UObject via chunk indexing.
+        // Falls back to structural scan if emulation fails.
         m_gobj.SetPid(m_pid);
+        if (TryInitViaVtable7()) {
+            std::cout << "[+] GObjectArray initialized via canonical vtable[7] ("
+                      << m_gobj.GetNumElements() << " objects)\n";
+            return true;
+        }
+        std::cout << "[!] Vtable[7] canonical enum failed; falling back to structural scan\n";
+
         if (!m_gobj.Init()) {
             std::cerr << "[-] GObjectArray direct init failed, trying world traversal...\n";
             m_gobj.PrintDiagnostics();
@@ -276,6 +286,83 @@ public:
         }
         std::cout << "[+] GObjectArray initialized (" << m_gobj.GetNumElements() << " objects)\n";
         return true;
+    }
+
+    // ── Canonical chunks-array recovery via vtable[7] emulation ──────────
+    // Patch 20260421: chunks_manager's vtable[7] is a ~24-insn inline SIMD
+    // decrypt (not VMP — the earlier belief that it was a bytecode dispatcher
+    // was a disasm misread of `add rax, gs:[0x60]`). Load the 16B blob at
+    // chunks_manager+0x30, call the function inside Unicorn with the target
+    // process's PEB at GS:[0x60], and the decrypted chunks_array arrives in
+    // xmm0.u64[0]. Then hand that off to GObjectArray for full enumeration.
+    bool TryInitViaVtable7() {
+        using namespace ArcDecrypt::Patch20260421;
+        uint8_t enc[16] = {}, mask[8] = {};
+        uint64_t xor_key = 0;
+        if (!m_reader.Read(MODULE_BASE + RVA_GUOBJECT_ARRAY_NEW, enc, 16)) return false;
+        if (!m_reader.Read(MODULE_BASE + RVA_GOBJ_PSHUFB_MASK, mask, 8))   return false;
+        if (!m_reader.Read(MODULE_BASE + RVA_GOBJ_MAX_XOR_KEY, &xor_key, 8)) return false;
+
+        uint64_t chunks_mgr = DecryptGObjChunksManager(enc, mask);
+        if (chunks_mgr < 0x10000 || chunks_mgr >= 0x800000000000) return false;
+
+        uint8_t max_enc[16] = {};
+        if (!m_reader.Read(chunks_mgr + GOBJ_MANAGER_MAX_OFFSET, max_enc, 16)) return false;
+        int32_t max_elements = DecryptGObjMaxElements(max_enc, xor_key);
+        if (max_elements < 1000 || max_elements > 2000000) return false;
+        int num_chunks = (max_elements + 0xFFFF) / 0x10000;  // ceil / ObjectsPerChunk
+
+        uint64_t vtable = 0, vt7 = 0;
+        if (!m_reader.Read(chunks_mgr, &vtable, 8) || !vtable) return false;
+        if (!m_reader.Read(vtable + 0x38, &vt7, 8) || !vt7)    return false;
+
+        uint8_t scratch_in[16] = {};
+        if (!m_reader.Read(chunks_mgr + 0x30, scratch_in, 16)) return false;
+
+        EmuEngine eng;
+        static const char* pe_path =
+            "/media/frost/Coding Stuf/Linux/FrostSDKDumper/Arc_Raiders_Binary_20260421_213315.exe";
+        if (!eng.Initialize(&m_reader, MODULE_BASE, 0xE9AF000, pe_path)) return false;
+        eng.PreMapRange(chunks_mgr & ~0xFFFULL, 0x4000);
+        eng.PreMapRange(vt7 & ~0xFFFULL, 0x4000);
+
+        constexpr uint64_t FAKE_TEB = 0x00007FFFFFFE0000ULL;
+        constexpr uint64_t FAKE_PEB = 0x7FFD0000ULL;  // Wine-canonical
+        uc_mem_map(eng.UC(), FAKE_TEB, 0x1000, UC_PROT_ALL);
+        uint8_t teb_zero[0x1000] = {};
+        uc_mem_write(eng.UC(), FAKE_TEB, teb_zero, sizeof(teb_zero));
+        uint64_t self = FAKE_TEB;
+        uc_mem_write(eng.UC(), FAKE_TEB + 0x30, &self, 8);
+        uc_mem_write(eng.UC(), FAKE_TEB + 0x60, &FAKE_PEB, 8);
+        eng.SetGSBase(FAKE_TEB);
+        eng.MapGamePage(FAKE_PEB);
+
+        const uint64_t SCRATCH_ADDR = 0x10000ULL;
+        eng.EmuWrite(SCRATCH_ADDR, scratch_in, 16);
+
+        eng.ResetCPU();
+        eng.WriteReg(UC_X86_REG_RCX, chunks_mgr);
+        eng.WriteReg(UC_X86_REG_RDX, SCRATCH_ADDR);
+        uint64_t sentinel = 0xDEAD0000ULL;
+        uint64_t rsp = eng.ReadReg(UC_X86_REG_RSP);
+        rsp -= 8;
+        eng.EmuWrite(rsp, &sentinel, 8);
+        eng.WriteReg(UC_X86_REG_RSP, rsp);
+
+        uc_err er = eng.Run(vt7, sentinel, /*timeout_us*/500'000, /*max*/200);
+        uint8_t xmm0_bytes[16] = {};
+        uc_reg_read(eng.UC(), UC_X86_REG_XMM0, xmm0_bytes);
+        uint64_t chunks_array = 0;
+        std::memcpy(&chunks_array, xmm0_bytes, 8);
+        if (chunks_array < 0x10000 || chunks_array >= 0x800000000000) {
+            std::printf("[vt7] emulation gave implausible xmm0=0x%llX (err=%d)\n",
+                (unsigned long long)chunks_array, (int)er);
+            return false;
+        }
+        std::printf("[vt7] chunks_array=0x%llX  num_chunks=%d  max_elements=%d\n",
+            (unsigned long long)chunks_array, num_chunks, max_elements);
+
+        return m_gobj.InitFromChunksCanonical(chunks_array, num_chunks, max_elements);
     }
 
     // ── World traversal: GWorld → Levels → actors + BFS UClass expansion ─────
@@ -1367,52 +1454,44 @@ int main(int argc, char* argv[]) {
         eng.SetGSBase(FAKE_TEB);
         eng.MapGamePage(FAKE_PEB);  // PEB page (may be read)
 
-        // Layout a scratch struct in INPUT region. The VMProtected dispatcher
-        // at vtable[7] interprets a bytecode stream whose pointer is at
-        // [rdx+0x20]. In the original caller's stack, that slot held a pointer
-        // to an adjacent __int128 zero buffer. Reproduce that layout:
-        //   scratch+0x00..+0x1F: undefined stack data (zero is fine)
-        //   scratch+0x20: pointer to bytecode stream (set to scratch+0x40)
-        //   scratch+0x30: the xmmword copied from chunks_manager+0x30
-        //   scratch+0x40: bytecode (start with 0 = opcode 0 = "return" in
-        //                 most VMP dispatchers we've seen)
+        // vtable[7] is NOT VMProtected (prior belief was wrong — the disasm
+        // `65 48 03 04 25 60 00 00 00` is a SINGLE `add rax, gs:[0x60]`, not a
+        // page-fault trap). It's ~24 inline SIMD instructions that take the
+        // 16B encrypted blob at [rdx] and decrypt to xmm0.u64[0] = chunks_array.
+        // Calling convention: rdx = ADDRESS OF the 16-byte blob; result in xmm0.
         const uint64_t SCRATCH_ADDR = 0x10000ULL;      // EmuEngine::INPUT_BASE
-        uint8_t scratch[0x200] = {};
-        uint64_t bc_stream = SCRATCH_ADDR + 0x40;
-        std::memcpy(scratch + 0x20, &bc_stream, 8);    // [rdx+0x20] = bytecode ptr
-        std::memcpy(scratch + 0x30, scratch_in, 16);   // [rdx+0x30] = xmmword from chunks_mgr+0x30
-        // scratch+0x40..+0x1FF = bytecode; all zeros (opcode 0 repeated)
-        eng.EmuWrite(SCRATCH_ADDR, scratch, sizeof(scratch));
+        eng.EmuWrite(SCRATCH_ADDR, scratch_in, 16);
 
-        // Call vtable[7](chunks_mgr, scratch)
         eng.ResetCPU();
         eng.WriteReg(UC_X86_REG_RCX, chunks_mgr);
         eng.WriteReg(UC_X86_REG_RDX, SCRATCH_ADDR);
-        // Set up return address = SENTINEL_RIP (EmuEngine provides an implicit
-        // sentinel page mapped at 0xDEAD0000 / 0x1000 filled with CCs).
         uint64_t sentinel = 0xDEAD0000ULL;
         uint64_t rsp = eng.ReadReg(UC_X86_REG_RSP);
         rsp -= 8;
         eng.EmuWrite(rsp, &sentinel, 8);
         eng.WriteReg(UC_X86_REG_RSP, rsp);
 
-        std::printf("[gobj] running vtable[7] emulation...\n");
-        uc_err er = eng.Run(vt7, sentinel, /*timeout_us*/2'000'000, /*max*/500000);
+        std::printf("[gobj] running vtable[7] emulation (non-VMP, ~24 insns)...\n");
+        uc_err er = eng.Run(vt7, sentinel, /*timeout_us*/500'000, /*max*/200);
         uint64_t rax = eng.ReadReg(UC_X86_REG_RAX);
-        std::printf("[gobj] run status: %d (%s)  rax=0x%llX\n",
-            (int)er, uc_strerror(er), (unsigned long long)rax);
+        // Pull xmm0.u64[0] — that's the actual result per Agent 2's disasm
+        uint8_t xmm0_bytes[16] = {};
+        uc_reg_read(eng.UC(), UC_X86_REG_XMM0, xmm0_bytes);
+        uint64_t xmm0_lo = 0;
+        std::memcpy(&xmm0_lo, xmm0_bytes, 8);
+        std::printf("[gobj] run status: %d (%s)  rax=0x%llX  xmm0.lo64=0x%llX\n",
+            (int)er, uc_strerror(er), (unsigned long long)rax,
+            (unsigned long long)xmm0_lo);
 
-        if (!rax || rax < 0x10000 || rax >= 0x800000000000) {
-            std::printf("[gobj] emu returned implausible rax=0x%llX\n",
-                (unsigned long long)rax);
-            std::printf("[gobj] (VMProtect anti-emulation is likely defeating Unicorn here)\n");
-            std::printf("[gobj] TODO: implement bytecode interpreter, or find a non-VMP\n");
-            std::printf("[gobj]       path to the chunks-ptr-array inside chunks_manager.\n");
+        // Pick xmm0.lo64 first (Agent 2's recipe), fall back to rax.
+        uint64_t chunks_array = 0;
+        if (xmm0_lo >= 0x10000 && xmm0_lo < 0x800000000000) chunks_array = xmm0_lo;
+        else if (rax >= 0x10000 && rax < 0x800000000000)    chunks_array = rax;
+
+        if (!chunks_array) {
+            std::printf("[gobj] emu returned no valid pointer in xmm0 or rax\n");
             return 1;
         }
-
-        // rax should point to the chunk-ptr-array
-        uint64_t chunks_array = rax;
         std::printf("[gobj] chunk-ptr-array @ 0x%llX\n",
             (unsigned long long)chunks_array);
         for (int ci = 0; ci < 8; ++ci) {
