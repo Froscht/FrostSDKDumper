@@ -172,6 +172,33 @@ public:
         return ArcDecrypt::GetFNameSlotIndex(obj_base);
     }
 
+    // ── Hash-based slot selector (patch 20260421) ────────────────────────
+    // Reverse-engineered from UObject::GetOuter (0x23F6690) and GetFName
+    // (0x353CD0). The game hashes (obj+0x10) through a 4-round FNV-like
+    // pipeline, then:
+    //     name_slot  = (h & 3) ^ 2
+    //     outer_slot = (h + 1) & 3
+    // Class/remaining slots fall out by elimination.
+    static uint32_t ObjSlotHash(uint64_t obj_ptr) {
+        uint64_t p = obj_ptr + 0x10;
+        uint32_t x  = static_cast<uint32_t>(p);
+        uint32_t hi = static_cast<uint32_t>(p >> 32);
+        constexpr uint32_t P = 0x01000193u;
+        constexpr uint32_t K = 0x48A34048u;
+        x = fn_rotl32(x, 19);
+        x = x * P + K;
+        x = fn_rotl32(x, 22);
+        x = x * P + hi + K;
+        x = fn_rotl32(x, 19);
+        x = x * P + K;
+        x = x >> 10;
+        x = x * P;
+        uint32_t y = (x + 0x34048u) >> 16;
+        return y ^ x;
+    }
+    static uint32_t ObjNameSlot (uint64_t obj_ptr) { return (ObjSlotHash(obj_ptr) & 3u) ^ 2u; }
+    static uint32_t ObjOuterSlot(uint64_t obj_ptr) { return (ObjSlotHash(obj_ptr) + 1u) & 3u; }
+
     // ── Decrypt one UObject slot (patch 20260421) ────────────────────────
     // From sub_24DEB60: PSHUFLW(0xB1) → ROL32(15) per 32-bit lane →
     //                   PSHUFB(mask@0xAD128C0) → XOR(const@0xAD128D0) → lo64.
@@ -218,6 +245,14 @@ public:
             valid[slot] = true;
         }
         auto is_ci = [](uint32_t h) { return h > 0 && h < 0x2000000u; };
+        // Tier 0: hash-based name-slot selection (RE'd from UObject::GetFName).
+        uint32_t ns = ObjNameSlot(obj_base);
+        if (valid[ns]) {
+            uint32_t lo = static_cast<uint32_t>(dec[ns]);
+            uint32_t hi = static_cast<uint32_t>(dec[ns] >> 32);
+            if (is_ci(hi) && (lo == 0 || lo < 0x100000u))
+                return static_cast<int32_t>(hi);
+        }
         // Tier 1
         for (int s = 0; s < 4; ++s) {
             if (!valid[s]) continue;
@@ -243,22 +278,29 @@ public:
 
     uint64_t GetClassPrivate(uint64_t obj_base) {
         if (!obj_base || !m_keyLoaded) return 0;
-        for (int slot = 0; slot < 4; ++slot) {
+        // Hash-based: class lives in one of the two slots that are NOT name/outer.
+        uint32_t ns = ObjNameSlot(obj_base);
+        uint32_t os = ObjOuterSlot(obj_base);
+        auto tryDecode = [&](int slot) -> uint64_t {
             alignas(16) uint8_t enc[16] = {};
             uint64_t addr = obj_base + 0x20 + static_cast<uint64_t>(slot) * 0x20;
-            if (!m_reader.Read(addr, enc, 16)) continue;
+            if (!m_reader.Read(addr, enc, 16)) return 0;
             uint64_t dec = DecryptUObjSlotNew(enc);
-            // Class slot: lo32 in heap range, hi32 = 0.
-            uint64_t ptr = dec;  // decrypted value IS the pointer when applicable.
-            if ((ptr >> 32) == 0 && ptr >= 0x100000ULL && ptr < 0x800000000000ULL) {
-                // Reject Outer candidates by preferring the FIRST heap pointer we see —
-                // callers that need Outer specifically use GetOuterPtr.
-                // (Class vs Outer resolution via slot shape is ambiguous externally;
-                // the main dumper uses GetClassPrivate to classify and doesn't need
-                // perfect discrimination for the name dump.)
-                // TODO: distinguish Class from Outer by reading target's vtable.
-                return ptr;
-            }
+            if ((dec >> 32) == 0 && dec >= 0x100000ULL && dec < 0x800000000000ULL)
+                return dec;
+            return 0;
+        };
+        // Preferred order: non-name, non-outer slots first.
+        for (int slot = 0; slot < 4; ++slot) {
+            if (static_cast<uint32_t>(slot) == ns || static_cast<uint32_t>(slot) == os) continue;
+            uint64_t p = tryDecode(slot);
+            if (p) return p;
+        }
+        // Fallback: if the preferred slots yielded nothing (e.g. hash mispicked),
+        // accept any heap-pointer slot so we don't regress pre-hash behavior.
+        for (int slot = 0; slot < 4; ++slot) {
+            uint64_t p = tryDecode(slot);
+            if (p) return p;
         }
         return 0;
     }
@@ -597,15 +639,25 @@ public:
     // distinct from GetClassPrivate's answer. Good enough for package walks.
     uint64_t GetOuterPtr(uint64_t obj_ptr) {
         if (!obj_ptr || !m_keyLoaded) return 0;
-        uint64_t cls = GetClassPrivate(obj_ptr);
-        for (int slot = 0; slot < 4; ++slot) {
+        auto tryDecode = [&](int slot) -> uint64_t {
             alignas(16) uint8_t enc[16] = {};
             uint64_t addr = obj_ptr + 0x20 + static_cast<uint64_t>(slot) * 0x20;
-            if (!m_reader.Read(addr, enc, 16)) continue;
+            if (!m_reader.Read(addr, enc, 16)) return 0;
             uint64_t dec = DecryptUObjSlotNew(enc);
-            if ((dec >> 32) == 0 && dec >= 0x100000ULL && dec < 0x800000000000ULL && dec != cls) {
+            if ((dec >> 32) == 0 && dec >= 0x100000ULL && dec < 0x800000000000ULL)
                 return dec;
-            }
+            return 0;
+        };
+        // Tier 0: hash-based outer-slot selection (RE'd from UObject::GetOuter).
+        uint32_t os = ObjOuterSlot(obj_ptr);
+        uint64_t p = tryDecode(static_cast<int>(os));
+        if (p) return p;
+        // Fallback: any heap-pointer slot distinct from class.
+        uint64_t cls = GetClassPrivate(obj_ptr);
+        for (int slot = 0; slot < 4; ++slot) {
+            if (static_cast<uint32_t>(slot) == os) continue;
+            uint64_t d = tryDecode(slot);
+            if (d && d != cls) return d;
         }
         return 0;
     }

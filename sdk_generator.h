@@ -1122,7 +1122,7 @@ public:
             else if (n == "Enum")         { if (!enumAddr) enumAddr = obj_ptr; }
 
             if (kClassMetaNames.count(n))        validClassTypes.insert(obj_ptr);
-            else if (kStructMetaNames.count(n)) { ssAddrs.insert(obj_ptr); validEnumTypes.insert(obj_ptr); }
+            else if (kStructMetaNames.count(n))  ssAddrs.insert(obj_ptr);
             else if (kEnumMetaNames.count(n))   { enumAddrs.insert(obj_ptr); validEnumTypes.insert(obj_ptr); }
         }
 
@@ -1150,7 +1150,6 @@ public:
                 if (validClassTypes.insert(cls).second) ++added_cls;
             } else if (kStructMetaNames.count(meta)) {
                 if (ssAddrs.insert(cls).second) ++added_ss;
-                validEnumTypes.insert(cls);
             } else if (kEnumMetaNames.count(meta)) {
                 if (enumAddrs.insert(cls).second) ++added_en;
                 validEnumTypes.insert(cls);
@@ -1371,7 +1370,8 @@ public:
                 uint32_t names_cnt = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 8);
                 uint32_t names_max = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 12);
                 if (names_ptr > 0x10000 && names_ptr < 0x7FFFFFFFFFFFULL &&
-                    names_cnt > 0 && names_cnt < 4096 && names_cnt == names_max) {
+                    names_cnt > 0 && names_cnt < 4096 &&
+                    names_max >= names_cnt && names_max < 4096) {
                     int32_t first_ci = Read<int32_t>(names_ptr);
                     // CI range expanded: 29-bit pool indices can be up to ~536M
                     if (first_ci > 0 && (uint32_t)first_ci < 0x1FFFFFFFu) {
