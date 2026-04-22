@@ -198,19 +198,18 @@ public:
     //   lo32 in heap range & hi32 == 0 → pointer (Class/Outer/etc.)
     int32_t GetCompIndex(uint64_t obj_base) {
         if (!obj_base || !m_keyLoaded) return 0;
-        // FName shape: decrypted slot = (CI << 32) | Number. Accept only when
-        // Number is zero and CI is nonzero + within plausible pool capacity —
-        // this is empirically what works on live UObjects. Relaxing the check
-        // (allowing nonzero Number) lets Class/Outer-slot noise leak in and
-        // tanks the hit rate.
+        // FName shape: decrypted slot = (CI << 32) | Number.
+        // UE auto-numbers names (Actor_7, Pawn_362…); Number is stored in lo32
+        // and *can* be non-zero for a perfectly valid FName. Gate only on CI
+        // (hi32) being in the plausible pool range — Class/Outer slots decrypt
+        // to pointer-shaped values where hi32==0, so they don't slip through.
         for (int slot = 0; slot < 4; ++slot) {
             alignas(16) uint8_t enc[16] = {};
             uint64_t addr = obj_base + 0x20 + static_cast<uint64_t>(slot) * 0x20;
             if (!m_reader.Read(addr, enc, 16)) continue;
             uint64_t dec = DecryptUObjSlotNew(enc);
-            uint32_t lo32 = static_cast<uint32_t>(dec);
             uint32_t hi32 = static_cast<uint32_t>(dec >> 32);
-            if (lo32 == 0 && hi32 > 0 && hi32 < 0x2000000) {
+            if (hi32 > 0 && hi32 < 0x2000000) {
                 return static_cast<int32_t>(hi32);
             }
         }

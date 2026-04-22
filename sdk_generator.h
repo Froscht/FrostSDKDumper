@@ -445,6 +445,62 @@ public:
         m_vtables_discovered = true;
     }
 
+    // ── Patch 20260421: hardcoded FFieldClass* → type-name map ──────────
+    // Obtained by scanning live .data for the FFieldClass signature
+    //   10 19 22 2B 34 3D 46 4F  at +0x08  and decoding +0x20 via the
+    // SIMD name-decrypt pipeline, then resolving CI→string via FNameDecryptor.
+    // See SIGNATURES.md §FFieldClass for details. 36 singletons total (34
+    // distinct property types; FObjectProperty has two singletons due to
+    // a secondary helper class sharing the same FName).
+    //
+    // Applied BEFORE Tier 1/2/3 auto-discovery so it supersedes any
+    // Tier-1 name-heuristic mistakes (e.g. NameProperty mislabeled as
+    // ObjectProperty because a property named "Owner" pointed to it).
+    void SeedHardcodedFClassMap_20260421() {
+        static const std::pair<uint64_t, const char*> kSeeds[] = {
+            { 0xDDC8BE0, "FArrayProperty" },
+            { 0xDDC8CC0, "FBoolProperty" },
+            { 0xDDC8D30, "FByteProperty" },
+            { 0xDDC8DA0, "FClassProperty" },
+            { 0xDDC8E10, "FClassPtrProperty" },
+            { 0xDDC8E80, "FDelegateProperty" },
+            { 0xDDC9610, "FDoubleProperty" },
+            { 0xDDC0EC0, "FEnumProperty" },
+            { 0xDDC1010, "FFieldPathProperty" },
+            { 0xDDC95A0, "FFloatProperty" },
+            { 0xDDC9300, "FInt16Property" },
+            { 0xDDC93E0, "FInt64Property" },
+            { 0xDDC9290, "FInt8Property" },
+            { 0xDDC9370, "FIntProperty" },
+            { 0xDDC8F00, "FInterfaceProperty" },
+            { 0xDDC8F70, "FLazyObjectProperty" },
+            { 0xDDC8FE0, "FMapProperty" },
+            { 0xDDC9060, "FMulticastDelegateProperty" },
+            { 0xDDC90D0, "FMulticastInlineDelegateProperty" },
+            { 0xDDC9140, "FMulticastSparseDelegateProperty" },
+            { 0xDDC91B0, "FNameProperty" },
+            { 0xDDC9220, "FNumericProperty" },
+            { 0xDDC9680, "FObjectProperty" },
+            { 0xDDC9700, "FObjectProperty" },
+            { 0xDDC8C50, "FObjectPropertyBase" },
+            { 0xDDC9770, "FOptionalProperty" },
+            { 0xDDC9B80, "FSetProperty" },
+            { 0xDDC9BF0, "FSoftClassProperty" },
+            { 0xDDC9C60, "FSoftObjectProperty" },
+            { 0xDDC9D20, "FStrProperty" },
+            { 0xDDC9D90, "FStructProperty" },
+            { 0xDDCB140, "FTextProperty" },
+            { 0xDDC9450, "FUInt16Property" },
+            { 0xDDC94C0, "FUInt32Property" },
+            { 0xDDC9530, "FUInt64Property" },
+            { 0xDDC9E10, "FWeakObjectProperty" },
+        };
+        for (auto [rva, type] : kSeeds)
+            m_fclass_to_type[MODULE_BASE + rva] = type;
+        std::printf("[fcmap] seeded %zu hardcoded FFieldClass mappings (patch 20260421)\n",
+            sizeof(kSeeds)/sizeof(kSeeds[0]));
+    }
+
     // ── Dump discovered vtable map to file (for SIGNATURES.md updates) ──
     void DumpVTableMap(const std::string& path) const {
         std::FILE* f = std::fopen(path.c_str(), "w");
@@ -615,6 +671,22 @@ public:
             if (visited.count(ff)) break;
             visited.insert(ff);
 
+            // Ghost-FField guard (patch 20260421): the ChildProperties chain
+            // often runs into uninitialized / sentinel memory past the real end.
+            // Reject entries whose ClassPrivate is not a heap pointer and those
+            // whose NamePrivate slot + Offset_Internal are both zero.
+            {
+                uint64_t cls_ptr = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
+                if (cls_ptr < 0x100000ULL || cls_ptr >= 0x800000000000ULL) break;
+                uint32_t raw_off = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::Offset_Internal);
+                alignas(16) uint8_t name_enc[16] = {};
+                m_reader.Read(ff + ArcDecrypt::Offsets::FField::NameEncrypted, name_enc, 16);
+                bool name_zero = true;
+                for (uint8_t b : name_enc) if (b) { name_zero = false; break; }
+                // Uninitialized: no name + default-sentinel offset
+                if (name_zero && (raw_off == 0 || raw_off == 0x01C4B859u)) break;
+            }
+
             PropertyRecord pr{};
             pr.ff_addr   = ff;
             pr.is_param  = is_param;
@@ -622,8 +694,12 @@ public:
             // Name
             pr.name = ReadFFieldName(ff);
             if (pr.name.empty()) {
-                // Get CI for use in fallback name (unique per name)
                 int32_t fci = m_fname.DecryptFFieldNameCI(ff);
+                // CI's chunk_offset = (ci >> 8) & 0xFFFF00. Anything past the
+                // live FNamePool's allocated range (~0x6A0000 on 20260421) is
+                // either runtime-only or a walk overshoot — drop the entry.
+                uint64_t chunk_off = (static_cast<uint64_t>(fci) >> 8) & 0xFFFF00ULL;
+                if (chunk_off > 0x6A0000ULL) break;
                 uint32_t stored_off2 = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::Offset_Internal);
                 uint32_t off2 = ArcDecrypt::Patch20260421::DecryptPropertyOffsetNew(stored_off2);
                 char buf[64];
@@ -1015,24 +1091,73 @@ public:
         // The actual metaclass is the FIRST one (lowest InternalIndex).
         // Also collect ALL such addresses since any could be a valid metaclass.
         std::unordered_set<uint64_t> ssAddrs, enumAddrs;
+
+        // Expanded metaclass whitelists for patch 20260421.
+        //   - Angelscript integration adds ASClass/ASStruct.
+        //   - Additional placeholder & generated-class variants appear.
+        //   - Core UE metaclasses (Interface, etc.) are UClass-kind even though
+        //     the dumper didn't historically track them.
+        // Names NOT covered here still fall through to the CDO detection below.
+        static const std::unordered_set<std::string> kClassMetaNames = {
+            "Class", "BlueprintGeneratedClass", "WidgetBlueprintGeneratedClass",
+            "AnimBlueprintGeneratedClass", "DynamicClass",
+            "LinkerPlaceholderClass", "LinkerPlaceholderExportObject",
+            "ASClass", "VerseClass", "AngelscriptClass",
+            "MaterialBlueprintGeneratedClass", "ControlRigBlueprintGeneratedClass"
+        };
+        static const std::unordered_set<std::string> kStructMetaNames = {
+            "ScriptStruct", "UserDefinedStruct", "ASStruct",
+            "VerseStruct", "AngelscriptStruct", "SparseClassDataStruct"
+        };
+        static const std::unordered_set<std::string> kEnumMetaNames = {
+            "Enum", "UserDefinedEnum", "VerseEnum", "AngelscriptEnum"
+        };
+
         for (const auto& [idx, obj_ptr] : object_ptrs) {
             auto it = addr_to_name.find(obj_ptr);
             if (it == addr_to_name.end()) continue;
             const std::string& n = it->second;
-            if (n == "Class")             { if (!classAddr) classAddr = obj_ptr; validClassTypes.insert(obj_ptr); }
-            else if (n == "ScriptStruct") { if (!ssAddr) ssAddr = obj_ptr; ssAddrs.insert(obj_ptr); }
-            else if (n == "Enum")         { if (!enumAddr) enumAddr = obj_ptr; enumAddrs.insert(obj_ptr); }
-            else if (n == "UserDefinedEnum" || n == "UserDefinedStruct") {
-                validEnumTypes.insert(obj_ptr);
-                ssAddrs.insert(obj_ptr);
-            }
-            else if (n == "BlueprintGeneratedClass" ||
-                     n == "WidgetBlueprintGeneratedClass" ||
-                     n == "AnimBlueprintGeneratedClass" ||
-                     n == "DynamicClass" ||
-                     n == "LinkerPlaceholderClass")
-                validClassTypes.insert(obj_ptr);
+            if (n == "Class")             { if (!classAddr) classAddr = obj_ptr; }
+            else if (n == "ScriptStruct") { if (!ssAddr) ssAddr = obj_ptr; }
+            else if (n == "Enum")         { if (!enumAddr) enumAddr = obj_ptr; }
+
+            if (kClassMetaNames.count(n))        validClassTypes.insert(obj_ptr);
+            else if (kStructMetaNames.count(n)) { ssAddrs.insert(obj_ptr); validEnumTypes.insert(obj_ptr); }
+            else if (kEnumMetaNames.count(n))   { enumAddrs.insert(obj_ptr); validEnumTypes.insert(obj_ptr); }
         }
+
+        // CDO-based metaclass detection: many metaclass objects have broken FName
+        // slots (their name can't decrypt), so the name-match above misses them.
+        // But Default__X CDOs DO decrypt, so we can recover the metaclass address
+        // from Default__X.ClassPrivate (= X, the class instance).
+        // e.g. Default__BlueprintGeneratedClass -> X=BlueprintGeneratedClass
+        //      (a UClass-kind metaclass whose own name slot failed).
+        std::size_t added_cls = 0, added_ss = 0, added_en = 0;
+        for (const auto& [idx, obj_ptr] : object_ptrs) {
+            auto it = addr_to_name.find(obj_ptr);
+            if (it == addr_to_name.end()) continue;
+            const std::string& n = it->second;
+            if (n.rfind("Default__", 0) != 0) continue;
+            uint64_t cls = m_fname.GetClassPrivate(obj_ptr);
+            if (!cls) continue;
+            std::string meta = n.substr(9);
+            // Recover canonical singletons even if their name slots are broken.
+            if (meta == "Class" && !classAddr)             classAddr = cls;
+            else if (meta == "ScriptStruct" && !ssAddr)    ssAddr    = cls;
+            else if (meta == "Enum" && !enumAddr)          enumAddr  = cls;
+
+            if (kClassMetaNames.count(meta)) {
+                if (validClassTypes.insert(cls).second) ++added_cls;
+            } else if (kStructMetaNames.count(meta)) {
+                if (ssAddrs.insert(cls).second) ++added_ss;
+                validEnumTypes.insert(cls);
+            } else if (kEnumMetaNames.count(meta)) {
+                if (enumAddrs.insert(cls).second) ++added_en;
+                validEnumTypes.insert(cls);
+            }
+        }
+        std::printf("[sdk] CDO-based metaclass detection: +%zu class, +%zu struct, +%zu enum\n",
+            added_cls, added_ss, added_en);
         if (!classAddr) {
             std::printf("[sdk] FATAL: Could not find 'Class' UClass object\n");
             return result;
@@ -1187,6 +1312,11 @@ public:
                 total_fn, m_owner_to_funcs.size());
         }
 
+        // ── Seed hardcoded FFieldClass→type map BEFORE auto-discovery so
+        //    Tier-1 name-heuristic mistakes cannot overwrite authoritative
+        //    data. See SeedHardcodedFClassMap_20260421() for the source.
+        SeedHardcodedFClassMap_20260421();
+
         // ── Auto-discover vtable-to-type mappings (replaces bootstrap + sweep) ──
         AutoDiscoverVTables(object_ptrs, addr_to_name, allTypeAddrs, ssAddr);
 
@@ -1231,7 +1361,7 @@ public:
             uint64_t cls = m_fname.GetClassPrivate(obj_ptr);
             bool is_class_by_cls = validClassTypes.count(cls) > 0;
             bool is_scriptstruct = ssAddrs.count(cls) > 0;
-            bool is_enum         = enumAddrs.count(cls) > 0 || validEnumTypes.count(cls) > 0;
+            bool is_enum         = enumAddrs.count(cls) > 0;
 
             // Path C: heuristic — Names array at +0xA8 (UEnum::Names)
             // Only apply when not already classified as a type

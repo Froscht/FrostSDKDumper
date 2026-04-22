@@ -398,6 +398,9 @@ namespace gobjects
             std::unordered_set<uint64_t> seen;
             ScanPass(max_elements, seen, out_objects, /*MIN_RUN=*/500, /*MAX_GAP=*/0);
             size_t after_a = out_objects.size();
+            // Pass B needs MAX_GAP>0 to find the small metaclass chunks (Class,
+            // ScriptStruct, Enum). Noise is now filtered in ScanPass emission
+            // via vtable re-validation — so gap tolerance is safe here.
             ScanPass(max_elements, seen, out_objects, /*MIN_RUN=*/32,  /*MAX_GAP=*/64);
             std::printf("[p21] scan pass A: %zu objs, pass B added %zu (total %zu)\n",
                 after_a, out_objects.size() - after_a, out_objects.size());
@@ -513,6 +516,11 @@ namespace gobjects
                     uint64_t item = start + (uint64_t)STRIDE * k;
                     uint64_t obj = 0;
                     if (!m_reader.Read(item, &obj, 8) || !obj) continue;
+                    // Re-validate the object's vtable here — the run may span
+                    // gap slots whose obj_ptr isn't actually a UObject. Cheap
+                    // check and tosses the bulk of heap-noise false-positives.
+                    uint64_t vt = 0;
+                    if (!m_reader.Read(obj, &vt, 8) || !is_vtable(vt)) continue;
                     if (!seen.insert(obj).second) continue;  // dedup across passes
                     out_objects.push_back(obj);
                 }
