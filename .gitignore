@@ -31,3 +31,6 @@ __pycache__/
 arc-*.md
 Findings.md
 *.exe
+memreader.ko
+probe_live_rvas
+probe_live_rvas
