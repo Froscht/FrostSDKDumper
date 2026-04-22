@@ -1496,6 +1496,29 @@ public:
         std::sort(result.structs.begin(), result.structs.end(), sort_by_pkg_name);
         std::sort(result.enums.begin(),   result.enums.end(),   sort_by_pkg_name);
 
+        // Disambiguate duplicate short names (UE Blueprint classes reuse names
+        // like "UpdateScript" / "From" / "SpawnScript" across hundreds of
+        // packages — the C++ namespace emission would otherwise collide).
+        // Track FINAL assigned names (not just bases) to avoid collisions
+        // between generated "_N" suffixes and pre-existing names that happen
+        // to match that pattern.
+        auto dedupe_names = [](auto& vec) {
+            std::unordered_set<std::string> taken;
+            for (auto& r : vec) {
+                if (taken.insert(r.name).second) continue;  // first use
+                // Find the lowest _N not yet taken.
+                for (int n = 1; ; ++n) {
+                    std::string candidate = r.name + "_" + std::to_string(n);
+                    if (taken.insert(candidate).second) {
+                        r.name = std::move(candidate);
+                        break;
+                    }
+                }
+            }
+        };
+        dedupe_names(result.structs);
+        dedupe_names(result.enums);
+
         return result;
     }
 };
