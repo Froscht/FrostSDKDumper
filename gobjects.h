@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <algorithm>
 #include <immintrin.h>
 #include "kernel_module/include/memreader_iface.h"
 #include "arc_decrypt.h"
@@ -93,6 +94,16 @@ namespace gobjects
         // Load SIMD tables, decrypt array base, count, and decrypt chunk ptr.
         bool Init() {
             if (m_initialized) return true;
+
+            // ── Patch 20260421 path (preferred) ──────────────────────────
+            // New GUObjectArray RVA + decrypt pipeline; vtable[7] is VMProtected
+            // so the chunks-ptr-array is recovered via structural heap scan
+            // instead. On success the chunk list is materialized as a flat
+            // UObject* vector served through the world-fallback accessor.
+            if (InitPatch20260421()) {
+                return true;
+            }
+            std::printf("[!] Patch 20260421 path failed, trying legacy pipeline...\n");
 
             // Load SIMD tables for GUObjectArray decrypt (ROL32(20)→XOR→ROL16(12)) — patch 20260414
             const bool haveSimdTables =
@@ -314,6 +325,176 @@ namespace gobjects
         alignas(16) uint8_t m_elemXorKey[16];// Element count XOR key (AD8EE30)
         alignas(16) uint8_t m_chunkKey1[16];
         alignas(16) uint8_t m_chunkKey2[16];
+
+        // ── Patch 20260421: primary init path ────────────────────────────
+        // 1. Decrypt GUObjectArray → chunks_manager (new RVA 0xDDCB420, new pipeline).
+        // 2. Decrypt chunks_manager+0x70 → max_elements.
+        // 3. Structural scan of live heap for 20-byte-stride FUObjectItem chunks
+        //    (vtable[7] is VMProtected so the canonical chunks-ptr-array is
+        //    unreachable without bytecode emulation). Accept any region with
+        //    ≥500 consecutive valid items, concatenate all regions, cap at
+        //    max_elements, and store as a flat UObject* list.
+        bool InitPatch20260421() {
+            using namespace ArcDecrypt::Patch20260421;
+
+            uint8_t enc[16] = {}, mask[8] = {};
+            uint64_t xor_key = 0;
+            if (!m_reader.Read(m_base + RVA_GUOBJECT_ARRAY_NEW, enc, 16)) {
+                std::printf("[p21] read GUObjectArray@0x%llX failed\n",
+                    (unsigned long long)(m_base + RVA_GUOBJECT_ARRAY_NEW));
+                return false;
+            }
+            if (!m_reader.Read(m_base + RVA_GOBJ_PSHUFB_MASK, mask, 8)) return false;
+            if (!m_reader.Read(m_base + RVA_GOBJ_MAX_XOR_KEY, &xor_key, 8)) return false;
+
+            uint64_t chunks_mgr = DecryptGObjChunksManager(enc, mask);
+            if (chunks_mgr < 0x10000ULL || chunks_mgr >= 0x800000000000ULL) {
+                std::printf("[p21] chunks_manager decrypt gave implausible 0x%llX\n",
+                    (unsigned long long)chunks_mgr);
+                return false;
+            }
+
+            uint8_t max_enc[16] = {};
+            if (!m_reader.Read(chunks_mgr + GOBJ_MANAGER_MAX_OFFSET, max_enc, 16)) {
+                std::printf("[p21] read chunks_mgr+0x70 failed (chunks_mgr=0x%llX)\n",
+                    (unsigned long long)chunks_mgr);
+                return false;
+            }
+            int32_t max_elements = DecryptGObjMaxElements(max_enc, xor_key);
+            if (max_elements < 1000 || max_elements > 2000000) {
+                std::printf("[p21] max_elements=%d out of range — decrypt constants drifted?\n",
+                    max_elements);
+                return false;
+            }
+            std::printf("[p21] chunks_manager=0x%llX  max_elements=%d\n",
+                (unsigned long long)chunks_mgr, max_elements);
+
+            std::vector<uint64_t> objects;
+            if (!StructuralScanFUObjectItems(max_elements, objects)) {
+                std::printf("[p21] structural chunk scan failed\n");
+                return false;
+            }
+
+            std::printf("[p21] structural scan collected %zu UObject pointers\n",
+                objects.size());
+            if (objects.size() < 1000) return false;
+
+            m_arrayBase = chunks_mgr;
+            return InitWithSeedObjects(std::move(objects));
+        }
+
+        // ── Structural heap scan for FUObjectItem chunks ─────────────────
+        // Sweeps mapped rw- regions for runs of 20-byte entries whose +0
+        // points to a valid UObject (first qword is a module-range vtable).
+        // Concatenates all runs of ≥MIN_RUN items; caller caps at max_elements.
+        bool StructuralScanFUObjectItems(int32_t max_elements,
+                                         std::vector<uint64_t>& out_objects) {
+            constexpr uint32_t STRIDE  = ArcDecrypt::Patch20260421::FUOBJECTITEM_STRIDE;
+            constexpr uint32_t MIN_RUN = 500;
+            const uint64_t vt_lo = m_base + 0x1000;
+            const uint64_t vt_hi = m_base + 0x10000000ULL;
+
+            auto is_heap = [](uint64_t p) {
+                return p >= 0x100000ULL && p < 0x800000000000ULL;
+            };
+            auto is_vtable = [&](uint64_t p) {
+                return p >= vt_lo && p < vt_hi;
+            };
+
+            // Resolve heap map from /proc; fall back to a wide numeric sweep.
+            struct Region { uint64_t lo, hi; };
+            std::vector<Region> ranges;
+            if (m_pid > 0) {
+                char path[64];
+                std::snprintf(path, sizeof(path), "/proc/%d/maps", m_pid);
+                if (FILE* f = std::fopen(path, "r")) {
+                    char line[512];
+                    while (std::fgets(line, sizeof(line), f)) {
+                        uint64_t s = 0, e = 0;
+                        char perms[5] = {};
+                        std::sscanf(line, "%llx-%llx %4s",
+                            (unsigned long long*)&s, (unsigned long long*)&e, perms);
+                        if (perms[0] != 'r' || perms[1] != 'w') continue;
+                        if ((e - s) < 0x100000ULL) continue;
+                        if (s < 0x10000 || s > 0x800000000000ULL) continue;
+                        if (s >= m_base && s < m_base + 0x10000000ULL) continue;
+                        ranges.push_back({s, e});
+                    }
+                    std::fclose(f);
+                }
+            }
+            if (ranges.empty()) {
+                ranges.push_back({0x10000000ULL,  0x80000000ULL});
+                ranges.push_back({0x100000000ULL, 0x400000000ULL});
+            }
+
+            const uint64_t WIN = 0x10000ULL;
+            std::vector<uint8_t> buf(WIN);
+            uint64_t cur_start = 0;
+            uint32_t cur_count = 0;
+            std::vector<uint64_t> run_starts;
+            std::vector<uint32_t> run_counts;
+
+            auto flush = [&]() {
+                if (cur_count >= MIN_RUN) {
+                    run_starts.push_back(cur_start);
+                    run_counts.push_back(cur_count);
+                }
+                cur_start = 0;
+                cur_count = 0;
+            };
+
+            for (const auto& rg : ranges) {
+                for (uint64_t page = rg.lo; page + WIN <= rg.hi; page += WIN) {
+                    if (!m_reader.Read(page, buf.data(), WIN)) { flush(); continue; }
+                    size_t start_off = 0;
+                    if (cur_count && (page % STRIDE)) {
+                        start_off = (STRIDE - (page - cur_start) % STRIDE) % STRIDE;
+                    }
+                    for (size_t off = start_off; off + STRIDE <= WIN; off += STRIDE) {
+                        uint64_t obj_ptr = 0;
+                        std::memcpy(&obj_ptr, buf.data() + off, 8);
+                        bool ok = is_heap(obj_ptr);
+                        if (ok) {
+                            uint64_t vt = 0;
+                            ok = m_reader.Read(obj_ptr, &vt, 8) && is_vtable(vt);
+                        }
+                        if (!ok) { flush(); continue; }
+                        if (cur_count == 0) cur_start = page + off;
+                        cur_count++;
+                    }
+                }
+                flush();
+            }
+
+            if (run_starts.empty()) return false;
+
+            // Sort runs by size desc — the actual chunks dominate, tiny
+            // lookalike runs (heap fragments with occasional vtable ptrs)
+            // contribute little.
+            std::vector<size_t> idx(run_starts.size());
+            for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+                return run_counts[a] > run_counts[b];
+            });
+
+            const size_t cap = static_cast<size_t>(max_elements) + 256;
+            out_objects.reserve(cap);
+            for (size_t i : idx) {
+                uint64_t start = run_starts[i];
+                uint32_t count = run_counts[i];
+                for (uint32_t k = 0; k < count && out_objects.size() < cap; ++k) {
+                    uint64_t item = start + (uint64_t)STRIDE * k;
+                    uint64_t obj = 0;
+                    if (!m_reader.Read(item, &obj, 8) || !obj) continue;
+                    out_objects.push_back(obj);
+                }
+                if (out_objects.size() >= cap) break;
+            }
+            std::printf("[p21] structural runs: %zu (largest=%u); collected %zu objs\n",
+                run_starts.size(), run_counts[idx[0]], out_objects.size());
+            return !out_objects.empty();
+        }
 
         // ── Validate SIMD tables are populated (not all zeros) ───────────
         bool ValidateSIMDTables() {

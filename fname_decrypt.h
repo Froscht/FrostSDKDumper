@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <immintrin.h>
 #include "kernel_module/include/memreader_ioctl.h"
+#include "arc_decrypt.h"
 
 namespace FName {
 
@@ -383,6 +384,36 @@ public:
         }
     }
 
+    // ── Patch 20260421: handle → FNameEntry pointer ──────────────────────
+    // The 16-byte inline FName field stores an obfuscated FNameEntry pointer
+    // directly; the FNV/CI chain is bypassed. Decrypt:
+    //     entry_ptr = bswap64(handle ^ 0x59B07C3D00000000)
+    // Probe both qwords of the 16B field (patch-20260421 FName layout stores
+    // the handle at one of {qword[0], qword[1]} depending on field kind);
+    // accept the first qword whose decrypt lands on a readable FNameEntry.
+    std::string GetNameByHandle(uint64_t obj_ptr, uint64_t fname_off) {
+        if (!obj_ptr || !m_keyLoaded) return {};
+        uint8_t bytes[16] = {};
+        if (!m_reader.Read(obj_ptr + fname_off, bytes, 16)) return {};
+
+        auto tryHandle = [&](uint64_t h) -> std::string {
+            if (!h || h == ArcDecrypt::Patch20260421::ENTRY_HANDLE_XOR) return {};
+            uint64_t entry = ArcDecrypt::Patch20260421::DecryptEntryHandle(h);
+            if (entry < 0x10000ULL || entry >= 0x800000000000ULL) return {};
+            // Reject pointers that land in the module image — valid entries
+            // live on the heap/FNamePool pages.
+            if (entry >= m_base && entry < m_base + 0x10000000ULL) return {};
+            return DecryptNameString(entry);
+        };
+
+        uint64_t h0 = 0, h1 = 0;
+        std::memcpy(&h0, bytes + 0, 8);
+        std::memcpy(&h1, bytes + 8, 8);
+        std::string s = tryHandle(h0);
+        if (!s.empty()) return s;
+        return tryHandle(h1);
+    }
+
     // ── Full pipeline: object pointer → name string ───────────────────────
     std::string GetName(uint64_t obj_ptr) {
         if (!obj_ptr || !m_keyLoaded) return {};
@@ -395,6 +426,14 @@ public:
                     ++printable;
             return printable * 5 >= static_cast<int>(s.size()) * 4;
         };
+
+        // Patch 20260421 primary path: inline encrypted FName handle at
+        // obj+0x28 → bswap64(h ^ sentinel) = FNameEntry*. Try a few candidate
+        // offsets (observed +0x28 on live UObjects; +0x18 as legacy fallback).
+        for (uint64_t off : {uint64_t(0x28), uint64_t(0x18), uint64_t(0x30)}) {
+            std::string s = GetNameByHandle(obj_ptr, off);
+            if (isSaneName(s)) return s;
+        }
 
         int32_t comp = GetCompIndex(obj_ptr);
         if (comp > 0) {

@@ -186,11 +186,12 @@ constexpr uint64_t MODULE_BASE = 0x140000000;
 
 // Runtime-overridable anchors (sig-scan may rewrite these at Init; hardcoded
 // values are the fallback and the "known good for current patch" default).
+// Values updated to patch 20260421; older patch values kept inline as comments.
 inline uint64_t RVA_GWORLD              = 0xE011D18;
-inline uint64_t RVA_GNAMES_BASE         = 0xDB48E80;
-inline uint64_t RVA_FNAME_KEY_TABLE     = 0xDA8D854;   // access: key_table[key+36]
-inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xDE04650;   // struct base; enc qword at +0x30
-constexpr uint64_t GOBJ_ENCRYPTED_OFF   = 0x30;
+inline uint64_t RVA_GNAMES_BASE         = 0xDB0FE00;   // 20260421 (was 0xDB48E80)
+inline uint64_t RVA_FNAME_KEY_TABLE     = 0xDA547F4;   // 20260421 keystream (was 0xDA8D854)
+inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xDDCB420;   // 20260421 (was 0xDE04650); enc xmmword at +0x00 for new pipeline
+constexpr uint64_t GOBJ_ENCRYPTED_OFF   = 0x30;        // legacy pipeline offset
 
 // SIMD runtime tables (GUObjectArray decrypt — patch 20260414)
 // Pipeline: ROL32(20) → XOR(key) → ROL16(12) [no PSHUFB step]

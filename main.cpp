@@ -59,14 +59,19 @@ public:
     ~KernelReader() { if (fd >= 0) close(fd); }
 
     bool Open(int target_pid) {
-        if (fd >= 0 && pid == target_pid) return true;
+        if (pid == target_pid && pid != 0) return true;
         pid = target_pid;
-        fd  = open("/dev/memreader", O_RDWR);
-        if (fd < 0) { perror("[-] open /dev/memreader"); return false; }
+        if (fd < 0) {
+            fd = open("/dev/memreader", O_RDWR);
+            if (fd < 0) {
+                std::printf("[!] /dev/memreader unavailable (%s) — falling back to process_vm_readv only\n",
+                    std::strerror(errno));
+            }
+        }
         return true;
     }
 
-    bool IsOpen() const { return fd >= 0; }
+    bool IsOpen() const { return pid > 0; }
 
     bool Read(uint64_t address, void* buffer, size_t size) override {
         if (!buffer || !size) return false;
@@ -217,7 +222,7 @@ public:
             SigScan::Scanner<KernelReader> scan(m_reader, MODULE_BASE, 0xE900000);
             static SigScan::PEFileReader s_pe;
             static const char* pe_path =
-                "/media/frost/Coding Stuf/Linux/FrostBinaryDumper/Arc_Raiders_Binary_20260421_160408.exe";
+                "/media/frost/Coding Stuf/Linux/FrostSDKDumper/Arc_Raiders_Binary_20260421_213315.exe";
             if (s_pe.Open(pe_path)) {
                 scan.SetPEFallback(&s_pe);
                 std::printf("[sig] PE fallback enabled: %s\n", pe_path);
@@ -1121,42 +1126,78 @@ int main(int argc, char* argv[]) {
         std::printf("[list] UObject array @ 0x%llX  items=%u\n",
             (unsigned long long)array_start, array_count);
 
-        // Enumerate and decrypt names. The UObject NamePrivate (16B) is at
-        // some offset we need to probe; prior-patch used +0x90 (UObject FName
-        // at +0x18, the raw handle qword is inside that 16B field).
-        // Per patch 20260421, the second qword of the 16B FName IS the
-        // encrypted entry-pointer handle → decrypt via DecryptEntryHandle.
-        // Common UObjectBase layout offsets to try for NamePrivate: +0x18.
-        int limit = 30;
-        std::printf("[list] first %d UObjects (obj, vtable, handle→entry):\n", limit);
-        int listed = 0, valid_names = 0;
-        for (uint32_t i = 0; i < array_count && listed < limit; ++i) {
+        // Probe the first few UObjects: dump 0x100 bytes and locate the FName
+        // handle slot by trying every 8-byte offset and checking whether
+        // DecryptEntryHandle lands on a plausible heap pointer whose first
+        // uint16 looks like an FNameEntry header (non-zero, length bits <1023).
+        auto lookLikeEntryHdr = [&](uint64_t entry_ptr) -> bool {
+            if (entry_ptr < 0x10000ULL || entry_ptr >= 0x800000000000ULL) return false;
+            uint16_t hdr = 0;
+            if (!r.Read(entry_ptr, &hdr, 2)) return false;
+            if (!hdr) return false;
+            int charCount = hdr & 0x3FF;
+            return charCount > 0 && charCount < 1023;
+        };
+        // Read raw bytes at a candidate FNameEntry and print both the hex
+        // and an ASCII interpretation so we can eyeball whether it's really
+        // an FNameEntry (either plain-text or XOR-encrypted with the keystream).
+        auto sniffEntry = [&](uint64_t entry_ptr) {
+            uint8_t raw[48] = {};
+            if (!r.Read(entry_ptr, raw, sizeof(raw))) { std::printf(" <read-fail>"); return; }
+            uint16_t hdr = 0; std::memcpy(&hdr, raw, 2);
+            int charCount = hdr & 0x3FF;
+            bool isWide = (hdr & 0x8000) != 0;
+            std::printf(" hdr=0x%04X len=%d%s  hex:", hdr, charCount, isWide?" wide":"");
+            for (int k = 2; k < 2 + std::min(charCount, 20); ++k) std::printf(" %02X", raw[k]);
+            std::printf("  ascii:'");
+            for (int k = 2; k < 2 + std::min(charCount, 20); ++k)
+                std::printf("%c", (raw[k] >= 32 && raw[k] < 127) ? raw[k] : '.');
+            std::printf("'");
+        };
+
+        int limit = 6;
+        std::printf("[list] scanning first %d UObjects for FName handle offset...\n", limit);
+        std::unordered_map<int, int> hits_by_off;
+        for (uint32_t i = 0; i < array_count && i < (uint32_t)limit; ++i) {
             uint64_t item = array_start + (uint64_t)STRIDE * i;
             uint64_t obj = 0;
             if (!r.Read(item, &obj, 8) || !obj) continue;
-            uint64_t vt = 0;
-            r.Read(obj, &vt, 8);
-            // NamePrivate is stored as an inline 16-byte FName at obj+0x28
-            // (UObjectBase layout for patch 20260421, confirmed by reading
-            // live UObject: +0x18/+0x20 are zero, first 16-byte encrypted
-            // FName block starts at +0x28).
-            uint8_t name_bytes[16] = {};
-            r.Read(obj + 0x28, name_bytes, 16);
-            uint64_t handle_lo = 0, handle_hi = 0;
-            std::memcpy(&handle_lo, name_bytes + 0, 8);
-            std::memcpy(&handle_hi, name_bytes + 8, 8);
-            uint64_t entry1 = ArcDecrypt::Patch20260421::DecryptEntryHandle(handle_lo);
-            uint64_t entry2 = ArcDecrypt::Patch20260421::DecryptEntryHandle(handle_hi);
-            bool v1 = entry1 >= 0x10000 && entry1 < 0x800000000000ULL;
-            bool v2 = entry2 >= 0x10000 && entry2 < 0x800000000000ULL;
-            if (v1 || v2) valid_names++;
-            std::printf("[list] [%5u] obj=0x%012llX vt=0x%09llX  h_lo→0x%016llX %s  h_hi→0x%016llX %s\n",
-                i, (unsigned long long)obj, (unsigned long long)vt,
-                (unsigned long long)entry1, v1 ? "✓" : " ",
-                (unsigned long long)entry2, v2 ? "✓" : " ");
-            listed++;
+            uint8_t dump[0x100] = {};
+            if (!r.Read(obj, dump, 0x100)) continue;
+
+            std::printf("\n[list] [%u] obj=0x%012llX raw first 0x100 bytes:\n",
+                i, (unsigned long long)obj);
+            for (int row = 0; row < 0x10; ++row) {
+                std::printf("  +%02X:", row * 16);
+                for (int col = 0; col < 16; ++col)
+                    std::printf(" %02X", dump[row * 16 + col]);
+                std::printf("\n");
+            }
+
+            std::printf("[list]   probing handle candidates:\n");
+            for (int off = 0; off + 8 <= 0x100; off += 8) {
+                uint64_t h = 0;
+                std::memcpy(&h, dump + off, 8);
+                if (!h) continue;
+                if (lookLikeEntryHdr(h)) {
+                    std::printf("    +0x%02X: PLAIN ptr=0x%012llX", off, (unsigned long long)h);
+                    sniffEntry(h);
+                    std::printf("\n");
+                    hits_by_off[off]++;
+                }
+                uint64_t entry = ArcDecrypt::Patch20260421::DecryptEntryHandle(h);
+                if (entry != h && lookLikeEntryHdr(entry)) {
+                    std::printf("    +0x%02X: HANDLE 0x%016llX → entry=0x%012llX",
+                        off, (unsigned long long)h, (unsigned long long)entry);
+                    sniffEntry(entry);
+                    std::printf("\n");
+                    hits_by_off[off | 0x1000]++;
+                }
+            }
         }
-        std::printf("[list] %d listed, %d with candidate name pointers\n", listed, valid_names);
+        std::printf("\n[list] offset frequency (handle→entry-header looked valid):\n");
+        for (auto& kv : hits_by_off)
+            std::printf("  +0x%02X: %d/%d hits\n", kv.first, kv.second, limit);
         return 0;
     }
 
@@ -1471,7 +1512,7 @@ int main(int argc, char* argv[]) {
         }
         EmuEngine eng;
         if (!eng.Initialize(&dumper.m_reader, dumper.MODULE_BASE, 0xE9AF000,
-                "/media/frost/Coding Stuf/Linux/FrostBinaryDumper/Arc_Raiders_Binary_20260421_160408.exe")) {
+                "/media/frost/Coding Stuf/Linux/FrostSDKDumper/Arc_Raiders_Binary_20260421_213315.exe")) {
             std::printf("[emu-smoke] init failed\n"); return 1;
         }
         uint64_t probe = dumper.MODULE_BASE + 0x22F9A4;
@@ -1498,7 +1539,7 @@ int main(int argc, char* argv[]) {
         }
         EmuEngine eng;
         if (!eng.Initialize(&dumper.m_reader, dumper.MODULE_BASE, 0xE9AF000,
-                "/media/frost/Coding Stuf/Linux/FrostBinaryDumper/Arc_Raiders_Binary_20260421_160408.exe")) {
+                "/media/frost/Coding Stuf/Linux/FrostSDKDumper/Arc_Raiders_Binary_20260421_213315.exe")) {
             std::printf("[emu-fname] engine init failed\n"); return 1;
         }
         EmuFName fn;
