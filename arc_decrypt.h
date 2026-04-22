@@ -104,12 +104,17 @@ namespace Offsets {
         constexpr uint64_t FieldsSlots  = 0x20; // slots at obj+0x20,+0x40,+0x60,+0x80 (stride 0x20)
     }
     namespace FField {
-        // Patch 20260421: FField simplified — NamePrivate is plain uint32 at +0x90.
+        // Patch 20260421 authoritative layout (verified via UStruct_Link / FField_GetFName IDA pass):
+        //   +0x00  vtable
+        //   +0x30  ClassPrivate (FFieldClass*)
+        //   +0x38  Owner ptr (bit 0 = tag) — walking chain via +0x40 also works (aliased)
+        //   +0x40  Next (FField*)
+        //   +0x60  NameEncrypted — 16-byte SIMD slot; decode with FField_GetFName pipeline
         constexpr uint64_t VTable        = 0x00;
-        constexpr uint64_t NamePrivate   = 0x90;   // plain uint32 CI (was encrypted 16B)
-        constexpr uint64_t NameEncrypted = 0x90;   // kept as alias for callers that loaded 16B
-        constexpr uint64_t Next          = 0x98;   // FField* (was 0xA8 in 20260414)
-        constexpr uint64_t ClassPrivate  = 0xA0;   // FFieldClass* (was 0xB0 in 20260414)
+        constexpr uint64_t ClassPrivate  = 0x30;
+        constexpr uint64_t Next          = 0x40;
+        constexpr uint64_t NameEncrypted = 0x60;   // encrypted 16B
+        constexpr uint64_t NamePrivate   = 0x60;   // alias
     }
     namespace FFieldClass {
         // Confirmed from live FFieldClass objects (e.g. 0xBDF31C00), patch 20260402
@@ -117,18 +122,17 @@ namespace Offsets {
         // NamePrivate: no fixed SIMD slot found; type identified via vtable map instead
     }
     namespace FProperty {
-        // Patch 20260421: verified via live probe of UFunction params.
-        // ArrayDim plain u32 at +0xF8 (was 0xD8 in 20260414).
-        // ElementSize plain u32 at +0x118 (was 0xDC).
-        // Offset_Internal: location not yet verified for 20260421 —
-        //   OLD patches used +0xEC encrypted with bswap32(stored^0x2AB03FD6).
-        //   Left in place; if offsets come out wrong, probe a real class member
-        //   via a property whose offset we know (e.g. AActor::RootComponent).
-        constexpr uint64_t ArrayDim        = 0xF8;   // uint32
-        constexpr uint64_t ElementSize     = 0x118;  // uint32
-        constexpr uint64_t Offset_Internal = 0xEC;   // (unverified for 20260421)
-        constexpr uint32_t Offset_XOR      = 0x2AB03FD6u;
-        constexpr uint64_t PropertyFlags   = 0xE0;
+        // Patch 20260421 authoritative layout (verified via UStruct_Link / sub_456A40 IDA pass
+        // and empirical live probe on ActorComponent/SceneComponent/PrimitiveComponent/ControlRigComponent):
+        //   +0xA8 ArrayDim (u32)
+        //   +0xAC ElementSize (u32)
+        //   +0xC0 Offset_Internal (ENCRYPTED u32): real = bswap32(stored) ^ 0x59B8C401
+        //   +0xB0..+0xB7 PropertyFlags (u64 — best guess)
+        constexpr uint64_t ArrayDim        = 0xA8;
+        constexpr uint64_t ElementSize     = 0xAC;
+        constexpr uint64_t Offset_Internal = 0xC0;
+        constexpr uint32_t Offset_XOR      = 0x59B8C401u;  // XOR after bswap32
+        constexpr uint64_t PropertyFlags   = 0xB0;
     }
     namespace FBoolProperty {
         // TODO: re-verify for patch 20260402; previous values assumed UE5 default layout
@@ -162,14 +166,17 @@ namespace Offsets {
         constexpr uint64_t PropertyFlags   = 0x70;  // plain uint64
     }
     namespace UStruct {
-        // Patch 20260421: layout verified by probing live ControlRigComponent @ 0x78933D00.
-        // +0xD0 holds the FField chain with real per-class records; +0xC8 holds a
-        // shared singleton-like node that walks to an empty sentinel.
-        constexpr uint64_t SuperStruct     = 0x0B0;  // was 0xA8
-        constexpr uint64_t Children        = 0x0C8;  // UField* sentinel (empty end marker)
-        constexpr uint64_t ChildProperties = 0x0D0;  // FField* chain (real records)
-        constexpr uint64_t PropertiesSize  = 0x118;  // uint32 sizeof(struct) (was 0x108)
-        constexpr uint64_t MinAlignment    = 0x0F8;  // uint32
+        // Patch 20260421 authoritative layout (verified via UStruct_Link @ sub_33E480):
+        //   +0xB0  SuperStruct (UStruct*)
+        //   +0xD0  Children (UField* chain — UFunctions)
+        //   +0xE0  ChildProperties (FField* chain — real FProperty members)
+        //   +0xF8  MinAlignment-ish u32
+        //   +0x118 PropertiesSize (u32 — the running sum UStruct_Link writes)
+        constexpr uint64_t SuperStruct     = 0x0B0;
+        constexpr uint64_t Children        = 0x0D0;  // UField* (UFunctions)
+        constexpr uint64_t ChildProperties = 0x0E0;  // FField* (FProperty chain)
+        constexpr uint64_t PropertiesSize  = 0x118;
+        constexpr uint64_t MinAlignment    = 0x0F8;
     }
     namespace UEnum {
         constexpr uint64_t Names = 0xB0;  // patch 20260414 (was 0xA8 in 20260409). +0xA0 holds CppType FString.
@@ -388,6 +395,32 @@ namespace Patch20260421 {
         uint64_t lo;
         _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo), c);
         return lo;
+    }
+
+    // =========================================================================
+    // FField NamePrivate decrypt (patch 20260421) — from FField_GetFName @ 0x3DBE00.
+    // The 16-byte encrypted slot lives at FField+0x60. Pipeline:
+    //   1. PSHUFLW(slot, 0x1E)
+    //   2. XOR with xmmword_AD15750  (low 8 bytes: 38 BA 6F 75 E8 89 57 36; high = 0)
+    //   3. ROL16(lo_qword, 1) per word-lane
+    //   4. Take lo64
+    //   5. ROL64(lo64, 32) → final = (Number << 32) | CI  (CI in LO32)
+    // =========================================================================
+    namespace FFieldName20260421 {
+        constexpr uint64_t RVA_XOR_CONST = 0xAD15750;
+        constexpr int      PSHUFLW_IMM   = 0x1E;
+        constexpr int      ROL16_AMT     = 1;
+        constexpr int      ROL64_AMT     = 32;
+    }
+
+    // =========================================================================
+    // FProperty::Offset_Internal decrypt (patch 20260421)
+    //   stored = bswap32(real) ^ 0x01C4B859    (equivalent: bswap32(real ^ 0x59B8C401))
+    //   real   = bswap32(stored) ^ 0x59B8C401  (equivalent: bswap32(stored ^ 0x01C4B859))
+    // stored=0x01C4B859 (sentinel) decrypts to 0.
+    // =========================================================================
+    inline uint32_t DecryptPropertyOffsetNew(uint32_t stored) {
+        return __builtin_bswap32(stored) ^ 0x59B8C401u;
     }
 
     // =========================================================================

@@ -625,7 +625,7 @@ public:
                 // Get CI for use in fallback name (unique per name)
                 int32_t fci = m_fname.DecryptFFieldNameCI(ff);
                 uint32_t stored_off2 = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::Offset_Internal);
-                uint32_t off2 = static_cast<uint32_t>(__builtin_bswap32(stored_off2 ^ ArcDecrypt::Offsets::FProperty::Offset_XOR));
+                uint32_t off2 = ArcDecrypt::Patch20260421::DecryptPropertyOffsetNew(stored_off2);
                 char buf[64];
                 snprintf(buf, sizeof(buf), "Prop_CI%u_Off0x%X", static_cast<uint32_t>(fci), off2);
                 pr.name = buf;
@@ -664,11 +664,11 @@ public:
                 pr.bool_field_size = Read<uint8_t>(ff + ArcDecrypt::Offsets::FBoolProperty::FieldSize);
             }
 
-            // Offset_Internal: encrypted at FProperty+0xEC (patch 20260414)
-            // Decrypt: (int32)bswap32(stored ^ 0x2AB03FD6)
+            // Offset_Internal: encrypted at FProperty+0xC0 (patch 20260421)
+            // real = bswap32(stored) ^ 0x59B8C401   (sentinel 0x01C4B859 → real=0)
             {
                 uint32_t stored_off = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::Offset_Internal);
-                pr.offset = static_cast<uint32_t>(__builtin_bswap32(stored_off ^ ArcDecrypt::Offsets::FProperty::Offset_XOR));
+                pr.offset = ArcDecrypt::Patch20260421::DecryptPropertyOffsetNew(stored_off);
             }
 
             // ElementSize and ArrayDim stored directly in FProperty (patch 20260414)

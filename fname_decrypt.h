@@ -141,6 +141,8 @@ public:
         // UObject slot decrypt tables (patch 20260421)
         if (!loadTable(ArcDecrypt::Patch20260421::UObjSlot20260421::RVA_SHUF_MASK, m_uobjShufMask, "uobjShufMask")) return false;
         if (!loadTable(ArcDecrypt::Patch20260421::UObjSlot20260421::RVA_XOR_CONST, m_uobjXorConst, "uobjXorConst")) return false;
+        // FField name decrypt constant (patch 20260421)
+        if (!loadTable(ArcDecrypt::Patch20260421::FFieldName20260421::RVA_XOR_CONST, m_fFieldXorConst, "fFieldXorConst")) return false;
 
         if (!loadTable(RVA_CIDX_XOR1_OFF,          m_cidxXor1,      "cidxXor1"))      return false;
         if (!loadTable(RVA_CIDX_XOR3_OFF,          m_cidxXor3,      "cidxXor3"))      return false;
@@ -252,11 +254,25 @@ public:
     // and name_offset to walk the FNamePool.
     int32_t DecryptFFieldNameCI(uint64_t ff_addr) {
         if (!ff_addr) return 0;
-        // Patch 20260421: FField::NamePrivate is a plain uint32 — no decrypt.
-        uint32_t ci = 0;
-        if (!m_reader.Read(ff_addr + ArcDecrypt::Offsets::FField::NamePrivate, &ci, 4))
+        // Patch 20260421: FField name is a 16-byte SIMD-encrypted slot at +0x60.
+        //   PSHUFLW(0x1E) → XOR(const@0xAD15750) → ROL16(1) → lo64 → ROL64(32)
+        //   Result: (Number << 32) | CI  — CI in LO32.
+        alignas(16) uint8_t enc[16] = {};
+        if (!m_reader.Read(ff_addr + ArcDecrypt::Offsets::FField::NameEncrypted, enc, 16))
             return 0;
-        return static_cast<int32_t>(ci);
+        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
+        // 1. PSHUFLW imm=0x1E (low 4 words)
+        __m128i s = _mm_shufflelo_epi16(v, 0x1E);
+        // 2. XOR with fixed constant (low 8 bytes loaded via loadl_epi64)
+        __m128i xk = _mm_load_si128(reinterpret_cast<const __m128i*>(m_fFieldXorConst));
+        __m128i x = _mm_xor_si128(s, xk);
+        // 3. ROL16(1) per word-lane (add_epi16 self | srli_epi16 15)
+        __m128i r = _mm_or_si128(_mm_add_epi16(x, x), _mm_srli_epi16(x, 15));
+        // 4/5. lo64 then ROL64(32) = swap hi/lo halves of lo64
+        uint64_t lo64;
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo64), r);
+        uint64_t rot = (lo64 >> 32) | (lo64 << 32);
+        return static_cast<int32_t>(rot & 0xFFFFFFFFu);  // CI is lo32
     }
 
     // ── FFieldClass → type name comp_index ───────────────────────────────
@@ -630,6 +646,9 @@ private:
     // Patch 20260421 UObject slot decrypt constants
     alignas(16) uint8_t m_uobjShufMask[16] = {};   // (AD128C0) 05,03,01,04,02,07,00,06
     alignas(16) uint8_t m_uobjXorConst[16] = {};   // (AD128D0) 09,43,BD,C8,4B,4B,BC,FF
+
+    // Patch 20260421 FField name decrypt constant
+    alignas(16) uint8_t m_fFieldXorConst[16] = {}; // (AD15750) 38,BA,6F,75,E8,89,57,36,0,0,0,0,0,0,0,0
 };
 
 // ── Free-function shims ────────────────────────────────────────────────────
