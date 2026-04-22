@@ -1318,9 +1318,12 @@ public:
                     rec.super_name = sit->second;
             }
 
-            // Properties: scan ALL offsets 0x80-0x140 for FField chains
-            // Dedup by offset+type (keep the one with the best name)
-            std::unordered_map<uint32_t, PropertyRecord> best_at_offset;  // offset → best record
+            // Properties: scan ALL offsets 0x80-0x140 for FField chains and
+            // dedup by FField address (unique per field). Previous version
+            // keyed on p.offset, which collapsed everything to a single entry
+            // on patch 20260421 where Offset_Internal is at an unknown RVA
+            // (current read lands on zeros for most FProperties).
+            std::unordered_map<uint64_t, PropertyRecord> best_at_ff;
             for (int co = 0x80; co <= 0x140; co += 8) {
                 uint64_t chain_head = Read<uint64_t>(obj_ptr + co);
                 if (chain_head <= 0x10000 || chain_head >= 0x7FFFFFFFFFFFULL) continue;
@@ -1328,27 +1331,24 @@ public:
                 if (cpvt < MODULE_BASE || cpvt >= MODULE_BASE + 0x10000000ULL) continue;
                 auto chain_props = ReadPropertyChain(chain_head);
                 for (auto& p : chain_props) {
-                    // Skip garbage
                     if (p.offset > 0x20000) continue;
-                    auto it = best_at_offset.find(p.offset);
-                    if (it == best_at_offset.end()) {
-                        best_at_offset[p.offset] = std::move(p);
+                    auto it = best_at_ff.find(p.ff_addr);
+                    if (it == best_at_ff.end()) {
+                        best_at_ff[p.ff_addr] = std::move(p);
                     } else {
-                        // Prefer entries with real names (no "UnknownProp") and known type
-                        bool cur_unk = (it->second.name.rfind("UnknownProp_", 0) == 0);
-                        bool new_unk = (p.name.rfind("UnknownProp_", 0) == 0);
-                        bool cur_type_known = (it->second.type_name != "FProperty_Unknown");
-                        bool new_type_known = (p.type_name != "FProperty_Unknown");
-                        // Prefer named over unnamed, and known type over unknown
-                        int cur_score = (cur_unk ? 0 : 2) + (cur_type_known ? 1 : 0);
-                        int new_score = (new_unk ? 0 : 2) + (new_type_known ? 1 : 0);
-                        if (new_score > cur_score) {
-                            best_at_offset[p.offset] = std::move(p);
-                        }
+                        bool cur_unk = (it->second.name.rfind("UnknownProp_", 0) == 0 ||
+                                        it->second.name.rfind("Prop_CI", 0) == 0);
+                        bool new_unk = (p.name.rfind("UnknownProp_", 0) == 0 ||
+                                        p.name.rfind("Prop_CI", 0) == 0);
+                        bool cur_tk  = (it->second.type_name != "FProperty_Unknown");
+                        bool new_tk  = (p.type_name != "FProperty_Unknown");
+                        int cur_score = (cur_unk ? 0 : 2) + (cur_tk ? 1 : 0);
+                        int new_score = (new_unk ? 0 : 2) + (new_tk ? 1 : 0);
+                        if (new_score > cur_score) best_at_ff[p.ff_addr] = std::move(p);
                     }
                 }
             }
-            for (auto& [off, p] : best_at_offset)
+            for (auto& [ff, p] : best_at_ff)
                 rec.properties.push_back(std::move(p));
             // Legacy UProperty chain intentionally disabled — it corrupts output with
             // bogus entries (~3%) and the FField chain covers almost everything.
