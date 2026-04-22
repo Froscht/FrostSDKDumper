@@ -138,6 +138,10 @@ public:
             return true;
         };
 
+        // UObject slot decrypt tables (patch 20260421)
+        if (!loadTable(ArcDecrypt::Patch20260421::UObjSlot20260421::RVA_SHUF_MASK, m_uobjShufMask, "uobjShufMask")) return false;
+        if (!loadTable(ArcDecrypt::Patch20260421::UObjSlot20260421::RVA_XOR_CONST, m_uobjXorConst, "uobjXorConst")) return false;
+
         if (!loadTable(RVA_CIDX_XOR1_OFF,          m_cidxXor1,      "cidxXor1"))      return false;
         if (!loadTable(RVA_CIDX_XOR3_OFF,          m_cidxXor3,      "cidxXor3"))      return false;
         if (!loadTable(RVA_BLOCK_HDR_AND_OFF,      m_blkHdrAnd,     "blkHdrAnd"))     return false;
@@ -166,33 +170,74 @@ public:
         return ArcDecrypt::GetFNameSlotIndex(obj_base);
     }
 
-    // ── Step 2: decrypt UObject FName slot → comp_index ──────────────────
-    // Pipeline (patch 20260402): PSHUFB(ABE2BD0) → PXOR(ABE2BE0) → ROL64(58) → PSHUFLW(30) → lo32
-    // Slot layout: 4 slots at obj+0x20, +0x40, +0x60, +0x80 (stride=0x20)
-    int32_t GetCompIndex(uint64_t obj_base) {
-        if (!obj_base || !m_keyLoaded) return 0;
-
-        uint32_t slot = ArcDecrypt::GetFNameSlotIndex(obj_base);
-        uint64_t addr = obj_base + 0x20 + static_cast<uint64_t>(slot) * 0x20;
-
-        alignas(16) uint8_t enc[16] = {};
-        if (!m_reader.Read(addr, enc, 16)) return 0;
-
-        return static_cast<int32_t>(DecryptSlot16(enc));
+    // ── Decrypt one UObject slot (patch 20260421) ────────────────────────
+    // From sub_24DEB60: PSHUFLW(0xB1) → ROL32(15) per 32-bit lane →
+    //                   PSHUFB(mask@0xAD128C0) → XOR(const@0xAD128D0) → lo64.
+    // If the slot stores an FName: result == (CI << 32) | Number.
+    // If it stores a pointer: result == heap pointer (low 32 bits populated).
+    uint64_t DecryptUObjSlotNew(const uint8_t enc[16]) const {
+        using namespace ArcDecrypt::Patch20260421::UObjSlot20260421;
+        __m128i v  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
+        __m128i s  = _mm_shufflelo_epi16(v, PSHUFLW_IMM);
+        __m128i r  = _mm_or_si128(_mm_slli_epi32(s, ROL32_AMT),
+                                  _mm_srli_epi32(s, 32 - ROL32_AMT));
+        __m128i b  = _mm_shuffle_epi8(r, _mm_load_si128(reinterpret_cast<const __m128i*>(m_uobjShufMask)));
+        __m128i xo = _mm_xor_si128(b, _mm_load_si128(reinterpret_cast<const __m128i*>(m_uobjXorConst)));
+        uint64_t lo64;
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo64), xo);
+        return lo64;
     }
 
-    // ── UObject::GetClassPrivate → UClass* pointer ───────────────────────
-    // Same slot decrypt pipeline as GetCompIndex; slot selected by GetClassSlotIndex.
+    // ── UObject FName / Class / Outer accessors (patch 20260421) ─────────
+    // The game picks slot via an FNV hash of (obj+16) and additional selectors
+    // for {FName, Class, Outer, Number/something}. External dumper just tries
+    // all 4 slots and classifies each decrypted value by shape:
+    //   lo32 == 0 & hi32 < some CI cap → FName (hi32 is CI)
+    //   lo32 in heap range & hi32 == 0 → pointer (Class/Outer/etc.)
+    int32_t GetCompIndex(uint64_t obj_base) {
+        if (!obj_base || !m_keyLoaded) return 0;
+        // FName shape (hi32=CI, lo32=Number): CI must be nonzero and lie inside
+        // the pool's capacity; Number is typically 0 but can be nonzero for
+        // auto-numbered names (Actor_1, Pawn_Default_2, ...).
+        // Slot decrypts that produce heap-pointer patterns (lo32 in heap range)
+        // are Class/Outer slots and skipped.
+        auto is_heap_ptr = [](uint64_t v) {
+            return v >= 0x100000ULL && v < 0x800000000000ULL && (v >> 32) == 0;
+        };
+        for (int slot = 0; slot < 4; ++slot) {
+            alignas(16) uint8_t enc[16] = {};
+            uint64_t addr = obj_base + 0x20 + static_cast<uint64_t>(slot) * 0x20;
+            if (!m_reader.Read(addr, enc, 16)) continue;
+            uint64_t dec = DecryptUObjSlotNew(enc);
+            if (!dec) continue;
+            if (is_heap_ptr(dec)) continue;               // Class/Outer
+            uint32_t hi32 = static_cast<uint32_t>(dec >> 32);
+            if (hi32 == 0 || hi32 >= 0x2000000) continue;  // bogus CI
+            return static_cast<int32_t>(hi32);
+        }
+        return 0;
+    }
+
     uint64_t GetClassPrivate(uint64_t obj_base) {
         if (!obj_base || !m_keyLoaded) return 0;
-
-        uint32_t slot = ArcDecrypt::GetClassSlotIndex(obj_base);
-        uint64_t addr = obj_base + 0x20 + static_cast<uint64_t>(slot) * 0x20;
-
-        alignas(16) uint8_t enc[16] = {};
-        if (!m_reader.Read(addr, enc, 16)) return 0;
-
-        return DecryptPtrSlot(enc);  // pointer via ROL64(15)
+        for (int slot = 0; slot < 4; ++slot) {
+            alignas(16) uint8_t enc[16] = {};
+            uint64_t addr = obj_base + 0x20 + static_cast<uint64_t>(slot) * 0x20;
+            if (!m_reader.Read(addr, enc, 16)) continue;
+            uint64_t dec = DecryptUObjSlotNew(enc);
+            // Class slot: lo32 in heap range, hi32 = 0.
+            uint64_t ptr = dec;  // decrypted value IS the pointer when applicable.
+            if ((ptr >> 32) == 0 && ptr >= 0x100000ULL && ptr < 0x800000000000ULL) {
+                // Reject Outer candidates by preferring the FIRST heap pointer we see —
+                // callers that need Outer specifically use GetOuterPtr.
+                // (Class vs Outer resolution via slot shape is ambiguous externally;
+                // the main dumper uses GetClassPrivate to classify and doesn't need
+                // perfect discrimination for the name dump.)
+                // TODO: distinguish Class from Outer by reading target's vtable.
+                return ptr;
+            }
+        }
+        return 0;
     }
 
     // ── FField::NamePrivate → comp_index (patch 20260414) ───────────────
@@ -210,25 +255,11 @@ public:
     // and name_offset to walk the FNamePool.
     int32_t DecryptFFieldNameCI(uint64_t ff_addr) {
         if (!ff_addr) return 0;
-        alignas(16) uint8_t enc[16] = {};
-        if (!m_reader.Read(ff_addr + ArcDecrypt::Offsets::FField::NameEncrypted, enc, 16))
+        // Patch 20260421: FField::NamePrivate is a plain uint32 — no decrypt.
+        uint32_t ci = 0;
+        if (!m_reader.Read(ff_addr + ArcDecrypt::Offsets::FField::NamePrivate, &ci, 4))
             return 0;
-
-        // Step 1: PSHUFLW(0x39)
-        __m128i v = _mm_loadl_epi64((const __m128i*)enc);
-        __m128i s1 = _mm_shufflelo_epi16(v, 0x39);
-        // Step 2: ROL64(33)
-        __m128i r = _mm_or_si128(_mm_slli_epi64(s1, 33), _mm_srli_epi64(s1, 31));
-        // Steps 3-5 combined: PSHUFB → XOR(effective_key)
-        // The AND/ANDNOT blend + PXOR combine into: PSHUFB(val) XOR effective_key
-        // where effective_key = flip_mask XOR pxor_key (same for all call sites)
-        alignas(16) static const uint8_t SHUF[16] = {0x07,0x02,0x03,0x06,0x05,0x00,0x01,0x04,0,0,0,0,0,0,0,0};
-        __m128i shuffled = _mm_shuffle_epi8(r, _mm_load_si128((const __m128i*)SHUF));
-        alignas(16) static const uint8_t EFF_KEY[16] = {0x31,0x7E,0x97,0x77,0x56,0x27,0x31,0x31,0,0,0,0,0,0,0,0};
-        __m128i result = _mm_xor_si128(shuffled, _mm_load_si128((const __m128i*)EFF_KEY));
-        // Step 6: ROL64(32) → lo32 = CI
-        uint64_t lo64 = static_cast<uint64_t>(_mm_cvtsi128_si64(result));
-        return static_cast<int32_t>(fn_rotl64(lo64, 32) & 0xFFFFFFFF);
+        return static_cast<int32_t>(ci);
     }
 
     // ── FFieldClass → type name comp_index ───────────────────────────────
@@ -239,78 +270,63 @@ public:
         return 0;
     }
 
-    // ── Step 4-7: comp_index → FNameEntry heap address (patch 20260414) ──
-    // CI is a 29-bit pool index: bits 16..28 = chunk_idx, bits 0..15 = name_offset_word
-    // Chunk header at GNAMES + 0xC8 + chunk_idx*0x40 (stride 0x40).
-    //   chunk_header + 0x08 = per-chunk heap block pointer (unused by this resolver)
-    //   chunk_header + 0x10 = module cache pointer (SHARED across all chunks; same value)
-    // Per game's FNamePool_FindOrAddEntry (sub_2408F0 in qoc9):
-    //   sub_block_addr = module_cache_ptr + ((CI >> 8) & 0x1FFF00)
-    //   FNV hash sub_block_addr+16 to pick block_idx
-    //   Decrypt 2 adjacent 16-byte blocks; combine via FNV-fold; add name_offset.
-    // Block decrypt: PSHUFLW(45) → ROL16(15)
-    // FNV fold: ROL64(57,42), P=0x100000001B3, ADD=0x2AE2DE663CDF7F3A
-    // Pointer fixup: bswap64(R^XOR1) ^ XOR2 → bswap64(^XOR3)
+    // ── Step 4-7: comp_index → FNameEntry heap address (patch 20260421) ──
+    // Derived from sub_242FC0 @ RVA 0x242FC0. Packed CI layout:
+    //   name_offset_word = ci & 0xFFFF
+    //   chunk_off        = (ci >> 8) & 0xFFFF00  (bytes into FNamePool base)
+    // Each chunk at GNAMES + chunk_off holds an FNV seed at +0x6570 and an
+    // 8-way slot array of 32-byte entries at +0x6580. FNV32 picks slot_idx;
+    // the two adjacent 16-byte slots are decrypted and combined via FNV64
+    // fold. The sentinel XOR + bswap chain collapses to `result ^ 0x086B0040`.
     uint64_t ResolveNamePtrFull(int32_t comp_index) {
         if (comp_index <= 0 || !m_keyLoaded) return 0;
 
-        uint32_t ci = static_cast<uint32_t>(comp_index) & 0x1FFFFFFF;
-        uint64_t name_offset    = 2ULL * (ci & 0xFFFF);
-        uint64_t sub_block_off  = (static_cast<uint64_t>(ci) >> 8) & 0x1FFF00ULL;
+        using namespace ArcDecrypt::Patch20260421::FNamePool20260421;
 
-        uint64_t gnames = m_base + FNAME_GNAMES_BASE_OFF;
+        uint32_t ci = static_cast<uint32_t>(comp_index);
+        uint64_t name_offset_word = ci & 0xFFFFu;
+        uint64_t chunk_off        = (static_cast<uint64_t>(ci) >> 8) & 0xFFFF00ULL;
 
-        // Read shared module cache pointer (same value for all chunks; just use chunk 0).
-        uint64_t module_cache = 0;
-        if (!m_reader.Read(gnames + 0xC8 + 0x10, &module_cache, 8) || !module_cache)
-            return 0;
+        uint64_t chunk_base = m_base + FNAME_GNAMES_BASE_OFF + chunk_off;
 
-        uint64_t block_base = module_cache + sub_block_off;
+        // FNV32 on (chunk_base + 25968)
+        uint64_t seed = chunk_base + CHUNK_FNV_SEED_OFF;
+        uint32_t seed_lo = static_cast<uint32_t>(seed);
+        uint32_t seed_hi = static_cast<uint32_t>(seed >> 32);
+        uint32_t h1 = FNV32_PRIME * fn_rotl32(seed_lo, 19) + FNV32_K;
+        uint32_t h2 = FNV32_PRIME * fn_rotl32(h1, 14) + seed_hi + FNV32_K;
+        uint32_t h3 = FNV32_PRIME * fn_rotl32(h2, 19) + FNV32_K;
+        uint32_t v8 = fn_rotl32(h3, 14);
+        uint8_t  v9 = static_cast<uint8_t>(
+            static_cast<uint32_t>(-109 * v8 - 30) ^
+            ((FNV32_PRIME * v8 + FNV32_K) >> 16));
+        unsigned slot_idx = v9 & 7u;
 
-        // Block hash: FNV32 on (block_base + 16)
-        constexpr uint32_t P32 = ArcDecrypt::FNV32_SLOT_PRIME;
-        constexpr uint32_t BK  = ArcDecrypt::FNAME_BHASH_ADD;
-        uint64_t seed = block_base + 16;
-        uint32_t lo = static_cast<uint32_t>(seed);
-        uint32_t hi = static_cast<uint32_t>(seed >> 32);
-        uint32_t h = fn_rotl32(lo, 20);
-        h = P32 * h + BK;
-        h = fn_rotl32(h, 22);
-        h = P32 * h + hi + BK;
-        h = fn_rotl32(h, 20);
-        h = P32 * h + BK;
-        h >>= 10;
-        uint32_t v9 = P32 * h + BK;
-        uint8_t bidx = static_cast<uint8_t>(v9) ^ static_cast<uint8_t>(v9 >> 16);
-
-        // Read two adjacent blocks
-        uint64_t b1_addr = block_base + 32 + 32ULL * (bidx & 7);
-        uint64_t b2_addr = block_base + 32 + 32ULL * ((bidx + 1) & 7);
         alignas(16) uint8_t sb1[16] = {}, sb2[16] = {};
-        if (!m_reader.Read(b1_addr, sb1, 16)) return 0;
-        if (!m_reader.Read(b2_addr, sb2, 16)) return 0;
+        uint64_t s1_addr = chunk_base + CHUNK_SLOT_BASE + 32ULL * slot_idx;
+        uint64_t s2_addr = chunk_base + CHUNK_SLOT_BASE + 32ULL * ((slot_idx + 1) & 7);
+        if (!m_reader.Read(s1_addr, sb1, 16)) return 0;
+        if (!m_reader.Read(s2_addr, sb2, 16)) return 0;
 
-        // Block decrypt: PSHUFLW(45) → ROL16(15)
-        auto decryptBlock = [](__m128i raw) -> uint64_t {
-            __m128i shuf = _mm_shufflelo_epi16(raw, 0x2D);
-            __m128i rot = _mm_or_si128(_mm_slli_epi16(shuf, 15), _mm_srli_epi16(shuf, 1));
-            return static_cast<uint64_t>(_mm_cvtsi128_si64(rot));
+        // Slot decrypt: PSHUFLW(0x93) → ROL32(25) → lo64 → XOR(SLOT_XOR)
+        auto decryptSlot = [](const uint8_t* raw) -> uint64_t {
+            __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(raw));
+            __m128i s = _mm_shufflelo_epi16(v, SLOT_PSHUFLW_IMM);
+            __m128i r = _mm_or_si128(_mm_slli_epi32(s, SLOT_ROL32),
+                                     _mm_srli_epi32(s, 32 - SLOT_ROL32));
+            uint64_t lo64;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo64), r);
+            return lo64 ^ SLOT_XOR;
         };
-        uint64_t v12 = decryptBlock(_mm_load_si128((const __m128i*)sb1));
-        uint64_t v13 = decryptBlock(_mm_load_si128((const __m128i*)sb2));
+        uint64_t v11 = decryptSlot(sb1);
+        uint64_t v13 = decryptSlot(sb2);
 
-        // FNV fold
-        constexpr uint64_t P64 = ArcDecrypt::FNAME_FNV_PRIME;
-        constexpr uint64_t FO  = ArcDecrypt::FNAME_FNV_OFFSET;
-        uint64_t fnv = P64 * fn_rotl64(v12, ArcDecrypt::FNAME_FNV_ROL1) + FO;
-        fnv = P64 * fn_rotl64(fnv, ArcDecrypt::FNAME_FNV_ROL2) + FO;
+        // FNV64 fold on v11
+        uint64_t fnv = FNV64_PRIME * fn_rotl64(v11, FNV64_ROL1) + FNV64_OFF;
+        fnv = FNV64_PRIME * fn_rotl64(fnv, FNV64_ROL2) + FNV64_OFF;
 
-        uint64_t R = v12 + (fnv ^ v13) + name_offset;
-
-        // Pointer fixup chain
-        uint64_t a = __builtin_bswap64(R ^ ArcDecrypt::FNAME_PTR_XOR1);
-        uint64_t b = a ^ ArcDecrypt::FNAME_PTR_XOR2;
-        return __builtin_bswap64(b ^ ArcDecrypt::FNAME_PTR_XOR3);
+        uint64_t result = v11 + (fnv ^ v13) + 2ULL * name_offset_word;
+        return result ^ RESULT_TO_ENTRY_XOR;
     }
 
     uint64_t ResolveNamePtr(int32_t comp_index) {
@@ -343,10 +359,15 @@ public:
         }
     }
 
-    // ── Step 8: read + decrypt FNameEntry string (patch 20260414) ──────────
-    // Header: isWide = bit15 (header < 0 as int16), charCount = header & 0x3FF
-    // ANSI: key = (uint16)(charCount - 25184); buf[i] ^= keyTable[(key+i) & 0x3F] >> 3
-    // Wide: key = charCount + 40352; word[i] ^= keyTable[(key+i) & 0x3F]
+    // ── Step 8: read + decrypt FNameEntry string (patch 20260421) ──────────
+    // Derived from FNameEntry_AppendNameToString[_WithNumber] @ 0x22EC20/0x245880.
+    // New header layout — length bits are scrambled:
+    //   length = (hdr & 3) | ((hdr >> 5) & 0x3FC)
+    //   isWide = bit15 (header < 0 as int16), unchanged
+    // Key schedule:
+    //   key = (uint16)(length - 17564)
+    //   ANSI: byte[i] ^= keyTable[52 + ((key + i) & 0x3F)] >> 3
+    //   Wide: word[i] ^= keyTable[52 + ((key + i) & 0x3F)]
     std::string DecryptNameString(uint64_t name_entry_ptr) {
         if (!name_entry_ptr || !m_keyLoaded) return {};
 
@@ -355,8 +376,7 @@ public:
 
         uint16_t header = static_cast<uint16_t>(header_s);
         bool isWide = (header_s < 0);
-        int charCount = header & 0x3FF;
-        // Be lenient: reject clearly invalid (1023 = max, often stale) but accept the rest
+        int charCount = (header & 3) | ((header >> 5) & 0x3FC);
         if (charCount <= 0 || charCount >= 1023) return {};
 
         int byteCount = isWide ? charCount * 2 : charCount;
@@ -365,17 +385,19 @@ public:
         std::vector<uint8_t> buf(byteCount, 0);
         if (!m_reader.Read(name_entry_ptr + 2, buf.data(), byteCount)) return {};
 
+        constexpr int TBL = ArcDecrypt::Patch20260421::FNameEntry20260421::KEY_TABLE_UINT16_OFFSET;
+        uint16_t key = static_cast<uint16_t>(
+            charCount + ArcDecrypt::Patch20260421::FNameEntry20260421::KEY_START_BIAS);
+
         if (!isWide) {
-            int key = static_cast<uint16_t>(charCount + ArcDecrypt::FNAME_ANSI_KEY_BASE);
             for (int i = 0; i < charCount && i < byteCount; ++i)
-                buf[i] ^= static_cast<uint8_t>(m_keyTable[(key + i) & 0x3F] >> 3);
+                buf[i] ^= static_cast<uint8_t>(m_keyTable[TBL + ((key + i) & 0x3F)] >> 3);
             return std::string(reinterpret_cast<char*>(buf.data()), charCount);
         } else {
             auto* wbuf = reinterpret_cast<uint16_t*>(buf.data());
             int wcharCount = byteCount / 2;
-            int key = charCount + ArcDecrypt::FNAME_WIDE_KEY_BASE;
             for (int i = 0; i < wcharCount; ++i)
-                wbuf[i] ^= m_keyTable[(key + i) & 0x3F];
+                wbuf[i] ^= m_keyTable[TBL + ((key + i) & 0x3F)];
             std::string result;
             result.reserve(wcharCount);
             for (int n = 0; n < wcharCount; ++n)
@@ -533,18 +555,22 @@ public:
         return CompIndexToName(ci);
     }
 
-    // ── Outer pointer from the outer slot ────────────────────────────────
-    // OuterPrivate slot = (class_slot + 1) & 3. Confirmed from sub_1404E2130: `inc r8d; and r8d, 3`.
-    // Pipeline: PSHUFLW(0x93) → XOR(sentinel) → ROL64(15) → ptr.
+    // ── Outer pointer from one of the 4 slots (patch 20260421) ───────────
+    // Tries all 4 slots and returns the first heap-pointer candidate that's
+    // distinct from GetClassPrivate's answer. Good enough for package walks.
     uint64_t GetOuterPtr(uint64_t obj_ptr) {
-        if (!obj_ptr) return 0;
-        uint32_t os   = ArcDecrypt::GetOuterSlotIndex(obj_ptr);
-        uint64_t addr = obj_ptr + 0x20 + static_cast<uint64_t>(os) * 0x20;
-
-        alignas(16) uint8_t enc[16] = {};
-        if (!m_reader.Read(addr, enc, 16)) return 0;
-
-        return DecryptPtrSlot(enc);
+        if (!obj_ptr || !m_keyLoaded) return 0;
+        uint64_t cls = GetClassPrivate(obj_ptr);
+        for (int slot = 0; slot < 4; ++slot) {
+            alignas(16) uint8_t enc[16] = {};
+            uint64_t addr = obj_ptr + 0x20 + static_cast<uint64_t>(slot) * 0x20;
+            if (!m_reader.Read(addr, enc, 16)) continue;
+            uint64_t dec = DecryptUObjSlotNew(enc);
+            if ((dec >> 32) == 0 && dec >= 0x100000ULL && dec < 0x800000000000ULL && dec != cls) {
+                return dec;
+            }
+        }
+        return 0;
     }
 
     // ── Walk outer chain → UPackage pointer ──────────────────────────────
@@ -603,6 +629,10 @@ private:
     alignas(16) uint8_t m_blkHdrAndnot[16];  // block header ANDNOT     (AD305B0)
     alignas(16) uint8_t m_blkHdrShuf[16];    // block header pshufb     (AD2FCC0)
     alignas(16) uint8_t m_blkHdrXor[16];     // block header pxor       (AD305D0)
+
+    // Patch 20260421 UObject slot decrypt constants
+    alignas(16) uint8_t m_uobjShufMask[16] = {};   // (AD128C0) 05,03,01,04,02,07,00,06
+    alignas(16) uint8_t m_uobjXorConst[16] = {};   // (AD128D0) 09,43,BD,C8,4B,4B,BC,FF
 };
 
 // ── Free-function shims ────────────────────────────────────────────────────

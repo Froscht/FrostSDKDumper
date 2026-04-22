@@ -390,7 +390,7 @@ namespace gobjects
         bool StructuralScanFUObjectItems(int32_t max_elements,
                                          std::vector<uint64_t>& out_objects) {
             constexpr uint32_t STRIDE  = ArcDecrypt::Patch20260421::FUOBJECTITEM_STRIDE;
-            constexpr uint32_t MIN_RUN = 500;
+            constexpr uint32_t MIN_RUN = 32;
             const uint64_t vt_lo = m_base + 0x1000;
             const uint64_t vt_hi = m_base + 0x10000000ULL;
 
@@ -429,9 +429,14 @@ namespace gobjects
             }
 
             const uint64_t WIN = 0x10000ULL;
+            // UE allows GC'd/null entries inside a chunk; allow up to
+            // MAX_GAP consecutive nulls before flushing a run, so a partially-
+            // cleared chunk still reports as one contiguous run.
+            constexpr uint32_t MAX_GAP = 64;
             std::vector<uint8_t> buf(WIN);
             uint64_t cur_start = 0;
             uint32_t cur_count = 0;
+            uint32_t cur_gap   = 0;     // consecutive null/bad items
             std::vector<uint64_t> run_starts;
             std::vector<uint32_t> run_counts;
 
@@ -442,6 +447,7 @@ namespace gobjects
                 }
                 cur_start = 0;
                 cur_count = 0;
+                cur_gap = 0;
             };
 
             for (const auto& rg : ranges) {
@@ -459,7 +465,13 @@ namespace gobjects
                             uint64_t vt = 0;
                             ok = m_reader.Read(obj_ptr, &vt, 8) && is_vtable(vt);
                         }
-                        if (!ok) { flush(); continue; }
+                        if (!ok) {
+                            if (cur_count == 0) continue;   // not in a run
+                            if (++cur_gap > MAX_GAP) { flush(); }
+                            else { cur_count++; }            // count the null slot in the run
+                            continue;
+                        }
+                        cur_gap = 0;
                         if (cur_count == 0) cur_start = page + off;
                         cur_count++;
                     }

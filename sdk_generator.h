@@ -677,10 +677,15 @@ public:
 
             // Validate property: reject obviously garbage entries
             // Property offsets rarely exceed 0x10000 (64KB). Array dims rarely > 256.
-            if (pr.offset > 0x20000 || pr.array_dim > 1024 || pr.elem_size > 0x10000) {
-                // Chain has gone bad — stop walking
+            // Patch 20260421: Offset_Internal location not yet confirmed, so the
+            // `offset` field is often 0 (or the old-patch decrypt of 0 produces a
+            // huge bogus value). Don't bail out on offset alone — check only the
+            // easy sanity checks (array_dim and elem_size) and zero the offset
+            // if it looks out of range so the downstream writer doesn't print it.
+            if (pr.array_dim > 1024 || pr.elem_size > 0x10000) {
                 break;
             }
+            if (pr.offset > 0x20000) pr.offset = 0;
 
             bool is_struct = pr.type_name == "FStructProperty";
             bool is_array  = pr.type_name == "FArrayProperty";
@@ -851,10 +856,11 @@ public:
             fr.name = m_fname.GetName(fn_addr);
             if (fr.name.empty()) fr.name = "<unnamed_func>";
 
-            // UFunction params are FFields in ChildProperties (+0x100) in patch 20260414.
-            // Scan typical FField-chain offsets (matches per-class scan strategy).
+            // UFunction params: for patch 20260421 the FField chain head is at +0xC8
+            // (= UStruct::ChildProperties). Keep a range scan so we also catch 20260414-
+            // style functions that put the param head at +0xE0..0x110.
             std::unordered_set<std::string> seen;
-            for (int co = 0xE0; co <= 0x110; co += 8) {
+            for (int co = 0xC0; co <= 0x110; co += 8) {
                 uint64_t head = Read<uint64_t>(fn_addr + co);
                 if (head <= 0x10000 || head >= 0x800000000000ULL) continue;
                 uint64_t hvt = Read<uint64_t>(head);

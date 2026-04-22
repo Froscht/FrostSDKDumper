@@ -104,12 +104,12 @@ namespace Offsets {
         constexpr uint64_t FieldsSlots  = 0x20; // slots at obj+0x20,+0x40,+0x60,+0x80 (stride 0x20)
     }
     namespace FField {
-        // Patch 20260414: FField layout (compacted from 0x160)
-        constexpr uint64_t VTable       = 0x00;
-        constexpr uint64_t NameEncrypted = 0x90;  // 16B encrypted FName (was 0xA0)
-        constexpr uint64_t Next         = 0xA8;   // plain FField* (was 0xB8)
-        constexpr uint64_t ClassPrivate = 0xB0;   // FFieldClass* (was 0x150)
-        constexpr uint64_t NamePrivate  = 0x90;   // encrypted, use DecryptFFieldName (was 0xA0)
+        // Patch 20260421: FField simplified — NamePrivate is plain uint32 at +0x90.
+        constexpr uint64_t VTable        = 0x00;
+        constexpr uint64_t NamePrivate   = 0x90;   // plain uint32 CI (was encrypted 16B)
+        constexpr uint64_t NameEncrypted = 0x90;   // kept as alias for callers that loaded 16B
+        constexpr uint64_t Next          = 0x98;   // FField* (was 0xA8 in 20260414)
+        constexpr uint64_t ClassPrivate  = 0xA0;   // FFieldClass* (was 0xB0 in 20260414)
     }
     namespace FFieldClass {
         // Confirmed from live FFieldClass objects (e.g. 0xBDF31C00), patch 20260402
@@ -117,12 +117,18 @@ namespace Offsets {
         // NamePrivate: no fixed SIMD slot found; type identified via vtable map instead
     }
     namespace FProperty {
-        // Patch 20260414: FField compacted
-        constexpr uint64_t ArrayDim        = 0xD8;   // uint32 (was 0x11C)
-        constexpr uint64_t ElementSize     = 0xDC;   // uint32 (was 0x120)
-        constexpr uint64_t Offset_Internal = 0xEC;   // encrypted uint32 → bswap32(stored ^ Offset_XOR) (was 0xE0)
-        constexpr uint32_t Offset_XOR      = 0x2AB03FD6u;  // XOR key for offset decrypt (was 0x8CCB9FAD)
-        constexpr uint64_t PropertyFlags   = 0xE0;   // uint32 property flags (was 0x110) — TODO: verify with IDA
+        // Patch 20260421: verified via live probe of UFunction params.
+        // ArrayDim plain u32 at +0xF8 (was 0xD8 in 20260414).
+        // ElementSize plain u32 at +0x118 (was 0xDC).
+        // Offset_Internal: location not yet verified for 20260421 —
+        //   OLD patches used +0xEC encrypted with bswap32(stored^0x2AB03FD6).
+        //   Left in place; if offsets come out wrong, probe a real class member
+        //   via a property whose offset we know (e.g. AActor::RootComponent).
+        constexpr uint64_t ArrayDim        = 0xF8;   // uint32
+        constexpr uint64_t ElementSize     = 0x118;  // uint32
+        constexpr uint64_t Offset_Internal = 0xEC;   // (unverified for 20260421)
+        constexpr uint32_t Offset_XOR      = 0x2AB03FD6u;
+        constexpr uint64_t PropertyFlags   = 0xE0;
     }
     namespace FBoolProperty {
         // TODO: re-verify for patch 20260402; previous values assumed UE5 default layout
@@ -156,10 +162,14 @@ namespace Offsets {
         constexpr uint64_t PropertyFlags   = 0x70;  // plain uint64
     }
     namespace UStruct {
-        constexpr uint64_t SuperStruct     = 0x0A8;
-        constexpr uint64_t Children        = 0x0E0;  // UField* chain (was 0xD0)
-        constexpr uint64_t ChildProperties = 0x100;  // FField* chain (was 0xC0)
-        constexpr uint64_t PropertiesSize  = 0x108;  // was 0xD8
+        // Patch 20260421: layout verified by probing live ControlRigComponent @ 0x78933D00.
+        // +0xD0 holds the FField chain with real per-class records; +0xC8 holds a
+        // shared singleton-like node that walks to an empty sentinel.
+        constexpr uint64_t SuperStruct     = 0x0B0;  // was 0xA8
+        constexpr uint64_t Children        = 0x0C8;  // UField* sentinel (empty end marker)
+        constexpr uint64_t ChildProperties = 0x0D0;  // FField* chain (real records)
+        constexpr uint64_t PropertiesSize  = 0x118;  // uint32 sizeof(struct) (was 0x108)
+        constexpr uint64_t MinAlignment    = 0x0F8;  // uint32
     }
     namespace UEnum {
         constexpr uint64_t Names = 0xB0;  // patch 20260414 (was 0xA8 in 20260409). +0xA0 holds CppType FString.
@@ -378,6 +388,87 @@ namespace Patch20260421 {
         uint64_t lo;
         _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo), c);
         return lo;
+    }
+
+    // =========================================================================
+    // UObject NamePrivate/ClassPrivate/OuterPrivate slot decrypt (patch 20260421)
+    // — from sub_24DEB60 @ 0x24DEB60. Slot layout unchanged from prior patches:
+    //   4 slots at obj+0x20, +0x40, +0x60, +0x80 (stride 0x20).
+    // Decrypt (on the 16-byte slot): PSHUFLW(0xB1) → ROL32(15) per lane
+    //   → PSHUFB(mask_AD128C0) → XOR(const_AD128D0) → take lo64.
+    // Result: if the slot holds an FName, lo64 = (CI << 32) | Number.
+    //         if it holds a pointer (Class/Outer), lo64 = heap pointer.
+    // =========================================================================
+    namespace UObjSlot20260421 {
+        constexpr uint64_t RVA_SHUF_MASK = 0xAD128C0;  // 05 03 01 04 02 07 00 06
+        constexpr uint64_t RVA_XOR_CONST = 0xAD128D0;  // 09 43 BD C8 4B 4B BC FF
+        constexpr int      PSHUFLW_IMM   = 0xB1;
+        constexpr int      ROL32_AMT     = 15;
+        // Slot base offset and stride (same as older patches).
+        constexpr int      SLOT_BASE_OFF = 0x20;
+        constexpr int      SLOT_STRIDE   = 0x20;
+    }
+
+    // =========================================================================
+    // FNamePool resolve pipeline (patch 20260421) — from sub_242FC0 @ 0x242FC0
+    //
+    // Input: si128 = a 16-byte CI-encoded FName slot (output of the UObject
+    // slot decrypt chain, or equivalent — see FName_ToString).
+    // Output: FNameEntry* pointer on the heap.
+    // =========================================================================
+    namespace FNamePool20260421 {
+        // Chunk header access: per-chunk data begins at RVA_GNAMES_BASE+chunk_off.
+        // Inside each chunk:
+        //   +25968 (= 0x6570): 16-byte region hashed by FNV32 to pick a slot
+        //   +25984 (= 0x6580): 8-slot array of 32-byte entries (2x 16-byte blocks)
+        constexpr uint64_t CHUNK_FNV_SEED_OFF = 25968;
+        constexpr uint64_t CHUNK_SLOT_BASE    = 25984;
+
+        // CI decode (from si128): PSHUFLW(57)→PSRLD(6)→PSHUFB(mask)→cvtsi128_si32
+        // Then name_offset = v5 & 0xFFFF, chunk_off_in_pool = (v5 >> 8) & 0xFFFF00
+        constexpr uint64_t RVA_CI_PSHUFB_MASK = 0xACF8D20;  // {06,00,01,04, 00*12}
+
+        // FNV32 hash constants (pick slot_idx)
+        constexpr uint32_t FNV32_PRIME = 0x01000193u;
+        constexpr uint32_t FNV32_K     = 0xCA3F9BE2u;        // (signed) -901800990
+
+        // Slot decrypt: PSHUFLW(0x93) → ROL32(25) → lo64 → XOR(SLOT_XOR)
+        constexpr uint64_t SLOT_XOR    = 0x662CF9C2408E7B59ULL;
+        constexpr int      SLOT_ROL32  = 25;
+        constexpr int      SLOT_PSHUFLW_IMM = 0x93;
+
+        // FNV64 fold on v11 (first slot decrypted):
+        //   fnv = P64 * ROL64(P64 * ROL64(v11, 51) + OFF, 38) + OFF
+        constexpr uint64_t FNV64_PRIME  = 0x100000001B3ULL;
+        constexpr uint64_t FNV64_OFF    = 0xA369D63928ACD6A2ULL; // -0x5C9629C6D753295E
+        constexpr int      FNV64_ROL1   = 51;
+        constexpr int      FNV64_ROL2   = 38;
+
+        // Final: result = v11 + (fnv ^ v13) + 2*name_offset_word
+        // sub_242FC0 writes:    var_50 = bswap64(result ^ 0x3517B019)
+        // sub_23B380 computes:  v19 = var_50 ^ 0x40006B0800000000
+        // FName_ToString:       entry_ptr = bswap64(v19 ^ 0x59B07C3D00000000)
+        // All XORs collapse: entry_ptr = result
+        //   bswap64(S) for S=0x40006B0800000000 = 0x086B0040
+        //   bswap64(T) for T=0x59B07C3D00000000 = 0x3D7CB059
+        //   0x3517B019 ^ 0x086B0040 ^ 0x3D7CB059 = 0  → entry_ptr == result
+        constexpr uint64_t RESULT_TO_ENTRY_XOR = 0;
+    }
+
+    // =========================================================================
+    // FNameEntry string decrypt (patch 20260421) — from FNameEntry_AppendNameToString
+    //
+    // Header layout CHANGED (bits scrambled):
+    //   length  = (hdr & 3) | ((hdr >> 5) & 0x3FC)
+    //   isWide  = (hdr >> 15) & 1   (unchanged)
+    //
+    // Key table base offset 0xDA547F4 (unchanged), but decrypt accesses
+    //   key_table[52 + ((key_start + i) & 0x3F)]
+    // i.e. 52*2 = 104 bytes into the table symbol. Starting key = length-17564.
+    // =========================================================================
+    namespace FNameEntry20260421 {
+        constexpr int      KEY_TABLE_UINT16_OFFSET = 52;
+        constexpr int32_t  KEY_START_BIAS          = -17564;
     }
 
     // Decrypt the NumElements/MaxElements stored at chunks_manager + 0x70.
