@@ -198,20 +198,45 @@ public:
     //   lo32 in heap range & hi32 == 0 → pointer (Class/Outer/etc.)
     int32_t GetCompIndex(uint64_t obj_base) {
         if (!obj_base || !m_keyLoaded) return 0;
-        // FName shape: decrypted slot = (CI << 32) | Number.
-        // UE auto-numbers names (Actor_7, Pawn_362…); Number is stored in lo32
-        // and *can* be non-zero for a perfectly valid FName. Gate only on CI
-        // (hi32) being in the plausible pool range — Class/Outer slots decrypt
-        // to pointer-shaped values where hi32==0, so they don't slip through.
+        // Decrypted slot = (CI << 32) | Number  (for FName slots)
+        //                = 64-bit heap pointer  (for Class/Outer slots)
+        // Blueprint-derived classes have a 64-bit heap pointer like
+        // 0x0000000175544A900 — hi32=0x17 passes the old CI<cap gate, so
+        // we'd pick a bogus CI of 23. Rank candidates:
+        //   Tier 1: lo32 == 0 AND hi32 in CI range → unambiguous FName.
+        //   Tier 2: lo32 < 0x100000 (small Number — UE numbering usually
+        //           stays well below that) AND hi32 in CI range.
+        //   Tier 3: fall through, just use the first CI-shaped slot as last
+        //           resort so we don't regress the non-numbered case.
+        alignas(16) uint8_t enc[4][16] = {};
+        uint64_t dec[4] = {};
+        bool valid[4] = {};
         for (int slot = 0; slot < 4; ++slot) {
-            alignas(16) uint8_t enc[16] = {};
             uint64_t addr = obj_base + 0x20 + static_cast<uint64_t>(slot) * 0x20;
-            if (!m_reader.Read(addr, enc, 16)) continue;
-            uint64_t dec = DecryptUObjSlotNew(enc);
-            uint32_t hi32 = static_cast<uint32_t>(dec >> 32);
-            if (hi32 > 0 && hi32 < 0x2000000) {
-                return static_cast<int32_t>(hi32);
-            }
+            if (!m_reader.Read(addr, enc[slot], 16)) continue;
+            dec[slot] = DecryptUObjSlotNew(enc[slot]);
+            valid[slot] = true;
+        }
+        auto is_ci = [](uint32_t h) { return h > 0 && h < 0x2000000u; };
+        // Tier 1
+        for (int s = 0; s < 4; ++s) {
+            if (!valid[s]) continue;
+            uint32_t lo = static_cast<uint32_t>(dec[s]);
+            uint32_t hi = static_cast<uint32_t>(dec[s] >> 32);
+            if (lo == 0 && is_ci(hi)) return static_cast<int32_t>(hi);
+        }
+        // Tier 2
+        for (int s = 0; s < 4; ++s) {
+            if (!valid[s]) continue;
+            uint32_t lo = static_cast<uint32_t>(dec[s]);
+            uint32_t hi = static_cast<uint32_t>(dec[s] >> 32);
+            if (lo < 0x100000u && is_ci(hi)) return static_cast<int32_t>(hi);
+        }
+        // Tier 3
+        for (int s = 0; s < 4; ++s) {
+            if (!valid[s]) continue;
+            uint32_t hi = static_cast<uint32_t>(dec[s] >> 32);
+            if (is_ci(hi)) return static_cast<int32_t>(hi);
         }
         return 0;
     }
