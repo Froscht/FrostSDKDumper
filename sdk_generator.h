@@ -1856,24 +1856,6 @@ public:
                 uint64_t names_ptr = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names);
                 uint32_t names_cnt = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 8);
 
-                // DEBUG: log empty-body enum addresses + bytes 0x80..0x180 to file
-                if (!names_ptr || names_cnt == 0 || names_cnt >= 4096) {
-                    static FILE* dbg = std::fopen("/tmp/empty_enum_probe.txt", "w");
-                    if (dbg) {
-                        std::fprintf(dbg, "ADDR=0x%llX NAME=%s PKG=%s\n",
-                            (unsigned long long)obj_ptr, short_name.c_str(), pkg.c_str());
-                        for (int row = 0; row < 16; ++row) {
-                            uint64_t a = obj_ptr + 0x80 + row * 16;
-                            uint64_t lo = Read<uint64_t>(a);
-                            uint64_t hi = Read<uint64_t>(a + 8);
-                            std::fprintf(dbg, "  +0x%03X: %016llX %016llX\n",
-                                0x80 + row * 16,
-                                (unsigned long long)lo, (unsigned long long)hi);
-                        }
-                        std::fflush(dbg);
-                    }
-                }
-
                 if (names_ptr && names_cnt > 0 && names_cnt < 4096) {
                     // Patch 20260428: entries are TPair<FName, int64> stride 16:
                     //   +0  uint32  FName.lo32 = direct FNamePool index (no obfuscation)

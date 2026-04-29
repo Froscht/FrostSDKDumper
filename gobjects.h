@@ -364,6 +364,33 @@ namespace gobjects
         }
 
     private:
+        struct Region { uint64_t lo, hi; };
+        // Parse /proc/<pid>/maps and append every rw- region whose size falls
+        // in [min_sz, max_sz] and which doesn't overlap the loaded module image.
+        // Used by ScanByVtable, ProbeChunkTableNoPEB, and the structural FUObjectItem
+        // walker — all three need the same heap-region enumeration.
+        void EnumerateRwHeapRegions(uint64_t min_sz, uint64_t max_sz,
+                                    std::vector<Region>& out) const {
+            if (m_pid <= 0) return;
+            char path[64];
+            std::snprintf(path, sizeof(path), "/proc/%d/maps", m_pid);
+            FILE* f = std::fopen(path, "r");
+            if (!f) return;
+            char line[512];
+            while (std::fgets(line, sizeof(line), f)) {
+                uint64_t s = 0, e = 0;
+                char perms[5] = {};
+                std::sscanf(line, "%llx-%llx %4s",
+                    (unsigned long long*)&s, (unsigned long long*)&e, perms);
+                if (perms[0] != 'r' || perms[1] != 'w') continue;
+                uint64_t sz = e - s;
+                if (sz < min_sz || sz > max_sz) continue;
+                if (s >= m_base && s < m_base + 0x10000000ULL) continue;
+                out.push_back({s, e});
+            }
+            std::fclose(f);
+        }
+
         uint64_t       m_base;
         IMemoryReader& m_reader;
         uint64_t       m_arrayBase;
@@ -405,25 +432,126 @@ namespace gobjects
         // decrypt shape):
         //   raw     = load 8B from GUObjectArray + 0xB0
         //   shuf    = PSHUFLW(raw, 0x1E)
-        //   xored   = shuf XOR qword[0xAD0FE50]   (= 0xC8727080CA112779)
+        //   xored   = shuf XOR qword[0xAD0FE50]   (verified bytes
+        //               38 BA 6F 75 E8 89 57 36 = 0x365789E8756FBA38;
+        //             this RVA is FField_NamePrivate_XOR_Const_20260428 in IDA)
         //   chunks_manager = ROL16(xored, 1) per uint16-lane
         //
         // Total NumElements decrypt (from inline asm in sub_398180):
         //   total = ROL32(*(u32*)(chunks_manager + 0x14) ^ 0xC88F6121, 17)
         //         ^ 0x4CF4AED0
         //
-        // chunk_table decrypt (vtable[5] of *(u64*)(chunks_manager + 0x80),
-        // bytes verified live at 0x140498D60 — pure inline SIMD, no VMP):
-        //   blob   = load 8B from chunks_manager + 0xB0
-        //   ROL32(blob, 9) per dword
-        //   PSHUFLW(_, 0x39)
-        //   ROL32(_, 1) per dword
-        //   key    = (PEB + 0xAD77D882) broadcast as {lo32,hi32,lo32,hi32}
+        // chunk_table decrypt (vt[5] of *(u64*)(chunks_manager + 0x80),
+        // live-RE'd 2026-04-29 from sub_49AC60 — pure inline SIMD with PEB,
+        // no VMP, returns chunk_table base in xmm0):
+        //   blob   = load 8B from chunks_manager + 0xB0   (rdx → xmm0)
+        //   ROL16(blob, 13) per word    (psllw 13 | psrlw 3)
+        //   PSHUFLW(_, 0x8D)
+        //   ROL32(_, 10) per dword      (pslld 10 | psrld 22)
+        //   key    = (PEB + 0x647A6348) broadcast as {lo32,hi32,lo32,hi32}
+        //                              ^^^ this CONST is per-binary; lives at
+        //                              RVA 0x49AC65 (5 bytes after the function
+        //                              entry — `mov eax, imm32`). Read live.
         //   chunk_table = lo64(_ XOR key)
+        //
+        // PEB on Wine: gs:[0x60] in-process; externally located at one of the
+        // standard candidate addresses (0x7FFD0000 etc.) and validated via
+        // PEB_LDR_DATA.Length == 0x58. See FindPEB() below.
+        //
+        // No-PEB fallback: if FindPEB() fails or the SIMD output looks bogus,
+        // ProbeChunkTableNoPEB() scans all rw heap regions for a 16B-aligned
+        // pointer-array shape (≥3 entries, all in heap range, slot 0 of chunk[0]
+        // holds a UObject with vtable in module range).
         //
         // chunk_table[ci] points 8 bytes INTO each chunk's heap allocation
         // (the 8B header at chunk_ptr - 8 holds the per-chunk capacity, e.g.
         // 0x10000 = 65536). FUObjectItem array starts at chunk_ptr + 0.
+
+        // ── PEB-free chunk_table locator ─────────────────────────────────
+        // Walk all rw regions and find an 8-byte-aligned uint64_t array of
+        // exactly `num_chunks` entries where every entry points to a heap
+        // allocation whose first slot holds a real UObject (vtable in module
+        // range). Used as a fallback when the SIMD/PEB pipeline fails.
+        //
+        // The shape constraint (num_chunks consecutive heap pointers, each
+        // backed by a UObject*) is restrictive enough that we essentially
+        // never get a false positive even on multi-GB heaps.
+        uint64_t ProbeChunkTableNoPEB(uint32_t num_chunks,
+                                       uint64_t vt_lo, uint64_t vt_hi) {
+            if (m_pid <= 0 || num_chunks == 0 || num_chunks > 64) return 0;
+
+            std::vector<Region> ranges;
+            ranges.reserve(64);
+            // Chunk-tables live in small dedicated allocations; engine
+            // bookkeeping is at the small end of the heap.
+            EnumerateRwHeapRegions(0x1000ULL, 0xC800000ULL, ranges);
+
+            // Pre-build the set of all rw-heap regions so we can verify each
+            // candidate chunk-pointer points into one of them.
+            auto inAnyHeap = [&](uint64_t p) {
+                for (const auto& rg : ranges) if (p >= rg.lo && p < rg.hi) return true;
+                return false;
+            };
+
+            const uint64_t CHUNK = 0x400000ULL;
+            std::vector<uint8_t> buf(CHUNK);
+
+            for (const auto& rg : ranges) {
+                for (uint64_t base_addr = rg.lo; base_addr < rg.hi; base_addr += CHUNK) {
+                    uint64_t want = std::min<uint64_t>(CHUNK, rg.hi - base_addr);
+                    if (!m_reader.Read(base_addr, buf.data(), want)) continue;
+                    // Walk every 8-byte-aligned position. We accept the FIRST
+                    // position that has num_chunks consecutive heap pointers
+                    // whose chunk[0] looks like a real FUObjectItem array.
+                    for (size_t off = 0; off + 8ULL * num_chunks <= want; off += 8) {
+                        // Quick reject: first qword must be a heap pointer.
+                        uint64_t cp0 = 0;
+                        std::memcpy(&cp0, buf.data() + off, 8);
+                        if (cp0 < 0x10000ULL || cp0 >= 0x800000000000ULL) continue;
+                        if (!inAnyHeap(cp0)) continue;
+
+                        // All N entries must be heap pointers.
+                        bool all_heap = true;
+                        for (uint32_t i = 1; i < num_chunks; ++i) {
+                            uint64_t cp = 0;
+                            std::memcpy(&cp, buf.data() + off + 8ULL*i, 8);
+                            if (cp < 0x10000ULL || cp >= 0x800000000000ULL ||
+                                !inAnyHeap(cp)) { all_heap = false; break; }
+                        }
+                        if (!all_heap) continue;
+
+                        // chunk[0] slot 0 must hold a UObject* with vtable
+                        // in module range. This is the load-bearing check
+                        // that separates real chunk-tables from incidental
+                        // pointer arrays (e.g. TArray data, vtable arenas).
+                        uint64_t obj0 = 0;
+                        if (!m_reader.Read(cp0, &obj0, 8)) continue;
+                        if (obj0 < 0x10000ULL || obj0 >= 0x800000000000ULL) continue;
+                        uint64_t vt0 = 0;
+                        if (!m_reader.Read(obj0, &vt0, 8)) continue;
+                        if (vt0 < vt_lo || vt0 >= vt_hi) continue;
+
+                        // Optional: chunk_ptr[0]-8 should hold the chunk
+                        // capacity (0x10000 = 65536). This is a second-tier
+                        // confirmation; if it doesn't match we still accept
+                        // the candidate (some chunk allocators may not use
+                        // the -8 header convention).
+                        uint64_t cap = 0;
+                        if (cp0 >= 8) m_reader.Read(cp0 - 8, &cap, 8);
+                        std::printf("[canon28] heap-scan candidate @ 0x%llX: "
+                                    "cp0=0x%llX cap-8=0x%llX obj0=0x%llX vt0=0x%llX\n",
+                            (unsigned long long)(base_addr + off),
+                            (unsigned long long)cp0,
+                            (unsigned long long)cap,
+                            (unsigned long long)obj0,
+                            (unsigned long long)vt0);
+                        return base_addr + off;
+                    }
+                }
+            }
+            return 0;
+        }
+
         bool CanonicalChunkWalk20260428(std::vector<uint64_t>& out_objects,
                                         int32_t& out_num_elements) {
             uint64_t base = m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE;
@@ -478,63 +606,160 @@ namespace gobjects
             std::printf("[canon28] total NumElements = %u (decrypted from chunks_mgr+0x14)\n",
                 total);
 
-            // Step 3: decrypt chunk_table base via vtable[5] pipeline.
-            // We need PEB; if not yet probed, do it now.
-            if (!m_pebAddr) {
-                m_pebAddr = FindPEB();
-                if (!m_pebAddr) {
-                    std::printf("[canon28] PEB not found — vtable[5] decrypt requires it\n");
-                    return false;
-                }
-                std::printf("[canon28] PEB = 0x%llX\n", (unsigned long long)m_pebAddr);
-            }
+            // Step 3: decrypt chunk_table base.
+            //
+            // Two paths, tried in order:
+            //   (a) SIMD pipeline (replicates the inline asm at sub_49AC60 vt[5]).
+            //       Needs PEB + a per-binary "mov eax, imm32" constant which we
+            //       read live from the binary at RVA 0x49AC65. The SIMD output
+            //       is validated by reading slot[0] of chunk[0] and checking it
+            //       holds a UObject* whose vtable lies in module range.
+            //   (b) PEB-free heap scan (ProbeChunkTableNoPEB). Walks all rw
+            //       heap regions and finds an 8-byte-aligned array of N>=1
+            //       chunk pointers (each pointing into a heap allocation
+            //       whose first slot holds a real UObject).
+            //
+            // Either path independently produces the chunk_table; if (a) fails,
+            // we try (b). This makes the walker robust against PEB shifts and
+            // per-session keystream variation in the SIMD const RVA.
 
-            alignas(16) uint8_t enc_table[16] = {};
-            if (!m_reader.Read(chunks_manager + 0xB0, enc_table, 16)) {
-                std::printf("[canon28] read chunks_manager+0xB0 failed\n");
-                return false;
-            }
-            uint32_t dw[4];
-            std::memcpy(dw, enc_table, 16);
-            // ROL32(9) per dword
-            for (int i = 0; i < 4; ++i)
-                dw[i] = (dw[i] << 9) | (dw[i] >> 23);
-            // PSHUFLW(0x39): operates on low 4 words = lo 2 dwords. imm 0x39 = idx [1,2,3,0]
-            uint16_t lo_w[4];
-            std::memcpy(lo_w, dw, 8);
-            uint16_t shuf_w[4] = { lo_w[1], lo_w[2], lo_w[3], lo_w[0] };
-            uint32_t shuf_dw[2];
-            std::memcpy(shuf_dw, shuf_w, 8);
-            dw[0] = shuf_dw[0];
-            dw[1] = shuf_dw[1];
-            // ROL32(1) per dword
-            for (int i = 0; i < 4; ++i)
-                dw[i] = (dw[i] << 1) | (dw[i] >> 31);
-            // XOR broadcast(PEB + 0xAD77D882) as {lo32,hi32,lo32,hi32}
-            uint64_t key64 = (m_pebAddr + 0xAD77D882ULL) & 0xFFFFFFFFFFFFFFFFULL;
-            uint32_t kl = static_cast<uint32_t>(key64 & 0xFFFFFFFF);
-            uint32_t kh = static_cast<uint32_t>(key64 >> 32);
-            dw[0] ^= kl; dw[1] ^= kh; dw[2] ^= kl; dw[3] ^= kh;
-            uint64_t chunk_table = (static_cast<uint64_t>(dw[1]) << 32) | dw[0];
-
-            if (chunk_table < 0x10000ULL || chunk_table >= 0x800000000000ULL) {
-                std::printf("[canon28] chunk_table 0x%llX out of range (PEB=0x%llX)\n",
-                    (unsigned long long)chunk_table, (unsigned long long)m_pebAddr);
-                return false;
-            }
-            std::printf("[canon28] chunk_table = 0x%llX\n", (unsigned long long)chunk_table);
-
-            // Step 4: walk chunks. ceil(total/65536).
             constexpr uint32_t ITEMS_PER_CHUNK = 65536;
             constexpr uint32_t STRIDE = 20;
             uint32_t num_chunks = (total + ITEMS_PER_CHUNK - 1) / ITEMS_PER_CHUNK;
             const uint64_t vt_lo = m_base + 0x1000;
             const uint64_t vt_hi = m_base + 0x10000000ULL;
 
-            // Read all chunk pointers up-front.
+            alignas(16) uint8_t enc_table[16] = {};
+            if (!m_reader.Read(chunks_manager + 0xB0, enc_table, 16)) {
+                std::printf("[canon28] read chunks_manager+0xB0 failed\n");
+                return false;
+            }
+
+            uint64_t chunk_table = 0;
+
+            // ── Path (a): SIMD with PEB ──────────────────────────────────
+            // Pipeline (live-RE'd from sub_49AC60 on patch 20260428):
+            //   xmm0 = movq([rdx])              # rdx = chunks_mgr+0xB0 stack copy
+            //   xmm0 = ROL16(xmm0, 13) per word
+            //   xmm1 = PSHUFLW(xmm0, 0x8D)      # idx [1,3,0,2]
+            //   xmm1 = ROL32(xmm1, 10) per dword
+            //   rax  = (gs:[0x60] + 0x647A6348) # PEB + per-binary imm32
+            //   xmm0 = pshufd(broadcast(rax), 0x44) # {lo32,hi32,lo32,hi32}
+            //   ret xmm1 ^ xmm0  → chunk_table = lo64
+            //
+            // The 4-byte imm32 is the immediate of the `mov eax, imm32`
+            // instruction at function-entry+5. Reading it live makes us
+            // robust against patch-day randomization of this constant.
+            //
+            // RVA 0x49AC60 is the entry of the chunk_table-decrypt SIMD
+            // function (= vt[5] of *(chunks_manager+0x80)) on patch 20260428.
+            // If patch shifts this RVA, both the SIMD path and the const-read
+            // will fail; path (b) catches that case.
+            constexpr uint64_t RVA_CHUNK_TABLE_DECRYPT_FN = 0x49AC60;
+            uint32_t peb_add_const = 0;
+            bool have_peb_const = m_reader.Read(
+                m_base + RVA_CHUNK_TABLE_DECRYPT_FN + 5, &peb_add_const, 4);
+            if (have_peb_const) {
+                std::printf("[canon28] PEB-add const (read live @ RVA 0x%llX+5) = 0x%08X\n",
+                    (unsigned long long)RVA_CHUNK_TABLE_DECRYPT_FN, peb_add_const);
+            } else {
+                std::printf("[canon28] failed to read PEB-add const at RVA 0x%llX+5\n",
+                    (unsigned long long)RVA_CHUNK_TABLE_DECRYPT_FN);
+            }
+
+            auto runSimdDecrypt = [&](uint64_t peb_addr) -> uint64_t {
+                if (!have_peb_const) return 0;
+                uint16_t w[4];
+                std::memcpy(w, enc_table, 8);
+                // ROL16(13) per word — no shared helper for 16-bit rotates.
+                for (int i = 0; i < 4; ++i)
+                    w[i] = static_cast<uint16_t>((w[i] << 13) | (w[i] >> 3));
+                // PSHUFLW imm=0x8D → idx [1,3,0,2] (b'10001101' lo→hi)
+                uint16_t shuf_w[4] = { w[1], w[3], w[0], w[2] };
+                uint32_t d[2];
+                std::memcpy(d, shuf_w, 8);
+                d[0] = ArcDecrypt::ROL32(d[0], 10);
+                d[1] = ArcDecrypt::ROL32(d[1], 10);
+                uint64_t key64 = peb_addr + static_cast<uint64_t>(peb_add_const);
+                d[0] ^= static_cast<uint32_t>(key64);
+                d[1] ^= static_cast<uint32_t>(key64 >> 32);
+                return (static_cast<uint64_t>(d[1]) << 32) | d[0];
+            };
+
+            auto validateChunkTable = [&](uint64_t cand) -> bool {
+                if (cand < 0x10000ULL || cand >= 0x800000000000ULL) return false;
+                // chunk_table[0] should be a heap pointer whose +0 holds a UObject.
+                uint64_t cp0 = 0;
+                if (!m_reader.Read(cand, &cp0, 8)) return false;
+                if (cp0 < 0x10000ULL || cp0 >= 0x800000000000ULL) return false;
+                uint64_t obj0 = 0;
+                if (!m_reader.Read(cp0, &obj0, 8)) return false;
+                if (obj0 < 0x10000ULL || obj0 >= 0x800000000000ULL) return false;
+                uint64_t vt0 = 0;
+                if (!m_reader.Read(obj0, &vt0, 8)) return false;
+                return vt0 >= vt_lo && vt0 < vt_hi;
+            };
+
+            if (have_peb_const) {
+                // Try cached PEB first, then full discovery list.
+                if (m_pebAddr) {
+                    uint64_t ct = runSimdDecrypt(m_pebAddr);
+                    if (validateChunkTable(ct)) {
+                        chunk_table = ct;
+                        std::printf("[canon28] chunk_table = 0x%llX (cached PEB 0x%llX)\n",
+                            (unsigned long long)ct, (unsigned long long)m_pebAddr);
+                    }
+                }
+                // Sweep the standard PEB ranges page-by-page. The candidates
+                // listed in the IDA RE pass (0x7FFD0000 etc.) all fall inside
+                // these sweeps so a separate candidate list is redundant.
+                if (!chunk_table) {
+                    auto sweep = [&](uint64_t lo, uint64_t hi, uint64_t step) {
+                        for (uint64_t cand = lo; cand < hi; cand += step) {
+                            uint64_t ct = runSimdDecrypt(cand);
+                            if (validateChunkTable(ct)) {
+                                chunk_table = ct;
+                                m_pebAddr = cand;
+                                std::printf("[canon28] chunk_table = 0x%llX (PEB @ 0x%llX)\n",
+                                    (unsigned long long)ct, (unsigned long long)cand);
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+                    if (!sweep(0x7FF00000, 0x7FFE0000, 0x10000))
+                        sweep(0x00010000, 0x00200000, 0x10000);
+                }
+            }
+
+            // ── Path (b): no-PEB heap scan ───────────────────────────────
+            // Walk all rw regions and find an aligned uint64_t array shaped
+            // like a chunk-table: at least N consecutive entries, each into
+            // a heap allocation whose +0 is a UObject* with vtable in module
+            // range. We require N == num_chunks (computed from `total`) so
+            // false positives are vanishingly rare.
+            if (!chunk_table) {
+                std::printf("[canon28] SIMD chunk_table decrypt failed; falling back to heap-scan\n");
+                chunk_table = ProbeChunkTableNoPEB(num_chunks, vt_lo, vt_hi);
+                if (chunk_table) {
+                    std::printf("[canon28] chunk_table = 0x%llX (heap-scan fallback, %u chunks)\n",
+                        (unsigned long long)chunk_table, num_chunks);
+                }
+            }
+
+            if (!chunk_table) {
+                std::printf("[canon28] could not locate chunk_table — bailing\n");
+                return false;
+            }
+
+            // Bulk read all chunk pointers (≤512B for max 64 chunks).
             std::vector<uint64_t> chunk_ptrs(num_chunks, 0);
+            if (!m_reader.Read(chunk_table, chunk_ptrs.data(), 8ULL * num_chunks)) {
+                std::printf("[canon28] bulk read of chunk_table @ 0x%llX failed\n",
+                    (unsigned long long)chunk_table);
+                return false;
+            }
             for (uint32_t ci = 0; ci < num_chunks; ++ci) {
-                if (!m_reader.Read(chunk_table + 8ULL * ci, &chunk_ptrs[ci], 8)) break;
                 if (chunk_ptrs[ci] < 0x10000ULL || chunk_ptrs[ci] >= 0x800000000000ULL) {
                     std::printf("[canon28] chunk_ptrs[%u] = 0x%llX invalid\n",
                         ci, (unsigned long long)chunk_ptrs[ci]);
@@ -559,6 +784,7 @@ namespace gobjects
             out_objects.clear();
             out_objects.reserve(total);
             std::unordered_set<uint64_t> seen;
+            seen.reserve(total);
 
             // Read each chunk in a single bulk read for speed.
             std::vector<uint8_t> buf(ITEMS_PER_CHUNK * STRIDE);
@@ -714,22 +940,21 @@ namespace gobjects
             ScanByVtable(m_base + 0xAD6D440, /*stride=*/0x300, objects);  // UClass
             ScanByVtable(m_base + 0xAD6D980, /*stride=*/0x200, objects);  // UFunction
             ScanByVtable(m_base + 0xAD6FF30, /*stride=*/0x130, objects);  // UEnum
-            ScanByVtable(m_base + 0xB527FC0, /*stride=*/0x490, objects);  // BPGC      (was 0x300; ~747 expected)
-            ScanByVtable(m_base + 0xB322870, /*stride=*/0x5D0, objects);  // WBPGC     (~16)
-            ScanByVtable(m_base + 0xC0092B0, /*stride=*/0x490, objects);  // SMBPGC    (~31)
-            ScanByVtable(m_base + 0xB4D5CC0, /*stride=*/0x7F0, objects);  // AnimBPGC  (~6)
-            ScanByVtable(m_base + 0xB8A9180, /*stride=*/0x340, objects);  // ASClass   (~2986)
-            ScanByVtable(m_base + 0xB8B2420, /*stride=*/0x150, objects);  // ASStruct  (~1136)
-            // Heaviest ASFunction subclass vtables (all stride 0x200).
-            // 13,079 total ASFunctions across 23 subclasses; the 7 below cover
-            // ~12K of them. Adding more would have negligible scan-time impact.
-            ScanByVtable(m_base + 0xB8ADCD0, /*stride=*/0x200, objects);  // ASFunction_NotThreadSafe_JIT (~4777)
-            ScanByVtable(m_base + 0xB8AE100, /*stride=*/0x200, objects);  // ASFunction_NoParams_JIT      (~4001)
-            ScanByVtable(m_base + 0xB8AFE80, /*stride=*/0x200, objects);  // ASFunction_ByteArg_JIT       (~1270)
-            ScanByVtable(m_base + 0xB8B02B0, /*stride=*/0x200, objects);  // ASFunction_ReferenceArg_JIT  (~837)
-            ScanByVtable(m_base + 0xB8B06E0, /*stride=*/0x200, objects);  // ASFunction_ObjectReturn_JIT  (~469)
-            ScanByVtable(m_base + 0xB8AF1E0, /*stride=*/0x200, objects);  // ASFunction_FloatExtToDbl_JIT (~435)
-            ScanByVtable(m_base + 0xB8B17A0, /*stride=*/0x200, objects);  // ASFunction_ByteReturn_JIT    (~347)
+            ScanByVtable(m_base + 0xB527FC0, /*stride=*/0x490, objects);  // BPGC
+            ScanByVtable(m_base + 0xB322870, /*stride=*/0x5D0, objects);  // WBPGC
+            ScanByVtable(m_base + 0xC0092B0, /*stride=*/0x490, objects);  // SMBPGC
+            ScanByVtable(m_base + 0xB4D5CC0, /*stride=*/0x7F0, objects);  // AnimBPGC
+            ScanByVtable(m_base + 0xB8A9180, /*stride=*/0x340, objects);  // ASClass
+            ScanByVtable(m_base + 0xB8B2420, /*stride=*/0x150, objects);  // ASStruct
+            // Heaviest 7 ASFunction subclasses (all stride 0x200) — cover ~12K
+            // of the 13K total. Remaining 16 subclasses are ≤250 instances each.
+            ScanByVtable(m_base + 0xB8ADCD0, /*stride=*/0x200, objects);  // ASFunction_NotThreadSafe_JIT
+            ScanByVtable(m_base + 0xB8AE100, /*stride=*/0x200, objects);  // ASFunction_NoParams_JIT
+            ScanByVtable(m_base + 0xB8AFE80, /*stride=*/0x200, objects);  // ASFunction_ByteArg_JIT
+            ScanByVtable(m_base + 0xB8B02B0, /*stride=*/0x200, objects);  // ASFunction_ReferenceArg_JIT
+            ScanByVtable(m_base + 0xB8B06E0, /*stride=*/0x200, objects);  // ASFunction_ObjectReturn_JIT
+            ScanByVtable(m_base + 0xB8AF1E0, /*stride=*/0x200, objects);  // ASFunction_FloatExtToDbl_JIT
+            ScanByVtable(m_base + 0xB8B17A0, /*stride=*/0x200, objects);  // ASFunction_ByteReturn_JIT
             std::printf("[p28] vtable scan added %zu UObject pointers (total %zu)\n",
                 objects.size() - pre, objects.size());
 
@@ -754,25 +979,9 @@ namespace gobjects
                           std::vector<uint64_t>& out_objects) {
             if (m_pid <= 0 || target_vt == 0) return;
 
-            struct Region { uint64_t lo, hi; };
             std::vector<Region> ranges;
-            char path[64];
-            std::snprintf(path, sizeof(path), "/proc/%d/maps", m_pid);
-            FILE* f = std::fopen(path, "r");
-            if (!f) return;
-            char line[512];
-            while (std::fgets(line, sizeof(line), f)) {
-                uint64_t s = 0, e = 0;
-                char perms[5] = {};
-                std::sscanf(line, "%llx-%llx %4s",
-                    (unsigned long long*)&s, (unsigned long long*)&e, perms);
-                if (perms[0] != 'r' || perms[1] != 'w') continue;
-                uint64_t sz = e - s;
-                if (sz < 0x10000ULL || sz > 0xC800000ULL) continue;          // 64KB..200MB
-                if (s >= m_base && s < m_base + 0x10000000ULL) continue;     // skip module image
-                ranges.push_back({s, e});
-            }
-            std::fclose(f);
+            ranges.reserve(64);
+            EnumerateRwHeapRegions(0x10000ULL, 0xC800000ULL, ranges);
 
             std::unordered_set<uint64_t> dedup(out_objects.begin(), out_objects.end());
 
@@ -912,27 +1121,8 @@ namespace gobjects
             };
 
             // Resolve heap map from /proc; fall back to a wide numeric sweep.
-            struct Region { uint64_t lo, hi; };
             std::vector<Region> ranges;
-            if (m_pid > 0) {
-                char path[64];
-                std::snprintf(path, sizeof(path), "/proc/%d/maps", m_pid);
-                if (FILE* f = std::fopen(path, "r")) {
-                    char line[512];
-                    while (std::fgets(line, sizeof(line), f)) {
-                        uint64_t s = 0, e = 0;
-                        char perms[5] = {};
-                        std::sscanf(line, "%llx-%llx %4s",
-                            (unsigned long long*)&s, (unsigned long long*)&e, perms);
-                        if (perms[0] != 'r' || perms[1] != 'w') continue;
-                        if ((e - s) < 0x100000ULL) continue;
-                        if (s < 0x10000 || s > 0x800000000000ULL) continue;
-                        if (s >= m_base && s < m_base + 0x10000000ULL) continue;
-                        ranges.push_back({s, e});
-                    }
-                    std::fclose(f);
-                }
-            }
+            EnumerateRwHeapRegions(0x100000ULL, ~0ULL, ranges);
             if (ranges.empty()) {
                 ranges.push_back({0x10000000ULL,  0x80000000ULL});
                 ranges.push_back({0x100000000ULL, 0x400000000ULL});
