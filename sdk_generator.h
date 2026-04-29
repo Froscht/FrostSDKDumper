@@ -1748,6 +1748,12 @@ public:
             std::string short_name = (fn_it != addr_to_name.end()) ? fn_it->second : std::string();
             // Skip packages (start with "/")
             if (!short_name.empty() && short_name[0] == '/') continue;
+            // Skip CDOs — Default__X objects are class default *instances*,
+            // not class definitions. They're already used in pass-1 to recover
+            // metaclass addresses; emitting them again as their own type
+            // produces 200+ bogus "Default__X" class entries with junk
+            // inheritance chains (FNamePool keys decrypt as float / utf16 noise).
+            if (short_name.rfind("Default__", 0) == 0) continue;
             // For unnamed objects, only proceed if they're referenced as a type
             if (short_name.empty()) {
                 // Will check is_type_by_ref below; generate a placeholder name
@@ -1850,6 +1856,24 @@ public:
                 uint64_t names_ptr = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names);
                 uint32_t names_cnt = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 8);
 
+                // DEBUG: log empty-body enum addresses + bytes 0x80..0x180 to file
+                if (!names_ptr || names_cnt == 0 || names_cnt >= 4096) {
+                    static FILE* dbg = std::fopen("/tmp/empty_enum_probe.txt", "w");
+                    if (dbg) {
+                        std::fprintf(dbg, "ADDR=0x%llX NAME=%s PKG=%s\n",
+                            (unsigned long long)obj_ptr, short_name.c_str(), pkg.c_str());
+                        for (int row = 0; row < 16; ++row) {
+                            uint64_t a = obj_ptr + 0x80 + row * 16;
+                            uint64_t lo = Read<uint64_t>(a);
+                            uint64_t hi = Read<uint64_t>(a + 8);
+                            std::fprintf(dbg, "  +0x%03X: %016llX %016llX\n",
+                                0x80 + row * 16,
+                                (unsigned long long)lo, (unsigned long long)hi);
+                        }
+                        std::fflush(dbg);
+                    }
+                }
+
                 if (names_ptr && names_cnt > 0 && names_cnt < 4096) {
                     // Patch 20260428: entries are TPair<FName, int64> stride 16:
                     //   +0  uint32  FName.lo32 = direct FNamePool index (no obfuscation)
@@ -1893,33 +1917,42 @@ public:
                     rec.super_name = sit->second;
             }
 
-            // Properties: scan ALL offsets 0x80-0x140 for FField chains and
-            // dedup by FField address (unique per field). Previous version
-            // keyed on p.offset, which collapsed everything to a single entry
-            // on patch 20260421 where Offset_Internal is at an unknown RVA
-            // (current read lands on zeros for most FProperties).
+            // Properties: read OWN-ONLY chain via UStruct::ChildProperties at
+            // the verified offset (+0xD0 on 20260428). The previous broad-scan
+            // [0x80..0x140] also picked up PropertyLink/RefLink/DestructorLink/
+            // PostConstructLink heads (the FULL inherited chains UE builds at
+            // CDO time), and walking those via FField::Next leaked PARENT-class
+            // properties into every derived class's namespace — inflating
+            // emitted prop count by ~106K (51%). Reference dumpers emit each
+            // field exactly once at its owning class, so we now mirror that.
+            //
+            // We still dedup by FField address to be safe in case ChildProperties
+            // is mirrored across +0xE8/+0xF0 (same head pointer); identical heads
+            // produce identical chains and are collapsed to one entry per FField.
             std::unordered_map<uint64_t, PropertyRecord> best_at_ff;
-            for (int co = 0x80; co <= 0x140; co += 8) {
-                uint64_t chain_head = Read<uint64_t>(obj_ptr + co);
-                if (chain_head <= 0x10000 || chain_head >= 0x7FFFFFFFFFFFULL) continue;
-                uint64_t cpvt = Read<uint64_t>(chain_head);
-                if (cpvt < MODULE_BASE || cpvt >= MODULE_BASE + 0x10000000ULL) continue;
-                auto chain_props = ReadPropertyChain(chain_head);
-                for (auto& p : chain_props) {
-                    if (p.offset > 0x20000) continue;
-                    auto it = best_at_ff.find(p.ff_addr);
-                    if (it == best_at_ff.end()) {
-                        best_at_ff[p.ff_addr] = std::move(p);
-                    } else {
-                        bool cur_unk = (it->second.name.rfind("UnknownProp_", 0) == 0 ||
-                                        it->second.name.rfind("Prop_CI", 0) == 0);
-                        bool new_unk = (p.name.rfind("UnknownProp_", 0) == 0 ||
-                                        p.name.rfind("Prop_CI", 0) == 0);
-                        bool cur_tk  = (it->second.type_name != "FProperty_Unknown");
-                        bool new_tk  = (p.type_name != "FProperty_Unknown");
-                        int cur_score = (cur_unk ? 0 : 2) + (cur_tk ? 1 : 0);
-                        int new_score = (new_unk ? 0 : 2) + (new_tk ? 1 : 0);
-                        if (new_score > cur_score) best_at_ff[p.ff_addr] = std::move(p);
+            {
+                uint64_t chain_head = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UStruct::ChildProperties);
+                if (chain_head > 0x10000 && chain_head < 0x7FFFFFFFFFFFULL) {
+                    uint64_t cpvt = Read<uint64_t>(chain_head);
+                    if (cpvt >= MODULE_BASE && cpvt < MODULE_BASE + 0x10000000ULL) {
+                        auto chain_props = ReadPropertyChain(chain_head);
+                        for (auto& p : chain_props) {
+                            if (p.offset > 0x20000) continue;
+                            auto it = best_at_ff.find(p.ff_addr);
+                            if (it == best_at_ff.end()) {
+                                best_at_ff[p.ff_addr] = std::move(p);
+                            } else {
+                                bool cur_unk = (it->second.name.rfind("UnknownProp_", 0) == 0 ||
+                                                it->second.name.rfind("Prop_CI", 0) == 0);
+                                bool new_unk = (p.name.rfind("UnknownProp_", 0) == 0 ||
+                                                p.name.rfind("Prop_CI", 0) == 0);
+                                bool cur_tk  = (it->second.type_name != "FProperty_Unknown");
+                                bool new_tk  = (p.type_name != "FProperty_Unknown");
+                                int cur_score = (cur_unk ? 0 : 2) + (cur_tk ? 1 : 0);
+                                int new_score = (new_unk ? 0 : 2) + (new_tk ? 1 : 0);
+                                if (new_score > cur_score) best_at_ff[p.ff_addr] = std::move(p);
+                            }
+                        }
                     }
                 }
             }
@@ -1954,15 +1987,17 @@ public:
             rec.props_size = Read<uint32_t>(sp + ArcDecrypt::Offsets::UStruct::PropertiesSize);
             rec.is_class = false;
             rec.super_addr = Read<uint64_t>(sp + ArcDecrypt::Offsets::UStruct::SuperStruct);
-            // Properties chain walk
-            for (int co = 0x80; co <= 0x140; co += 8) {
-                uint64_t head = Read<uint64_t>(sp + co);
-                if (head <= 0x10000 || head >= 0x7FFFFFFFFFFFULL) continue;
-                uint64_t cpvt = Read<uint64_t>(head);
-                if (cpvt < MODULE_BASE || cpvt >= MODULE_BASE + 0x10000000ULL) continue;
-                auto chain = ReadPropertyChain(head);
-                for (auto& p : chain) rec.properties.push_back(std::move(p));
-                break;
+            // Properties chain walk — own-only via ChildProperties.
+            // (See main pass above for why broad-scan was removed.)
+            {
+                uint64_t head = Read<uint64_t>(sp + ArcDecrypt::Offsets::UStruct::ChildProperties);
+                if (head > 0x10000 && head < 0x7FFFFFFFFFFFULL) {
+                    uint64_t cpvt = Read<uint64_t>(head);
+                    if (cpvt >= MODULE_BASE && cpvt < MODULE_BASE + 0x10000000ULL) {
+                        auto chain = ReadPropertyChain(head);
+                        for (auto& p : chain) rec.properties.push_back(std::move(p));
+                    }
+                }
             }
             result.structs.push_back(std::move(rec));
             ++extra_structs_added;
@@ -2040,14 +2075,38 @@ public:
             return a.addr < b.addr;
         };
 
-        // Group by short name, pick the "best" record per group to keep its
-        // bare name, rename the rest with _N suffixes (stable within group by
-        // package then addr).
-        auto dedupe_by_quality = [&](auto& vec, auto&& cmp) {
+        // Group by short name, pick the "best" record per group. Runner-ups
+        // that are *empty* (size=0, no props, no funcs) get DROPPED — these
+        // are stale UClass instances / hot-reload remnants / per-AngelScript
+        // shadow copies that share a name with the real type but have no
+        // reflection content. Runner-ups with content are renamed to *_N
+        // (preserves legitimate cross-package collisions, e.g. "Object" in
+        // Engine vs Game).
+        //
+        // Why drop instead of _N rename: pre-fix, /Script/Niagara had 2571
+        // _N classes, /Script/UMG had 2237, /Script/Angelscript had 2K+. All
+        // had size=0, no properties, no super_addr — i.e. zero reflection
+        // content. They inflated the output 1.8x with no information value.
+        auto struct_is_empty = [](const StructRecord& r) -> bool {
+            if (r.props_size != 0) return false;
+            if (!r.functions.empty()) return false;
+            if (r.super_addr != 0) return false;
+            for (const auto& p : r.properties) {
+                if (p.name.rfind("UnknownProp_", 0) != 0 &&
+                    p.name.rfind("Prop_CI", 0)      != 0) return false;
+            }
+            return true;
+        };
+        // Enums are never treated as "empty junk" — a typed but entry-less
+        // UEnum is still useful, and there's no over-emit phenomenon for them.
+        auto enum_is_empty = [](const EnumRecord&) -> bool { return false; };
+        auto dedupe_by_quality = [&](auto& vec, auto&& cmp, auto&& is_empty) {
             std::unordered_map<std::string, std::vector<size_t>> by_name;
             for (size_t i = 0; i < vec.size(); ++i)
                 by_name[vec[i].name].push_back(i);
             std::unordered_set<std::string> taken;
+            std::vector<bool> drop(vec.size(), false);
+            size_t dropped_empty = 0;
             // First pass: claim bare names for the best record in each group.
             for (auto& [name, idxs] : by_name) {
                 std::sort(idxs.begin(), idxs.end(), [&](size_t x, size_t y) {
@@ -2055,23 +2114,43 @@ public:
                 });
                 taken.insert(vec[idxs.front()].name);  // best keeps bare name
             }
-            // Second pass: rename runner-ups with the lowest free _N suffix.
+            // Second pass: drop empty runner-ups; rename non-empty runner-ups _N.
             for (auto& [name, idxs] : by_name) {
                 if (idxs.size() <= 1) continue;
+                bool best_has_content = !is_empty(vec[idxs.front()]);
                 int n = 1;
                 for (size_t k = 1; k < idxs.size(); ++k) {
+                    auto& r = vec[idxs[k]];
+                    if (best_has_content && is_empty(r)) {
+                        drop[idxs[k]] = true;
+                        ++dropped_empty;
+                        continue;
+                    }
                     std::string candidate;
                     for (;; ++n) {
                         candidate = name + "_" + std::to_string(n);
                         if (taken.insert(candidate).second) break;
                     }
-                    vec[idxs[k]].name = std::move(candidate);
+                    r.name = std::move(candidate);
                     ++n;
                 }
             }
+            // Compact: erase dropped entries.
+            if (dropped_empty) {
+                size_t w = 0;
+                for (size_t r = 0; r < vec.size(); ++r) {
+                    if (!drop[r]) {
+                        if (w != r) vec[w] = std::move(vec[r]);
+                        ++w;
+                    }
+                }
+                vec.resize(w);
+                std::printf("[sdk] Dedup dropped %zu empty duplicate records\n",
+                            dropped_empty);
+            }
         };
-        dedupe_by_quality(result.structs, better_for_bare_name);
-        dedupe_by_quality(result.enums,   better_for_bare_name_enum);
+        dedupe_by_quality(result.structs, better_for_bare_name,      struct_is_empty);
+        dedupe_by_quality(result.enums,   better_for_bare_name_enum, enum_is_empty);
 
         // Final emit-order sort (after dedup so renamed entries stay grouped).
         std::sort(result.structs.begin(), result.structs.end(), sort_by_pkg_name);
