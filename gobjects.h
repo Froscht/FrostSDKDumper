@@ -385,6 +385,224 @@ namespace gobjects
         alignas(16) uint8_t m_chunkKey1[16];
         alignas(16) uint8_t m_chunkKey2[16];
 
+        // ── Canonical chunk walker for patch 20260428 ────────────────────
+        // Live-RE'd 2026-04-29 from sub_398180 (GC_GatherUnreachable_20260428):
+        //   chunks_manager = decrypt(GUObjectArray + 0xB0)
+        //   total = decrypt-u32(chunks_manager + 0x14)
+        //   chunk_table = decrypt(chunks_manager + 0xB0, via vtable[5])
+        //   for idx in [0, total):
+        //     chunk_idx = idx >> 16; slot_idx = idx & 0xFFFF
+        //     chunk_ptr = chunk_table[chunk_idx] (8B aligned, header at -8)
+        //     item     = chunk_ptr + 20*slot_idx; obj = u64 at item
+        //
+        // CRUCIAL: GUObjectArray + 0x38 holds a *partial* NumActive counter
+        // (= 70592 in the verified live session) — NOT the true element count.
+        // The true count comes from chunks_manager + 0x14 (= 279375 in verified
+        // session). The structural-scan-only path was capping itself at the
+        // partial counter and missing 200K+ objects.
+        //
+        // chunks_manager pipeline (from sub_398180, also matches FField NamePrivate
+        // decrypt shape):
+        //   raw     = load 8B from GUObjectArray + 0xB0
+        //   shuf    = PSHUFLW(raw, 0x1E)
+        //   xored   = shuf XOR qword[0xAD0FE50]   (= 0xC8727080CA112779)
+        //   chunks_manager = ROL16(xored, 1) per uint16-lane
+        //
+        // Total NumElements decrypt (from inline asm in sub_398180):
+        //   total = ROL32(*(u32*)(chunks_manager + 0x14) ^ 0xC88F6121, 17)
+        //         ^ 0x4CF4AED0
+        //
+        // chunk_table decrypt (vtable[5] of *(u64*)(chunks_manager + 0x80),
+        // bytes verified live at 0x140498D60 — pure inline SIMD, no VMP):
+        //   blob   = load 8B from chunks_manager + 0xB0
+        //   ROL32(blob, 9) per dword
+        //   PSHUFLW(_, 0x39)
+        //   ROL32(_, 1) per dword
+        //   key    = (PEB + 0xAD77D882) broadcast as {lo32,hi32,lo32,hi32}
+        //   chunk_table = lo64(_ XOR key)
+        //
+        // chunk_table[ci] points 8 bytes INTO each chunk's heap allocation
+        // (the 8B header at chunk_ptr - 8 holds the per-chunk capacity, e.g.
+        // 0x10000 = 65536). FUObjectItem array starts at chunk_ptr + 0.
+        bool CanonicalChunkWalk20260428(std::vector<uint64_t>& out_objects,
+                                        int32_t& out_num_elements) {
+            uint64_t base = m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE;
+
+            // Step 1: decrypt chunks_manager pointer.
+            alignas(16) uint8_t blob[16] = {};
+            if (!m_reader.Read(base + 0xB0, blob, 16)) {
+                std::printf("[canon28] read GUObjectArray+0xB0 failed\n");
+                return false;
+            }
+            uint64_t xor_const = 0;
+            if (!m_reader.Read(m_base + 0xAD0FE50, &xor_const, 8)) {
+                std::printf("[canon28] read XOR const @ 0xAD0FE50 failed\n");
+                return false;
+            }
+
+            uint16_t bw[4];
+            std::memcpy(bw, blob, 8);
+            uint16_t shuf[4] = { bw[2], bw[3], bw[1], bw[0] };  // PSHUFLW imm 0x1E = idx [2,3,1,0]
+            uint64_t shuf_q = 0;
+            std::memcpy(&shuf_q, shuf, 8);
+            uint64_t xored = shuf_q ^ xor_const;
+            uint16_t xw[4];
+            std::memcpy(xw, &xored, 8);
+            for (int i = 0; i < 4; ++i)
+                xw[i] = static_cast<uint16_t>((xw[i] << 1) | (xw[i] >> 15));
+            uint64_t chunks_manager = 0;
+            std::memcpy(&chunks_manager, xw, 8);
+
+            if (chunks_manager < 0x10000ULL || chunks_manager >= 0x800000000000ULL) {
+                std::printf("[canon28] chunks_manager 0x%llX out of range\n",
+                    (unsigned long long)chunks_manager);
+                return false;
+            }
+            std::printf("[canon28] chunks_manager = 0x%llX\n",
+                (unsigned long long)chunks_manager);
+
+            // Step 2: decrypt total NumElements from chunks_manager + 0x14.
+            uint32_t enc_count = 0;
+            if (!m_reader.Read(chunks_manager + 0x14, &enc_count, 4)) {
+                std::printf("[canon28] read chunks_manager+0x14 failed\n");
+                return false;
+            }
+            uint32_t xored32 = enc_count ^ 0xC88F6121u;
+            uint32_t rol = (xored32 << 17) | (xored32 >> 15);
+            uint32_t total = rol ^ 0x4CF4AED0u;
+            if (total < 1000 || total > 2000000) {
+                std::printf("[canon28] total NumElements %u out of range (raw 0x%08X)\n",
+                    total, enc_count);
+                return false;
+            }
+            std::printf("[canon28] total NumElements = %u (decrypted from chunks_mgr+0x14)\n",
+                total);
+
+            // Step 3: decrypt chunk_table base via vtable[5] pipeline.
+            // We need PEB; if not yet probed, do it now.
+            if (!m_pebAddr) {
+                m_pebAddr = FindPEB();
+                if (!m_pebAddr) {
+                    std::printf("[canon28] PEB not found — vtable[5] decrypt requires it\n");
+                    return false;
+                }
+                std::printf("[canon28] PEB = 0x%llX\n", (unsigned long long)m_pebAddr);
+            }
+
+            alignas(16) uint8_t enc_table[16] = {};
+            if (!m_reader.Read(chunks_manager + 0xB0, enc_table, 16)) {
+                std::printf("[canon28] read chunks_manager+0xB0 failed\n");
+                return false;
+            }
+            uint32_t dw[4];
+            std::memcpy(dw, enc_table, 16);
+            // ROL32(9) per dword
+            for (int i = 0; i < 4; ++i)
+                dw[i] = (dw[i] << 9) | (dw[i] >> 23);
+            // PSHUFLW(0x39): operates on low 4 words = lo 2 dwords. imm 0x39 = idx [1,2,3,0]
+            uint16_t lo_w[4];
+            std::memcpy(lo_w, dw, 8);
+            uint16_t shuf_w[4] = { lo_w[1], lo_w[2], lo_w[3], lo_w[0] };
+            uint32_t shuf_dw[2];
+            std::memcpy(shuf_dw, shuf_w, 8);
+            dw[0] = shuf_dw[0];
+            dw[1] = shuf_dw[1];
+            // ROL32(1) per dword
+            for (int i = 0; i < 4; ++i)
+                dw[i] = (dw[i] << 1) | (dw[i] >> 31);
+            // XOR broadcast(PEB + 0xAD77D882) as {lo32,hi32,lo32,hi32}
+            uint64_t key64 = (m_pebAddr + 0xAD77D882ULL) & 0xFFFFFFFFFFFFFFFFULL;
+            uint32_t kl = static_cast<uint32_t>(key64 & 0xFFFFFFFF);
+            uint32_t kh = static_cast<uint32_t>(key64 >> 32);
+            dw[0] ^= kl; dw[1] ^= kh; dw[2] ^= kl; dw[3] ^= kh;
+            uint64_t chunk_table = (static_cast<uint64_t>(dw[1]) << 32) | dw[0];
+
+            if (chunk_table < 0x10000ULL || chunk_table >= 0x800000000000ULL) {
+                std::printf("[canon28] chunk_table 0x%llX out of range (PEB=0x%llX)\n",
+                    (unsigned long long)chunk_table, (unsigned long long)m_pebAddr);
+                return false;
+            }
+            std::printf("[canon28] chunk_table = 0x%llX\n", (unsigned long long)chunk_table);
+
+            // Step 4: walk chunks. ceil(total/65536).
+            constexpr uint32_t ITEMS_PER_CHUNK = 65536;
+            constexpr uint32_t STRIDE = 20;
+            uint32_t num_chunks = (total + ITEMS_PER_CHUNK - 1) / ITEMS_PER_CHUNK;
+            const uint64_t vt_lo = m_base + 0x1000;
+            const uint64_t vt_hi = m_base + 0x10000000ULL;
+
+            // Read all chunk pointers up-front.
+            std::vector<uint64_t> chunk_ptrs(num_chunks, 0);
+            for (uint32_t ci = 0; ci < num_chunks; ++ci) {
+                if (!m_reader.Read(chunk_table + 8ULL * ci, &chunk_ptrs[ci], 8)) break;
+                if (chunk_ptrs[ci] < 0x10000ULL || chunk_ptrs[ci] >= 0x800000000000ULL) {
+                    std::printf("[canon28] chunk_ptrs[%u] = 0x%llX invalid\n",
+                        ci, (unsigned long long)chunk_ptrs[ci]);
+                    return false;
+                }
+            }
+
+            // Quick validation: chunk[0] slot 0 should hold a real UObject.
+            uint64_t obj0 = 0;
+            if (!m_reader.Read(chunk_ptrs[0], &obj0, 8) ||
+                obj0 < 0x10000ULL || obj0 >= 0x800000000000ULL) {
+                std::printf("[canon28] chunk[0] slot 0 read failed or invalid\n");
+                return false;
+            }
+            uint64_t vt0 = 0;
+            if (!m_reader.Read(obj0, &vt0, 8) || vt0 < vt_lo || vt0 >= vt_hi) {
+                std::printf("[canon28] chunk[0] slot 0 vtable 0x%llX outside module range\n",
+                    (unsigned long long)vt0);
+                return false;
+            }
+
+            out_objects.clear();
+            out_objects.reserve(total);
+            std::unordered_set<uint64_t> seen;
+
+            // Read each chunk in a single bulk read for speed.
+            std::vector<uint8_t> buf(ITEMS_PER_CHUNK * STRIDE);
+            for (uint32_t ci = 0; ci < num_chunks; ++ci) {
+                uint64_t cp = chunk_ptrs[ci];
+                uint32_t chunk_base_idx = ci * ITEMS_PER_CHUNK;
+                uint32_t chunk_lim = std::min(ITEMS_PER_CHUNK,
+                    (total > chunk_base_idx) ? (total - chunk_base_idx) : 0u);
+                if (chunk_lim == 0) break;
+                if (!m_reader.Read(cp, buf.data(), static_cast<size_t>(chunk_lim) * STRIDE)) {
+                    std::printf("[canon28] bulk read chunk[%u] @ 0x%llX failed (lim=%u)\n",
+                        ci, (unsigned long long)cp, chunk_lim);
+                    continue;
+                }
+                uint32_t valid = 0;
+                for (uint32_t i = 0; i < chunk_lim; ++i) {
+                    uint64_t obj = 0;
+                    std::memcpy(&obj, buf.data() + i * STRIDE, 8);
+                    if (!obj) continue;
+                    if (obj < 0x10000ULL || obj >= 0x800000000000ULL) continue;
+                    // Re-validate vtable per object — runtime can hold stale
+                    // pointers in tail slots beyond NumActive.
+                    uint64_t vt = 0;
+                    if (!m_reader.Read(obj, &vt, 8)) continue;
+                    if (vt < vt_lo || vt >= vt_hi) continue;
+                    if (seen.insert(obj).second) {
+                        out_objects.push_back(obj);
+                        ++valid;
+                    }
+                }
+                std::printf("[canon28] chunk[%u] @ 0x%llX: %u/%u valid\n",
+                    ci, (unsigned long long)cp, valid, chunk_lim);
+            }
+
+            if (out_objects.size() < 1000) {
+                std::printf("[canon28] only %zu valid UObjects collected — bailing\n",
+                    out_objects.size());
+                return false;
+            }
+
+            out_num_elements = static_cast<int32_t>(total);
+            return true;
+        }
+
         // ── Patch 20260421: primary init path ────────────────────────────
         // 1. Decrypt GUObjectArray → chunks_manager (new RVA 0xDDCB420, new pipeline).
         // 2. Decrypt chunks_manager+0x70 → max_elements.
@@ -393,45 +611,60 @@ namespace gobjects
         //    unreachable without bytecode emulation). Accept any region with
         //    ≥500 consecutive valid items, concatenate all regions, cap at
         //    max_elements, and store as a flat UObject* list.
-        // Patch 20260428: layout simplified — NumElements is now a plain u64
-        // at GUObjectArray + 0x38, no decrypt needed. Verified on live PID
-        // 92919 (256-byte read of GUObjectArray showed +0x38 = 70592 with
-        // matching duplicate at +0x68 and N-1 at +0x70). The encrypted
-        // chunks-manager-pointer blob moved to +0xB0 and decrypts via a new
-        // PSHUFLW(0x1E)+ROL16(1) pipeline, but since the structural heap
-        // scan doesn't actually need chunks_manager (it sweeps mapped pages
-        // for FUObjectItem runs), we skip the pointer decrypt entirely.
+        // Patch 20260428: switched to CANONICAL chunk walker via the
+        // chunks_manager pipeline (live-RE'd 2026-04-29 from sub_398180,
+        // GC_GatherUnreachable_20260428). +0x38 is misleading (= 70592 NumActive
+        // counter only); the TRUE total is encrypted at chunks_manager+0x14:
+        //   total = ROL32(*(u32*)(chunks_mgr+0x14) ^ 0xC88F6121, 17) ^ 0x4CF4AED0
+        // The chunk_table base is decrypted from chunks_manager+0xB0 via
+        // vtable[5] of chunks_manager+0x80:
+        //   ROL32(blob, 9) → PSHUFLW(0x39) → ROL32(1) → XOR(broadcast(PEB+0xAD77D882))
+        // Then standard IndexToObject:
+        //   chunk_idx = idx>>16; slot_idx = idx&0xFFFF
+        //   chunk_ptr = chunk_table[chunk_idx]   (each chunk has 8B header at -8)
+        //   item_ptr  = chunk_ptr + 20*slot_idx
+        // Recovers ~277K UObjects (vs ~90K via structural scan), eliminating
+        // the 65K-slot chunk-0 coverage gap and missing 8K UFunctions / 1K UEnums /
+        // 366 UPackages from previous structural-scan output.
         bool InitPatch20260428() {
             uint64_t base = m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE;
-            uint64_t num_at_38 = 0;
-            if (!m_reader.Read(base + 0x38, &num_at_38, 8)) {
-                std::printf("[p28] read GUObjectArray+0x38 failed\n");
-                return false;
-            }
-            // Sanity: lo32 should be a plausible UObject count; hi32 should be 0.
-            int32_t max_elements = static_cast<int32_t>(num_at_38 & 0xFFFFFFFFu);
-            if (max_elements < 1000 || max_elements > 2000000 || (num_at_38 >> 32) != 0) {
-                std::printf("[p28] +0x38 = 0x%llX doesn't look like plain NumElements\n",
-                    (unsigned long long)num_at_38);
-                return false;
-            }
-            // Cross-check duplicate at +0x68 — they should match.
-            uint64_t num_at_68 = 0;
-            if (m_reader.Read(base + 0x68, &num_at_68, 8) && num_at_68 != num_at_38) {
-                std::printf("[p28] +0x38 (%lld) and +0x68 (%lld) disagree — layout may have shifted\n",
-                    (long long)num_at_38, (long long)num_at_68);
-                // Don't bail — pick whichever is in-range.
-            }
-            std::printf("[p28] NumElements (plain @ +0x38) = %d\n", max_elements);
 
+            // Try canonical chunk walker first. Falls through to structural
+            // scan on failure (e.g. game in early init before chunks_manager
+            // is allocated, or PEB not yet readable).
             std::vector<uint64_t> objects;
-            if (!StructuralScanFUObjectItems(max_elements, objects)) {
-                std::printf("[p28] structural chunk scan failed\n");
-                return false;
+            int32_t max_elements = 0;
+            bool canonical_ok = CanonicalChunkWalk20260428(objects, max_elements);
+
+            if (!canonical_ok) {
+                std::printf("[p28] canonical chunk walk failed, falling back to structural scan\n");
+
+                // Fallback path (legacy 20260428 behavior): use +0x38 as a hint
+                // and structural-scan the heap for FUObjectItem runs.
+                uint64_t num_at_38 = 0;
+                if (!m_reader.Read(base + 0x38, &num_at_38, 8)) {
+                    std::printf("[p28] read GUObjectArray+0x38 failed\n");
+                    return false;
+                }
+                max_elements = static_cast<int32_t>(num_at_38 & 0xFFFFFFFFu);
+                if (max_elements < 1000 || max_elements > 2000000 || (num_at_38 >> 32) != 0) {
+                    std::printf("[p28] +0x38 = 0x%llX doesn't look like plain NumElements\n",
+                        (unsigned long long)num_at_38);
+                    return false;
+                }
+                std::printf("[p28] NumElements (plain @ +0x38, fallback) = %d\n", max_elements);
+
+                if (!StructuralScanFUObjectItems(max_elements, objects)) {
+                    std::printf("[p28] structural chunk scan failed\n");
+                    return false;
+                }
+                std::printf("[p28] structural scan collected %zu UObject pointers\n",
+                    objects.size());
+                if (objects.size() < 1000) return false;
+            } else {
+                std::printf("[p28] canonical chunk walk: %zu UObjects (NumElements=%d)\n",
+                    objects.size(), max_elements);
             }
-            std::printf("[p28] structural scan collected %zu UObject pointers\n",
-                objects.size());
-            if (objects.size() < 1000) return false;
 
             // Direct vtable scan recovers UObjects allocated in heap arenas
             // that aren't tracked by the FUObjectItem array (UScriptStruct +

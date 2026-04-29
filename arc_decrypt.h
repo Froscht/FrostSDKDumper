@@ -193,15 +193,24 @@ namespace Offsets {
         constexpr uint64_t PropertyFlags   = 0x70;  // plain uint64
     }
     namespace UStruct {
-        // Patch 20260428 LIVE-PROBED layout (EmbarkPlayerController chain walk):
-        //   +0xB0  SuperStruct (UStruct*)
+        // Patch 20260428 LIVE-PROBED layout (Pawn/Actor/Character chain walk
+        // verified against expected parents — see chain-walk verification
+        // 2026-04-29):
+        //   +0xA8  SuperStruct (UStruct*)  ← was +0xB0 in earlier RE pass
+        //   +0xB0  literal 0x10 for UClasses, 0x8 for UScriptStructs (looks
+        //          like alignment / size pad — NOT a pointer; reading +0xB0
+        //          previously produced "→ Unknown (0x10, size=0)" for every
+        //          class in SDK_Output.txt)
         //   +0xD0  ChildProperties (FField* chain — FProperty members)
         //          mirrored at +0xE8 and +0xF0 — same pointer value
         //   +0x118 PropertiesSize (u32)
-        // 20260421: ChildProperties was at +0xE0; in 20260428 +0xE0 holds
-        // unrelated data. The broad-scan in sdk_generator.h compensated by
-        // sweeping +0x80..+0x140 step 8, but the primary read should be +0xD0.
-        constexpr uint64_t SuperStruct     = 0x0B0;
+        // Verified chain: StaticMeshComponent → MeshComponent →
+        //   PrimitiveComponent → SceneComponent → ActorComponent → UObject.
+        //   UObject's +0xA8 reads 0 (no parent). Character → Pawn → Actor
+        //   → UObject also matches.
+        // 20260421: SuperStruct was at +0xB0, ChildProperties at +0xE0; both
+        // shifted in 20260428.
+        constexpr uint64_t SuperStruct     = 0x0A8;  // 20260421: 0x0B0
         constexpr uint64_t Children        = 0x0D0;  // legacy alias
         constexpr uint64_t ChildProperties = 0x0D0;  // 20260421: 0x0E0
         constexpr uint64_t PropertiesSize  = 0x118;

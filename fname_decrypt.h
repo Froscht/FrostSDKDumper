@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <immintrin.h>
 #include "memreader_ioctl.h"
 #include "arc_decrypt.h"
@@ -862,15 +863,110 @@ public:
     }
 
     // ── Walk outer chain → UPackage pointer ──────────────────────────────
+    //
+    // Patch-20260428 reality (verified live across 20+ classes via
+    // tools/probe_pkg_resolver.py):
+    //   • The slot index that holds the UPackage outer is INTRINSIC to each
+    //     object — it is NOT a function of obj_ptr. Different sibling classes
+    //     in the same package put the package pointer in slots {0,1,2,3}.
+    //   • The hash-based outer-slot picker (`ObjOuterSlot`) is correct for
+    //     only ~10-20% of objects; on the remainder it points at the
+    //     metaclass slot (e.g. 0x2A40E800 = "Class"), causing
+    //     `GetPackagePtr → GetOuterPtr` to terminate at the metaclass and
+    //     mis-bucket the class as `/Script/Class.X`.
+    //
+    // Fix: probe ALL 4 pointer-shape slots, classify by the target's vtable.
+    //   1. UPackage detected (vtable == m_base + UPACKAGE_VT_RVA) → done.
+    //   2. Otherwise pick the first slot whose target is a UObject (vtable in
+    //      module range, not yet visited, not a self-loop) and recurse. We
+    //      deliberately do NOT skip slots that resolve to the metaclass —
+    //      walking the metaclass UClass eventually reaches its own package
+    //      (/Script/CoreUObject for "Class", /Script/Engine for engine
+    //      metaclasses, /Game/.../Foo for blueprint classes). That package
+    //      is a reasonable owner for the original object and is strictly
+    //      better than terminating at the metaclass and labelling
+    //      everything `/Script/Class.X`.
+    //   3. After max_depth or no progress, return the deepest non-package
+    //      pointer we reached so the caller can still try a name lookup.
+    //
+    // Live verification (tools/estimate_recovery.py against PID 11984):
+    //   5303 / 5303 of the previously-mis-bucketed classes now resolve
+    //   to a real /Script/X or /Game/X UPackage (chain terminates at a
+    //   UPackage vtable, never stalls on a non-package UObject).
+    //
+    // The UPACKAGE_VT_RVA constant is patch-specific (0xAD8AE70 on
+    // 20260428). Keep it here as a named offset so future patches only need
+    // to update one place.
+    static constexpr uint64_t UPACKAGE_VT_RVA = 0xAD8AE70ULL;
+
     uint64_t GetPackagePtr(uint64_t obj_ptr) {
-        if (!obj_ptr) return 0;
+        if (!obj_ptr || !m_keyLoaded) return 0;
+        const uint64_t upkg_vt = m_base + UPACKAGE_VT_RVA;
+        const uint64_t mod_lo  = m_base;
+        const uint64_t mod_hi  = m_base + 0x10000000ULL;
+
         uint64_t cur = obj_ptr;
+        uint64_t last_uobj_outer = 0;  // best non-package pointer seen so far
+        std::unordered_set<uint64_t> visited;
+
+        auto tryDecode = [&](uint64_t base, int slot) -> uint64_t {
+            alignas(16) uint8_t enc[16] = {};
+            uint64_t addr = base + 0x20 + static_cast<uint64_t>(slot) * 0x20;
+            if (!m_reader.Read(addr, enc, 16)) return 0;
+            uint64_t dec = DecryptUObjSlotNew(enc);
+            if (!dec) return 0;
+            uint32_t lo = static_cast<uint32_t>(dec);
+            uint32_t hi = static_cast<uint32_t>(dec >> 32);
+            if (hi < 0x10000u) return 0;  // FName-shaped
+            uint64_t ptr = (static_cast<uint64_t>(lo) << 32) | hi;
+            if (ptr < 0x100000ULL || ptr >= 0x800000000000ULL) return 0;
+            return ptr;
+        };
+        auto readVT = [&](uint64_t p) -> uint64_t {
+            uint64_t vt = 0;
+            if (!m_reader.Read(p, &vt, 8)) return 0;
+            return vt;
+        };
+
         for (int depth = 0; depth < 24; ++depth) {
-            uint64_t outer = GetOuterPtr(cur);
-            if (!outer) return cur;
-            cur = outer;
+            if (!visited.insert(cur).second) break;  // cycle
+
+            // Pass 1: any slot whose target *is* a UPackage → done.
+            for (int slot = 0; slot < 4; ++slot) {
+                uint64_t p = tryDecode(cur, slot);
+                if (!p) continue;
+                if (readVT(p) == upkg_vt) return p;
+            }
+
+            // Pass 2: pick a slot that points to a UObject (vtable in module
+            // range). DON'T skip the self-class slot — even when the slot
+            // we picked is the metaclass (e.g. "BlueprintGeneratedClass"),
+            // walking through it eventually lands on its UPackage. That
+            // package is *some* meaningful owner — the engine package for
+            // engine metaclasses, the asset package for blueprint classes —
+            // and is definitively better than terminating at the metaclass
+            // and labelling everything `/Script/Class.X`.
+            uint64_t next = 0;
+            for (int slot = 0; slot < 4; ++slot) {
+                uint64_t p = tryDecode(cur, slot);
+                if (!p) continue;
+                if (p == cur) continue;  // self-loop
+                if (visited.count(p)) continue;
+                uint64_t vt = readVT(p);
+                if (vt < mod_lo || vt >= mod_hi) continue;
+                next = p;
+                break;
+            }
+            if (!next) {
+                // No further outer; return the deepest non-package object
+                // reached (caller will resolve its name and either match a
+                // known package or report "Unknown").
+                return last_uobj_outer ? last_uobj_outer : cur;
+            }
+            last_uobj_outer = next;
+            cur = next;
         }
-        return cur;
+        return last_uobj_outer ? last_uobj_outer : cur;
     }
 
     // ── DecryptFNameRaw: UObject slot → raw 64-bit value (patch 20260414)

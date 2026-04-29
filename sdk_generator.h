@@ -1346,6 +1346,50 @@ public:
         {
             int fn_found = 0;
             std::unordered_set<uint64_t> found_set;
+
+            // Structural sanity test for "could be a UFunction".  Audit
+            // (tools/audit_pass3_pass4.py + audit_b0_pattern.py) showed that
+            // 100% of class-discovered UFunctions satisfy:
+            //
+            //   qword @ +0xB0 has high 56 bits == 0  (NumParms is a u8 followed
+            //                                         by 7 padding bytes; non-
+            //                                         UFunction objects store
+            //                                         floats / heap ptrs there)
+            //   low byte (NumParms) <= 64            (very loose UE limit)
+            //
+            // Pass 3's outer_ok path used to admit any named subobject under a
+            // known type whose +0x120 happened to look like flags — including
+            // OverlaySlots, StaticMeshes, Textures, etc. (≈19K bogus passers).
+            // Adding this u8-shape gate catches those.
+            auto looks_like_ufunc_struct = [&](uint64_t obj_ptr) -> bool {
+                uint64_t qB0 = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UFunction::NumParms);
+                if ((qB0 >> 8) != 0) return false;       // high 56 bits must be zero
+                if ((qB0 & 0xFF) > 64) return false;     // NumParms range
+                return true;
+            };
+
+            // Vtable-destructor sanity: the first virtual slot of a real
+            // UFunction vtable points to module text containing real code, NOT
+            // to a 0xCC INT3-padded region (which is where a stripped /
+            // VMP-protected destructor leaves a placeholder).  Cached because
+            // there are only ~5 distinct UFunction-shaped vtables in practice.
+            std::unordered_map<uint64_t, bool> vt_dtor_ok_cache;
+            auto vt_dtor_looks_real = [&](uint64_t vt) -> bool {
+                auto it = vt_dtor_ok_cache.find(vt);
+                if (it != vt_dtor_ok_cache.end()) return it->second;
+                bool ok = false;
+                if (vt >= MODULE_BASE && vt < MODULE_BASE + 0x10000000ULL) {
+                    uint64_t dtor = Read<uint64_t>(vt);
+                    if (dtor >= MODULE_BASE && dtor < MODULE_BASE + 0x10000000ULL) {
+                        // Reject 0xCCCC… INT3 pads (stripped destructors).
+                        uint64_t first_qw = Read<uint64_t>(dtor);
+                        ok = (first_qw != 0xCCCCCCCCCCCCCCCCULL);
+                    }
+                }
+                vt_dtor_ok_cache[vt] = ok;
+                return ok;
+            };
+
             for (const auto& [idx, obj_ptr] : object_ptrs) {
                 uint64_t cls = m_fname.GetClassPrivate(obj_ptr);
                 if (!funcMetaAddrs.count(cls)) continue;
@@ -1370,13 +1414,16 @@ public:
                 uint64_t outer = m_fname.GetOuterPtr(obj_ptr);
                 if (!outer || !addr_to_name.count(outer)) continue;
                 m_owner_to_funcs[outer].push_back(obj_ptr);
+                found_set.insert(obj_ptr);  // FIX: prevent Pass 3/4 from re-pushing
                 ++extra;
             }
             std::printf("[sdk] UFunction pass 2 (vtable+outer): %d extra funcs\n", extra);
 
             // Pass 3: heuristic — any named non-type object whose Outer is a known type
-            // and has reasonable FunctionFlags at +0x128 is likely a UFunction.
+            // and has reasonable FunctionFlags at +0x120 is likely a UFunction.
             int pass3 = 0;
+            int pass3_rej_struct = 0;
+            int pass3_rej_dtor   = 0;
             for (const auto& [idx, obj_ptr] : object_ptrs) {
                 if (found_set.count(obj_ptr)) continue;
                 auto nit = addr_to_name.find(obj_ptr);
@@ -1388,9 +1435,12 @@ public:
                 // Skip if it's a known type itself
                 if (allTypeAddrs.count(obj_ptr)) continue;
                 if (validEnumTypes.count(obj_ptr)) continue;
-                // FunctionFlags at +0x128 must be reasonable
+                // FunctionFlags at +0x120 must be reasonable
                 uint32_t flags = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UFunction::FunctionFlags);
                 if (flags == 0 || flags > 0x10000000u) continue;
+                // Structural shape gate (catches OverlaySlot/StaticMesh/Texture
+                // false positives whose +0xB0 holds a float / heap ptr).
+                if (!looks_like_ufunc_struct(obj_ptr)) { ++pass3_rej_struct; continue; }
                 // Accept if EITHER:
                 //   (a) vtable is a known UFunction vtable, OR
                 //   (b) Outer resolves to a known type (the original strict heuristic)
@@ -1399,6 +1449,11 @@ public:
                 bool vt_ok    = ufunc_vtbls.count(vt) > 0;
                 bool outer_ok = outer && allTypeAddrs.count(outer) > 0;
                 if (!vt_ok && !outer_ok) continue;
+                // If admission is via outer-only (vt not yet in known set), the
+                // vtable destructor must look real — rejects vtables whose
+                // first slot points into 0xCC-padded / VMP-stripped regions
+                // (e.g. 0x14B8ADCD0 / 0x14B8AE100, ~10K UWidget subobjects).
+                if (!vt_ok && !vt_dtor_looks_real(vt)) { ++pass3_rej_dtor; continue; }
                 // If accepted by vtable but outer isn't a known type, push to orphans
                 if (!outer_ok) outer = 0;
                 m_owner_to_funcs[outer].push_back(obj_ptr);
@@ -1406,7 +1461,9 @@ public:
                 ufunc_vtbls.insert(vt);  // expand vtable set so pass 4 can rescue siblings
                 ++pass3;
             }
-            std::printf("[sdk] UFunction pass 3 (heuristic): %d extra funcs\n", pass3);
+            std::printf("[sdk] UFunction pass 3 (heuristic): %d extra funcs "
+                "(rejected %d by struct shape, %d by vt dtor)\n",
+                pass3, pass3_rej_struct, pass3_rej_dtor);
 
             // Pass 4: catch UFunctions whose ClassPrivate/Outer slots are empty or
             // un-decryptable (sparse slot pattern — only one of the four UObject
@@ -1417,6 +1474,7 @@ public:
             // Outer of 0 → orphan owner; the function still appears in the SDK's
             // orphan section.
             int pass4 = 0;
+            int pass4_rej_struct = 0;
             for (const auto& [idx, obj_ptr] : object_ptrs) {
                 if (found_set.count(obj_ptr)) continue;
                 uint64_t vt = Read<uint64_t>(obj_ptr);
@@ -1425,13 +1483,19 @@ public:
                 if (flags == 0 || flags > 0x10000000u) continue;
                 uint64_t nxt = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UFunction::NextPtr);
                 if (nxt != 0 && (nxt < 0x10000 || nxt >= 0x800000000000ULL)) continue;
+                // Structural shape gate — same rationale as Pass 3.  Necessary
+                // because Pass 3 may expand ufunc_vtbls with a sibling vtable
+                // that legitimately matches some UFunctions but also matches
+                // unrelated UObjects on the same heap chunk.
+                if (!looks_like_ufunc_struct(obj_ptr)) { ++pass4_rej_struct; continue; }
                 uint64_t outer = m_fname.GetOuterPtr(obj_ptr);
                 m_owner_to_funcs[outer].push_back(obj_ptr);
                 found_set.insert(obj_ptr);
                 ++pass4;
             }
-            std::printf("[sdk] UFunction pass 4 (sparse-slot rescue): %d extra funcs (ufunc_vtbls=%zu)\n",
-                pass4, ufunc_vtbls.size());
+            std::printf("[sdk] UFunction pass 4 (sparse-slot rescue): %d extra funcs "
+                "(rejected %d by struct shape, ufunc_vtbls=%zu)\n",
+                pass4, pass4_rej_struct, ufunc_vtbls.size());
 
             // Pass 5: walk UClass FuncMap (TMap<FName, UFunction*> at UClass+0x268).
             // Each UClass has a TMap with up to ~40 functions per class; total ~11K
@@ -1456,6 +1520,14 @@ public:
             for (const auto& [idx, obj_ptr] : object_ptrs) {
                 // Skip if already known to be a non-class type (enum/struct/CDO).
                 if (validEnumTypes.count(obj_ptr)) continue;
+
+                // FIX: skip walking FuncMaps of UFunction-meta classes themselves
+                // (Function, DelegateFunction, SparseDelegateFunction, ASFunction*).
+                // Their FuncMap data is either invalid or holds a global registry
+                // of UFunctions whose real owner is some other class — walking them
+                // here causes the same UFunction to be assigned to TWO owners (the
+                // meta-class AND the real class), producing 2K+ duplicate emissions.
+                if (funcMetaAddrs.count(obj_ptr)) { ++pass5_skipped_nonclass; continue; }
 
                 // Strict UClass gate: object must EITHER be referenced as a class
                 // pointer by some other object (allTypeAddrs), OR have its own
@@ -1511,6 +1583,33 @@ public:
             std::printf("[sdk] UFunction pass 5 (UClass FuncMap): %d new funcs across %d classes (skipped %d non-class objs)\n",
                 pass5, classes_walked, pass5_skipped_nonclass);
         }
+
+        // ── Dedup: ensure each UFunction appears in exactly ONE owner bucket ──
+        // Defensive cleanup against the pass-5 reassignment race (the inner
+        // for-loop over m_owner_to_funcs uses `break` after the first hit, so
+        // if the same ufunc somehow lands in two buckets it stays in one of
+        // them after a "reassign"). Also catches any remaining intra-bucket
+        // duplicates from earlier passes. Walk in iteration order; first
+        // sighting wins.
+        {
+            std::unordered_set<uint64_t> globally_seen;
+            int dropped_dup_inter = 0;
+            int dropped_dup_intra = 0;
+            for (auto& [owner, fns] : m_owner_to_funcs) {
+                std::vector<uint64_t> kept;
+                kept.reserve(fns.size());
+                std::unordered_set<uint64_t> bucket_seen;
+                for (uint64_t fn : fns) {
+                    if (!bucket_seen.insert(fn).second) { ++dropped_dup_intra; continue; }
+                    if (!globally_seen.insert(fn).second) { ++dropped_dup_inter; continue; }
+                    kept.push_back(fn);
+                }
+                fns = std::move(kept);
+            }
+            std::printf("[sdk] UFunction dedup: %d intra-bucket + %d cross-bucket duplicates removed\n",
+                dropped_dup_intra, dropped_dup_inter);
+        }
+
         {
             int total_fn = 0;
             for (auto& [owner, fns] : m_owner_to_funcs) total_fn += fns.size();
@@ -1841,35 +1940,97 @@ public:
         std::printf("[sdk] Pass-3 emit extras: +%zu structs, +%zu enums\n",
             extra_structs_added, extra_enums_added);
 
-        // Sort alphabetically by package then name
+        // Sort alphabetically by package then name (used for final emit order)
         auto sort_by_pkg_name = [](const auto& a, const auto& b) {
             return a.package < b.package || (a.package == b.package && a.name < b.name);
         };
-        std::sort(result.structs.begin(), result.structs.end(), sort_by_pkg_name);
-        std::sort(result.enums.begin(),   result.enums.end(),   sort_by_pkg_name);
 
-        // Disambiguate duplicate short names (UE Blueprint classes reuse names
-        // like "UpdateScript" / "From" / "SpawnScript" across hundreds of
-        // packages — the C++ namespace emission would otherwise collide).
-        // Track FINAL assigned names (not just bases) to avoid collisions
-        // between generated "_N" suffixes and pre-existing names that happen
-        // to match that pattern.
-        auto dedupe_names = [](auto& vec) {
+        // ── Quality-first dedup ────────────────────────────────────────────────
+        // Multiple records can share a short name (Object, Function,
+        // HorizontalBoxSlot, …). We must rename collisions to *_N so C++
+        // namespaces don't collide, but we want the *highest-quality*
+        // record to keep the bare name. Quality factors (highest first):
+        //   • package looks like a real engine/game package ("/Script/X" or "/Game/X")
+        //     vs a misresolved outer (e.g. package="Class" or "Unknown" produced
+        //     when GetPackagePtr's outer chain terminates at a UClass instead of
+        //     a UPackage).
+        //   • record has functions (UClass with reflected methods)
+        //   • record has properties
+        //   • is_class > is_struct (rare-name UClasses outweigh BP UScriptStructs)
+        //   • larger props_size (more complete reflection)
+        // Tie-break: shorter package name (prefers /Script/Engine over a deep
+        // BP path), then lexical package, then addr (deterministic).
+        auto pkg_quality = [](const std::string& p) -> int {
+            // Real engine/game packages start with a script/game prefix or are
+            // recognized as canonical UE module paths. Misresolved outers like
+            // "Class", "Unknown", or a bare object name get score 0.
+            if (p.empty() || p == "Unknown" || p == "Class" ||
+                p == "ScriptStruct" || p == "Enum" || p == "Package")
+                return 0;
+            // Heuristic: a real package short-name typically contains no dot
+            // and is one of /Script/X or /Game/Y/Z. Since we already strip to
+            // the last segment, accept any non-blacklisted name as tier 1.
+            return 1;
+        };
+        auto better_for_bare_name = [&](const auto& a, const auto& b) {
+            int qa = pkg_quality(a.package), qb = pkg_quality(b.package);
+            if (qa != qb) return qa > qb;
+            bool fa = !a.functions.empty(), fb = !b.functions.empty();
+            if (fa != fb) return fa;
+            bool pa = !a.properties.empty(), pb = !b.properties.empty();
+            if (pa != pb) return pa;
+            if (a.is_class != b.is_class) return a.is_class;
+            if (a.props_size != b.props_size) return a.props_size > b.props_size;
+            if (a.package.size() != b.package.size()) return a.package.size() < b.package.size();
+            if (a.package != b.package) return a.package < b.package;
+            return a.addr < b.addr;
+        };
+        // Enums don't have functions/properties/is_class/props_size — fall
+        // back to package-quality + lexical.
+        auto better_for_bare_name_enum = [&](const auto& a, const auto& b) {
+            int qa = pkg_quality(a.package), qb = pkg_quality(b.package);
+            if (qa != qb) return qa > qb;
+            if (a.package.size() != b.package.size()) return a.package.size() < b.package.size();
+            if (a.package != b.package) return a.package < b.package;
+            return a.addr < b.addr;
+        };
+
+        // Group by short name, pick the "best" record per group to keep its
+        // bare name, rename the rest with _N suffixes (stable within group by
+        // package then addr).
+        auto dedupe_by_quality = [&](auto& vec, auto&& cmp) {
+            std::unordered_map<std::string, std::vector<size_t>> by_name;
+            for (size_t i = 0; i < vec.size(); ++i)
+                by_name[vec[i].name].push_back(i);
             std::unordered_set<std::string> taken;
-            for (auto& r : vec) {
-                if (taken.insert(r.name).second) continue;  // first use
-                // Find the lowest _N not yet taken.
-                for (int n = 1; ; ++n) {
-                    std::string candidate = r.name + "_" + std::to_string(n);
-                    if (taken.insert(candidate).second) {
-                        r.name = std::move(candidate);
-                        break;
+            // First pass: claim bare names for the best record in each group.
+            for (auto& [name, idxs] : by_name) {
+                std::sort(idxs.begin(), idxs.end(), [&](size_t x, size_t y) {
+                    return cmp(vec[x], vec[y]);
+                });
+                taken.insert(vec[idxs.front()].name);  // best keeps bare name
+            }
+            // Second pass: rename runner-ups with the lowest free _N suffix.
+            for (auto& [name, idxs] : by_name) {
+                if (idxs.size() <= 1) continue;
+                int n = 1;
+                for (size_t k = 1; k < idxs.size(); ++k) {
+                    std::string candidate;
+                    for (;; ++n) {
+                        candidate = name + "_" + std::to_string(n);
+                        if (taken.insert(candidate).second) break;
                     }
+                    vec[idxs[k]].name = std::move(candidate);
+                    ++n;
                 }
             }
         };
-        dedupe_names(result.structs);
-        dedupe_names(result.enums);
+        dedupe_by_quality(result.structs, better_for_bare_name);
+        dedupe_by_quality(result.enums,   better_for_bare_name_enum);
+
+        // Final emit-order sort (after dedup so renamed entries stay grouped).
+        std::sort(result.structs.begin(), result.structs.end(), sort_by_pkg_name);
+        std::sort(result.enums.begin(),   result.enums.end(),   sort_by_pkg_name);
 
         return result;
     }
