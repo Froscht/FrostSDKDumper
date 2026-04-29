@@ -14,14 +14,6 @@ vtable_map.md
 .mcp.json
 
 # Kernel module build artifacts
-kernel_module/src/*.ko
-kernel_module/src/*.o
-kernel_module/src/*.mod
-kernel_module/src/*.mod.c
-kernel_module/src/.*.cmd
-kernel_module/src/Module.symvers
-kernel_module/src/modules.order
-kernel_module/src/.tmp_versions/
 
 # Python
 __pycache__/

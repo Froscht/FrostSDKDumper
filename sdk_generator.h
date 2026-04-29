@@ -676,6 +676,49 @@ public:
                 if (!en.empty()) type_name = en;
             }
         }
+        // FByteProperty: if it wraps a UEnum, emit the enum name; else fall
+        // through to primitive lowering (uint8_t).
+        if (type_name == "FByteProperty") {
+            uint64_t en = Read<uint64_t>(ff + ArcDecrypt::Offsets::FEnumProperty::UnderlyingProp); // shares +0x108
+            if (en > 0x10000 && en < 0x7FFFFFFFFFFFULL) {
+                m_known_enums.insert(en);
+                std::string n = m_fname.GetName(en);
+                if (!n.empty()) { type_name = n; return; }
+            }
+        }
+        // FDelegateProperty: SignatureFunction at +0x108 names the delegate.
+        if (type_name == "FDelegateProperty" ||
+            type_name == "FMulticastInlineDelegateProperty" ||
+            type_name == "FMulticastSparseDelegateProperty" ||
+            type_name == "FMulticastDelegateProperty") {
+            uint64_t sig = Read<uint64_t>(ff + 0x108);
+            if (sig > 0x10000 && sig < 0x7FFFFFFFFFFFULL) {
+                std::string n = m_fname.GetName(sig);
+                if (!n.empty()) { type_name = "TDelegate<" + n + ">"; return; }
+            }
+        }
+        // FFieldPathProperty: PropertyClass-style pointer; the field-class
+        // struct holds a reflection-stripped pointer. Lower to TFieldPath<FField>.
+        if (type_name == "FFieldPathProperty") {
+            type_name = "TFieldPath<FField>";
+            return;
+        }
+        // ── Primitive type lowering ────────────────────────────────────────
+        // Rewrite raw FXxxProperty type names to their C++ equivalents. Runs
+        // last so enum/struct/object resolution above takes precedence. Closes
+        // the ~30K placeholder-token leak in function param/return types.
+        static const std::unordered_map<std::string, std::string> kPrim = {
+            {"FBoolProperty",   "bool"},      {"FByteProperty",   "uint8_t"},
+            {"FIntProperty",    "int32_t"},   {"FInt64Property",  "int64_t"},
+            {"FInt16Property",  "int16_t"},   {"FInt8Property",   "int8_t"},
+            {"FUInt32Property", "uint32_t"},  {"FUInt64Property", "uint64_t"},
+            {"FUInt16Property", "uint16_t"},
+            {"FFloatProperty",  "float"},     {"FDoubleProperty", "double"},
+            {"FNameProperty",   "FName"},     {"FStrProperty",    "FString"},
+            {"FStringProperty", "FString"},   {"FTextProperty",   "FText"},
+        };
+        auto it = kPrim.find(type_name);
+        if (it != kPrim.end()) type_name = it->second;
     }
 
     // ── Read a single FProperty chain from any FField* head pointer ─────────
@@ -841,9 +884,11 @@ public:
                              pr.type_name == "FLazyObjectProperty";
             bool is_interface = pr.type_name == "FInterfaceProperty";
 
-            // Resolve sub-property types (struct name, object class, enum, etc.)
-            if (is_struct || is_object || is_class || is_interface || is_enum)
-                ResolveSubPropertyType(ff, pr.type_name);
+            // Resolve sub-property types (struct name, object class, enum,
+            // FByteProperty.Enum, delegate signature, primitive lowering).
+            // ResolveSubPropertyType always runs — it handles all subclass
+            // rewrites + final primitive lowering pass.
+            ResolveSubPropertyType(ff, pr.type_name);
 
             // FArrayProperty: enrich parent + add Inner sub-property
             if (is_array) {

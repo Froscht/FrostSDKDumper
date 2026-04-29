@@ -229,7 +229,7 @@ namespace Offsets {
         //                (generic ProcessInternal VM thunk for BP).
         // 20260421 values: FunctionFlags=0x128, NativeFunc=0x1C8.
         constexpr uint64_t FunctionFlags = 0x120;   // 20260421: 0x128
-        constexpr uint64_t NativeFunc    = 0x150;   // 20260428: shifted +8 from initial RE; +0x148 reads zero, +0x150 is the x64 prologue. 20260421: 0x1C8
+        constexpr uint64_t NativeFunc    = 0x148;   // 20260428: live-verified across 4650 native + 1489 BP UFunctions (Pass-3/4 audit); +0x150 reads garbage on real UFunctions. 20260421: 0x1C8
         constexpr uint64_t NumParms      = 0xB0;    // u8 — useful cross-check vs ChildProperties chain length
     }
     // UClass extends UStruct. Patch 20260428 stores the per-class function table
