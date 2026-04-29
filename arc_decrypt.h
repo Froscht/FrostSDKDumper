@@ -104,17 +104,21 @@ namespace Offsets {
         constexpr uint64_t FieldsSlots  = 0x20; // slots at obj+0x20,+0x40,+0x60,+0x80 (stride 0x20)
     }
     namespace FField {
-        // Patch 20260421 authoritative layout (verified via UStruct_Link / FField_GetFName IDA pass):
+        // Patch 20260428 LIVE-PROBED layout (20-entry chain walk on
+        // EmbarkPlayerController @ 0x7AC8CA00 confirmed every offset):
         //   +0x00  vtable
-        //   +0x30  ClassPrivate (FFieldClass*)
-        //   +0x38  Owner ptr (bit 0 = tag) — walking chain via +0x40 also works (aliased)
-        //   +0x40  Next (FField*)
-        //   +0x60  NameEncrypted — 16-byte SIMD slot; decode with FField_GetFName pipeline
+        //   +0x20  ClassPrivate (FFieldClass*)        (was +0x30)
+        //   +0x48  Next (FField*)                     (was +0x40)
+        //   +0x50  Owner (parent UStruct | 1 — low-bit tag)
+        //   +0x70  NamePrivate (16-byte SIMD slot)    (was +0x60)
+        //   +0x78  encryption salt 0x893BCE4393840650 (validation sentinel)
         constexpr uint64_t VTable        = 0x00;
-        constexpr uint64_t ClassPrivate  = 0x30;
-        constexpr uint64_t Next          = 0x40;
-        constexpr uint64_t NameEncrypted = 0x60;   // encrypted 16B
-        constexpr uint64_t NamePrivate   = 0x60;   // alias
+        constexpr uint64_t ClassPrivate  = 0x20;   // 20260421: 0x30
+        constexpr uint64_t Next          = 0x48;   // 20260421: 0x40
+        constexpr uint64_t Owner         = 0x50;
+        constexpr uint64_t NameEncrypted = 0x70;   // 20260421: 0x60
+        constexpr uint64_t NamePrivate   = 0x70;   // alias
+        constexpr uint64_t SaltSentinel  = 0x78;   // expected = 0x893BCE4393840650
     }
     namespace FFieldClass {
         // Confirmed from live FFieldClass objects (e.g. 0xBDF31C00), patch 20260402
@@ -122,17 +126,23 @@ namespace Offsets {
         // NamePrivate: no fixed SIMD slot found; type identified via vtable map instead
     }
     namespace FProperty {
-        // Patch 20260421 authoritative layout (verified via UStruct_Link / sub_456A40 IDA pass
-        // and empirical live probe on ActorComponent/SceneComponent/PrimitiveComponent/ControlRigComponent):
-        //   +0xA8 ArrayDim (u32)
-        //   +0xAC ElementSize (u32)
-        //   +0xC0 Offset_Internal (ENCRYPTED u32): real = bswap32(stored) ^ 0x59B8C401
-        //   +0xB0..+0xB7 PropertyFlags (u64 — best guess)
-        constexpr uint64_t ArrayDim        = 0xA8;
-        constexpr uint64_t ElementSize     = 0xAC;
-        constexpr uint64_t Offset_Internal = 0xC0;
-        constexpr uint32_t Offset_XOR      = 0x59B8C401u;  // XOR after bswap32
-        constexpr uint64_t PropertyFlags   = 0xB0;
+        // Patch 20260428 LIVE-VERIFIED layout (probed FVector::X/Y/Z @ 0x98A91DE0,
+        // known offsets 0/8/16 — fully consistent):
+        //   +0x98 PropertyFlags (u64)             [was +0xB0]
+        //   +0xA0 ElementSize (u32)               [was +0xAC]
+        //   +0xB4 Offset_Internal (ENCRYPTED u32) [was +0xC0]
+        //         real = bswap32(stored) ^ 0x34605D14
+        //   +0xE0 ArrayDim (u32)                  [was +0xA8]
+        //
+        // Verification:
+        //   X stored=0x145D6034 → bswap=0x34605D14 ^ key = 0x00 ✓ (offset 0)
+        //   Y stored=0x1C5D6034 → bswap=0x34605D1C ^ key = 0x08 ✓ (offset 8)
+        //   Z stored=0x045D6034 → bswap=0x34605D04 ^ key = 0x10 ✓ (offset 16)
+        constexpr uint64_t ArrayDim        = 0xE0;        // 20260421: 0xA8
+        constexpr uint64_t ElementSize     = 0xA0;        // 20260421: 0xAC
+        constexpr uint64_t Offset_Internal = 0xB4;        // 20260421: 0xC0
+        constexpr uint32_t Offset_XOR      = 0x34605D14u; // 20260421: 0x59B8C401
+        constexpr uint64_t PropertyFlags   = 0x98;        // 20260421: 0xB0
     }
     namespace FBoolProperty {
         // TODO: re-verify for patch 20260402; previous values assumed UE5 default layout
@@ -142,26 +152,26 @@ namespace Offsets {
         constexpr uint64_t FieldMask  = 0x133;
     }
     // Sub-property offsets for inner type resolution.
-    // Patch 20260421 (verified via LinkInternal decomp + live probe on Arc_Raiders_Binary_20260421).
-    // Each subclass reads its inner pointer at +0xE8 or +0xF0. Sources:
-    //   FArrayProperty::LinkInternal    @ 0x428210 reads a1+0xF0 (Inner)
-    //   FMapProperty::LinkInternal      @ 0x456A40 reads a1+0xE8 (Key), a1+0xF0 (Value)
-    //   FSetProperty::LinkInternal      @ 0x46B880 reads a1+0xE8 (ElementProp)
-    //   FStructProperty::LinkInternal   @ 0x45C6C0 reads a1+0xE8 (Struct)
-    //   FObjectProperty::ARO            @ 0x4250F0 passes a1+0xE8 (PropertyClass)
-    //   FEnumProperty::LinkInternal     @ 0x3E5850 reads a1+0xE8 (UnderlyingProp); Enum at +0xF0 (ARO sub_3AFDE0)
-    namespace FStructProperty  { constexpr uint64_t Struct        = 0xE8; }
-    namespace FObjectProperty  { constexpr uint64_t PropertyClass = 0xE8; }
+    // Patch 20260428: ALL FProperty subclass sub-pointers shifted +0x20 from 20260421.
+    //   Inner/Key/Value/Element/Struct/PropertyClass: 0xE8 → 0x108
+    //   FArrayProperty::Inner / FMapProperty::ValueProp / FEnumProperty::Enum: 0xF0 → 0x110
+    // Verified via live probe on patch 20260428 across:
+    //   FObjectProperty (ACLDatabase, ActorSequencePlayer): +0x108 = PropertyClass UClass*
+    //   FInterfaceProperty (MovieSceneSequencePlayerObserver): +0x108 = InterfaceClass UClass*
+    //   FMapProperty: +0x108 = KeyProp, +0x110 = ValueProp
+    //   FEnumProperty: +0x108 = UnderlyingProp (FField*), +0x110 = Enum (UEnum*)
+    namespace FStructProperty  { constexpr uint64_t Struct        = 0x108; }
+    namespace FObjectProperty  { constexpr uint64_t PropertyClass = 0x108; }
     namespace FEnumProperty    {
-        constexpr uint64_t UnderlyingProp = 0xE8;  // FField*
-        constexpr uint64_t Enum           = 0xF0;  // UEnum*
+        constexpr uint64_t UnderlyingProp = 0x108;  // FField*
+        constexpr uint64_t Enum           = 0x110;  // UEnum*
     }
-    namespace FArrayProperty   { constexpr uint64_t Inner         = 0xF0; }
-    namespace FSetProperty     { constexpr uint64_t ElementProp   = 0xE8; }
-    namespace FSoftObjectProperty { constexpr uint64_t PropertyClass = 0xE8; }
+    namespace FArrayProperty   { constexpr uint64_t Inner         = 0x110; }
+    namespace FSetProperty     { constexpr uint64_t ElementProp   = 0x108; }
+    namespace FSoftObjectProperty { constexpr uint64_t PropertyClass = 0x108; }
     namespace FMapProperty {
-        constexpr uint64_t KeyProp   = 0xE8;
-        constexpr uint64_t ValueProp = 0xF0;
+        constexpr uint64_t KeyProp   = 0x108;
+        constexpr uint64_t ValueProp = 0x110;
     }
     // Additional subclasses identified in IDA (shared parent FObjectPropertyBase):
     // FWeakObjectProperty, FLazyObjectProperty, FInterfaceProperty → PropertyClass at +0xE8 (inherited).
@@ -183,26 +193,49 @@ namespace Offsets {
         constexpr uint64_t PropertyFlags   = 0x70;  // plain uint64
     }
     namespace UStruct {
-        // Patch 20260421 authoritative layout (verified via UStruct_Link @ sub_33E480):
+        // Patch 20260428 LIVE-PROBED layout (EmbarkPlayerController chain walk):
         //   +0xB0  SuperStruct (UStruct*)
-        //   +0xD0  Children (UField* chain — UFunctions)
-        //   +0xE0  ChildProperties (FField* chain — real FProperty members)
-        //   +0xF8  MinAlignment-ish u32
-        //   +0x118 PropertiesSize (u32 — the running sum UStruct_Link writes)
+        //   +0xD0  ChildProperties (FField* chain — FProperty members)
+        //          mirrored at +0xE8 and +0xF0 — same pointer value
+        //   +0x118 PropertiesSize (u32)
+        // 20260421: ChildProperties was at +0xE0; in 20260428 +0xE0 holds
+        // unrelated data. The broad-scan in sdk_generator.h compensated by
+        // sweeping +0x80..+0x140 step 8, but the primary read should be +0xD0.
         constexpr uint64_t SuperStruct     = 0x0B0;
-        constexpr uint64_t Children        = 0x0D0;  // UField* (UFunctions)
-        constexpr uint64_t ChildProperties = 0x0E0;  // FField* (FProperty chain)
+        constexpr uint64_t Children        = 0x0D0;  // legacy alias
+        constexpr uint64_t ChildProperties = 0x0D0;  // 20260421: 0x0E0
         constexpr uint64_t PropertiesSize  = 0x118;
         constexpr uint64_t MinAlignment    = 0x0F8;
     }
     namespace UEnum {
-        constexpr uint64_t Names = 0xB0;  // patch 20260414 (was 0xA8 in 20260409). +0xA0 holds CppType FString.
+        constexpr uint64_t Names = 0xA8;  // 20260428: shifted from 0xB0; +0xA0 holds CppType FString. Names[i].lo32 is direct FNamePool index (no obfuscation).
     }
     namespace UFunction {
         constexpr uint64_t VTable        = 0x000;
         constexpr uint64_t NextPtr       = 0x098;
-        constexpr uint64_t FunctionFlags = 0x128;
-        constexpr uint64_t NativeFunc    = 0x1C8;
+        // 20260428: UFunction layout shrank ~0x80 bytes. Verified live via
+        //   Tick native: FunctionFlags=0x0802080A, NativeFunc=0x14049AE10
+        //                (= valid x86-64 prologue at the target).
+        //   ExecuteUbergraph BP: FunctionFlags=0x00808001, NativeFunc same
+        //                (generic ProcessInternal VM thunk for BP).
+        // 20260421 values: FunctionFlags=0x128, NativeFunc=0x1C8.
+        constexpr uint64_t FunctionFlags = 0x120;   // 20260421: 0x128
+        constexpr uint64_t NativeFunc    = 0x150;   // 20260428: shifted +8 from initial RE; +0x148 reads zero, +0x150 is the x64 prologue. 20260421: 0x1C8
+        constexpr uint64_t NumParms      = 0xB0;    // u8 — useful cross-check vs ChildProperties chain length
+    }
+    // UClass extends UStruct. Patch 20260428 stores the per-class function table
+    // as TMap<FName, UFunction*> at the offsets below (verified live across
+    // 6 vtable variants — native UClass, ASClass, BPGC, WBPGC, SMBPGC, AnimBPGC).
+    // Total recoverable: ~11K UFunctions across 4020 UClass-like objects.
+    namespace UClass {
+        constexpr uint64_t FuncMap_PairsData = 0x268;  // u64* heap ptr to TPair array
+        constexpr uint64_t FuncMap_Num       = 0x270;  // u32 entry count
+        constexpr uint64_t FuncMap_Max       = 0x274;  // u32 capacity
+        constexpr uint64_t FuncMap_PairStride = 24;    // bytes per TPair
+        // TPair layout: +0x00 FName (key), +0x08 UFunction* (value),
+        //               +0x10 HashNextId (i32), +0x14 HashIndex (i32)
+        constexpr uint64_t FuncMapPair_FName    = 0x00;
+        constexpr uint64_t FuncMapPair_UFunction = 0x08;
     }
     namespace UWorld {
         constexpr uint64_t PersistentLevel = 0x0F0;  // user-verified 20260414 (was 0x0F8)
@@ -220,12 +253,13 @@ constexpr uint64_t MODULE_BASE = 0x140000000;
 
 // Runtime-overridable anchors (sig-scan may rewrite these at Init; hardcoded
 // values are the fallback and the "known good for current patch" default).
-// Values updated to patch 20260421; older patch values kept inline as comments.
-inline uint64_t RVA_GWORLD              = 0xE011D18;
-inline uint64_t RVA_GNAMES_BASE         = 0xDB0FE00;   // 20260421 (was 0xDB48E80)
-inline uint64_t RVA_FNAME_KEY_TABLE     = 0xDA547F4;   // 20260421 keystream (was 0xDA8D854)
-inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xDDCB420;   // 20260421 (was 0xDE04650); enc xmmword at +0x00 for new pipeline
-constexpr uint64_t GOBJ_ENCRYPTED_OFF   = 0x30;        // legacy pipeline offset
+// Values are the latest verified patch's defaults; older patches kept as
+// comments so a stale sig-scan or a partial revert can fall back gracefully.
+inline uint64_t RVA_GWORLD              = 0xE024F68;   // 20260428 (20260421: 0xE011D18)
+inline uint64_t RVA_GNAMES_BASE         = 0xDB5BE80;   // 20260428 (20260421: 0xDB0FE00, 20260414: 0xDB48E80)
+inline uint64_t RVA_FNAME_KEY_TABLE     = 0xDAA07F4;   // 20260428 (20260421: 0xDA547F4, 20260414: 0xDA8D854)
+inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xDE173A0;   // 20260428 (20260421: 0xDDCB420)
+constexpr uint64_t GOBJ_ENCRYPTED_OFF   = 0x30;        // legacy pipeline offset (unused on 20260428: NumElements is plain at +0x38)
 
 // SIMD runtime tables (GUObjectArray decrypt — patch 20260414)
 // Pipeline: ROL32(20) → XOR(key) → ROL16(12) [no PSHUFB step]
@@ -323,26 +357,57 @@ constexpr uint64_t UPROP_FNAME_OFFSET    = 0x50;
 constexpr uint64_t UPROP_FNAME_XOR_KEY   = 0x19AE9873B7A3AC48ULL;     // same key as FNAME_BLOCK2_XOR (patch 20260414)
 
 // =============================================================================
-// 5. Patch 20260421 additions (from IDA instance 0dpx / 3sw0 rename pass)
-//    Binary: Arc_Raiders_Binary_20260421_213315.exe (100% coverage dump)
-//    Keep prior constants intact for cross-patch fallback.
+// 5. Patch 20260421 / 20260428 active constants
+//
+// 20260428 (2026-04-28) breakdown — RE'd from IDA instance jjn1
+// (binary `ARC_RAIDERS_UNKNOWN_20260428_111248_D3D694C7_77PagesDecrypted.exe`):
+//
+// - FNamePool resolver: shape mostly preserved, but ~every constant changed.
+//   See FNamePool20260421 below — values updated in-place; old values kept
+//   in trailing comments. Verified from `sub_22F3E0` (FNamePool_ResolveCI)
+//   decompile.
+// - GUObjectArray encrypted blob moved to +0xB0 (was +0x00 in 20260421).
+//   Decrypt shape now uses PSHUFLW(0x1E) → ROL16(1) (similar to old FField
+//   name decrypt). `vtable[5]` (offset 40) replaces `vtable[7]` for the
+//   chunks_manager indirection. Full chain still needs live RE.
+// - FNameEntry decrypt is no longer a simple per-byte XOR. It's now a
+//   stateful LCG that emits two keystream lookups per pair, with a
+//   multiplicative state advance — see feedback_20260428_breakdown.md
+//   for the exact formula. New keytable RVA = 0xDAA07F4.
 // =============================================================================
 namespace Patch20260421 {
     // FName_ToString @ RVA 0x24C8130 recovers the entry pointer from the
     // public FName handle via:
     //     entry_ptr = bswap64(handle_qword ^ ENTRY_HANDLE_XOR)
-    constexpr uint64_t ENTRY_HANDLE_XOR      = 0x59B07C3D00000000ULL;
+    //
+    // Runtime-overridable: extracted from the live game's FName function
+    // body during BootEmuFNameFallback (see find_fname_func.h::ExtractEntryHandleXor).
+    // If extraction fails, the patch-20260421 default is used.
+    // 20260428: 0x9CB9AD0A00000000  (auto-extracted at runtime by
+    //           find_fname_func.h::ExtractEntryHandleXor; verified in IDA jjn1
+    //           decompile of FName_ToString_20260428 @ 0x23AD40)
+    // 20260421: 0x59B07C3D00000000
+    inline uint64_t ENTRY_HANDLE_XOR = 0x9CB9AD0A00000000ULL;
+    inline void SetEntryHandleXor(uint64_t v) { ENTRY_HANDLE_XOR = v; }
 
     // Secondary XOR seen on (entry + 192) field in FName_ToString:
     //     field_dec = bswap32(*(u32*)(entry+0xC0) ^ ENTRY_FIELD_XOR)
     constexpr uint32_t ENTRY_FIELD_XOR       = 0x01C4B859u;
 
-    // FNamePool base moved from RVA_GNAMES_BASE (0xDB48E80) to 0xDB0FE00
-    // (verify with probe_live_rvas before trusting for live sessions).
-    constexpr uint64_t RVA_GNAMES_BASE_NEW   = 0xDB0FE00;
+    // FNamePool base — moved each patch.
+    //   20260414: 0xDB48E80
+    //   20260421: 0xDB0FE00
+    //   20260428: 0xDB5BE80   (verified via init guard `byte_DB5BE78` before
+    //                           the static initializer in FNamePool_ResolveCI)
+    constexpr uint64_t RVA_GNAMES_BASE_NEW   = 0xDB5BE80;
 
-    // Per-byte XOR keystream for FNameEntry content encryption.
-    constexpr uint64_t RVA_FNAME_KEYSTREAM   = 0xDA547F4;
+    // FNameEntry keystream table (shifted +0x4C000 in 20260428).
+    // Old (≤20260421): 0xDA547F4 — still has structured non-keystream bytes,
+    //                  causes `[sig] FNameKeyTbl 0xDA547F4 (matches constant)`
+    //                  false positive in current sig scan.
+    // New (20260428): 0xDAA07F4 (uniform-random byte pattern; verified via
+    //                  FNameEntry_AppendNameToString_20260428 decompile).
+    constexpr uint64_t RVA_FNAME_KEYSTREAM   = 0xDAA07F4;
 
     // FField NamePrivate decrypt SIMD constants moved:
     //   PSHUFB mask (`07 02 03 06 05 00 01 04`) — was 0xAD85670
@@ -368,9 +433,14 @@ namespace Patch20260421 {
     // FUObjectItem stride = **20 bytes** (not 24). ObjectsPerChunk = 65536.
     //   chunk_idx = iter >> 16;  in_chunk = iter & 0xFFFF
     //   slot = chunks_array[chunk_idx] + 20 * in_chunk
-    constexpr uint64_t RVA_GUOBJECT_ARRAY_NEW   = 0xDDCB420;
-    constexpr uint64_t RVA_GOBJ_PSHUFB_MASK     = 0xACBFCA0;
-    constexpr uint64_t RVA_GOBJ_MAX_XOR_KEY     = 0xAD12960;
+    // 20260428: GUObjectArray moved to 0xDE173A0 AND the encrypted blob
+    // moved from +0x00 to +0x B0. The `RVA_GUOBJECT_ARRAY_NEW` is now
+    // mutable so `sig_scan` can update it; `RVA_GOBJECT_ARRAY_BASE`
+    // (in the parent namespace) is also auto-fixed but the 20260421 path
+    // was reading this stale constexpr instead.
+    inline    uint64_t RVA_GUOBJECT_ARRAY_NEW   = 0xDE173A0;   // 20260421: 0xDDCB420
+    constexpr uint64_t RVA_GOBJ_PSHUFB_MASK     = 0xACBFCA0;   // 20260428: pipeline shape changed; this RVA is stale
+    constexpr uint64_t RVA_GOBJ_MAX_XOR_KEY     = 0xAD12960;   // 20260428: pipeline shape changed; this RVA is stale
     constexpr int      GOBJ_PIPELINE_ROL32_A    = 23;
     constexpr int      GOBJ_PIPELINE_ROL32_B    = 13;
     constexpr int      GOBJ_MAX_PSHUFLW_IMM     = 0xA3;
@@ -424,7 +494,11 @@ namespace Patch20260421 {
     //   5. ROL64(lo64, 32) → final = (Number << 32) | CI  (CI in LO32)
     // =========================================================================
     namespace FFieldName20260421 {
-        constexpr uint64_t RVA_XOR_CONST = 0xAD15750;
+        // 20260428: XOR const relocated from AD15750 → AD0FE50.
+        // Byte values unchanged: 38 BA 6F 75 E8 89 57 36 (lo8) + zeros (hi8).
+        // Verified live: AD0FE50 has the salt; AD15750 now contains unrelated
+        // global state (was used for the OLD FField name slot encryption).
+        constexpr uint64_t RVA_XOR_CONST = 0xAD0FE50;  // 20260421: 0xAD15750
         constexpr int      PSHUFLW_IMM   = 0x1E;
         constexpr int      ROL16_AMT     = 1;
         constexpr int      ROL64_AMT     = 32;
@@ -437,7 +511,8 @@ namespace Patch20260421 {
     // stored=0x01C4B859 (sentinel) decrypts to 0.
     // =========================================================================
     inline uint32_t DecryptPropertyOffsetNew(uint32_t stored) {
-        return __builtin_bswap32(stored) ^ 0x59B8C401u;
+        // 20260428: key changed from 0x59B8C401 to 0x34605D14.
+        return __builtin_bswap32(stored) ^ 0x34605D14u;
     }
 
     // =========================================================================
@@ -460,6 +535,136 @@ namespace Patch20260421 {
     }
 
     // =========================================================================
+    // 20260428 UObject 4-slot decrypt — pipeline ENTIRELY DIFFERENT from 20260421
+    // From REFERENCE_FName_20260428.h ("Actor FName decrypt"):
+    //   shuffle_epi8(enc, ACTOR_SHUF_MASK) → ROL32(17) → XOR(scalar) → ROL64(32)
+    // Slot picker hash uses ROL32(25/27) and ADD=0x114E4953.
+    // Slot offset = idx*32 + 0x20 (stride 0x20; same as older patches).
+    // The decrypted lo32 IS the comp_index directly (no high-half "Number").
+    // =========================================================================
+    namespace UObjSlot20260428 {
+        // 8-byte PSHUFB mask (from xmmword in .rdata — exact RVA TBD; bytes are:
+        //     01 06 00 04 07 03 02 05  (lo64; hi64 = 0))
+        // The MASK lives in the .rdata table that 20260421 used for AD128C0;
+        // the new mask bytes are different so the constant moved to a new RVA.
+        constexpr uint8_t SHUF_MASK_BYTES[8] = { 0x01, 0x06, 0x00, 0x04,
+                                                 0x07, 0x03, 0x02, 0x05 };
+        constexpr uint64_t XOR_SCALAR    = 0x4834C6DEA02581C7ULL;
+        constexpr int      ROL32_AMT     = 17;
+        constexpr int      ROL64_AMT     = 32;
+        constexpr int      SLOT_BASE_OFF = 0x20;
+        constexpr int      SLOT_STRIDE   = 0x20;
+
+        // Slot index hash constants (from ComputeHashAndIndex):
+        //   h = ROL32(lo, 25) → P*h + ADD
+        //   h = ROL32(h, 27)  → P*h + hi + ADD
+        //   h >>= 7; h = P*h + ADD
+        //   h >>= 5; v7 = P*h + ADD
+        //   slot_idx = ((v7 ^ HIWORD(v7)) & 3) ^ 2
+        constexpr uint32_t HASH_PRIME = 0x01000193u;     // FNV32 prime (unchanged)
+        // Verified via C# reference (decimal = 290405715). Earlier incorrectly
+        // documented as 0x114E4953 which is the wrong hex; correct hex is 0x114F3D53.
+        constexpr uint32_t HASH_ADD   = 0x114F3D53u;
+        constexpr int      HASH_ROL1  = 25;
+        constexpr int      HASH_ROL2  = 27;
+        constexpr int      HASH_SHR1  = 7;
+        constexpr int      HASH_SHR2  = 5;
+    }
+
+    // =========================================================================
+    // 20260428 FNamePool full resolver — verified via REFERENCE_FName_20260428.h
+    // Takes a comp_index (i32) and returns FNameEntry*. Three-stage SIMD CI
+    // transform → block-selector hash → 2 block decrypts → FNV fold → 3-XOR
+    // pointer fixup.
+    // =========================================================================
+    namespace FNamePool20260428 {
+        constexpr uint64_t CHUNK_FNV_SEED_OFF  = 0x7090;   // 28816
+        constexpr uint64_t CHUNK_BLOCK_BASE_OFF = 0x70A0;  // 28832
+
+        // CI 3-stage transform constants (verified live + reference):
+        //   Stage 1 SHUF1 @ 0xAD49100 — bytes (lo8): 00 02 00 01 03 00 00 00 (replicated to hi8)
+        //   Stage 1 XOR1  @ 0xAD49110 — bytes (lo8): BC BD 4B 43 C8 09 FF 4B (replicated to hi8)
+        //   Stage 2 XOR   @ 0xAD49390 — bytes (lo8): 00 BD 00 43 C8 09 00 00 (replicated to hi8)
+        //   Stage 3 SHUF  @ 0xAD49140 — bytes:       05 03 01 04 00*12       (CI extract mask)
+        //   Stage 3 XOR   @ 0xAD49150 — bytes:       09 43 BD C8 00*12       (CI extract const)
+        constexpr uint64_t RVA_GIDX_SHUF1   = 0xAD49100;
+        constexpr uint64_t RVA_GIDX_XOR1    = 0xAD49110;
+        constexpr uint64_t RVA_STAGE2_XOR   = 0xAD49390;
+        constexpr uint64_t RVA_EXTRACT_SHUF = 0xAD49140;
+        constexpr uint64_t RVA_EXTRACT_XOR  = 0xAD49150;
+        constexpr int      STAGE_PSHUFLW_IMM = 0xB1;
+        constexpr int      STAGE_ROL32_A     = 17;  // stages 1/2 final ROL
+        constexpr int      STAGE_ROL32_B     = 15;  // stages 2/3 entry ROL
+
+        // Block-selector hash:
+        //   h = ((seed_lo >> 6) | 0x40000000) → P*h + BHASH_ADD
+        //   h = ROL32(h, 28) → P*h + seed_hi + BHASH_ADD
+        //   h >>= 6; h = P*h + BHASH_ADD; h >>= 4
+        //   nxt = P*h + BHASH_ADD
+        //   bidx = ((-109*h - 126) ^ (nxt >> 16)) & 0xFF
+        constexpr uint32_t BHASH_PRIME = 0x01000193u;
+        constexpr uint32_t BHASH_ADD   = 0xCA104182u;  // (= -904904318)
+        constexpr int      BHASH_ROL   = 28;
+
+        // Block decrypt (8-byte PSHUFB mask + 16-bit ROL + scalar XOR):
+        //   shuffle_epi8(slot, BLOCK_SHUF) → ROL16(5) → XOR(BLOCK_POST_XOR)
+        // BLOCK_SHUF @ 0xAD49130 (lo8): 05 00 06 04 03 07 02 01
+        constexpr uint64_t RVA_BLOCK_SHUF      = 0xAD49130;
+        constexpr int      BLOCK_ROL16_AMT     = 5;
+        constexpr uint64_t BLOCK_POST_XOR      = 0x9F737271C0F041C4ULL;
+
+        // FNV fold on first decoded block:
+        //   fnv = P64 * ROL64(v14, 50) + OFF
+        //   fnv = P64 * ROL64(fnv, 56) + OFF
+        constexpr uint64_t FNV64_PRIME = 0x100000001B3ULL;
+        constexpr uint64_t FNV64_OFF   = 0x7631B6D6E2D67842ULL;
+        constexpr int      FNV64_ROL1  = 50;
+        constexpr int      FNV64_ROL2  = 56;
+
+        // Result composition:
+        //   R = v14 + (fnv ^ v15_dec) + 2 * (uint16)v5
+        //   a = bswap64(R ^ PTR_XOR_1)
+        //   b = a ^ PTR_XOR_2
+        //   name_ptr = bswap64(b ^ PTR_XOR_3)
+        constexpr uint64_t PTR_XOR_1 = 0x00000000BD8F879CULL;
+        constexpr uint64_t PTR_XOR_2 = 0x003E22B700000000ULL;
+        constexpr uint64_t PTR_XOR_3 = 0x9CB9AD0A00000000ULL;  // = ENTRY_HANDLE_XOR
+    }
+
+    // =========================================================================
+    // 20260428 FNameEntry string decrypt — char-based LCG (8-bit signed key)
+    // Header:
+    //   v3 = hdr & 0x7F
+    //   v4 = (hdr >> 5) & 0x380
+    //   length = v3 + v4
+    //   isWide = bit15
+    // Keystream (key is 8-bit signed, advances per-pair):
+    //   key0 = (char)(length - 68)
+    //   For each pair (i, i+1):
+    //     idx_a = key & 0x3F
+    //     idx_b = (68 * key + 96) & 0x3C
+    //     ANSI:  byte ^= keytable[idx_a + 8] >> 3
+    //            byte ^= keytable[idx_b + 8] >> 3
+    //     Wide:  word ^= keytable[idx_a + 8]
+    //            word ^= keytable[idx_b + 8]
+    //     key = (char)(16 * key - 32)
+    //   Trailing odd byte/word: ^= keytable[idx_a + 8] (>>3 for ANSI)
+    // Key table is at RVA_FNAME_KEY_TABLE = 0xDAA07F4 (uint16 array; +8 entries
+    // = +16 bytes pre-offset is the actual data; the +8 in the indexing
+    // formulas is encoded in the keystream offsets themselves).
+    // =========================================================================
+    namespace FNameEntryString20260428 {
+        constexpr int      KEY_TABLE_UINT16_OFFSET = 8;
+        constexpr int8_t   KEY_START_BIAS = -68;
+        constexpr int8_t   KEY_LCG_MUL    = 16;
+        constexpr int8_t   KEY_LCG_ADD    = -32;
+        constexpr uint8_t  IDX_A_MASK     = 0x3F;
+        constexpr uint8_t  IDX_B_MASK     = 0x3C;
+        constexpr uint8_t  IDX_B_MUL      = 68;
+        constexpr uint8_t  IDX_B_ADD      = 96;
+    }
+
+    // =========================================================================
     // FNamePool resolve pipeline (patch 20260421) — from sub_242FC0 @ 0x242FC0
     //
     // Input: si128 = a 16-byte CI-encoded FName slot (output of the UObject
@@ -468,57 +673,123 @@ namespace Patch20260421 {
     // =========================================================================
     namespace FNamePool20260421 {
         // Chunk header access: per-chunk data begins at RVA_GNAMES_BASE+chunk_off.
-        // Inside each chunk:
-        //   +25968 (= 0x6570): 16-byte region hashed by FNV32 to pick a slot
-        //   +25984 (= 0x6580): 8-slot array of 32-byte entries (2x 16-byte blocks)
-        constexpr uint64_t CHUNK_FNV_SEED_OFF = 25968;
-        constexpr uint64_t CHUNK_SLOT_BASE    = 25984;
+        // 20260421:  +0x6570 / +0x6580
+        // 20260428:  +0x7090 / +0x70A0  (verified — sub_22F3E0 reads
+        //            `v8 + 28816` and `v8[..*32 + 28832]`)
+        constexpr uint64_t CHUNK_FNV_SEED_OFF = 28816;   // 0x7090 (was 0x6570 = 25968)
+        constexpr uint64_t CHUNK_SLOT_BASE    = 28832;   // 0x70A0 (was 0x6580 = 25984)
 
-        // CI decode (from si128): PSHUFLW(57)→PSRLD(6)→PSHUFB(mask)→cvtsi128_si32
-        // Then name_offset = v5 & 0xFFFF, chunk_off_in_pool = (v5 >> 8) & 0xFFFF00
-        constexpr uint64_t RVA_CI_PSHUFB_MASK = 0xACF8D20;  // {06,00,01,04, 00*12}
+        // CI decode pipeline shape changed in 20260428:
+        //   20260421:  PSHUFLW(0x39) → PSRLD(6)        → PSHUFB(mask) → cvtsi128_si32
+        //   20260428:  PSHUFLW(0xB1) → ROL32(15)       → PSHUFB(mask) → PXOR(const) → cvtsi128_si32
+        // PSRLD is gone; ROL32(15) inserted; an extra PXOR step appears after PSHUFB.
+        // The dumper's static decode in fname_decrypt.h::DecryptCI must be
+        // rewritten to match — this namespace only carries the constants.
+        constexpr uint64_t RVA_CI_PSHUFB_MASK = 0xAD49140;  // 20260421: 0xACF8D20
+        constexpr uint64_t RVA_CI_XOR_CONST   = 0xAD49150;  // NEW (no analogue in 20260421)
+        constexpr int      CI_PSHUFLW_IMM     = 0xB1;       // 20260421: 0x39
+        constexpr int      CI_ROL32_AMT       = 15;         // NEW (20260421 used PSRLD 6, no ROL)
 
         // FNV32 hash constants (pick slot_idx)
         constexpr uint32_t FNV32_PRIME = 0x01000193u;
-        constexpr uint32_t FNV32_K     = 0xCA3F9BE2u;        // (signed) -901800990
+        constexpr uint32_t FNV32_K     = 0xCA104182u;        // 20260421: 0xCA3F9BE2 (signed -904904318)
 
-        // Slot decrypt: PSHUFLW(0x93) → ROL32(25) → lo64 → XOR(SLOT_XOR)
-        constexpr uint64_t SLOT_XOR    = 0x662CF9C2408E7B59ULL;
-        constexpr int      SLOT_ROL32  = 25;
-        constexpr int      SLOT_PSHUFLW_IMM = 0x93;
+        // Slot decrypt:
+        //   20260421:  PSHUFLW(0x93) → ROL32(25) → lo64 → XOR(SLOT_XOR)
+        //   20260428:  loadl(slot_mask) → PSHUFB → ROL16(5)  → lo64 → XOR(SLOT_XOR)
+        // Per-uint16 lane rotation (was per-uint32). PSHUFB step uses an 8-byte
+        // mask loaded via `loadl_epi64` from RVA_SLOT_PSHUFB_MASK.
+        // Existing fname_decrypt.h::ResolveNamePtrFull lambda uses the 20260421
+        // values; rewrite when wiring 20260428.
+        constexpr uint64_t SLOT_XOR    = 0x9F737271C0F041C4ULL;  // 20260421: 0x662CF9C2408E7B59
+        constexpr int      SLOT_ROL32  = 25;             // 20260421 (also: 20260428 SLOT_ROL_AMT=5 per uint16 lane)
+        constexpr int      SLOT_PSHUFLW_IMM = 0x93;      // 20260421 (gone in 20260428; PSHUFB replaces it)
+        // 20260428-specific (unused by current code):
+        constexpr uint64_t RVA_SLOT_PSHUFB_MASK_20260428 = 0xAD49130;
+        constexpr int      SLOT_ROL_AMT_20260428         = 5;
+        constexpr int      SLOT_ROL_LANE_20260428        = 16;
 
         // FNV64 fold on v11 (first slot decrypted):
-        //   fnv = P64 * ROL64(P64 * ROL64(v11, 51) + OFF, 38) + OFF
+        //   fnv = P64 * ROL64(P64 * ROL64(v11, ROL1) + OFF, ROL2) + OFF
         constexpr uint64_t FNV64_PRIME  = 0x100000001B3ULL;
-        constexpr uint64_t FNV64_OFF    = 0xA369D63928ACD6A2ULL; // -0x5C9629C6D753295E
-        constexpr int      FNV64_ROL1   = 51;
-        constexpr int      FNV64_ROL2   = 38;
+        constexpr uint64_t FNV64_OFF    = 0x7631B6D6E2D67842ULL;  // 20260421: 0xA369D63928ACD6A2
+        constexpr int      FNV64_ROL1   = 50;   // 20260421: 51
+        constexpr int      FNV64_ROL2   = 56;   // 20260421: 38
 
-        // Final: result = v11 + (fnv ^ v13) + 2*name_offset_word
-        // sub_242FC0 writes:    var_50 = bswap64(result ^ 0x3517B019)
-        // sub_23B380 computes:  v19 = var_50 ^ 0x40006B0800000000
-        // FName_ToString:       entry_ptr = bswap64(v19 ^ 0x59B07C3D00000000)
-        // All XORs collapse: entry_ptr = result
-        //   bswap64(S) for S=0x40006B0800000000 = 0x086B0040
-        //   bswap64(T) for T=0x59B07C3D00000000 = 0x3D7CB059
-        //   0x3517B019 ^ 0x086B0040 ^ 0x3D7CB059 = 0  → entry_ptr == result
-        constexpr uint64_t RESULT_TO_ENTRY_XOR = 0;
+        // Final: result = (fnv ^ v15_decoded ^ SLOT_XOR) + v14 + 2*name_offset_word
+        // 20260428: sub_22F3E0 writes  *(qword*)(a2+8) = bswap64(result ^ 0xBD8F879C)
+        //           and returns un-bswapped/un-XORed `result`.
+        // 20260421: chain collapsed to entry_ptr = result (RESULT_TO_ENTRY_XOR = 0).
+        // For 20260428 the result-to-entry chain is a single bswap64+XOR step.
+        constexpr uint64_t RESULT_TO_ENTRY_XOR = 0xBD8F879CULL;  // 20260421: 0
     }
 
     // =========================================================================
-    // FNameEntry string decrypt (patch 20260421) — from FNameEntry_AppendNameToString
+    // FNameEntry string decrypt
     //
-    // Header layout CHANGED (bits scrambled):
-    //   length  = (hdr & 3) | ((hdr >> 5) & 0x3FC)
-    //   isWide  = (hdr >> 15) & 1   (unchanged)
+    // 20260421 (FNameEntry_AppendNameToString @ 0x22EC20):
+    //   header:  length = (hdr & 3) | ((hdr >> 5) & 0x3FC); isWide = bit15
+    //   key_idx: 52 + ((key_start + i) & 0x3F)
+    //   key_start = (uint16)(length - 17564)
+    //   ANSI: byte ^= keytable[idx] >> 3
+    //   Wide: word ^= keytable[idx]
     //
-    // Key table base offset 0xDA547F4 (unchanged), but decrypt accesses
-    //   key_table[52 + ((key_start + i) & 0x3F)]
-    // i.e. 52*2 = 104 bytes into the table symbol. Starting key = length-17564.
+    // 20260428 (FNameEntry_AppendNameToString_20260428 @ 0x23B950):
+    //   header:  length = (hdr & 0x7F) | ((hdr >> 5) & 0x380); isWide = bit15
+    //   STATEFUL LCG keystream — 2 keytable lookups per pair, advance state
+    //   each iteration. NOT a simple per-byte/per-word XOR anymore.
+    //
+    //   Common: keytable base = RVA_FNAME_KEYSTREAM (= 0xDAA07F4 in 20260428)
+    //           idx_a = (state & 0x3F) + 8           (uint16 units)
+    //           idx_b = ((68 * state + 96) & 0x3C) + 8
+    //
+    //   ANSI:   state0 = ((hdr & 0x7F) | ((hdr >> 5) & 0x80)) - 68
+    //           per pair (i, i+1):
+    //             byte[i]   ^= keytable[idx_a] >> 3
+    //             byte[i+1] ^= keytable[idx_b] >> 3
+    //             state = 16 * state - 32
+    //           (tail byte if length is odd: byte ^= keytable[idx_a] >> 3)
+    //
+    //   Wide:   state0 = length + 61116
+    //           per pair (i, i+1):
+    //             word[i]   ^= keytable[idx_a]
+    //             word[i+1] ^= keytable[idx_b]
+    //             state = -559801840 * state - 537812000     (LCG)
+    //           (tail word if length is odd: word ^= keytable[idx_a])
+    //
+    // Implementation lives in fname_decrypt.h — must be rewritten for
+    // 20260428 (per-pair LCG, not per-byte stateless XOR). Constants below
+    // are the patch-20260421 values; the 20260428 namespace `FNameEntry20260428`
+    // carries the new ones.
     // =========================================================================
     namespace FNameEntry20260421 {
+        // 20260421 values (kept for reference / fallback)
         constexpr int      KEY_TABLE_UINT16_OFFSET = 52;
         constexpr int32_t  KEY_START_BIAS          = -17564;
+    }
+
+    namespace FNameEntry20260428 {
+        // Header bit-extract masks
+        constexpr uint16_t LENGTH_LO_MASK    = 0x007F;   // bits 0..6 of hdr → bits 0..6 of length
+        constexpr uint16_t LENGTH_HI_MASK    = 0x0380;   // ((hdr >> 5) & 0x380) → bits 7..9 of length
+        constexpr uint16_t LENGTH_HI_LO8     = 0x0080;   // ((hdr >> 5) & 0x80) → bit 7 of length (ANSI state)
+        constexpr uint16_t IS_WIDE_BIT       = 0x8000;   // bit15 = wide flag
+
+        // Key-table indexing (uint16 units)
+        constexpr int      KEY_TABLE_UINT16_OFFSET = 8;
+        constexpr int      IDX_B_MUL = 68;
+        constexpr int      IDX_B_ADD = 96;
+        constexpr int      IDX_B_MASK = 0x3C;
+
+        // ANSI LCG: state = ANSI_LCG_MUL * state + ANSI_LCG_ADD
+        constexpr int32_t  ANSI_KEY_START_BIAS_HI  = -68;     // hdr_lo8 - 68
+        constexpr int32_t  ANSI_LCG_MUL            = 16;      // state = 16*state - 32
+        constexpr int32_t  ANSI_LCG_ADD            = -32;
+
+        // Wide LCG: state = WIDE_LCG_MUL * state + WIDE_LCG_ADD
+        constexpr int32_t  WIDE_KEY_START_BIAS     = 61116;   // length + 61116
+        constexpr int32_t  WIDE_LCG_MUL            = -559801840;
+        constexpr int32_t  WIDE_LCG_ADD            = -537812000;
     }
 
     // Decrypt the NumElements/MaxElements stored at chunks_manager + 0x70.

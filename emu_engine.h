@@ -26,7 +26,7 @@
 
 #include <unicorn/unicorn.h>
 
-#include "kernel_module/include/memreader_iface.h"
+#include "memreader_iface.h"
 
 namespace EmuEngineNS {
 
@@ -59,9 +59,13 @@ public:
             return false;
         }
 
+        // Single-item fread wrapper — bails the whole Open() on a short read.
+        auto rd = [this](void* p, size_t sz) {
+            return std::fread(p, sz, 1, m_file) == 1;
+        };
+
         uint16_t dosSig = 0;
-        std::fread(&dosSig, 2, 1, m_file);
-        if (dosSig != 0x5A4D) {
+        if (!rd(&dosSig, 2) || dosSig != 0x5A4D) {
             std::printf("[PE] Invalid DOS signature\n");
             Close();
             return false;
@@ -69,38 +73,35 @@ public:
 
         std::fseek(m_file, 0x3C, SEEK_SET);
         uint32_t peOffset = 0;
-        std::fread(&peOffset, 4, 1, m_file);
+        if (!rd(&peOffset, 4)) { Close(); return false; }
 
         std::fseek(m_file, peOffset, SEEK_SET);
         uint32_t peSig = 0;
-        std::fread(&peSig, 4, 1, m_file);
-        if (peSig != 0x00004550) {
+        if (!rd(&peSig, 4) || peSig != 0x00004550) {
             std::printf("[PE] Invalid PE signature\n");
             Close();
             return false;
         }
 
         uint16_t machine = 0, numSections = 0;
-        std::fread(&machine, 2, 1, m_file);
-        std::fread(&numSections, 2, 1, m_file);
+        if (!rd(&machine, 2) || !rd(&numSections, 2)) { Close(); return false; }
         std::fseek(m_file, 12, SEEK_CUR);
         uint16_t optHeaderSize = 0;
-        std::fread(&optHeaderSize, 2, 1, m_file);
+        if (!rd(&optHeaderSize, 2)) { Close(); return false; }
         std::fseek(m_file, 2, SEEK_CUR);
 
         long optHeaderStart = std::ftell(m_file);
         uint16_t optMagic = 0;
-        std::fread(&optMagic, 2, 1, m_file);
+        if (!rd(&optMagic, 2)) { Close(); return false; }
 
         if (optMagic == 0x20B) { // PE32+
             std::fseek(m_file, optHeaderStart + 24, SEEK_SET);
-            std::fread(&m_imageBase, 8, 1, m_file);
+            if (!rd(&m_imageBase, 8)) { Close(); return false; }
             std::fseek(m_file, optHeaderStart + 56, SEEK_SET);
-            std::fread(&m_sizeOfImage, 4, 1, m_file);
+            if (!rd(&m_sizeOfImage, 4)) { Close(); return false; }
             // DataDirectory[5] = BASE_RELOC (offset +112 into opt header for PE32+)
             std::fseek(m_file, optHeaderStart + 24 + 112, SEEK_SET);
-            std::fread(&m_relocDirRVA,  4, 1, m_file);
-            std::fread(&m_relocDirSize, 4, 1, m_file);
+            if (!rd(&m_relocDirRVA, 4) || !rd(&m_relocDirSize, 4)) { Close(); return false; }
         }
 
         std::fseek(m_file, optHeaderStart + optHeaderSize, SEEK_SET);
@@ -108,7 +109,7 @@ public:
         m_sections.clear();
         for (uint16_t i = 0; i < numSections; i++) {
             uint8_t hdr[40];
-            std::fread(hdr, 40, 1, m_file);
+            if (!rd(hdr, 40)) { Close(); return false; }
             PESection sec = {};
             std::memcpy(sec.name, hdr, 8);
             sec.name[8] = 0;
@@ -204,7 +205,8 @@ private:
                 relocRVA <  sec.virtualAddress + sec.rawDataSize) {
                 uint32_t fileOff = sec.rawDataOffset + (relocRVA - sec.virtualAddress);
                 std::fseek(m_file, fileOff, SEEK_SET);
-                std::fread(relocData.data(), 1, relocSize, m_file);
+                size_t got = std::fread(relocData.data(), 1, relocSize, m_file);
+                if (got < relocSize) relocData.resize(got);  // walk only what we read
                 break;
             }
         }
@@ -330,6 +332,72 @@ public:
 
     bool IsReady() const { return m_initialized && m_uc; }
 
+    // ── Section-budget management ───────────────────────────────────────────
+    // Unicorn (Qemu) hard-limits the phys-section table to TARGET_PAGE_SIZE
+    // (4096) entries. Each `uc_mem_map` consumes one slot — `uc_mem_unmap`
+    // does NOT reclaim it. Long batch sessions that lazily fault in
+    // thousands of distinct game pages will trip the assertion:
+    //   `phys_section_add: map->sections_nb < TARGET_PAGE_SIZE`
+    //
+    // Workaround: when the live-mapped page set grows past `kSectionsBudget`,
+    // tear down the engine entirely and reopen — fresh slot counter, all
+    // game pages forgotten. The fixed regions (stack, scratch, sentinel)
+    // are remapped immediately; everything else re-faults on demand.
+    //
+    // Callers that pin per-call state on top of the engine (e.g. EmuFName's
+    // fake TEB) can detect a reset by watching `Epoch()` — it ticks every
+    // time the engine is rebuilt.
+    static constexpr size_t kSectionsBudget = 3500;   // headroom under 4096
+    uint32_t Epoch() const { return m_epoch; }
+    size_t   MappedPages() const { return m_mapped.size(); }
+
+    bool MaybeReset(size_t headroom_pages = 64) {
+        if (!m_uc) return false;
+        if (m_mapped.size() + headroom_pages <= kSectionsBudget) return false;
+        return Reset();
+    }
+
+    // Full teardown + reinit. Restores fixed regions and last-set GS_BASE.
+    // Returns false if reopen failed (engine then unusable).
+    bool Reset() {
+        if (m_uc) { uc_close(m_uc); m_uc = nullptr; }
+        m_mapped.clear();
+        m_initialized = false;
+
+        uc_err err = uc_open(UC_ARCH_X86, UC_MODE_64, &m_uc);
+        if (err != UC_ERR_OK) {
+            std::printf("[EMU] reset uc_open failed: %s\n", uc_strerror(err));
+            return false;
+        }
+        if ((err = uc_mem_map(m_uc, STACK_BASE, STACK_SIZE, UC_PROT_ALL)) != UC_ERR_OK) {
+            std::printf("[EMU] reset stack map failed: %s\n", uc_strerror(err));
+            return false;
+        }
+        for (uint64_t p = STACK_BASE; p < STACK_BASE + STACK_SIZE; p += 0x1000)
+            m_mapped.insert(p);
+        uc_mem_map(m_uc, INPUT_BASE,    0x1000, UC_PROT_ALL);
+        uc_mem_map(m_uc, OUTPUT_BASE,   0x1000, UC_PROT_ALL);
+        uc_mem_map(m_uc, SENTINEL_PAGE, 0x1000, UC_PROT_ALL);
+        m_mapped.insert(INPUT_BASE);
+        m_mapped.insert(OUTPUT_BASE);
+        m_mapped.insert(SENTINEL_PAGE);
+
+        uc_hook hk;
+        err = uc_hook_add(m_uc, &hk, UC_HOOK_MEM_UNMAPPED,
+                          (void*)HookMemFault, this, 1, 0);
+        if (err != UC_ERR_OK) {
+            std::printf("[EMU] reset hook_add failed: %s\n", uc_strerror(err));
+            return false;
+        }
+        if (m_gsBase) {
+            uc_reg_write(m_uc, UC_X86_REG_GS_BASE, &m_gsBase);
+        }
+        m_initialized = true;
+        ++m_epoch;
+        std::printf("[EMU] Reset (epoch=%u, mapped=%zu)\n", m_epoch, m_mapped.size());
+        return true;
+    }
+
     // Most recent unmapped-access details captured by HookMemFault, useful
     // for diagnostics. Reset on every Run() call by callers if needed.
     uint64_t LastFaultAddr() const { return m_lastFaultAddr; }
@@ -342,6 +410,7 @@ public:
             std::printf("[EMU] SetGSBase failed: %s\n", uc_strerror(err));
             return false;
         }
+        m_gsBase = gsBase;   // remember for Reset() restore
         return true;
     }
 
@@ -490,6 +559,8 @@ private:
     PEFileReader      m_peFile;
     uint64_t          m_lastFaultAddr = 0;
     int               m_lastFaultType = 0;
+    uint64_t          m_gsBase        = 0;   // last value passed to SetGSBase, restored on Reset()
+    uint32_t          m_epoch         = 0;   // ticks every Reset() so dependent state can re-arm
 
     // Lazy page-fault handler — also intercepts external calls
     static bool HookMemFault(uc_engine* uc, uc_mem_type type,

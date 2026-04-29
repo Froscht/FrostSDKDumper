@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-#include "kernel_module/include/memreader_iface.h"
+#include "memreader_iface.h"
 
 namespace FNameFuncFinder {
 
@@ -531,6 +531,167 @@ inline std::vector<CallerHit> FindRipRelRefs(IMemoryReader& reader,
     }
 
     return out;
+}
+
+// =============================================================================
+// Plan D — find the FName decrypt function by its distinctive SIMD body
+// instead of a caller-side stack-setup pattern.
+//
+// Patch 20260421's FName decrypt (sub_23D3E0) executes this fingerprint:
+//
+//   66 0F 38 00 05 ?? ?? ?? ??   pshufb xmm0, [rip+disp32]   ; FName_CI_PSHUFB_Mask
+//   66 0F 6F C8                  movdqa xmm1, xmm0
+//   66 0F 72 D1 1A               psrld  xmm1, 0x1A           ; ROR shift = 32-6
+//   66 0F 72 F0 06               pslld  xmm0, 6              ; ROL shift = 6
+//   66 0F EB C1                  por    xmm0, xmm1
+//   F2 0F 70 C0 93               pshuflw xmm0, xmm0, 0x93
+//
+// The combination of PSRLD imm=0x1A + PSLLD imm=6 (a ROL32(6) implemented as
+// shifts + OR) and PSHUFLW imm=0x93 doesn't occur naturally elsewhere in the
+// binary — those three immediates are the FName algorithm's "shape". Even if
+// the encryption KEYS change between patches, this *shape* tends to survive
+// (the algorithm is the same, only the constants move).
+//
+// We scan .text for the fingerprint, then back-walk via WalkBackToFrameSetup
+// to find the function entry. Returns the function-start RVA, or 0.
+// =============================================================================
+inline uint64_t FindBySimdFingerprint(IMemoryReader& reader, uint64_t module_base) {
+    uint32_t text_rva = 0, text_size = 0;
+    if (!GetTextBoundsLive(reader, module_base, text_rva, text_size)) return 0;
+    if (text_size > 0x10000000u) text_size = 0x10000000u;
+
+    // 36-byte signature with a single 4-byte wildcard for the PSHUFB rip-rel disp.
+    // Each byte: lo nibble of `mask[i]` set means literal-match required.
+    static const uint8_t sig[]  = {
+        0x66, 0x0F, 0x38, 0x00, 0x05,   0x00, 0x00, 0x00, 0x00,  // pshufb xmm0,[rip+?]
+        0x66, 0x0F, 0x6F, 0xC8,                                   // movdqa xmm1, xmm0
+        0x66, 0x0F, 0x72, 0xD1, 0x1A,                             // psrld xmm1, 0x1A
+        0x66, 0x0F, 0x72, 0xF0, 0x06,                             // pslld xmm0, 6
+        0x66, 0x0F, 0xEB, 0xC1,                                   // por xmm0, xmm1
+        0xF2, 0x0F, 0x70, 0xC0, 0x93                              // pshuflw xmm0,xmm0,0x93
+    };
+    static const uint8_t mask[] = {
+        1,1,1,1,1, 0,0,0,0,        // pshufb (4 wildcards for disp32)
+        1,1,1,1,
+        1,1,1,1,1,
+        1,1,1,1,1,
+        1,1,1,1,
+        1,1,1,1,1
+    };
+    constexpr size_t SIG_LEN = sizeof(sig);
+
+    // Sliding-window page scanner mirroring Plan A.
+    constexpr size_t PAGE = 0x1000;
+    uint8_t window[PAGE * 2] = {};
+    bool    page_valid[2] = { false, false };
+    uint64_t hit_text_off = 0;
+    bool     found_hit    = false;
+
+    for (uint32_t page_off = 0; page_off < text_size && !found_hit; page_off += PAGE) {
+        std::memcpy(window, window + PAGE, PAGE);
+        page_valid[0] = page_valid[1];
+        page_valid[1] = false;
+
+        size_t read_size = PAGE;
+        if (page_off + read_size > text_size) read_size = text_size - page_off;
+        if (reader.Read(module_base + text_rva + page_off, window + PAGE, read_size)) {
+            if (read_size < PAGE) std::memset(window + PAGE + read_size, 0, PAGE - read_size);
+            page_valid[1] = true;
+        } else {
+            std::memset(window + PAGE, 0, PAGE);
+        }
+
+        if (!page_valid[0]) continue;
+        size_t search_len = page_valid[1] ? (PAGE + SIG_LEN) : PAGE;
+        if (search_len > sizeof(window)) search_len = sizeof(window);
+        if (search_len < SIG_LEN) continue;
+
+        const size_t last = search_len - SIG_LEN;
+        for (size_t i = 0; i <= last; ++i) {
+            bool ok = true;
+            for (size_t j = 0; j < SIG_LEN; ++j) {
+                if (mask[j] && window[i + j] != sig[j]) { ok = false; break; }
+            }
+            if (!ok) continue;
+            // page_off-PAGE is the absolute base of window[0..PAGE]; the hit is at i.
+            hit_text_off = (uint64_t)(page_off - PAGE) + i;
+            // Back-walk from the SIMD body to the function start. The
+            // body starts ~0x21 bytes into sub_23D3E0 (push x4 + sub rsp +
+            // security cookie setup), so a 0x100-byte back-walk is plenty.
+            // Note: WalkBackToFrameSetup expects the offset INSIDE `window`.
+            size_t start_off = WalkBackToFrameSetup(window, i, /*max_back=*/0x200);
+            uint64_t func_start_rva = 0;
+            if (start_off > 0)
+                func_start_rva = (uint64_t)text_rva + (page_off - PAGE) + start_off;
+            else
+                func_start_rva = (uint64_t)text_rva + hit_text_off; // fallback: SIMD-body addr
+            std::printf("[find-fname-simd] fingerprint @ rva=0x%llX  func_start≈0x%llX\n",
+                        (unsigned long long)((uint64_t)text_rva + hit_text_off),
+                        (unsigned long long)func_start_rva);
+            found_hit = true;
+            return func_start_rva;
+        }
+    }
+    std::printf("[find-fname-simd] SIMD fingerprint not found\n");
+    return 0;
+}
+
+// =============================================================================
+// Extract the ENTRY_HANDLE_XOR constant (`bswap64(handle ^ XOR)`) from the
+// FName function body. Pattern in patch 20260421:
+//
+//   48 B? <imm64-LE>          mov r64, imm64        ; the XOR constant
+//   48 33 ?? ?? ?? ?? ??      xor r64, [rsp+disp]   ; xor with the pipeline value
+//   48 0F C?                  bswap r64
+//
+// We scan from `func_start_rva` for the first MOV r64,imm64 (REX prefix 0x48
+// or 0x49, opcode 0xB8..0xBF) followed within ~32 bytes by a BSWAP r64.
+// Returns the imm64 on success, 0 on failure.
+// =============================================================================
+inline uint64_t ExtractEntryHandleXor(IMemoryReader& reader,
+                                      uint64_t module_base,
+                                      uint64_t func_start_rva,
+                                      size_t   max_scan = 0x200)
+{
+    if (!func_start_rva) return 0;
+    std::vector<uint8_t> buf(max_scan);
+    if (!reader.Read(module_base + func_start_rva, buf.data(), max_scan)) {
+        std::printf("[xor-extract] couldn't read function body @ 0x%llX\n",
+                    (unsigned long long)func_start_rva);
+        return 0;
+    }
+
+    // Walk the buffer looking for the MOV r64,imm64 instruction.
+    // 48 B8..BF = mov r{ax..di},imm64; 49 B8..BF = mov r{8..15},imm64.
+    // The instruction is 10 bytes; imm64 is at +2.
+    for (size_t i = 0; i + 16 < max_scan; ++i) {
+        bool rex_w   = (buf[i] == 0x48 || buf[i] == 0x49);
+        bool mov_imm = (buf[i + 1] >= 0xB8 && buf[i + 1] <= 0xBF);
+        if (!rex_w || !mov_imm) continue;
+
+        uint64_t imm64 = 0;
+        std::memcpy(&imm64, buf.data() + i + 2, 8);
+
+        // Look ahead up to 32 bytes for a BSWAP r64 (48/49 0F C8..CF).
+        // Must also see a XOR (48/49 33 ...) between the MOV and the BSWAP.
+        bool saw_xor = false, saw_bswap = false;
+        for (size_t j = i + 10; j + 2 < std::min(max_scan, i + 10 + 32); ++j) {
+            bool rex2 = (buf[j] == 0x48 || buf[j] == 0x49);
+            if (!rex2) continue;
+            if (buf[j + 1] == 0x33) { saw_xor = true; continue; }
+            if (buf[j + 1] == 0x0F &&
+                buf[j + 2] >= 0xC8 && buf[j + 2] <= 0xCF) {
+                saw_bswap = true; break;
+            }
+        }
+        if (saw_xor && saw_bswap) {
+            std::printf("[xor-extract] found XOR=0x%016llX at func+0x%zX\n",
+                        (unsigned long long)imm64, i);
+            return imm64;
+        }
+    }
+    std::printf("[xor-extract] MOV r64,imm64 + XOR + BSWAP triple not found\n");
+    return 0;
 }
 
 } // namespace FNameFuncFinder

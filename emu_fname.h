@@ -260,7 +260,16 @@ public:
     std::string DecryptByIndex(uint32_t comp_index, uint32_t number = 0) {
         if (!m_engine || !m_engine->IsReady()) return {};
 
-        // One-time: map a fake TEB page and set GS_BASE so that
+        // Section-budget guard: if the engine has lazy-faulted close to its
+        // 4096-section ceiling, rebuild it before this call. After rebuild
+        // the fake TEB is gone, so re-arm it below by clearing m_tebReady.
+        m_engine->MaybeReset(/*headroom*/ 64);
+        if (m_engineEpoch != m_engine->Epoch()) {
+            m_tebReady = false;
+            m_engineEpoch = m_engine->Epoch();
+        }
+
+        // One-time (per-engine-epoch): map a fake TEB page and set GS_BASE
         //   gs:[0x08] = stack base (top of our emulator stack)
         //   gs:[0x10] = stack limit (bottom of our emulator stack)
         //   gs:[0x30] = self-pointer (required by some TEB walkers)
@@ -449,13 +458,14 @@ public:
     uint64_t FuncRVA() const { return m_funcRVA; }
 
 private:
-    EmuEngine* m_engine   = nullptr;
-    uint64_t   m_module   = 0;
-    uint64_t   m_funcRVA  = 0;
-    uint64_t   m_funcAbs  = 0;
-    uint64_t   m_gamePeb  = 0;
-    bool       m_verbose  = true;
-    bool       m_tebReady = false;
+    EmuEngine* m_engine     = nullptr;
+    uint64_t   m_module     = 0;
+    uint64_t   m_funcRVA    = 0;
+    uint64_t   m_funcAbs    = 0;
+    uint64_t   m_gamePeb    = 0;
+    bool       m_verbose    = true;
+    bool       m_tebReady   = false;
+    uint32_t   m_engineEpoch = 0;   // tracks EmuEngine::Epoch() so we re-arm TEB after Reset()
 };
 
 } // namespace EmuFNameNS

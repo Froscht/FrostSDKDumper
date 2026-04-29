@@ -1,16 +1,22 @@
 // =============================================================================
 // ARC Raiders – External SDK Dumper (newest patch)
 //
-// Build:  g++ -O2 -std=c++17 -mavx2 -o FrostDumper main.cpp
+// Build:  g++ -O2 -std=c++17 -mavx2 -o FrostDumper main.cpp -lunicorn -lcapstone
 // Run:    sudo ./FrostDumper <pid>          (PID of ARC Raiders / wine process)
-//         sudo ./FrostDumper               (uses auto-detect via /proc)
+//         sudo ./FrostDumper                (uses auto-detect via /proc)
 //
-// Requires:  kernel module loaded (sudo insmod kernel_module/src/memreader.ko)
+// No flags needed — the default does the full automatic pipeline:
+//   1. /dev/memreader open + sig-scan auto-discovery of all critical RVAs
+//   2. Boot Unicorn + locate FName decrypt fn + arm fallback for static-fail CIs
+//   3. Enumerate GObjects via canonical chunks_manager vtable[7] path
+//   4. Walk every UClass/UStruct/UEnum and emit SDK_Output.txt
+//
+// Requires:  kernel module loaded (sudo insmod ../KernelDriver/src/memreader.ko)
 // Output:    dump_objects.txt    – full object list (idx, addr, name)
 //            dump_names.txt      – unique FNames sorted
 //            dump_classes.txt    – objects with a class prefix e.g. /Script/...
 //            dump_log.txt        – timestamped run log
-//            SDK_Output.txt      – full SDK struct/enum output (--sdk mode)
+//            SDK_Output.txt      – full SDK struct/enum output
 // =============================================================================
 
 #include <iostream>
@@ -18,6 +24,7 @@
 #include <sstream>
 #include <vector>
 #include <string>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
@@ -34,9 +41,10 @@
 #include <sys/ioctl.h>
 #include <sys/uio.h>
 #include <immintrin.h>
+#include <glob.h>
 
-#include "kernel_module/include/memreader_ioctl.h"
-#include "kernel_module/include/memreader_iface.h"
+#include "memreader_ioctl.h"
+#include "memreader_iface.h"
 #include "arc_decrypt.h"
 #include "sig_scan.h"
 #include "emu_engine.h"
@@ -46,6 +54,33 @@
 #include "fname_decrypt.h"
 using FNameDecryptor = FName::FNameDecryptor;
 #include "sdk_generator.h"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PE binary path — glob the latest Arc_Raiders_Binary_*.exe so a new patch
+// dropped into the dumper directory is picked up without code changes.
+// Returns "" if nothing matches; callers treat that as "no PE fallback".
+// ─────────────────────────────────────────────────────────────────────────────
+static const std::string& GetPEBinaryPath() {
+    static std::string cached = []() -> std::string {
+        const char* dir = "/media/frost/Coding Stuf/Linux/FrostSDKDumper";
+        std::string pattern = std::string(dir) + "/Arc_Raiders_Binary_*.exe";
+        glob_t g{};
+        std::string best;
+        if (glob(pattern.c_str(), 0, nullptr, &g) == 0) {
+            for (size_t i = 0; i < g.gl_pathc; ++i) {
+                std::string p = g.gl_pathv[i];
+                if (p > best) best = p;   // lexicographic = chronological for YYYYMMDD names
+            }
+        }
+        globfree(&g);
+        if (!best.empty())
+            std::printf("[pe] PE binary auto-selected: %s\n", best.c_str());
+        else
+            std::printf("[pe] no Arc_Raiders_Binary_*.exe found in %s — PE fallback disabled\n", dir);
+        return best;
+    }();
+    return cached;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IMemoryReader implementation via /dev/memreader kernel module
@@ -196,10 +231,15 @@ class SDKDumper {
 public:
     uint64_t       MODULE_BASE;   // runtime-detected module base
 
-    KernelReader           m_reader;
-    FNameDecryptor         m_fname;
-    gobjects::GObjectArray m_gobj;
-    int                    m_pid;
+    KernelReader               m_reader;
+    FNameDecryptor             m_fname;
+    gobjects::GObjectArray     m_gobj;
+    int                        m_pid;
+    // Lazily-booted Unicorn engine + FName wrapper. Kept alive for the
+    // entire dumper lifetime so FNameDecryptor's emu-fallback callback
+    // can hit them on demand. Null if boot failed (static path still works).
+    std::unique_ptr<EmuEngine> m_emuEngine;
+    std::unique_ptr<EmuFName>  m_emuFName;
 
     SDKDumper(int pid)
         : MODULE_BASE(FindModuleBase(pid)),
@@ -221,11 +261,10 @@ public:
         {
             SigScan::Scanner<KernelReader> scan(m_reader, MODULE_BASE, 0xE900000);
             static SigScan::PEFileReader s_pe;
-            static const char* pe_path =
-                "/media/frost/Coding Stuf/Linux/FrostSDKDumper/Arc_Raiders_Binary_20260421_213315.exe";
-            if (s_pe.Open(pe_path)) {
+            const std::string& pe_path = GetPEBinaryPath();
+            if (!pe_path.empty() && s_pe.Open(pe_path.c_str())) {
                 scan.SetPEFallback(&s_pe);
-                std::printf("[sig] PE fallback enabled: %s\n", pe_path);
+                std::printf("[sig] PE fallback enabled: %s\n", pe_path.c_str());
             }
 
             auto apply = [](const char* name, uint64_t& slot, uint64_t dyn) {
@@ -264,28 +303,242 @@ public:
         }
         std::cout << "[+] FName decryptor initialized\n";
 
+        // ── Auto-boot Unicorn FName fallback ────────────────────────────────
+        // Locate the live game's outer FName decrypt function via signature
+        // scan, boot Unicorn with the PE-on-disk fallback, and plumb it into
+        // FNameDecryptor as the "couldn't statically resolve this CI" path.
+        // Failures here are non-fatal: the static decrypt path keeps working,
+        // we just lose the patch-resilient fallback.
+        BootEmuFNameFallback();
+
         // Canonical path: emulate chunks_manager vtable[7] (NOT VMProtected on
         // patch 20260421 despite earlier belief) to recover the real chunks-
         // array pointer, then enumerate every UObject via chunk indexing.
         // Falls back to structural scan if emulation fails.
         m_gobj.SetPid(m_pid);
+        bool gobj_ok = false;
         if (TryInitViaVtable7()) {
             std::cout << "[+] GObjectArray initialized via canonical vtable[7] ("
                       << m_gobj.GetNumElements() << " objects)\n";
-            return true;
+            gobj_ok = true;
+        } else {
+            std::cout << "[!] Vtable[7] canonical enum failed; falling back to structural scan\n";
+            if (!m_gobj.Init()) {
+                std::cerr << "[-] GObjectArray direct init failed, trying world traversal...\n";
+                m_gobj.PrintDiagnostics();
+                if (!CollectWorldObjects()) {
+                    std::cerr << "[-] World traversal also failed. Aborting.\n";
+                    return false;
+                }
+            }
+            std::cout << "[+] GObjectArray initialized (" << m_gobj.GetNumElements() << " objects)\n";
+            gobj_ok = true;
         }
-        std::cout << "[!] Vtable[7] canonical enum failed; falling back to structural scan\n";
 
-        if (!m_gobj.Init()) {
-            std::cerr << "[-] GObjectArray direct init failed, trying world traversal...\n";
-            m_gobj.PrintDiagnostics();
-            if (!CollectWorldObjects()) {
-                std::cerr << "[-] World traversal also failed. Aborting.\n";
-                return false;
+        // Patch resilience: with GObjects up and the runtime ENTRY_HANDLE_XOR
+        // settled, sample objects to find which inline-handle offset works
+        // best on this build. Sets the FNameDecryptor primary so GetName tries
+        // it first instead of walking the legacy candidate list every call.
+        if (gobj_ok) CalibrateInlineHandleOffset();
+        return true;
+    }
+
+    // ── Probe: find the most-productive UObject inline-handle offset ─────
+    // For each candidate offset in [0x10..0x80] step 8, read 8 bytes from a
+    // sample of live objects, run them through DecryptByHandle, count the
+    // ones that yield a sane name. Highest-scoring offset wins. Robust to
+    // ENTRY_HANDLE_XOR drift because BootEmuFNameFallback already updated
+    // the XOR before we get here.
+    void CalibrateInlineHandleOffset() {
+        // Same sanity check the dump phase uses (≥80% printable chars).
+        // Stricter would reject quirky-but-real names; looser would credit
+        // random heap garbage as a "name" and pick a bogus offset.
+        auto isSaneName = [](const std::string& s) {
+            if (s.empty() || s.size() > 128) return false;
+            int printable = 0;
+            for (unsigned char c : s)
+                if (c >= 32 && c <= 126) ++printable;
+            return printable * 5 >= static_cast<int>(s.size()) * 4;
+        };
+
+        const int kSampleTarget = 500;
+        std::unordered_map<uint64_t, int> hits;
+        int sampled = 0;
+        int total = m_gobj.GetNumElements();
+        // Emit the first sample's raw layout for patch-day forensics — if
+        // the inline-handle path stops working, the bytes here show why.
+        bool dumped_sample = false;
+        for (int i = 0; i < total && sampled < kSampleTarget; ++i) {
+            uint64_t obj = m_gobj.GetObjectPtr(i);
+            if (!obj) continue;
+            ++sampled;
+            if (!dumped_sample) {
+                uint8_t bytes[0x80] = {};
+                bool ok = m_reader.Read(obj, bytes, sizeof(bytes));
+                std::string via_get = m_fname.GetName(obj);
+                std::printf("[probe-dbg] sample obj[%d]=0x%llX  GetName='%s'\n",
+                            i, (unsigned long long)obj, via_get.c_str());
+                if (ok) {
+                    std::printf("[probe-dbg]   bytes 0x10..0x40: ");
+                    for (int b = 0x10; b < 0x40; ++b) std::printf("%02X ", bytes[b]);
+                    std::printf("\n");
+                }
+                dumped_sample = true;
+            }
+            for (uint64_t off = 0x10; off <= 0x80; off += 8) {
+                std::string s = m_fname.GetNameByHandle(obj, off);
+                if (isSaneName(s)) hits[off]++;
             }
         }
-        std::cout << "[+] GObjectArray initialized (" << m_gobj.GetNumElements() << " objects)\n";
-        return true;
+
+        uint64_t best_off = 0;
+        int      best_cnt = 0, runner_up = 0;
+        for (auto& [off, cnt] : hits) {
+            if (cnt > best_cnt) { runner_up = best_cnt; best_cnt = cnt; best_off = off; }
+            else if (cnt > runner_up) runner_up = cnt;
+        }
+
+        // Always print the full distribution — invaluable for patch-day debug.
+        std::printf("[probe] inline-handle calibration (%d objects sampled):\n", sampled);
+        for (uint64_t off = 0x10; off <= 0x80; off += 8) {
+            int cnt = hits.count(off) ? hits[off] : 0;
+            if (cnt) std::printf("[probe]   +0x%02llX: %d hits (%d%%)\n",
+                                 (unsigned long long)off, cnt, sampled ? cnt * 100 / sampled : 0);
+        }
+
+        // Set as primary if best is meaningfully ahead (≥25% hit rate AND
+        // ≥1.5× the runner-up). Anything weaker risks picking a wrong offset
+        // that also produces sane-shaped strings by coincidence.
+        if (best_off && best_cnt * 4 >= sampled && best_cnt * 2 >= runner_up * 3) {
+            std::printf("[probe] UObject inline handle offset = 0x%llX (winner by %d vs %d)\n",
+                        (unsigned long long)best_off, best_cnt, runner_up);
+            m_fname.SetPrimaryHandleOffset(best_off);
+        } else {
+            std::printf("[probe] no dominant offset (best 0x%llX: %d, runner-up: %d) — "
+                        "GetName uses 0x28/0x18/0x30 fallback list\n",
+                        (unsigned long long)best_off, best_cnt, runner_up);
+        }
+    }
+
+    // ── Auto-boot Unicorn-backed FName fallback ──────────────────────────
+    // Best-effort. On any failure we log and continue with no fallback —
+    // the static decrypt path still produces names for the majority of CIs.
+    void BootEmuFNameFallback() {
+        // 1. Locate the outer FName decrypt entry. Two anchors run in
+        //    sequence; whichever finds it first wins. Both must come back
+        //    with the same RVA (or the SIMD anchor takes priority — its
+        //    fingerprint targets the algorithm body itself, not a caller).
+        //
+        //    Plan A — caller-side opcode pattern (LEA RCX, LEA RDX, CALL).
+        //             Brittle if callers' stack layout shifts on a patch.
+        //    Plan B — distinctive SIMD body fingerprint (PSHUFB + PSRLD 0x1A
+        //             + PSLLD 6 + POR + PSHUFLW 0x93). Targets the algorithm
+        //             itself; survives caller rearrangement and most code
+        //             reshuffling.
+        auto find = FNameFuncFinder::Find(m_reader, MODULE_BASE);
+        uint64_t simd_rva = FNameFuncFinder::FindBySimdFingerprint(m_reader, MODULE_BASE);
+
+        // Quick prologue validator — the FName function ALWAYS has a x64 ABI
+        // prologue with `SUB RSP, imm` somewhere in the first 16 bytes. Used
+        // to guard against picking an off-by-N back-walked address that lands
+        // mid-instruction (the SIMD fingerprint can over-shoot when sibling
+        // functions share the same body shape).
+        auto has_clean_prologue = [&](uint64_t rva) -> bool {
+            if (!rva) return false;
+            uint8_t pro[16] = {};
+            if (!m_reader.Read(MODULE_BASE + rva, pro, sizeof(pro))) return false;
+            for (int i = 0; i + 3 < 16; ++i) {
+                bool sub_imm8  = (pro[i] == 0x48 && pro[i+1] == 0x83 && pro[i+2] == 0xEC);
+                bool sub_imm32 = (pro[i] == 0x48 && pro[i+1] == 0x81 && pro[i+2] == 0xEC);
+                if (sub_imm8 || sub_imm32) return true;
+            }
+            return false;
+        };
+
+        // Priority: caller-pattern (proven across many dumps) > SIMD anchor.
+        // If both succeed and disagree, prefer caller — but if caller's pick
+        // doesn't have a clean prologue (i.e. signature drifted to a wrong
+        // target), fall back to SIMD. Same for SIMD without prologue → reject.
+        uint64_t fname_rva = 0;
+        if (find.found && has_clean_prologue(find.best_target_rva)) {
+            fname_rva = find.best_target_rva;
+            if (simd_rva == fname_rva) {
+                std::printf("[emu-auto] FName decrypt @ rva=0x%llX  (caller+SIMD agree)\n",
+                            (unsigned long long)fname_rva);
+            } else if (simd_rva) {
+                std::printf("[emu-auto] FName decrypt @ rva=0x%llX  (caller pattern; "
+                            "SIMD anchor disagreed at 0x%llX — kept caller as proven)\n",
+                            (unsigned long long)fname_rva, (unsigned long long)simd_rva);
+            } else {
+                std::printf("[emu-auto] FName decrypt @ rva=0x%llX  (caller pattern; "
+                            "SIMD anchor missed — encryption shape may have shifted)\n",
+                            (unsigned long long)fname_rva);
+            }
+        } else if (simd_rva && has_clean_prologue(simd_rva)) {
+            fname_rva = simd_rva;
+            std::printf("[emu-auto] FName decrypt @ rva=0x%llX  (SIMD fingerprint; "
+                        "caller pattern %s)\n",
+                        (unsigned long long)fname_rva,
+                        find.found ? "found wrong target" : "missed");
+        } else {
+            std::printf("[emu-auto] FName decrypt not located with clean prologue "
+                        "(caller=0x%llX simd=0x%llX) — fallback disabled\n",
+                        (unsigned long long)(find.found ? find.best_target_rva : 0),
+                        (unsigned long long)simd_rva);
+            return;
+        }
+
+        // 1b. Extract ENTRY_HANDLE_XOR from the function body (patch-resilient).
+        //     The constant lives in a `MOV r64,imm64; XOR; BSWAP r64` triple
+        //     near the top of the function. If extraction succeeds, override
+        //     the compile-time default in ArcDecrypt::Patch20260421.
+        uint64_t live_xor = FNameFuncFinder::ExtractEntryHandleXor(
+            m_reader, MODULE_BASE, fname_rva);
+        if (live_xor) {
+            uint64_t old_xor = ArcDecrypt::Patch20260421::ENTRY_HANDLE_XOR;
+            if (live_xor != old_xor) {
+                std::printf("[emu-auto] ENTRY_HANDLE_XOR drifted: 0x%016llX → 0x%016llX (auto-fixed)\n",
+                            (unsigned long long)old_xor, (unsigned long long)live_xor);
+            } else {
+                std::printf("[emu-auto] ENTRY_HANDLE_XOR matches constant (0x%016llX)\n",
+                            (unsigned long long)live_xor);
+            }
+            ArcDecrypt::Patch20260421::SetEntryHandleXor(live_xor);
+        } else {
+            std::printf("[emu-auto] ENTRY_HANDLE_XOR extraction failed; using constant 0x%016llX\n",
+                        (unsigned long long)ArcDecrypt::Patch20260421::ENTRY_HANDLE_XOR);
+        }
+
+        // 2. Boot Unicorn with PE-on-disk fallback for VMProtect-cold pages.
+        const std::string& pe_path = GetPEBinaryPath();
+        m_emuEngine = std::make_unique<EmuEngine>();
+        if (!m_emuEngine->Initialize(&m_reader, MODULE_BASE, 0xE9AF000,
+                                     pe_path.empty() ? nullptr : pe_path.c_str())) {
+            std::printf("[emu-auto] EmuEngine init failed — fallback disabled\n");
+            m_emuEngine.reset();
+            return;
+        }
+
+        // 3. Init the FName wrapper at the located RVA.
+        m_emuFName = std::make_unique<EmuFName>();
+        if (!m_emuFName->Init(m_emuEngine.get(), MODULE_BASE, fname_rva)) {
+            std::printf("[emu-auto] EmuFName init failed — fallback disabled\n");
+            m_emuFName.reset();
+            m_emuEngine.reset();
+            return;
+        }
+        m_emuFName->SetVerbose(false);          // silence per-call logging
+        m_emuFName->SetGamePeb(0x7FFD0000ULL);  // Wine-canonical PEB
+        m_emuEngine->MapGamePage(0x7FFD0000ULL);
+
+        // 4. Plumb into FNameDecryptor — every CompIndexToName(Lenient) that
+        //    fails the static path will now hit the game's real function via
+        //    Unicorn, with results cached in FNameDecryptor's m_emuCache.
+        m_fname.SetEmuFallback([this](int32_t ci) -> std::string {
+            if (ci <= 0 || !m_emuFName) return {};
+            return m_emuFName->DecryptByIndex(static_cast<uint32_t>(ci));
+        });
+        std::printf("[emu-auto] Unicorn FName fallback armed\n");
     }
 
     // ── Canonical chunks-array recovery via vtable[7] emulation ──────────
@@ -320,9 +573,9 @@ public:
         if (!m_reader.Read(chunks_mgr + 0x30, scratch_in, 16)) return false;
 
         EmuEngine eng;
-        static const char* pe_path =
-            "/media/frost/Coding Stuf/Linux/FrostSDKDumper/Arc_Raiders_Binary_20260421_213315.exe";
-        if (!eng.Initialize(&m_reader, MODULE_BASE, 0xE9AF000, pe_path)) return false;
+        const std::string& pe_path = GetPEBinaryPath();
+        if (!eng.Initialize(&m_reader, MODULE_BASE, 0xE9AF000,
+                            pe_path.empty() ? nullptr : pe_path.c_str())) return false;
         eng.PreMapRange(chunks_mgr & ~0xFFFULL, 0x4000);
         eng.PreMapRange(vt7 & ~0xFFFULL, 0x4000);
 
@@ -935,7 +1188,10 @@ public:
                 if (written % 500 == 0)
                     std::cout << "\r[*] Written " << written << "/" << sdk.structs.size() << "  " << std::flush;
             }
-            // Write orphan functions (functions whose owner wasn't dumped as a type)
+            // Write orphan functions (functions whose owner wasn't dumped as a type).
+            // Walk parameters via ReadFunctionsFromMap so each orphan emits a real
+            // signature instead of a stub line — recovers ~85% of UFunctions that
+            // would otherwise be dropped.
             sdk_file << "\n// === Orphan Functions ===\n";
             sdk_file << "namespace Globals {\n";
             int orphan_count = 0;
@@ -944,13 +1200,17 @@ public:
                 std::string owner_name = "Owner_0x";
                 char buf[32]; std::snprintf(buf, sizeof(buf), "%llX", (unsigned long long)owner);
                 owner_name += buf;
-                sdk_file << "// Orphan owner @ 0x" << std::hex << owner << " (" << fn_list.size() << " functions)\n";
-                for (uint64_t fn_addr : fn_list) {
-                    std::string fn_name = m_fname.GetName(fn_addr);
-                    if (fn_name.empty()) fn_name = "<unnamed>";
-                    sdk_file << "// fn 0x" << std::hex << fn_addr << " " << owner_name << "::" << fn_name << "\n";
+                std::string owner_resolved = m_fname.GetName(owner);
+                sdk_file << "// Orphan owner @ 0x" << std::hex << owner;
+                if (!owner_resolved.empty()) sdk_file << " (" << owner_resolved << ")";
+                sdk_file << " — " << std::dec << fn_list.size() << " functions\n";
+                sdk_file << "namespace " << owner_name << " {\n";
+                auto fns = gen.ReadFunctionsFromMap(owner);
+                for (const auto& fn : fns) {
+                    sdk_file << gen.FormatFunction(fn);
                     ++orphan_count;
                 }
+                sdk_file << "} // namespace " << owner_name << "\n";
             }
             sdk_file << "// Total orphan functions: " << std::dec << orphan_count << "\n";
             sdk_file << "} // namespace Globals\n";
@@ -1136,7 +1396,8 @@ int main(int argc, char* argv[]) {
     auto print_help = []() {
         std::cerr <<
             "Usage: sudo ./FrostDumper [<pid>] [mode flags]\n"
-            "Mode flags (one or more; no flag → --test + --dump):\n"
+            "No flags → full automatic SDK dump (sig-scan + emu fallback + SDK_Output.txt + dump_*.txt).\n"
+            "Mode flags (override the auto behaviour for development / debugging):\n"
             "  --test       Sample known FName CIs to verify decryptor.\n"
             "  --dump       Enumerate GObjects → dump_*.txt.\n"
             "  --sdk        Full C++ SDK → SDK_Output.txt.\n"
@@ -1432,8 +1693,9 @@ int main(int argc, char* argv[]) {
 
         // Boot Unicorn, map live memory on demand.
         EmuEngine eng;
+        const std::string& pe_path = GetPEBinaryPath();
         if (!eng.Initialize(&r, base, 0xE9AF000,
-                "/media/frost/Coding Stuf/Linux/FrostSDKDumper/Arc_Raiders_Binary_20260421_213315.exe")) {
+                            pe_path.empty() ? nullptr : pe_path.c_str())) {
             std::cerr << "[gobj] emu init failed\n"; return 1;
         }
         // Pre-map chunks_manager pages + vt7 pages
@@ -1567,8 +1829,14 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // Default behaviour — no flags = full automatic SDK dump.
+    // The `--test`, `--dump`, `--probe`, `--emu-*` flags are diagnostic
+    // overrides retained for development; passing none of them runs the
+    // canonical pipeline (sig-scan + autodiscovery + Unicorn FName fallback
+    // + SDK_Output.txt). dump_*.txt comes free as side output of DumpSDK's
+    // GObject walk.
     if (!do_sdk && !do_test && !do_dump && !do_probe && !do_emu_smoke && !do_emu_fname) {
-        do_test = true;
+        do_sdk  = true;
         do_dump = true;
     }
 
@@ -1590,8 +1858,9 @@ int main(int argc, char* argv[]) {
             std::printf("[emu-smoke] /dev/memreader open failed\n"); return 1;
         }
         EmuEngine eng;
+        const std::string& pe_path = GetPEBinaryPath();
         if (!eng.Initialize(&dumper.m_reader, dumper.MODULE_BASE, 0xE9AF000,
-                "/media/frost/Coding Stuf/Linux/FrostSDKDumper/Arc_Raiders_Binary_20260421_213315.exe")) {
+                            pe_path.empty() ? nullptr : pe_path.c_str())) {
             std::printf("[emu-smoke] init failed\n"); return 1;
         }
         uint64_t probe = dumper.MODULE_BASE + 0x22F9A4;
@@ -1617,8 +1886,9 @@ int main(int argc, char* argv[]) {
             std::printf("[emu-fname] couldn't locate FName decrypt in .text\n"); return 1;
         }
         EmuEngine eng;
+        const std::string& pe_path = GetPEBinaryPath();
         if (!eng.Initialize(&dumper.m_reader, dumper.MODULE_BASE, 0xE9AF000,
-                "/media/frost/Coding Stuf/Linux/FrostSDKDumper/Arc_Raiders_Binary_20260421_213315.exe")) {
+                            pe_path.empty() ? nullptr : pe_path.c_str())) {
             std::printf("[emu-fname] engine init failed\n"); return 1;
         }
         EmuFName fn;
@@ -1634,7 +1904,7 @@ int main(int argc, char* argv[]) {
 
     if (!dumper.Init()) {
         std::cerr << "[-] Initialization failed. Check:\n";
-        std::cerr << "    * Is memreader.ko loaded?  (sudo insmod kernel_module/src/memreader.ko)\n";
+        std::cerr << "    * Is memreader.ko loaded?  (sudo insmod ../KernelDriver/src/memreader.ko)\n";
         std::cerr << "    * Are you running as root? (sudo)\n";
         std::cerr << "    * Is the PID correct?\n";
         return 1;

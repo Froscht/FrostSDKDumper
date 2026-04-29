@@ -30,47 +30,47 @@ public:
         m_file = std::fopen(path, "rb");
         if (!m_file) { std::printf("[PE] fopen failed: %s\n", path); return false; }
 
+        // Single-item fread wrapper — bails the whole Open() on a short read.
+        auto rd = [this](void* p, size_t sz) {
+            return std::fread(p, sz, 1, m_file) == 1;
+        };
+
         uint16_t dosSig = 0;
-        std::fread(&dosSig, 2, 1, m_file);
-        if (dosSig != 0x5A4D) { Close(); return false; }
+        if (!rd(&dosSig, 2) || dosSig != 0x5A4D) { Close(); return false; }
 
         std::fseek(m_file, 0x3C, SEEK_SET);
         uint32_t peOffset = 0;
-        std::fread(&peOffset, 4, 1, m_file);
+        if (!rd(&peOffset, 4)) { Close(); return false; }
 
         std::fseek(m_file, peOffset, SEEK_SET);
         uint32_t peSig = 0;
-        std::fread(&peSig, 4, 1, m_file);
-        if (peSig != 0x00004550) { Close(); return false; }
+        if (!rd(&peSig, 4) || peSig != 0x00004550) { Close(); return false; }
 
         uint16_t machine = 0, numSections = 0;
-        std::fread(&machine, 2, 1, m_file);
-        std::fread(&numSections, 2, 1, m_file);
+        if (!rd(&machine, 2) || !rd(&numSections, 2)) { Close(); return false; }
         std::fseek(m_file, 12, SEEK_CUR);
         uint16_t optHeaderSize = 0;
-        std::fread(&optHeaderSize, 2, 1, m_file);
+        if (!rd(&optHeaderSize, 2)) { Close(); return false; }
         std::fseek(m_file, 2, SEEK_CUR);
 
         long optHeaderStart = std::ftell(m_file);
         uint16_t optMagic = 0;
-        std::fread(&optMagic, 2, 1, m_file);
-        if (optMagic != 0x20B) { Close(); return false; } // PE32+ only
+        if (!rd(&optMagic, 2) || optMagic != 0x20B) { Close(); return false; } // PE32+ only
 
         std::fseek(m_file, optHeaderStart + 24, SEEK_SET);
-        std::fread(&m_imageBase, 8, 1, m_file);
+        if (!rd(&m_imageBase, 8)) { Close(); return false; }
         std::fseek(m_file, optHeaderStart + 56, SEEK_SET);
-        std::fread(&m_sizeOfImage, 4, 1, m_file);
+        if (!rd(&m_sizeOfImage, 4)) { Close(); return false; }
 
         // DataDirectory[5] = BASE_RELOC (offset +112 into opt header for PE32+)
         std::fseek(m_file, optHeaderStart + 24 + 112, SEEK_SET);
-        std::fread(&m_relocDirRVA,  4, 1, m_file);
-        std::fread(&m_relocDirSize, 4, 1, m_file);
+        if (!rd(&m_relocDirRVA, 4) || !rd(&m_relocDirSize, 4)) { Close(); return false; }
 
         std::fseek(m_file, optHeaderStart + optHeaderSize, SEEK_SET);
         m_sections.clear();
         for (uint16_t i = 0; i < numSections; ++i) {
             uint8_t hdr[40];
-            std::fread(hdr, 40, 1, m_file);
+            if (!rd(hdr, 40)) { Close(); return false; }
             PESection sec = {};
             std::memcpy(sec.name, hdr, 8);
             sec.name[8] = 0;

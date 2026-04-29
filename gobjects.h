@@ -35,7 +35,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <immintrin.h>
-#include "kernel_module/include/memreader_iface.h"
+#include "memreader_iface.h"
 #include "arc_decrypt.h"
 
 namespace gobjects
@@ -96,7 +96,18 @@ namespace gobjects
         bool Init() {
             if (m_initialized) return true;
 
-            // ── Patch 20260421 path (preferred) ──────────────────────────
+            // ── Patch 20260428 path (preferred) ──────────────────────────
+            // 20260428 layout exposes NumElements as a PLAIN u64 at
+            // GUObjectArray + 0x38 (verified via live probe on PID 92919).
+            // The chunks-manager-pointer pipeline shape changed too, but
+            // since we can't enumerate via vtable[5/7] without live RE we
+            // just lean on StructuralScanFUObjectItems as before.
+            if (InitPatch20260428()) {
+                return true;
+            }
+            std::printf("[!] Patch 20260428 path failed, trying 20260421 path...\n");
+
+            // ── Patch 20260421 path ──────────────────────────────────────
             // New GUObjectArray RVA + decrypt pipeline; vtable[7] is VMProtected
             // so the chunks-ptr-array is recovered via structural heap scan
             // instead. On success the chunk list is materialized as a flat
@@ -382,6 +393,203 @@ namespace gobjects
         //    unreachable without bytecode emulation). Accept any region with
         //    ≥500 consecutive valid items, concatenate all regions, cap at
         //    max_elements, and store as a flat UObject* list.
+        // Patch 20260428: layout simplified — NumElements is now a plain u64
+        // at GUObjectArray + 0x38, no decrypt needed. Verified on live PID
+        // 92919 (256-byte read of GUObjectArray showed +0x38 = 70592 with
+        // matching duplicate at +0x68 and N-1 at +0x70). The encrypted
+        // chunks-manager-pointer blob moved to +0xB0 and decrypts via a new
+        // PSHUFLW(0x1E)+ROL16(1) pipeline, but since the structural heap
+        // scan doesn't actually need chunks_manager (it sweeps mapped pages
+        // for FUObjectItem runs), we skip the pointer decrypt entirely.
+        bool InitPatch20260428() {
+            uint64_t base = m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE;
+            uint64_t num_at_38 = 0;
+            if (!m_reader.Read(base + 0x38, &num_at_38, 8)) {
+                std::printf("[p28] read GUObjectArray+0x38 failed\n");
+                return false;
+            }
+            // Sanity: lo32 should be a plausible UObject count; hi32 should be 0.
+            int32_t max_elements = static_cast<int32_t>(num_at_38 & 0xFFFFFFFFu);
+            if (max_elements < 1000 || max_elements > 2000000 || (num_at_38 >> 32) != 0) {
+                std::printf("[p28] +0x38 = 0x%llX doesn't look like plain NumElements\n",
+                    (unsigned long long)num_at_38);
+                return false;
+            }
+            // Cross-check duplicate at +0x68 — they should match.
+            uint64_t num_at_68 = 0;
+            if (m_reader.Read(base + 0x68, &num_at_68, 8) && num_at_68 != num_at_38) {
+                std::printf("[p28] +0x38 (%lld) and +0x68 (%lld) disagree — layout may have shifted\n",
+                    (long long)num_at_38, (long long)num_at_68);
+                // Don't bail — pick whichever is in-range.
+            }
+            std::printf("[p28] NumElements (plain @ +0x38) = %d\n", max_elements);
+
+            std::vector<uint64_t> objects;
+            if (!StructuralScanFUObjectItems(max_elements, objects)) {
+                std::printf("[p28] structural chunk scan failed\n");
+                return false;
+            }
+            std::printf("[p28] structural scan collected %zu UObject pointers\n",
+                objects.size());
+            if (objects.size() < 1000) return false;
+
+            // Direct vtable scan recovers UObjects allocated in heap arenas
+            // that aren't tracked by the FUObjectItem array (UScriptStruct +
+            // UClass-of-UScriptStruct + UEnum + UFunction). Each adds a few
+            // thousand objects to the seed set; downstream classification then
+            // routes them through Path A / Pass-3 emit.
+            // Populate the known-metaclass-vtable set used by ScanByVtable's
+            // neighbor check. Verified live (agent vtable distribution sweep,
+            // 2026-04-28/29). Per-kind instance counts and verified strides:
+            //   UScriptStruct  5779  stride 0x130
+            //   UClass         4222  stride 0x300
+            //   UFunction      21802 stride 0x200
+            //   UEnum          855   stride 0x130
+            //   UPackage       (universe ~13K, mostly false hits)
+            //   BPGC           747   stride 0x490
+            //   WBPGC          16    stride 0x5D0
+            //   SMBPGC         31    stride 0x490
+            //   AnimBPGC       6     stride 0x7F0
+            //   ASClass        2986  stride 0x340
+            //   ASStruct       1136  stride 0x150
+            m_knownTypeVtables = {
+                m_base + 0xAD6CB80,  // UScriptStruct
+                m_base + 0xAD6D440,  // UClass
+                m_base + 0xAD6D980,  // UFunction (also DelegateFunction shape)
+                m_base + 0xAD6FF30,  // UEnum
+                m_base + 0xB527FC0,  // UBlueprintGeneratedClass
+                m_base + 0xB322870,  // UWidgetBlueprintGeneratedClass
+                m_base + 0xC0092B0,  // USMBlueprintGeneratedClass
+                m_base + 0xB4D5CC0,  // UAnimBlueprintGeneratedClass
+                m_base + 0xB8A9180,  // UASClass (AngelScript)
+                m_base + 0xB8B2420,  // UASStruct (AngelScript)
+                m_base + 0xAD8AE70,  // UPackage
+                // ASFunction subclass vtables (23 variants) — populating these
+                // primarily helps the neighbor check on ASClass/ASStruct scans.
+                m_base + 0xB8A9A60, m_base + 0xB8A9E80, m_base + 0xB8AAF20,
+                m_base + 0xB8ABBA0, m_base + 0xB8ABFD0, m_base + 0xB8AC400,
+                m_base + 0xB8AD490, m_base + 0xB8AD8A0, m_base + 0xB8ADCD0,
+                m_base + 0xB8AE100, m_base + 0xB8AE530, m_base + 0xB8AE960,
+                m_base + 0xB8AED90, m_base + 0xB8AF1E0, m_base + 0xB8AF630,
+                m_base + 0xB8AFA60, m_base + 0xB8AFE80, m_base + 0xB8B02B0,
+                m_base + 0xB8B06E0, m_base + 0xB8B0B10, m_base + 0xB8B0F40,
+                m_base + 0xB8B1370, m_base + 0xB8B17A0,
+            };
+
+            size_t pre = objects.size();
+            ScanByVtable(m_base + 0xAD6CB80, /*stride=*/0x130, objects);  // UScriptStruct
+            ScanByVtable(m_base + 0xAD6D440, /*stride=*/0x300, objects);  // UClass
+            ScanByVtable(m_base + 0xAD6D980, /*stride=*/0x200, objects);  // UFunction
+            ScanByVtable(m_base + 0xAD6FF30, /*stride=*/0x130, objects);  // UEnum
+            ScanByVtable(m_base + 0xB527FC0, /*stride=*/0x490, objects);  // BPGC      (was 0x300; ~747 expected)
+            ScanByVtable(m_base + 0xB322870, /*stride=*/0x5D0, objects);  // WBPGC     (~16)
+            ScanByVtable(m_base + 0xC0092B0, /*stride=*/0x490, objects);  // SMBPGC    (~31)
+            ScanByVtable(m_base + 0xB4D5CC0, /*stride=*/0x7F0, objects);  // AnimBPGC  (~6)
+            ScanByVtable(m_base + 0xB8A9180, /*stride=*/0x340, objects);  // ASClass   (~2986)
+            ScanByVtable(m_base + 0xB8B2420, /*stride=*/0x150, objects);  // ASStruct  (~1136)
+            // Heaviest ASFunction subclass vtables (all stride 0x200).
+            // 13,079 total ASFunctions across 23 subclasses; the 7 below cover
+            // ~12K of them. Adding more would have negligible scan-time impact.
+            ScanByVtable(m_base + 0xB8ADCD0, /*stride=*/0x200, objects);  // ASFunction_NotThreadSafe_JIT (~4777)
+            ScanByVtable(m_base + 0xB8AE100, /*stride=*/0x200, objects);  // ASFunction_NoParams_JIT      (~4001)
+            ScanByVtable(m_base + 0xB8AFE80, /*stride=*/0x200, objects);  // ASFunction_ByteArg_JIT       (~1270)
+            ScanByVtable(m_base + 0xB8B02B0, /*stride=*/0x200, objects);  // ASFunction_ReferenceArg_JIT  (~837)
+            ScanByVtable(m_base + 0xB8B06E0, /*stride=*/0x200, objects);  // ASFunction_ObjectReturn_JIT  (~469)
+            ScanByVtable(m_base + 0xB8AF1E0, /*stride=*/0x200, objects);  // ASFunction_FloatExtToDbl_JIT (~435)
+            ScanByVtable(m_base + 0xB8B17A0, /*stride=*/0x200, objects);  // ASFunction_ByteReturn_JIT    (~347)
+            std::printf("[p28] vtable scan added %zu UObject pointers (total %zu)\n",
+                objects.size() - pre, objects.size());
+
+            m_arrayBase = base;
+            m_numElements = max_elements;
+            return InitWithSeedObjects(std::move(objects));
+        }
+
+        // The set of all known metaclass vtables — used for neighbor validation
+        // in ScanByVtable. UScriptStructs and UEnums cluster in mixed arenas
+        // so a strict same-vtable neighbor check rejects too many real hits;
+        // accepting any known metaclass vtable as the neighbor is sufficient
+        // to suppress incidental data-as-pointer false positives.
+        std::unordered_set<uint64_t> m_knownTypeVtables;
+
+        // Scan all rw- heap regions (from /proc/<pid>/maps) for an exact 8-byte
+        // vtable pattern. For each hit, validate by re-reading +0x00 (defends
+        // against transient page-tear) and checking that a neighbor at
+        // ±neighbor_stride has ANY known metaclass vtable (suppresses lone
+        // false positives where the vtable address appears as data).
+        void ScanByVtable(uint64_t target_vt, uint32_t neighbor_stride,
+                          std::vector<uint64_t>& out_objects) {
+            if (m_pid <= 0 || target_vt == 0) return;
+
+            struct Region { uint64_t lo, hi; };
+            std::vector<Region> ranges;
+            char path[64];
+            std::snprintf(path, sizeof(path), "/proc/%d/maps", m_pid);
+            FILE* f = std::fopen(path, "r");
+            if (!f) return;
+            char line[512];
+            while (std::fgets(line, sizeof(line), f)) {
+                uint64_t s = 0, e = 0;
+                char perms[5] = {};
+                std::sscanf(line, "%llx-%llx %4s",
+                    (unsigned long long*)&s, (unsigned long long*)&e, perms);
+                if (perms[0] != 'r' || perms[1] != 'w') continue;
+                uint64_t sz = e - s;
+                if (sz < 0x10000ULL || sz > 0xC800000ULL) continue;          // 64KB..200MB
+                if (s >= m_base && s < m_base + 0x10000000ULL) continue;     // skip module image
+                ranges.push_back({s, e});
+            }
+            std::fclose(f);
+
+            std::unordered_set<uint64_t> dedup(out_objects.begin(), out_objects.end());
+
+            // 4 MB chunks per the agent's spec — 8 MB caused short-read failures
+            // on /dev/memreader during testing.
+            const uint64_t CHUNK = 0x400000ULL;
+            std::vector<uint8_t> buf(CHUNK);
+            uint8_t target_bytes[8];
+            std::memcpy(target_bytes, &target_vt, 8);
+
+            size_t added = 0;
+            for (const auto& rg : ranges) {
+                for (uint64_t base_addr = rg.lo; base_addr < rg.hi; base_addr += CHUNK) {
+                    uint64_t want = std::min<uint64_t>(CHUNK, rg.hi - base_addr);
+                    if (!m_reader.Read(base_addr, buf.data(), want)) continue;
+                    // Search at 8-byte alignment (UObject allocations are 0x10-aligned;
+                    // vtable always lives at +0x00 with 8-byte alignment).
+                    for (size_t off = 0; off + 8 <= want; off += 8) {
+                        if (std::memcmp(buf.data() + off, target_bytes, 8) != 0) continue;
+                        uint64_t cand = base_addr + off;
+
+                        // Re-read to defend against torn page during the chunk read.
+                        uint64_t vt0 = 0;
+                        if (!m_reader.Read(cand, &vt0, 8) || vt0 != target_vt) continue;
+
+                        // Neighbor check: ±neighbor_stride should hold ANY known
+                        // metaclass vtable (UScriptStruct/UClass/UEnum/UFunction/BPGC).
+                        // Loose check tolerates mixed-kind arenas while still
+                        // rejecting lone vtable-as-data false positives.
+                        auto neighbor_ok = [&](uint64_t addr) {
+                            uint64_t vt_n = 0;
+                            if (!m_reader.Read(addr, &vt_n, 8)) return false;
+                            return m_knownTypeVtables.count(vt_n) > 0;
+                        };
+                        bool ok = false;
+                        if (neighbor_ok(cand + neighbor_stride))                       ok = true;
+                        if (!ok && cand >= neighbor_stride && neighbor_ok(cand - neighbor_stride)) ok = true;
+                        if (!ok) continue;
+
+                        if (dedup.insert(cand).second) {
+                            out_objects.push_back(cand);
+                            ++added;
+                        }
+                    }
+                }
+            }
+            std::printf("[p28] ScanByVtable(0x%llX, stride=0x%x): +%zu hits\n",
+                (unsigned long long)target_vt, neighbor_stride, added);
+        }
+
         bool InitPatch20260421() {
             using namespace ArcDecrypt::Patch20260421;
 

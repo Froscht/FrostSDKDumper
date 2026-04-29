@@ -33,7 +33,7 @@
 #include <unordered_map>
 #include <string>
 
-#include "kernel_module/include/memreader_ioctl.h"
+#include "memreader_ioctl.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Scan configuration
