@@ -1163,51 +1163,53 @@ namespace gobjects
             //   AnimBPGC       6     stride 0x7F0
             //   ASClass        2986  stride 0x340
             //   ASStruct       1136  stride 0x150
+            // CL-1177146 vtable map — live-verified 2026-04-30 by reading
+            // the +0x00 pointer of known-name objects. 20260428 RVAs all hit
+            // +0 on this patch — the engine type-pool relocated en masse with
+            // the patch CRT shift. Probe targets used:
+            //   PostProcessSettings/Vector/Rotator      → 0xAD9DC20  UScriptStruct
+            //   ABBHighCompressedVectorMixinLibrary etc → 0xAD9E500  UClass (native)
+            //   ReceiveTick/ReceiveBeginPlay/GetActorLocation → 0xAD9EA70 UFunction
+            //   ETeleportType/EAttachmentRule/EAICombatPhase  → 0xADA1140 UEnum
+            //   /Script/EngineMessages                   → 0xADBC9A0 UPackage
+            //   BP_Placement_Deployable_SoundTrap_C etc  → 0xB5653C0 BPGC
+            //   WBP_VignetteContainer_C etc              → 0xB35B400 WBPGC
+            //   ABP_Master_C, ABP_MainLayer_C            → 0xB512510 AnimBPGC
+            //   SK_WorkshopStation_RecycleStation_01_C   → 0xB7BBCF0 SMBPGC
+            //   PowerComponent/AIBSMEncounterModifierTransition → 0xB8ED140 ASClass
+            //   ASStruct LevelSequenceListEntry etc      → 0xB8F6920 ASStruct
+            //   AS-bound Tick (MainMenuCarouselWidget)   → 0xB8EDA70 ASFunction-A
+            //   AS-bound Destruct                        → 0xB8EDEC0 ASFunction-B
             m_knownTypeVtables = {
-                m_base + 0xAD6CB80,  // UScriptStruct
-                m_base + 0xAD6D440,  // UClass
-                m_base + 0xAD6D980,  // UFunction (also DelegateFunction shape)
-                m_base + 0xAD6FF30,  // UEnum
-                m_base + 0xB527FC0,  // UBlueprintGeneratedClass
-                m_base + 0xB322870,  // UWidgetBlueprintGeneratedClass
-                m_base + 0xC0092B0,  // USMBlueprintGeneratedClass
-                m_base + 0xB4D5CC0,  // UAnimBlueprintGeneratedClass
-                m_base + 0xB8A9180,  // UASClass (AngelScript)
-                m_base + 0xB8B2420,  // UASStruct (AngelScript)
-                m_base + 0xAD8AE70,  // UPackage
-                // ASFunction subclass vtables (23 variants) — populating these
-                // primarily helps the neighbor check on ASClass/ASStruct scans.
-                m_base + 0xB8A9A60, m_base + 0xB8A9E80, m_base + 0xB8AAF20,
-                m_base + 0xB8ABBA0, m_base + 0xB8ABFD0, m_base + 0xB8AC400,
-                m_base + 0xB8AD490, m_base + 0xB8AD8A0, m_base + 0xB8ADCD0,
-                m_base + 0xB8AE100, m_base + 0xB8AE530, m_base + 0xB8AE960,
-                m_base + 0xB8AED90, m_base + 0xB8AF1E0, m_base + 0xB8AF630,
-                m_base + 0xB8AFA60, m_base + 0xB8AFE80, m_base + 0xB8B02B0,
-                m_base + 0xB8B06E0, m_base + 0xB8B0B10, m_base + 0xB8B0F40,
-                m_base + 0xB8B1370, m_base + 0xB8B17A0,
+                m_base + 0xAD9DC20,  // UScriptStruct
+                m_base + 0xAD9E500,  // UClass (native)
+                m_base + 0xAD9EA70,  // UFunction
+                m_base + 0xADA1140,  // UEnum
+                m_base + 0xADBC9A0,  // UPackage
+                m_base + 0xB5653C0,  // UBlueprintGeneratedClass
+                m_base + 0xB35B400,  // UWidgetBlueprintGeneratedClass
+                m_base + 0xB512510,  // UAnimBlueprintGeneratedClass
+                m_base + 0xB7BBCF0,  // USkeletalMeshBlueprintGeneratedClass
+                m_base + 0xB8ED140,  // UASClass (AngelScript)
+                m_base + 0xB8F6920,  // UASStruct (AngelScript)
+                m_base + 0xB8EDA70,  // ASFunction subclass A (Tick-shape)
+                m_base + 0xB8EDEC0,  // ASFunction subclass B (Destruct-shape)
             };
 
             size_t pre = objects.size();
             std::vector<VtableScanTarget> vt_targets = {
-                { m_base + 0xAD6CB80, 0x130 },  // UScriptStruct
-                { m_base + 0xAD6D440, 0x300 },  // UClass
-                { m_base + 0xAD6D980, 0x200 },  // UFunction
-                { m_base + 0xAD6FF30, 0x130 },  // UEnum
-                { m_base + 0xB527FC0, 0x490 },  // BPGC
-                { m_base + 0xB322870, 0x5D0 },  // WBPGC
-                { m_base + 0xC0092B0, 0x490 },  // SMBPGC
-                { m_base + 0xB4D5CC0, 0x7F0 },  // AnimBPGC
-                { m_base + 0xB8A9180, 0x340 },  // ASClass
-                { m_base + 0xB8B2420, 0x150 },  // ASStruct
-                // Heaviest 7 ASFunction subclasses (all stride 0x200) — cover
-                // ~12K of the 13K total. Remaining 16 subclasses ≤250 each.
-                { m_base + 0xB8ADCD0, 0x200 },  // ASFunction_NotThreadSafe_JIT
-                { m_base + 0xB8AE100, 0x200 },  // ASFunction_NoParams_JIT
-                { m_base + 0xB8AFE80, 0x200 },  // ASFunction_ByteArg_JIT
-                { m_base + 0xB8B02B0, 0x200 },  // ASFunction_ReferenceArg_JIT
-                { m_base + 0xB8B06E0, 0x200 },  // ASFunction_ObjectReturn_JIT
-                { m_base + 0xB8AF1E0, 0x200 },  // ASFunction_FloatExtToDbl_JIT
-                { m_base + 0xB8B17A0, 0x200 },  // ASFunction_ByteReturn_JIT
+                { m_base + 0xAD9DC20, 0x130 },  // UScriptStruct
+                { m_base + 0xAD9E500, 0x300 },  // UClass (native)
+                { m_base + 0xAD9EA70, 0x200 },  // UFunction
+                { m_base + 0xADA1140, 0x130 },  // UEnum
+                { m_base + 0xB5653C0, 0x490 },  // BPGC
+                { m_base + 0xB35B400, 0x5D0 },  // WBPGC
+                { m_base + 0xB512510, 0x7F0 },  // AnimBPGC
+                { m_base + 0xB7BBCF0, 0x490 },  // SMBPGC
+                { m_base + 0xB8ED140, 0x340 },  // ASClass
+                { m_base + 0xB8F6920, 0x150 },  // ASStruct
+                { m_base + 0xB8EDA70, 0x200 },  // ASFunction-A
+                { m_base + 0xB8EDEC0, 0x200 },  // ASFunction-B
             };
             ScanByVtables(vt_targets, objects);
             std::printf("[p28] vtable scan added %zu UObject pointers (total %zu)\n",

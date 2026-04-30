@@ -550,16 +550,22 @@ static bool read_physical_memory(unsigned long phys_addr, void *buffer, size_t s
     return true;
 }
 
-// Read memory from target process using access_remote_vm (preferred)
-// or fall back to page table walking if unavailable.
-// access_remote_vm properly handles file-backed and shared mappings (Wine/Proton tmpmap)
-static long read_process_memory(int pid, unsigned long addr, void __user *user_buffer, unsigned long size) {
+#define MEMREADER_PID_FAILURE_THRESHOLD 256
+
+struct memreader_fd_state {
+    int last_pid;
+    unsigned int consecutive_failures;
+    bool pid_poisoned;
+};
+
+static long read_process_memory(struct file *file, int pid, unsigned long addr, void __user *user_buffer, unsigned long size) {
     struct task_struct *task;
     struct mm_struct *mm;
     void *kernel_buffer;
+    struct memreader_fd_state *state;
+    bool read_succeeded = false;
     long ret = 0;
 
-    // Input validation
     if (size < MIN_READ_SIZE || size > MAX_READ_SIZE) {
         return -EINVAL;
     }
@@ -569,50 +575,69 @@ static long read_process_memory(int pid, unsigned long addr, void __user *user_b
     if (pid <= 0) {
         return -EINVAL;
     }
-    // Check for address overflow
     if (addr + size < addr) {
         return -EINVAL;
     }
 
-    kernel_buffer = kmalloc(size, GFP_KERNEL);
-    if (!kernel_buffer) {
-        return -ENOMEM;
+    state = file ? file->private_data : NULL;
+    if (state) {
+        if (state->last_pid != pid) {
+            state->last_pid = pid;
+            state->consecutive_failures = 0;
+            state->pid_poisoned = false;
+        } else if (state->pid_poisoned) {
+            return -ESRCH;
+        }
     }
 
     task = get_task_by_pid(pid);
     if (!task) {
-        kfree(kernel_buffer);
+        if (state) {
+            state->pid_poisoned = true;
+        }
         return -ESRCH;
+    }
+
+    if (READ_ONCE(task->exit_state) != 0 || (READ_ONCE(task->flags) & PF_EXITING)) {
+        if (state) {
+            state->pid_poisoned = true;
+        }
+        put_task_struct(task);
+        return -ESRCH;
+    }
+
+    kernel_buffer = kmalloc(size, GFP_KERNEL);
+    if (!kernel_buffer) {
+        put_task_struct(task);
+        return -ENOMEM;
     }
 
     mm = get_task_mm(task);
     if (!mm) {
+        if (state) {
+            state->pid_poisoned = true;
+        }
         put_task_struct(task);
         kfree(kernel_buffer);
-        return -EINVAL;
+        return -ESRCH;
     }
 
-    // Use access_remote_vm if available (handles shared mappings, Wine tmpmap, etc.)
     if (fn_access_remote_vm) {
         int bytes_read;
 
-        // FOLL_FORCE allows reading even without explicit read permission in VMA
         bytes_read = fn_access_remote_vm(mm, addr, kernel_buffer, size, FOLL_FORCE);
 
         if (bytes_read <= 0) {
-            printk_ratelimited(KERN_DEBUG "MemReader: access_remote_vm failed for pid=%d addr=0x%lx size=%lu\n",
-                               pid, addr, size);
             memset(kernel_buffer, 0, size);
-        } else if ((unsigned long)bytes_read < size) {
-            printk_ratelimited(KERN_DEBUG "MemReader: partial read for pid=%d addr=0x%lx: %d of %lu bytes\n",
-                               pid, addr, bytes_read, size);
-            memset((char *)kernel_buffer + bytes_read, 0, size - bytes_read);
+        } else {
+            read_succeeded = true;
+            if ((unsigned long)bytes_read < size) {
+                memset((char *)kernel_buffer + bytes_read, 0, size - bytes_read);
+            }
         }
     } else {
-        // Fallback: manual page table walking (doesn't work for shared file mappings)
         unsigned long offset = 0;
-        unsigned long pages_not_present = 0;
-        unsigned long pages_not_allocated = 0;
+        unsigned long bytes_recovered = 0;
 
         mmap_read_lock(mm);
 
@@ -626,20 +651,12 @@ static long read_process_memory(int pid, unsigned long addr, void __user *user_b
             phys_addr = virt_to_phys_manual(mm, vaddr, &status);
 
             if (phys_addr == 0) {
-                switch (status) {
-                    case PAGE_STATUS_NOT_PRESENT:
-                        pages_not_present++;
-                        break;
-                    case PAGE_STATUS_NOT_ALLOCATED:
-                        pages_not_allocated++;
-                        break;
-                    default:
-                        break;
-                }
                 memset((char *)kernel_buffer + offset, 0, bytes_to_read);
             } else {
                 if (!read_physical_memory(phys_addr, (char *)kernel_buffer + offset, bytes_to_read)) {
                     memset((char *)kernel_buffer + offset, 0, bytes_to_read);
+                } else {
+                    bytes_recovered += bytes_to_read;
                 }
             }
 
@@ -648,10 +665,21 @@ static long read_process_memory(int pid, unsigned long addr, void __user *user_b
 
         mmap_read_unlock(mm);
 
-        if (pages_not_present > 0 || pages_not_allocated > 0) {
-            printk_ratelimited(KERN_DEBUG "MemReader: pid=%d addr=0x%lx size=%lu: "
-                               "%lu pages not present, %lu not allocated\n",
-                               pid, addr, size, pages_not_present, pages_not_allocated);
+        if (bytes_recovered > 0) {
+            read_succeeded = true;
+        }
+    }
+
+    if (state) {
+        if (read_succeeded) {
+            state->consecutive_failures = 0;
+        } else {
+            if (state->consecutive_failures < UINT_MAX) {
+                state->consecutive_failures++;
+            }
+            if (state->consecutive_failures >= MEMREADER_PID_FAILURE_THRESHOLD) {
+                state->pid_poisoned = true;
+            }
         }
     }
 
@@ -3254,7 +3282,7 @@ static long memreader_ioctl(struct file *file, unsigned int cmd, unsigned long a
             if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
                 return -EFAULT;
             }
-            ret = read_process_memory(req.pid, req.address, req.buffer, req.size);
+            ret = read_process_memory(file, req.pid, req.address, req.buffer, req.size);
             break;
         }
 
@@ -3503,6 +3531,15 @@ static atomic_t memreader_open_count = ATOMIC_INIT(0);
 
 static int memreader_open(struct inode *inode, struct file *file)
 {
+    struct memreader_fd_state *state;
+
+    state = kzalloc(sizeof(*state), GFP_KERNEL);
+    if (!state) {
+        return -ENOMEM;
+    }
+    state->last_pid = -1;
+    file->private_data = state;
+
     atomic_inc(&memreader_open_count);
     return 0;
 }
@@ -3510,6 +3547,9 @@ static int memreader_open(struct inode *inode, struct file *file)
 static int memreader_release(struct inode *inode, struct file *file)
 {
     int i;
+
+    kfree(file->private_data);
+    file->private_data = NULL;
 
     if (!atomic_dec_and_test(&memreader_open_count))
         return 0;

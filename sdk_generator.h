@@ -116,6 +116,8 @@ public:
     std::unordered_map<int32_t, std::string> m_type_idx_to_name;
     std::unordered_set<std::string> m_canonical_property_type_names;
     bool m_dynamic_type_table_loaded = false;
+    std::unordered_set<uint64_t> m_observed_fclass_ptrs;
+    int32_t m_fclass_typeidx_offset = -1;
     // Sets populated during property walk: every FStructProperty.Struct value is
     // a UScriptStruct address; every FEnumProperty.Enum value is a UEnum.
     // Used in classification to mark these UObjects as struct/enum even when
@@ -600,6 +602,95 @@ public:
             sizeof(kSeeds)/sizeof(kSeeds[0]));
     }
 
+    int32_t CalibrateFClassTypeIdxOffset() {
+        if (!m_dynamic_type_table_loaded || m_type_idx_to_name.empty()) return -1;
+        if (m_fclass_to_type.empty()) return -1;
+        std::unordered_map<std::string, int32_t> NameToIdx;
+        for (const auto& [Idx, Nm] : m_type_idx_to_name) {
+            NameToIdx[Nm] = Idx;
+            NameToIdx["F" + Nm] = Idx;
+        }
+        struct OffsetScore { int32_t Off; int32_t Hits; int32_t Total; };
+        std::vector<OffsetScore> Scores;
+        for (int32_t Off = 0x00; Off <= 0x6C; Off += 4) {
+            int32_t Hits = 0;
+            int32_t Total = 0;
+            for (const auto& [FcPtr, TypeName] : m_fclass_to_type) {
+                auto Nit = NameToIdx.find(TypeName);
+                if (Nit == NameToIdx.end()) continue;
+                ++Total;
+                uint32_t StoredIdx = 0;
+                if (!m_reader.Read(FcPtr + static_cast<uint64_t>(Off), &StoredIdx, 4)) continue;
+                if (static_cast<int32_t>(StoredIdx) == Nit->second) ++Hits;
+            }
+            Scores.push_back({Off, Hits, Total});
+        }
+        std::sort(Scores.begin(), Scores.end(),
+            [](const OffsetScore& A, const OffsetScore& B) { return A.Hits > B.Hits; });
+        if (Scores.empty() || Scores[0].Hits == 0) {
+            std::printf("[fcmap] typeidx offset calibration FAILED — no offset matched any seeded entry\n");
+            return -1;
+        }
+        const OffsetScore& Best = Scores[0];
+        int32_t Required = Best.Total / 2;
+        if (Best.Hits < Required) {
+            std::printf("[fcmap] typeidx offset calibration WEAK: best=+0x%X hits=%d/%d (need >=%d) — skipping\n",
+                Best.Off, Best.Hits, Best.Total, Required);
+            return -1;
+        }
+        std::printf("[fcmap] typeidx offset calibrated: +0x%X hits=%d/%d\n",
+            Best.Off, Best.Hits, Best.Total);
+        m_fclass_typeidx_offset = Best.Off;
+        return Best.Off;
+    }
+
+    size_t SeedDynamicFClassMap() {
+        if (m_fclass_typeidx_offset < 0) return 0;
+        if (!m_dynamic_type_table_loaded) return 0;
+        if (m_observed_fclass_ptrs.empty()) {
+            std::printf("[fcmap-dyn] no observed FFieldClass pointers — pre-pass must run first\n");
+            return 0;
+        }
+        size_t Added = 0;
+        size_t Examined = 0;
+        size_t IdxMissing = 0;
+        size_t ReadFail = 0;
+        size_t Already = 0;
+        size_t TypeIdxBad = 0;
+        std::unordered_map<std::string, size_t> AddedByType;
+        for (uint64_t FcPtr : m_observed_fclass_ptrs) {
+            ++Examined;
+            if (m_fclass_to_type.count(FcPtr)) { ++Already; continue; }
+            uint32_t StoredIdx = 0;
+            if (!m_reader.Read(FcPtr + static_cast<uint64_t>(m_fclass_typeidx_offset), &StoredIdx, 4)) {
+                ++ReadFail; continue;
+            }
+            int32_t TypeIdx = static_cast<int32_t>(StoredIdx);
+            if (TypeIdx < 0 || TypeIdx >= 4096) { ++TypeIdxBad; continue; }
+            auto Nit = m_type_idx_to_name.find(TypeIdx);
+            if (Nit == m_type_idx_to_name.end()) { ++IdxMissing; continue; }
+            std::string TypeName = "F" + Nit->second;
+            m_fclass_to_type[FcPtr] = TypeName;
+            ++Added;
+            ++AddedByType[TypeName];
+        }
+        std::printf("[fcmap-dyn] examined=%zu already=%zu read_fail=%zu bad_idx=%zu unmapped_idx=%zu added=%zu\n",
+            Examined, Already, ReadFail, TypeIdxBad, IdxMissing, Added);
+        if (Added > 0) {
+            std::vector<std::pair<std::string, size_t>> Sorted(AddedByType.begin(), AddedByType.end());
+            std::sort(Sorted.begin(), Sorted.end(),
+                [](const auto& A, const auto& B) { return A.second > B.second; });
+            std::printf("[fcmap-dyn] new mappings by type:");
+            size_t Shown = 0;
+            for (const auto& [Tn, Cnt] : Sorted) {
+                if (Shown++ >= 12) break;
+                std::printf(" %s=%zu", Tn.c_str(), Cnt);
+            }
+            std::printf("\n");
+        }
+        return Added;
+    }
+
     // ── Dump discovered vtable map to file (for SIGNATURES.md updates) ──
     void DumpVTableMap(const std::string& path) const {
         std::FILE* f = std::fopen(path.c_str(), "w");
@@ -838,16 +929,19 @@ public:
                 uint64_t cls_ptr = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
                 if (cls_ptr != 0 &&
                     (cls_ptr < 0x100000ULL || cls_ptr >= 0x800000000000ULL)) break;
-                uint32_t raw_off = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::Offset_Internal);
+                // Sample the +0xB0..+0xCB region for any of the two known
+                // CL-1177146 offset-sentinel positions (+0xC4 and +0xC8 both
+                // observed live for different FProperty subclasses).
                 alignas(16) uint8_t name_enc[16] = {};
                 m_reader.Read(ff + ArcDecrypt::Offsets::FField::NameEncrypted, name_enc, 16);
                 bool name_zero = true;
                 for (uint8_t b : name_enc) if (b) { name_zero = false; break; }
-                // CL-1177146 zero-offset sentinel: bswap32(0) ^ 0x40277448 = 0x40277448 stored.
-                // 20260428 sentinel 0x145D6034 retained for cross-patch tolerance.
-                if (name_zero && (raw_off == 0 ||
-                                  raw_off == 0x145D6034u ||
-                                  raw_off == 0x40277448u)) break;
+                uint32_t raw_off_c4 = Read<uint32_t>(ff + 0xC4);
+                uint32_t raw_off_c8 = Read<uint32_t>(ff + 0xC8);
+                bool any_offset_sentinel =
+                    (raw_off_c4 == 0 || raw_off_c4 == 0x40277448u || raw_off_c4 == 0x145D6034u) &&
+                    (raw_off_c8 == 0 || raw_off_c8 == 0x40277448u || raw_off_c8 == 0x145D6034u);
+                if (name_zero && any_offset_sentinel) break;
             }
 
             PropertyRecord pr{};
@@ -884,19 +978,18 @@ public:
                 pr.name = buf;
             }
 
-            // Type identification (20260428): the per-type global is at FField+0x88,
-            // NOT at FField+0x20 (ClassPrivate, which is 0 for engine reflection-
-            // stripped FFields). The +0x88 read is consistent across all properties.
             pr.fclass_ptr = Read<uint64_t>(ff + 0x88);
             if (!pr.fclass_ptr) {
                 pr.fclass_ptr = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
+            }
+            if (pr.fclass_ptr > 0x10000ULL && pr.fclass_ptr < 0x800000000000ULL) {
+                m_observed_fclass_ptrs.insert(pr.fclass_ptr);
             }
 
             auto fc_it = m_fclass_to_type.find(pr.fclass_ptr);
             if (fc_it != m_fclass_to_type.end()) {
                 pr.type_name = fc_it->second;
             } else {
-                // Fallback: element-size heuristic via IdentifyPropertyType
                 std::string vt_type = IdentifyPropertyType(ff);
                 pr.type_name = (vt_type.find("UNKNOWN") == std::string::npos)
                                ? vt_type : "FProperty_Unknown";
@@ -907,35 +1000,37 @@ public:
                 pr.bool_field_size = Read<uint8_t>(ff + ArcDecrypt::Offsets::FBoolProperty::FieldSize);
             }
 
-            // Offset_Internal: encrypted at FProperty+0xB4 in 20260428, but
-            // SHIFTED BY 1-3 BYTES for some property subtypes (probably due to
-            // FProperty subclass field reordering). The encrypted u32 always
-            // has the pattern `34 60 ?? ??` (bytes 0..1 = the high half of XOR
-            // key in BE = `0x34605D14 >> 16`). Scan +0xB0..+0xC0 for this
-            // signature and pick the first match whose decoded offset is in
-            // a plausible range [0..0x100000).
+            // Offset_Internal: encrypted u32 with subtype-dependent placement.
+            // CL-1177146 XOR key = 0x40277448 (LE bytes `48 74 27 40`). Live-verified positions:
+            //   FBoolProperty (PostProcessSettings bools) → +0xC4
+            //   non-bool FFields (RigidBodyState fields)  → +0xC8
+            //   BPGC FFields with offset > 0xFF           → byte 2 of stored differs from 0x27
+            //
+            // Encoding: stored = bswap32(real_offset) XOR 0x40277448. For
+            // real=0: stored = 0x40277448 (bytes `48 74 27 40`). For real>0xFF
+            // (most fields), bswap32 puts the offset's middle bytes into stored
+            // bytes 2-3, so byte 2 ≠ 0x27 and byte 3 ≠ 0x40. The OLD scan
+            // required all 3 of byte 0=0x48, 1=0x74, 2=0x27 — which excluded
+            // every non-zero offset > 0xFF. Now match only bytes 0-1 (which
+            // remain `48 74` for all offsets < 0x10000, the practical range
+            // for UE5 property offsets) and validate via the decoded value.
             {
                 pr.offset = 0;
-                alignas(8) uint8_t probe[20] = {};
-                m_reader.Read(ff + 0xB0, probe, 20);  // scan +0xB0..+0xC3
+                alignas(8) uint8_t probe[28] = {};
+                m_reader.Read(ff + 0xB0, probe, 28);  // scan +0xB0..+0xCB
                 bool found = false;
-                for (int dx = 0; dx < 16 && !found; ++dx) {
-                    if (probe[dx + 1] != 0x60) continue;  // sig byte 1 of XOR_KEY
-                    if (probe[dx]     != 0x34) continue;  // sig byte 0 of XOR_KEY
+                for (int dx = 0; dx + 4 <= 28 && !found; ++dx) {
+                    if (probe[dx]     != 0x48) continue;  // low byte of XOR key (stable for offset < 0x100000)
+                    if (probe[dx + 1] != 0x74) continue;  // 2nd byte (stable for offset < 0x1000000 — beyond practical UE5 props)
                     uint32_t stored;
                     std::memcpy(&stored, probe + dx, 4);
-                    // The bytes 0..1 of `stored` in mem are 34 60 (LE), so the
-                    // u32 LE has 0x34 at byte 0, 0x60 at byte 1 — meaning the
-                    // u32 LE itself starts with `34 60` only if we're at byte 0
-                    // of the encrypted slot. Need bswap32 to put it in the
-                    // canonical XOR form.
-                    uint32_t real = __builtin_bswap32(stored) ^ 0x34605D14u;
+                    uint32_t real = __builtin_bswap32(stored ^ 0x40277448u);
                     if (real <= 0x100000u) {
                         pr.offset = real;
                         found = true;
                     }
                 }
-                // Fallback to fixed +0xB4 read.
+                // Fallback to fixed primary offset.
                 if (!found) {
                     uint32_t stored_off = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::Offset_Internal);
                     pr.offset = ArcDecrypt::Patch20260421::DecryptPropertyOffsetNew(stored_off);
@@ -989,6 +1084,8 @@ public:
                     ipr.fclass_ptr = Read<uint64_t>(inner_ptr + 0x88);
                     if (!ipr.fclass_ptr || !m_fclass_to_type.count(ipr.fclass_ptr))
                         ipr.fclass_ptr = Read<uint64_t>(inner_ptr + ArcDecrypt::Offsets::FField::ClassPrivate);
+                    if (ipr.fclass_ptr > 0x10000ULL && ipr.fclass_ptr < 0x800000000000ULL)
+                        m_observed_fclass_ptrs.insert(ipr.fclass_ptr);
                     {
                         auto ifc_it = m_fclass_to_type.find(ipr.fclass_ptr);
                         if (ifc_it != m_fclass_to_type.end()) {
@@ -1023,6 +1120,8 @@ public:
                     epr.fclass_ptr = Read<uint64_t>(elem_ptr + 0x88);
                     if (!epr.fclass_ptr)
                         epr.fclass_ptr = Read<uint64_t>(elem_ptr + ArcDecrypt::Offsets::FField::ClassPrivate);
+                    if (epr.fclass_ptr > 0x10000ULL && epr.fclass_ptr < 0x800000000000ULL)
+                        m_observed_fclass_ptrs.insert(epr.fclass_ptr);
                     {
                         auto efc_it = m_fclass_to_type.find(epr.fclass_ptr);
                         if (efc_it != m_fclass_to_type.end()) {
@@ -1058,6 +1157,8 @@ public:
                     mpr.fclass_ptr = Read<uint64_t>(mp + 0x88);
                     if (!mpr.fclass_ptr)
                         mpr.fclass_ptr = Read<uint64_t>(mp + ArcDecrypt::Offsets::FField::ClassPrivate);
+                    if (mpr.fclass_ptr > 0x10000ULL && mpr.fclass_ptr < 0x800000000000ULL)
+                        m_observed_fclass_ptrs.insert(mpr.fclass_ptr);
                     {
                         auto mfc_it = m_fclass_to_type.find(mpr.fclass_ptr);
                         if (mfc_it != m_fclass_to_type.end()) {
@@ -1195,8 +1296,13 @@ public:
     // ── Dump a single UStruct/UClass to string ──────────────────────────────────
     std::string DumpStruct(const StructRecord& rec) {
         std::ostringstream oss;
-        oss << "// " << (rec.is_class ? "Class" : "Struct") << " /Script/"
-            << rec.package << "." << rec.name << "\n";
+        // rec.package now holds the FULL UE5 path ("/Script/Engine",
+        // "/Game/Pioneer/Items/BP_X"). Legacy non-path names (basename or
+        // "Unknown") fall through with a "/Script/" prefix for back-compat.
+        const std::string& pkg = rec.package;
+        oss << "// " << (rec.is_class ? "Class" : "Struct") << " "
+            << (!pkg.empty() && pkg[0] == '/' ? pkg : "/Script/" + pkg)
+            << "." << rec.name << "\n";
         oss << "// Address: 0x" << std::hex << rec.addr << "\n";
         oss << "// Size: 0x" << std::hex << rec.props_size
             << " (" << std::dec << rec.props_size << " bytes)\n";
@@ -1251,7 +1357,10 @@ public:
     // ── Dump a UEnum to string ────────────────────────────────────────────────────────
     std::string DumpEnum(const EnumRecord& rec) {
         std::ostringstream oss;
-        oss << "// Enum /Script/" << rec.package << "." << rec.name << "\n";
+        const std::string& pkg = rec.package;
+        oss << "// Enum "
+            << (!pkg.empty() && pkg[0] == '/' ? pkg : "/Script/" + pkg)
+            << "." << rec.name << "\n";
         oss << "namespace " << rec.name << " {\n";
         for (const auto& e : rec.entries) {
             std::string padded = e.name;
@@ -1277,16 +1386,17 @@ public:
         result.enums.reserve(3000);
         std::unordered_set<uint64_t> seen;
 
-        // ── Pass 0: build package map  (addr → short name, e.g. "Engine") ────
-        // Package objects have names starting with "/" (e.g. "/Script/Engine").
+        // ── Pass 0: build package map  (addr → full path, e.g. "/Script/Engine") ────
+        // Package objects have names starting with "/" (e.g. "/Script/Engine"
+        // or "/Game/Pioneer/Items/BP_X"). Store the FULL path so DumpStruct
+        // can emit the correct prefix — was previously stripped to basename
+        // and DumpStruct hardcoded "/Script/" before it, which mis-formatted
+        // /Game/ packages as "/Script/BP_X.BP_X".
         std::unordered_map<uint64_t, std::string> pkg_map;
         for (const auto& kv : addr_to_fullname) {
             const std::string& n = kv.second;
             if (n.empty() || n[0] != '/') continue;
-            size_t last_slash = n.rfind('/');
-            std::string short_pkg = n.substr(last_slash + 1);
-            if (!short_pkg.empty())
-                pkg_map[kv.first] = short_pkg;
+            pkg_map[kv.first] = n;
         }
         std::printf("[sdk] Package map: %zu packages\n", pkg_map.size());
 
@@ -1440,20 +1550,50 @@ public:
         // The function metaclass (named "Function") should appear as ClassPrivate of children.
         // Find "Function" metaclass: must be a UClass (ClassPrivate = classAddr)
         std::unordered_set<uint64_t> funcMetaAddrs;
+        // Path A: scan named objects whose name = "Function"/"DelegateFunction"/etc.
+        // Drop the validClassTypes gate — on CL-1177146 the FName slot picker is
+        // unstable so GetClassPrivate may not yield the UClass metaclass; the
+        // single Function-named UObject may still be the legitimate metaclass.
+        // The strict gate caused "Function metaclasses found: 0" → Pass 1+2
+        // returned zero functions.  Accept any heap-shaped match.
+        auto is_func_meta_name = [](const std::string& n) {
+            return n == "Function" || n == "DelegateFunction" ||
+                   n == "SparseDelegateFunction" ||
+                   n.rfind("ASFunction", 0) == 0;
+        };
         for (const auto& [idx, obj_ptr] : object_ptrs) {
             auto it = addr_to_name.find(obj_ptr);
             if (it == addr_to_name.end()) continue;
             const auto& n = it->second;
-            // Native UE function metaclasses + all 23 AngelScript ASFunction
-            // subclasses (which all start with "ASFunction" — Embark uses
-            // per-signature subclasses for JIT-compiled AS bytecode).
-            bool is_func_meta = (n == "Function" || n == "DelegateFunction" ||
-                                 n == "SparseDelegateFunction" ||
-                                 n.rfind("ASFunction", 0) == 0);
-            if (is_func_meta) {
-                uint64_t cls = m_fname.GetClassPrivate(obj_ptr);
-                if (validClassTypes.count(cls))  // Must be a UClass object
-                    funcMetaAddrs.insert(obj_ptr);
+            if (!is_func_meta_name(n)) continue;
+            // The Function metaclass UClass is itself a UObject; require a vtable
+            // in module range as the only sanity check.
+            uint64_t vt = Read<uint64_t>(obj_ptr);
+            if (vt < MODULE_BASE || vt >= MODULE_BASE + 0x10000000ULL) continue;
+            funcMetaAddrs.insert(obj_ptr);
+        }
+        // Path B: CDO-based recovery. Default__ASFunction* / Default__Function CDOs
+        // decrypt their name reliably; their ClassPrivate (one of 4 slot candidates)
+        // IS the function metaclass UClass we want. Catches metaclasses whose own
+        // name slot failed to decrypt.
+        for (const auto& [idx, obj_ptr] : object_ptrs) {
+            auto it = addr_to_name.find(obj_ptr);
+            if (it == addr_to_name.end()) continue;
+            const auto& n = it->second;
+            if (n.rfind("Default__", 0) != 0) continue;
+            std::string meta = n.substr(9);
+            if (!is_func_meta_name(meta)) continue;
+            auto cands = m_fname.GetAllClassCandidates(obj_ptr);
+            for (uint64_t cls : cands) {
+                if (!cls) continue;
+                if (cls < 0x10000 || cls >= 0x800000000000ULL) continue;
+                // Reject package slots (start with '/').
+                std::string cname = m_fname.GetName(cls);
+                if (!cname.empty() && cname[0] == '/') continue;
+                // Vtable sanity.
+                uint64_t vt = Read<uint64_t>(cls);
+                if (vt < MODULE_BASE || vt >= MODULE_BASE + 0x10000000ULL) continue;
+                funcMetaAddrs.insert(cls);
             }
         }
         std::printf("[sdk] Function metaclasses found: %zu\n", funcMetaAddrs.size());
@@ -1524,8 +1664,15 @@ public:
             };
 
             for (const auto& [idx, obj_ptr] : object_ptrs) {
-                uint64_t cls = m_fname.GetClassPrivate(obj_ptr);
-                if (!funcMetaAddrs.count(cls)) continue;
+                // Probe ALL 4 slot candidates — slot picker hash is unstable on
+                // CL-1177146 so a single-slot GetClassPrivate misses UFunctions
+                // whose metaclass landed in a non-default slot.
+                auto cands = m_fname.GetAllClassCandidates(obj_ptr);
+                bool is_ufunc = false;
+                for (uint64_t cls : cands) {
+                    if (funcMetaAddrs.count(cls)) { is_ufunc = true; break; }
+                }
+                if (!is_ufunc) continue;
                 uint64_t outer = m_fname.GetOuterPtr(obj_ptr);
                 // Always push even if outer is 0 (orphan); allows the function
                 // to appear in the orphan section instead of being lost.
@@ -1785,10 +1932,7 @@ public:
             auto fn = addr_to_fullname.find(pkg_ptr);
             if (fn != addr_to_fullname.end()) {
                 const std::string& s = fn->second;
-                if (!s.empty() && s[0]=='/') {
-                    size_t ls = s.rfind('/');
-                    return s.substr(ls+1);
-                }
+                if (!s.empty() && s[0]=='/') return s;  // full path
                 return s;
             }
             // Live fallback — read the name directly. ONLY accept results
@@ -1799,10 +1943,8 @@ public:
             if (cached != live_pkg_cache.end()) return cached->second;
             std::string live_name = m_fname.GetName(pkg_ptr);
             if (!live_name.empty() && live_name[0] == '/') {
-                size_t ls = live_name.rfind('/');
-                std::string short_pkg = live_name.substr(ls + 1);
-                live_pkg_cache[pkg_ptr] = short_pkg;
-                return short_pkg;
+                live_pkg_cache[pkg_ptr] = live_name;  // full path
+                return live_name;
             }
             live_pkg_cache[pkg_ptr] = "Unknown";
             return "Unknown";
@@ -1838,6 +1980,15 @@ public:
         for (uint64_t a : m_known_structs) (obj_set.count(a) ? ks_in : ks_out)++;
         std::printf("[sdk] Pre-pass walked %zu chains; m_known_structs=%zu (in_set=%zu, extras=%zu) m_known_enums=%zu\n",
             pre_walked, m_known_structs.size(), ks_in, ks_out, m_known_enums.size());
+        std::printf("[fcmap-dyn] observed %zu unique FFieldClass pointers during pre-pass\n",
+            m_observed_fclass_ptrs.size());
+
+        if (m_dynamic_type_table_loaded) {
+            CalibrateFClassTypeIdxOffset();
+            size_t DynAdded = SeedDynamicFClassMap();
+            std::printf("[fcmap-dyn] dynamic seeding produced %zu new FFieldClass mappings (total=%zu)\n",
+                DynAdded, m_fclass_to_type.size());
+        }
 
         // ── Pass 2: iterate objects — include all type objects ──────────────────
         // An object is a type if: (a) it's in allTypeAddrs (used as class ptr by others),
@@ -2014,31 +2165,45 @@ public:
             // is mirrored across +0xE8/+0xF0 (same head pointer); identical heads
             // produce identical chains and are collapsed to one entry per FField.
             std::unordered_map<uint64_t, PropertyRecord> best_at_ff;
-            {
-                uint64_t chain_head = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UStruct::ChildProperties);
-                if (chain_head > 0x10000 && chain_head < 0x7FFFFFFFFFFFULL) {
-                    uint64_t cpvt = Read<uint64_t>(chain_head);
-                    if (cpvt >= MODULE_BASE && cpvt < MODULE_BASE + 0x10000000ULL) {
-                        auto chain_props = ReadPropertyChain(chain_head);
-                        for (auto& p : chain_props) {
-                            if (p.offset > 0x20000) continue;
-                            auto it = best_at_ff.find(p.ff_addr);
-                            if (it == best_at_ff.end()) {
-                                best_at_ff[p.ff_addr] = std::move(p);
-                            } else {
-                                bool cur_unk = (it->second.name.rfind("UnknownProp_", 0) == 0 ||
-                                                it->second.name.rfind("Prop_CI", 0) == 0);
-                                bool new_unk = (p.name.rfind("UnknownProp_", 0) == 0 ||
-                                                p.name.rfind("Prop_CI", 0) == 0);
-                                bool cur_tk  = (it->second.type_name != "FProperty_Unknown");
-                                bool new_tk  = (p.type_name != "FProperty_Unknown");
-                                int cur_score = (cur_unk ? 0 : 2) + (cur_tk ? 1 : 0);
-                                int new_score = (new_unk ? 0 : 2) + (new_tk ? 1 : 0);
-                                if (new_score > cur_score) best_at_ff[p.ff_addr] = std::move(p);
-                            }
-                        }
+            // Try ChildProperties at +0x100 first (UStruct/UScriptStruct/native-UClass).
+            // If that's null, fall back to candidate offsets where BPGCs and
+            // engine-generated UClass subclasses store their PropertyLink:
+            //   +0xB8  observed on BPGC (e.g. BP_CinCam_HandHeldShake_Jitter_C)
+            //   +0x118 observed live as another chain head
+            // Each candidate must point to a heap object whose +0x00 vtable
+            // is in module range (= a real FField). Walking PropertyLink may
+            // include inherited fields from parent classes, but ff_addr dedup
+            // collapses identical FFields and the per-class emit (own-by-walk)
+            // is preserved per call site. Matches reference dumpers for game
+            // BPGCs that otherwise emit empty bodies.
+            static constexpr uint64_t kChainOffs[] = { 0x100, 0xB8, 0x118 };
+            auto walk_chain = [&](uint64_t chain_head) {
+                if (chain_head <= 0x10000 || chain_head >= 0x7FFFFFFFFFFFULL) return;
+                uint64_t cpvt = Read<uint64_t>(chain_head);
+                if (cpvt < MODULE_BASE || cpvt >= MODULE_BASE + 0x10000000ULL) return;
+                auto chain_props = ReadPropertyChain(chain_head);
+                for (auto& p : chain_props) {
+                    if (p.offset > 0x20000) continue;
+                    auto it = best_at_ff.find(p.ff_addr);
+                    if (it == best_at_ff.end()) {
+                        best_at_ff[p.ff_addr] = std::move(p);
+                    } else {
+                        bool cur_unk = (it->second.name.rfind("UnknownProp_", 0) == 0 ||
+                                        it->second.name.rfind("Prop_CI", 0) == 0);
+                        bool new_unk = (p.name.rfind("UnknownProp_", 0) == 0 ||
+                                        p.name.rfind("Prop_CI", 0) == 0);
+                        bool cur_tk  = (it->second.type_name != "FProperty_Unknown");
+                        bool new_tk  = (p.type_name != "FProperty_Unknown");
+                        int cur_score = (cur_unk ? 0 : 2) + (cur_tk ? 1 : 0);
+                        int new_score = (new_unk ? 0 : 2) + (new_tk ? 1 : 0);
+                        if (new_score > cur_score) best_at_ff[p.ff_addr] = std::move(p);
                     }
                 }
+            };
+            for (uint64_t off : kChainOffs) {
+                uint64_t head = Read<uint64_t>(obj_ptr + off);
+                walk_chain(head);
+                if (!best_at_ff.empty()) break;  // first non-empty chain wins
             }
             for (auto& [ff, p] : best_at_ff)
                 rec.properties.push_back(std::move(p));

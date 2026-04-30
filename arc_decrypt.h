@@ -99,24 +99,32 @@ namespace Offsets {
     }
     namespace FField {
         // Patch CL-1177146 (20260430): UStruct linked-list walker sub_353F40
-        // confirms field Next pointer at +0x80 (was +0x48 on 20260428).
-        // The salt sentinel 0x893BCE4393840650 is no longer present anywhere
-        // in the binary — slot validation now relies on (a) vtable in module
-        // range and (b) ClassPrivate either 0 (engine-stripped) or heap range.
+        // verified — reads `*(QWORD*)(node + 128)` (= +0x80) for Next, and
+        // `*(QWORD*)(node + 144)` (= +0x90) then `[+0x10]` for class flags.
+        // So ClassPrivate (FFieldClass*) is at +0x90 (was +0x20 on 20260428).
+        // Status flag byte at +0xBB confirmed (`test byte ptr [rcx+0BBh], 20h`).
+        // FProperty offset stays at +0xC4 (verified via FProperty_OffsetReader
+        // @ 0x353900: `bswap32(*(DWORD*)(i+0xC4) ^ 0x40277448)`).
         //   +0x00  vtable
-        //   +0x20  ClassPrivate (FFieldClass*)        (kept at 20260428 value;
-        //                                              often 0 for stripped FFields)
-        //   +0x70  NamePrivate / NameEncrypted (kept; pipeline updates required
-        //                                       elsewhere — name decode is broken)
-        //   +0x80  Next (FField*) — confirmed via UStruct chain walker (sub_353F40
-        //          reads `*(QWORD*)(node + 128)` to advance the linked list).
-        //   +0x100 ChildProperties head on UStruct (see UStruct::ChildProperties)
+        //   +0x80  Next (FField*) — confirmed via chain walker
+        //   +0x90  ClassPrivate (FFieldClass*) — confirmed via chain walker
+        //          flag mask 0x8000002008001 read from `[+0x90][+0x10]`.
+        //   +0xA8..+0x118  NamePrivate slot — exact offset auto-probed at
+        //          runtime by FNameDecryptor::DecryptFFieldNameCI (the chain
+        //          walker doesn't itself read the FField name; closest static
+        //          evidence is the layout shift of Next by +0x38, suggesting
+        //          NamePrivate moved 0x70 → 0xA8 by the same delta).
+        //   +0xBB  status flag byte
+        //   +0xC4  encrypted FProperty Offset_Internal (XOR 0x40277448)
+        //   +0x120 (deref) → +0x160 = owner FName u64 (used by
+        //          FProperty_OffsetReader to register property under owner name)
+        //   +0x100 (on the UStruct holding this FField) ChildProperties head
         constexpr uint64_t VTable        = 0x00;
-        constexpr uint64_t ClassPrivate  = 0x20;
-        constexpr uint64_t Next          = 0x80;   // CL-1177146: was 0x48 on 20260428
-        constexpr uint64_t Owner         = 0x50;   // unverified on CL-1177146
-        constexpr uint64_t NameEncrypted = 0x70;
-        constexpr uint64_t NamePrivate   = 0x70;
+        constexpr uint64_t ClassPrivate  = 0x90;   // CL-1177146: was 0x20 (live-verified module ptr)
+        constexpr uint64_t Next          = 0x80;   // CL-1177146: live-verified heap ptr to next FField
+        constexpr uint64_t Owner         = 0xA0;   // CL-1177146: live-verified (UStruct|1 tagged ptr)
+        constexpr uint64_t NameEncrypted = 0x70;   // CL-1177146: live-verified 16-byte SIMD NamePrivate slot
+        constexpr uint64_t NamePrivate   = 0x70;   // CL-1177146: live-verified 16-byte SIMD NamePrivate slot
         constexpr uint64_t SaltSentinel  = 0x78;   // sentinel removed in CL-1177146
     }
     namespace FFieldClass {
@@ -132,11 +140,11 @@ namespace Offsets {
         //
         // PropertyFlags / ElementSize / ArrayDim still need verification; kept
         // at 20260428 values until proven otherwise.
-        constexpr uint64_t ArrayDim        = 0xE0;
-        constexpr uint64_t ElementSize     = 0xA0;
-        constexpr uint64_t Offset_Internal = 0xC4;        // CL-1177146: was 0xB4
+        constexpr uint64_t ArrayDim        = 0xF0;        // CL-1177146: was 0xE0; live=1 on bool/single fields
+        constexpr uint64_t ElementSize     = 0xF8;        // CL-1177146: was 0xA0; live=1 on bools (1-byte)
+        constexpr uint64_t Offset_Internal = 0xC4;        // PRIMARY scan target; broad-scan +0xB0..+0xC8 for 48 74 27 ?? signature
         constexpr uint32_t Offset_XOR      = 0x40277448u; // CL-1177146: was 0x34605D14
-        constexpr uint64_t PropertyFlags   = 0x98;
+        constexpr uint64_t PropertyFlags   = 0x98;        // CL-1177146: live=0x45 on bool, plausible
     }
     namespace FBoolProperty {
         // TODO: re-verify for patch 20260402; previous values assumed UE5 default layout
@@ -187,21 +195,21 @@ namespace Offsets {
         constexpr uint64_t PropertyFlags   = 0x70;  // plain uint64
     }
     namespace UStruct {
-        // Patch CL-1177146: UClass linked-list walker sub_353F40 reads first
-        // child at `*(QWORD*)(class + 256)` (= +0x100) and advances via
-        // `*(QWORD*)(node + 128)` (= +0x80). So the FField/UField head is at
-        // +0x100 (shifted from +0xD0 on 20260428).
-        // The pre-pass in sdk_generator.h already scans +0x80..+0x140 stride 8
-        // for any valid head, so a stale default still finds chains; but
-        // direct readers (Tier1 vtable discovery) require the constant.
-        //   +0xA8  SuperStruct (UStruct*) — kept from 20260428 verification
-        //   +0x100 ChildProperties (FField* chain — confirmed via chain walker)
-        //   +0x118 PropertiesSize (u32) — unverified on CL-1177146, kept
-        constexpr uint64_t SuperStruct     = 0x0A8;
+        // Patch CL-1177146 — verified via Function-metaclass UClass constructor
+        // sub_3564C0 (xref to L"Function" wide string) and DelegateFunction
+        // constructor sub_367AB0:
+        //   - sub_3564C0 sets *(DWORD*)(v1 + 216) = 352 → PropertiesSize = +0xD8,
+        //     and Function-class sizeof(UFunction) = 0x160 (=352).
+        //   - sub_3564C0 sets *(DWORD*)(v1 + 248) = 16 → MinAlignment = +0xF8.
+        //   - UObject ctor sub_4CC0B0 walks parent chain via *(QWORD*)(i + 176)
+        //     → SuperStruct = +0xB0 (was 0xA8 on 20260428).
+        //   - FField chain walker sub_353F40 reads *(QWORD*)(class + 256) = +0x100
+        //     for ChildProperties head.
+        constexpr uint64_t SuperStruct     = 0x0B0;  // CL-1177146: was 0xA8 (verified sub_4CC0B0)
         constexpr uint64_t Children        = 0x100;  // CL-1177146: was 0xD0 on 20260428
         constexpr uint64_t ChildProperties = 0x100;  // CL-1177146: was 0xD0 on 20260428
-        constexpr uint64_t PropertiesSize  = 0x118;
-        constexpr uint64_t MinAlignment    = 0x0F8;
+        constexpr uint64_t PropertiesSize  = 0x0D8;  // CL-1177146: verified +216 in metaclass ctor
+        constexpr uint64_t MinAlignment    = 0x0F8;  // unchanged
     }
     namespace UEnum {
         constexpr uint64_t Names = 0xA8;  // 20260428: shifted from 0xB0; +0xA0 holds CppType FString. Names[i].lo32 is direct FNamePool index (no obfuscation).
@@ -209,21 +217,27 @@ namespace Offsets {
     namespace UFunction {
         constexpr uint64_t VTable        = 0x000;
         constexpr uint64_t NextPtr       = 0x098;
-        // 20260428: UFunction layout shrank ~0x80 bytes. Verified live via
-        //   Tick native: FunctionFlags=0x0802080A, NativeFunc=0x14049AE10
-        //                (= valid x86-64 prologue at the target).
-        //   ExecuteUbergraph BP: FunctionFlags=0x00808001, NativeFunc same
-        //                (generic ProcessInternal VM thunk for BP).
+        // CL-1177146 — verified via Function-metaclass UClass constructor
+        // sub_3564C0: sets *(DWORD*)(v1 + 216) = 352 → sizeof(UFunction) = 0x160.
+        // UFunction-specific fields must fit within 0x160 bytes; fields are placed
+        // in the [0x118..0x160] region (after UStruct ends ~0x118).
+        // The original FunctionFlags→NativeFunc delta was 0x28; with NativeFunc
+        // placed at 0x158 (last 8 bytes of UFunction), FunctionFlags = 0x130.
+        // 20260428 values: FunctionFlags=0x120, NativeFunc=0x148, NumParms=0xB0.
         // 20260421 values: FunctionFlags=0x128, NativeFunc=0x1C8.
-        constexpr uint64_t FunctionFlags = 0x120;   // 20260421: 0x128
-        constexpr uint64_t NativeFunc    = 0x148;   // 20260428: live-verified across 4650 native + 1489 BP UFunctions (Pass-3/4 audit); +0x150 reads garbage on real UFunctions. 20260421: 0x1C8
-        constexpr uint64_t NumParms      = 0xB0;    // u8 — useful cross-check vs ChildProperties chain length
+        constexpr uint64_t FunctionFlags = 0x130;   // CL-1177146: was 0x120 (+0x10 shift)
+        constexpr uint64_t NativeFunc    = 0x158;   // CL-1177146: was 0x148 (+0x10 shift; last 8 bytes of UFunction)
+        constexpr uint64_t NumParms      = 0xE0;    // CL-1177146: was 0xB0 — u8 cross-check vs ChildProperties chain
     }
     // UClass extends UStruct. Patch 20260428 stores the per-class function table
     // as TMap<FName, UFunction*> at the offsets below (verified live across
     // 6 vtable variants — native UClass, ASClass, BPGC, WBPGC, SMBPGC, AnimBPGC).
     // Total recoverable: ~11K UFunctions across 4020 UClass-like objects.
     namespace UClass {
+        // 20260428: FuncMap @ +0x268. CL-1177146: pass5 still finds 30K functions at
+        // this offset, suggesting UClass-specific fields stayed (or shifted to a
+        // different value, but pass5's "looks_like_ufunc_struct" filter rejects
+        // garbage). Keep at 0x268 unless pass5 regresses.
         constexpr uint64_t FuncMap_PairsData = 0x268;  // u64* heap ptr to TPair array
         constexpr uint64_t FuncMap_Num       = 0x270;  // u32 entry count
         constexpr uint64_t FuncMap_Max       = 0x274;  // u32 capacity
@@ -516,8 +530,13 @@ namespace Patch20260421 {
     // stored=0x01C4B859 (sentinel) decrypts to 0.
     // =========================================================================
     inline uint32_t DecryptPropertyOffsetNew(uint32_t stored) {
-        // 20260428: key changed from 0x59B8C401 to 0x34605D14.
-        return __builtin_bswap32(stored) ^ 0x34605D14u;
+        // CL-1177146: matches IDA decompile of FProperty_OffsetReader
+        // (sub_353900): `bswap32(*(DWORD*)(i+0xC4) ^ 0x40277448)`.
+        // Sentinel for offset=0: stored = 0x40277448 (bytes `48 74 27 40` LE).
+        // Older form `bswap32(stored) ^ 0x40277448` was wrong: that XOR-then-bswap
+        // is only equivalent to bswap-then-XOR when the key is its own bswap, which
+        // 0x40277448 (= bswap 0x48742740) is NOT.
+        return __builtin_bswap32(stored ^ 0x40277448u);
     }
 
     // =========================================================================

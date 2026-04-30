@@ -309,6 +309,28 @@ public:
         return (Raw << 32) | (Raw >> 32);
     }
 
+    // ── FField NamePrivate slot decrypt (patch CL-1177146) ───────────────
+    // Verified IDA: function at 0x4544A0 (FBoolProperty's GetCPPType / "Unsupported
+    // FBoolProperty %s size %d." error path). It loads FField+0x70 and runs:
+    //   1. ROL32(_, 13) per uint32-lane  (PSLLD 13 | PSRLD 19)
+    //   2. take lo64
+    //   3. XOR with 0x9A492C85DDF6F193ULL
+    //   4. ROL64(_, 7)
+    //   → result u64 = (Number << 32) | CI ; CI in lo32.
+    // Pipeline differs from UObject 4-slot (which uses PSHUFB+XOR+ROL64(32)) and
+    // from 20260428 FField (which used ROL64(21)+XOR+ROL16(15)+ROL64(32)).
+    static constexpr uint64_t FFIELD_NAME_XOR_CL1177146 = 0x9A492C85DDF6F193ULL;
+    uint64_t DecryptFFieldNameSlot(const uint8_t enc[16]) const {
+        __m128i V    = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
+        // ROL32(13) per uint32-lane
+        __m128i Rot  = _mm_or_si128(_mm_slli_epi32(V, 13), _mm_srli_epi32(V, 19));
+        uint64_t Lo;
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Rot);
+        uint64_t Xored = Lo ^ FFIELD_NAME_XOR_CL1177146;
+        // ROL64 by 7
+        return (Xored << 7) | (Xored >> 57);
+    }
+
     // ── UObject FName accessor (patch 20260428) ──────────────────────────
     // After DecryptUObjSlotNew_20260428 (PSHUFB → ROL32(17) → XOR → ROL64(32)),
     // the comp_index lives in the LO 32 bits of the decrypted u64 (matches
@@ -427,41 +449,81 @@ public:
     // and name_offset to walk the FNamePool.
     int32_t DecryptFFieldNameCI(uint64_t ff_addr) {
         if (!ff_addr) return 0;
-        // Patch 20260428 — VERIFIED via IDA decompile of FBoolProperty error
-        // handler at sub_4586C6. Pipeline:
-        //   1. enc16 = load(FField + 0x70)
-        //   2. tmp1  = ROL64(enc16, 21) per 64-bit lane
-        //   3. tmp2  = tmp1 XOR xmmword_AD65E90  (lo64=0xC8727080CA112779, hi64=0)
-        //   4. tmp3  = ROL16(tmp2, 15) per uint16-lane = ROR16(_, 1)
-        //   5. lo64  = lo 8 bytes of tmp3
-        //   6. ROL64(lo64, 32) → swap halves → (Number<<32) | CI (CI in lo32)
-        alignas(16) uint8_t enc[16] = {};
-        if (!m_reader.Read(ff_addr + ArcDecrypt::Offsets::FField::NameEncrypted, enc, 16))
-            return 0;
-        uint64_t hi_check;
-        std::memcpy(&hi_check, enc + 8, 8);
-        if (hi_check == 0) return 0;  // uninitialized slot
+        // Patch CL-1177146 PRIMARY PATH: FField+0x70 with the NEW pipeline
+        // verified from IDA sub_4544A0 (FBoolProperty GetCPPType, the error
+        // path that calls FName_ToString_Wide on FField NamePrivate):
+        //   ROL32(13) per uint32-lane → lo64 → XOR(0x9A492C85DDF6F193) → ROL64(7)
+        // Different from UObject 4-slot AND from 20260428's FField pipeline.
+        {
+            alignas(16) uint8_t enc[16] = {};
+            if (m_reader.Read(ff_addr + 0x70, enc, 16)) {
+                bool any = false;
+                for (uint8_t b : enc) if (b) { any = true; break; }
+                if (any) {
+                    uint64_t fn = DecryptFFieldNameSlot(enc);
+                    int32_t ci = static_cast<int32_t>(fn & 0xFFFFFFFFu);
+                    if (ci > 1 && (uint32_t)ci < 0x06A00000u) {
+                        // Stash the offset for downstream callers (auto-cal short-circuit).
+                        if (m_ffieldNameOff == 0) m_ffieldNameOff = 0x70;
+                        return ci;
+                    }
+                }
+            }
+        }
 
-        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-        // Step 2: ROL64(v, 21) per 64-bit lane
-        __m128i r1 = _mm_or_si128(_mm_slli_epi64(v, 21),
-                                  _mm_srli_epi64(v, 64 - 21));
-        // Step 3: XOR with constant (16-byte; only lo64 is non-zero)
-        alignas(16) static const uint8_t kXor[16] = {
-            0x79, 0x27, 0x11, 0xCA, 0x80, 0x70, 0x72, 0xC8,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        // Fallback: legacy auto-cal in case the +0x70 pipeline produces a
+        // bogus CI (e.g., subclass with different layout). Tries UObject
+        // 4-slot at various candidate offsets — kept for graceful degrade.
+        // CL-1177146 (live-verified): NamePrivate is at +0x70 — same as
+        // 20260428. Earlier auto-cal locked onto +0x118 because the bytes
+        // there happened to decrypt for a single FField; +0x70 is the real
+        // universal offset per IDA chain walker sub_353F40 and live SIMD
+        // shape across PostProcessSettings/RigidBodyState samples.
+        static constexpr uint64_t kCandOffs[] = {
+            0x70,                                          // primary CL-1177146
+            0xA8, 0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xE0,
+            0xE8, 0xF0, 0xF8, 0x100, 0x108, 0x110, 0x118,
         };
-        __m128i xk = _mm_load_si128(reinterpret_cast<const __m128i*>(kXor));
-        __m128i x = _mm_xor_si128(r1, xk);
-        // Step 4: ROL16(x, 15) per uint16-lane
-        __m128i r2 = _mm_or_si128(_mm_slli_epi16(x, 15),
-                                  _mm_srli_epi16(x, 1));
-        // Step 5+6: lo64 then ROL64(_, 32)
-        uint64_t lo64;
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo64), r2);
-        uint64_t rot = (lo64 >> 32) | (lo64 << 32);
-        return static_cast<int32_t>(rot & 0xFFFFFFFFu);  // CI in lo32
+        if (m_ffieldNameOff != 0) {
+            int32_t ci = TryDecodeFFieldNameAt(ff_addr, m_ffieldNameOff);
+            if (ci > 1 && (uint32_t)ci < 0x06A00000u) return ci;
+            return 0;
+        }
+        for (uint64_t off : kCandOffs) {
+            int32_t ci = TryDecodeFFieldNameAt(ff_addr, off);
+            if (ci <= 1) continue;
+            uint64_t chunk_off = (static_cast<uint64_t>(ci) >> 8) & 0xFFFF00ULL;
+            if (chunk_off == 0 || chunk_off > 0x6A0000ULL) continue;
+            uint64_t name_ptr = ResolveNamePtrFull(ci);
+            if (!name_ptr) continue;
+            std::string nm = DecryptNameString(name_ptr);
+            if (nm.empty()) continue;
+            bool printable = true;
+            int letters = 0;
+            for (char c : nm) {
+                if ((c>='A'&&c<='Z')||(c>='a'&&c<='z')) ++letters;
+                else if (!((c>='0'&&c<='9')||c=='_')) { printable = false; break; }
+            }
+            if (!printable || letters < 2) continue;
+            m_ffieldNameOff = off;
+            std::printf("[ffield] auto-calibrated NamePrivate offset = +0x%llX (sample name='%s' CI=%d)\n",
+                (unsigned long long)off, nm.c_str(), ci);
+            return ci;
+        }
+        return 0;
     }
+
+private:
+    int32_t TryDecodeFFieldNameAt(uint64_t ff_addr, uint64_t off) {
+        alignas(16) uint8_t enc[16] = {};
+        if (!m_reader.Read(ff_addr + off, enc, 16)) return 0;
+        bool any = false;
+        for (uint8_t b : enc) if (b) { any = true; break; }
+        if (!any) return 0;
+        uint64_t dec = DecryptUObjSlotNew(enc);
+        return static_cast<int32_t>(dec & 0xFFFFFFFFu);
+    }
+public:
 
     // ── FFieldClass → type name comp_index ───────────────────────────────
     // FFieldClass does not store a plain FName at a discoverable offset in the known
@@ -887,9 +949,13 @@ public:
     //   UPackage vtable, never stalls on a non-package UObject).
     //
     // The UPACKAGE_VT_RVA constant is patch-specific (0xAD8AE70 on
-    // 20260428). Keep it here as a named offset so future patches only need
-    // to update one place.
-    static constexpr uint64_t UPACKAGE_VT_RVA = 0xAD8AE70ULL;
+    // 20260428, 0xADBC9A0 on CL-1177146). Keep it here as a named offset so
+    // future patches only need to update one place. Without the correct value,
+    // GetPackagePtr never recognizes that the outer chain has reached a real
+    // UPackage and instead stalls at the UPackage METACLASS UClass — whose
+    // own NamePrivate is literally "Package", causing every recovered class to
+    // bucket into `/Script/Package.X`.
+    static constexpr uint64_t UPACKAGE_VT_RVA = 0xADBC9A0ULL;
 
     uint64_t GetPackagePtr(uint64_t obj_ptr) {
         if (!obj_ptr || !m_keyLoaded) return 0;
@@ -1047,6 +1113,7 @@ private:
     EmuFallback    m_emuFallback;
     std::unordered_map<int32_t, std::string> m_emuCache;
     uint64_t       m_primaryHandleOffset = 0;  // 0 = no calibration yet, fall back to candidate list
+    uint64_t       m_ffieldNameOff = 0;        // 0 = uncalibrated; first valid offset wins
 
     // SIMD tables loaded from process memory during Init()
     alignas(16) uint8_t m_cidxXor1[16];      // slot PXOR key           (AD30540)
