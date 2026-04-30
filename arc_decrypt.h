@@ -98,21 +98,26 @@ namespace Offsets {
         constexpr uint64_t FieldsSlots  = 0x20; // slots at obj+0x20,+0x40,+0x60,+0x80 (stride 0x20)
     }
     namespace FField {
-        // Patch 20260428 LIVE-PROBED layout (20-entry chain walk on
-        // EmbarkPlayerController @ 0x7AC8CA00 confirmed every offset):
+        // Patch CL-1177146 (20260430): UStruct linked-list walker sub_353F40
+        // confirms field Next pointer at +0x80 (was +0x48 on 20260428).
+        // The salt sentinel 0x893BCE4393840650 is no longer present anywhere
+        // in the binary — slot validation now relies on (a) vtable in module
+        // range and (b) ClassPrivate either 0 (engine-stripped) or heap range.
         //   +0x00  vtable
-        //   +0x20  ClassPrivate (FFieldClass*)        (was +0x30)
-        //   +0x48  Next (FField*)                     (was +0x40)
-        //   +0x50  Owner (parent UStruct | 1 — low-bit tag)
-        //   +0x70  NamePrivate (16-byte SIMD slot)    (was +0x60)
-        //   +0x78  encryption salt 0x893BCE4393840650 (validation sentinel)
+        //   +0x20  ClassPrivate (FFieldClass*)        (kept at 20260428 value;
+        //                                              often 0 for stripped FFields)
+        //   +0x70  NamePrivate / NameEncrypted (kept; pipeline updates required
+        //                                       elsewhere — name decode is broken)
+        //   +0x80  Next (FField*) — confirmed via UStruct chain walker (sub_353F40
+        //          reads `*(QWORD*)(node + 128)` to advance the linked list).
+        //   +0x100 ChildProperties head on UStruct (see UStruct::ChildProperties)
         constexpr uint64_t VTable        = 0x00;
-        constexpr uint64_t ClassPrivate  = 0x20;   // 20260421: 0x30
-        constexpr uint64_t Next          = 0x48;   // 20260421: 0x40
-        constexpr uint64_t Owner         = 0x50;
-        constexpr uint64_t NameEncrypted = 0x70;   // 20260421: 0x60
-        constexpr uint64_t NamePrivate   = 0x70;   // alias
-        constexpr uint64_t SaltSentinel  = 0x78;   // expected = 0x893BCE4393840650
+        constexpr uint64_t ClassPrivate  = 0x20;
+        constexpr uint64_t Next          = 0x80;   // CL-1177146: was 0x48 on 20260428
+        constexpr uint64_t Owner         = 0x50;   // unverified on CL-1177146
+        constexpr uint64_t NameEncrypted = 0x70;
+        constexpr uint64_t NamePrivate   = 0x70;
+        constexpr uint64_t SaltSentinel  = 0x78;   // sentinel removed in CL-1177146
     }
     namespace FFieldClass {
         // Confirmed from live FFieldClass objects (e.g. 0xBDF31C00), patch 20260402
@@ -120,23 +125,18 @@ namespace Offsets {
         // NamePrivate: no fixed SIMD slot found; type identified via vtable map instead
     }
     namespace FProperty {
-        // Patch 20260428 LIVE-VERIFIED layout (probed FVector::X/Y/Z @ 0x98A91DE0,
-        // known offsets 0/8/16 — fully consistent):
-        //   +0x98 PropertyFlags (u64)             [was +0xB0]
-        //   +0xA0 ElementSize (u32)               [was +0xAC]
-        //   +0xB4 Offset_Internal (ENCRYPTED u32) [was +0xC0]
-        //         real = bswap32(stored) ^ 0x34605D14
-        //   +0xE0 ArrayDim (u32)                  [was +0xA8]
+        // Patch CL-1177146: FProperty Offset_Internal moved to +0xC4 (was +0xB4
+        // on 20260428) and the XOR key changed to 0x40277448. Confirmed via
+        // sub_353900 / sub_353F40 chain reader: `_byteswap_ulong(*(DWORD*)(i+196)
+        // ^ 0x40277448)` — i.e. bswap32(stored ^ 0x40277448) gives the offset.
         //
-        // Verification:
-        //   X stored=0x145D6034 → bswap=0x34605D14 ^ key = 0x00 ✓ (offset 0)
-        //   Y stored=0x1C5D6034 → bswap=0x34605D1C ^ key = 0x08 ✓ (offset 8)
-        //   Z stored=0x045D6034 → bswap=0x34605D04 ^ key = 0x10 ✓ (offset 16)
-        constexpr uint64_t ArrayDim        = 0xE0;        // 20260421: 0xA8
-        constexpr uint64_t ElementSize     = 0xA0;        // 20260421: 0xAC
-        constexpr uint64_t Offset_Internal = 0xB4;        // 20260421: 0xC0
-        constexpr uint32_t Offset_XOR      = 0x34605D14u; // 20260421: 0x59B8C401
-        constexpr uint64_t PropertyFlags   = 0x98;        // 20260421: 0xB0
+        // PropertyFlags / ElementSize / ArrayDim still need verification; kept
+        // at 20260428 values until proven otherwise.
+        constexpr uint64_t ArrayDim        = 0xE0;
+        constexpr uint64_t ElementSize     = 0xA0;
+        constexpr uint64_t Offset_Internal = 0xC4;        // CL-1177146: was 0xB4
+        constexpr uint32_t Offset_XOR      = 0x40277448u; // CL-1177146: was 0x34605D14
+        constexpr uint64_t PropertyFlags   = 0x98;
     }
     namespace FBoolProperty {
         // TODO: re-verify for patch 20260402; previous values assumed UE5 default layout
@@ -187,26 +187,19 @@ namespace Offsets {
         constexpr uint64_t PropertyFlags   = 0x70;  // plain uint64
     }
     namespace UStruct {
-        // Patch 20260428 LIVE-PROBED layout (Pawn/Actor/Character chain walk
-        // verified against expected parents — see chain-walk verification
-        // 2026-04-29):
-        //   +0xA8  SuperStruct (UStruct*)  ← was +0xB0 in earlier RE pass
-        //   +0xB0  literal 0x10 for UClasses, 0x8 for UScriptStructs (looks
-        //          like alignment / size pad — NOT a pointer; reading +0xB0
-        //          previously produced "→ Unknown (0x10, size=0)" for every
-        //          class in SDK_Output.txt)
-        //   +0xD0  ChildProperties (FField* chain — FProperty members)
-        //          mirrored at +0xE8 and +0xF0 — same pointer value
-        //   +0x118 PropertiesSize (u32)
-        // Verified chain: StaticMeshComponent → MeshComponent →
-        //   PrimitiveComponent → SceneComponent → ActorComponent → UObject.
-        //   UObject's +0xA8 reads 0 (no parent). Character → Pawn → Actor
-        //   → UObject also matches.
-        // 20260421: SuperStruct was at +0xB0, ChildProperties at +0xE0; both
-        // shifted in 20260428.
-        constexpr uint64_t SuperStruct     = 0x0A8;  // 20260421: 0x0B0
-        constexpr uint64_t Children        = 0x0D0;  // legacy alias
-        constexpr uint64_t ChildProperties = 0x0D0;  // 20260421: 0x0E0
+        // Patch CL-1177146: UClass linked-list walker sub_353F40 reads first
+        // child at `*(QWORD*)(class + 256)` (= +0x100) and advances via
+        // `*(QWORD*)(node + 128)` (= +0x80). So the FField/UField head is at
+        // +0x100 (shifted from +0xD0 on 20260428).
+        // The pre-pass in sdk_generator.h already scans +0x80..+0x140 stride 8
+        // for any valid head, so a stale default still finds chains; but
+        // direct readers (Tier1 vtable discovery) require the constant.
+        //   +0xA8  SuperStruct (UStruct*) — kept from 20260428 verification
+        //   +0x100 ChildProperties (FField* chain — confirmed via chain walker)
+        //   +0x118 PropertiesSize (u32) — unverified on CL-1177146, kept
+        constexpr uint64_t SuperStruct     = 0x0A8;
+        constexpr uint64_t Children        = 0x100;  // CL-1177146: was 0xD0 on 20260428
+        constexpr uint64_t ChildProperties = 0x100;  // CL-1177146: was 0xD0 on 20260428
         constexpr uint64_t PropertiesSize  = 0x118;
         constexpr uint64_t MinAlignment    = 0x0F8;
     }

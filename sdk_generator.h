@@ -821,31 +821,33 @@ public:
             if (visited.count(ff)) break;
             visited.insert(ff);
 
-            // Ghost-FField guard (patch 20260428):
+            // Ghost-FField guard (patch CL-1177146):
+            // - Vtable at +0x00 must be in module range — strongest single
+            //   signal that this is a real FField.
             // - ClassPrivate at +0x20 is often 0 for engine reflection-stripped
-            //   FFields (don't break on that — only break on garbage pointer)
-            // - Vtable at +0x00 must be in module range — that's the strongest
-            //   single signal for "this is a real FField"
-            // - Validation salt at +0x78 should be 0x893BCE4393840650 if the
-            //   slot was ever initialized; mismatch = uninitialized memory
-            // - Sentinel for offset=0 changed: bswap32(0x34605D14) = 0x145D6034
+            //   FFields (don't break on that — only break on garbage non-zero)
+            // - Salt sentinel 0x893BCE4393840650 is GONE in CL-1177146 (no
+            //   matches anywhere in the binary), so the +0x78 salt check is
+            //   removed; structural validation via vtable + class ptr only.
+            // - 20260428 zero-offset sentinel 0x145D6034 (=bswap of old XOR key)
+            //   still tracked for empty-slot detection alongside new key.
             {
                 uint64_t vtbl = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::VTable);
                 if (vtbl < (MODULE_BASE + 0x1000) ||
                     vtbl >= (MODULE_BASE + 0xE9D0000ULL)) break;
                 uint64_t cls_ptr = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
-                // Accept 0 (reflection-stripped) — only reject garbage non-zero
                 if (cls_ptr != 0 &&
                     (cls_ptr < 0x100000ULL || cls_ptr >= 0x800000000000ULL)) break;
-                uint64_t salt = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::SaltSentinel);
-                if (salt != 0x893BCE4393840650ULL && salt != 0) break;
                 uint32_t raw_off = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::Offset_Internal);
                 alignas(16) uint8_t name_enc[16] = {};
                 m_reader.Read(ff + ArcDecrypt::Offsets::FField::NameEncrypted, name_enc, 16);
                 bool name_zero = true;
                 for (uint8_t b : name_enc) if (b) { name_zero = false; break; }
-                // 20260428 sentinel for offset=0 is 0x145D6034 (= bswap of XOR key)
-                if (name_zero && (raw_off == 0 || raw_off == 0x145D6034u)) break;
+                // CL-1177146 zero-offset sentinel: bswap32(0) ^ 0x40277448 = 0x40277448 stored.
+                // 20260428 sentinel 0x145D6034 retained for cross-patch tolerance.
+                if (name_zero && (raw_off == 0 ||
+                                  raw_off == 0x145D6034u ||
+                                  raw_off == 0x40277448u)) break;
             }
 
             PropertyRecord pr{};
