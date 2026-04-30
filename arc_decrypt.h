@@ -28,31 +28,25 @@ inline uint32_t bswap32(uint32_t x) { return __builtin_bswap32(x); }
 // =============================================================================
 namespace ActorFName {
     constexpr uint32_t FNV_PRIME   = 0x01000193u;
-    constexpr int32_t  HASH_ADD    = -1072765379;  // 0xC00C3C3D (from other person's confirmed code)
+    constexpr int32_t  HASH_ADD    = static_cast<int32_t>(0x8E195662);
 }
 
-// Hash + slot index (patch 20260414, confirmed from other person's working code)
-// ROL32(15) → P*h+ADD → ROL32(24) → P*h+hi+ADD → ROL32(15) → v8
-// Complex index: (-109 * ((uint16)(403*v8-6595) >> 8) + 61) ^ ((P*((P*v8+ADD)>>8)+ADD) >> 16) & 3 ^ 2
-inline uint32_t ComputeHashAndIndex(uintptr_t obj_base, uint32_t& out_idx) {
+inline uint32_t ComputeHashAndIndex(uintptr_t ObjBase, uint32_t& OutIdx) {
     constexpr uint32_t P = ActorFName::FNV_PRIME;
     constexpr int32_t  K = ActorFName::HASH_ADD;
-    uint64_t ptr = obj_base + 0x10;
-    uint32_t lo = static_cast<uint32_t>(ptr);
-    uint32_t hi = static_cast<uint32_t>(ptr >> 32);
-    uint32_t h = ROL32(lo, 15);
-    h = static_cast<uint32_t>(P * h + K);
-    h = ROL32(h, 24);
-    h = static_cast<uint32_t>(P * h + hi + K);
-    uint32_t v8 = ROL32(h, 15);
-
-    uint16_t temp1 = static_cast<uint16_t>(403u * v8 - 6595u);
-    uint8_t left = static_cast<uint8_t>(-109 * (temp1 >> 8) + 61);
-    uint32_t temp2 = static_cast<uint32_t>(P * v8 + K) >> 8;
-    uint32_t v6eq = static_cast<uint32_t>(P * temp2 + K);
-    uint8_t right = static_cast<uint8_t>(v6eq >> 16);
-    out_idx = ((left ^ right) & 3u) ^ 2u;
-    return v8;
+    uint64_t Ptr = ObjBase + 0x10;
+    uint32_t Lo = static_cast<uint32_t>(Ptr);
+    uint32_t Hi = static_cast<uint32_t>(Ptr >> 32);
+    uint32_t H = ROL32(Lo, 24);
+    H = static_cast<uint32_t>(P * H + K);
+    H = ROL32(H, 25);
+    H = static_cast<uint32_t>(P * H + Hi + K);
+    H = ROL32(H, 24);
+    H = static_cast<uint32_t>(P * H + K);
+    H >>= 7;
+    uint32_t V8 = static_cast<uint32_t>(P * H + K);
+    OutIdx = ((((uint8_t)V8) ^ ((uint8_t)(V8 >> 16))) & 3u) ^ 2u;
+    return V8;
 }
 
 inline uint32_t GetFNameSlotIndex(uintptr_t obj_base) {
@@ -264,10 +258,10 @@ constexpr uint64_t MODULE_BASE = 0x140000000;
 // values are the fallback and the "known good for current patch" default).
 // Values are the latest verified patch's defaults; older patches kept as
 // comments so a stale sig-scan or a partial revert can fall back gracefully.
-inline uint64_t RVA_GWORLD              = 0xE024F68;   // 20260428 (20260421: 0xE011D18)
-inline uint64_t RVA_GNAMES_BASE         = 0xDB5BE80;   // 20260428 (20260421: 0xDB0FE00, 20260414: 0xDB48E80)
-inline uint64_t RVA_FNAME_KEY_TABLE     = 0xDAA07F4;   // 20260428 (20260421: 0xDA547F4, 20260414: 0xDA8D854)
-inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xDE173A0;   // 20260428 (20260421: 0xDDCB420)
+inline uint64_t RVA_GWORLD              = 0xDFDB4D8;   // CL-1177146 (20260428: 0xE024F68, 20260421: 0xE011D18)
+inline uint64_t RVA_GNAMES_BASE         = 0xDBB3F80;   // CL-1177146 (20260428: 0xDB5BE80, 20260421: 0xDB0FE00, 20260414: 0xDB48E80)
+inline uint64_t RVA_FNAME_KEY_TABLE     = 0xDAF88EC;   // CL-1177146 verified working reference (64 u16 entries; old 0xDA4F130 was sig-scan false positive)
+inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xDE6F6E0;   // CL-1177146 (verified via init-once sled @ 0x38D4BA, NumElements plain @ +0x30; 20260428: 0xDE173A0, 20260421: 0xDDCB420)
 constexpr uint64_t GOBJ_ENCRYPTED_OFF   = 0x30;        // legacy pipeline offset (unused on 20260428: NumElements is plain at +0x38)
 
 // SIMD runtime tables (GUObjectArray decrypt — patch 20260414)
@@ -421,8 +415,13 @@ namespace Patch20260421 {
     // FField NamePrivate decrypt SIMD constants moved:
     //   PSHUFB mask (`07 02 03 06 05 00 01 04`) — was 0xAD85670
     //   XOR const  (`31 7E 97 77 56 27 31 31`) — was 0xAD85690
-    constexpr uint64_t RVA_FFIELD_PSHUFB_MASK = 0xB59FDF0;
-    constexpr uint64_t RVA_FFIELD_XOR_CONST   = 0xB59FE00;
+    // 20260428 live-verified locations (IDA instance e3k3, doubled in .rdata):
+    //   0xB59FDF0 / 0xB59FE00 are stale (zero-filled in 20260428).
+    //   Real PSHUFB mask now at 0xB5E3020 (and 0xB5E3028); real XOR const at 0xB5E3030 (and 0xB5E3038).
+    // Patch CL-1177146 (2026-04-30): both moved by +0x18E1E0 to:
+    //   PSHUFB mask 0xB771200; XOR const 0xB771210.
+    constexpr uint64_t RVA_FFIELD_PSHUFB_MASK = 0xB771200;
+    constexpr uint64_t RVA_FFIELD_XOR_CONST   = 0xB771210;
 
     // GUObjectArray moved from 0xDE04650 → 0xDDCB420.
     // The 16-byte xmmword at this address IS the encrypted chunks-manager
@@ -459,10 +458,14 @@ namespace Patch20260421 {
     constexpr int      OBJECTS_PER_CHUNK        = 0x10000;
 
     // FName CityHash64 entry point (moved from 0xC0C80).
-    constexpr uint64_t RVA_FNAME_CITYHASH64   = 0xC1960;
+    // 20260421: 0xC1960
+    // 20260428: 0xF1540  — verified via cross-binary signature `48 B8 4F 40 90 2F 3B 6A E1 9A 41 83 FD 10 0F 87` (see SIGNATURES.md §11.5)
+    constexpr uint64_t RVA_FNAME_CITYHASH64   = 0xF1540;
 
     // FName_ToString entry.
-    constexpr uint64_t RVA_FNAME_TOSTRING     = 0x24C8130;
+    // 20260421: 0x24C8130
+    // 20260428: 0x24BE2F0 — verified via §11.1 signature still hitting on new binary
+    constexpr uint64_t RVA_FNAME_TOSTRING     = 0x24BE2F0;
 
     // Decrypt the public FName handle (the 64-bit value stored in any
     // FName-typed field) to recover a pointer to the FNameEntry.
@@ -503,11 +506,11 @@ namespace Patch20260421 {
     //   5. ROL64(lo64, 32) → final = (Number << 32) | CI  (CI in LO32)
     // =========================================================================
     namespace FFieldName20260421 {
-        // 20260428: XOR const relocated from AD15750 → AD0FE50.
-        // Byte values unchanged: 38 BA 6F 75 E8 89 57 36 (lo8) + zeros (hi8).
-        // Verified live: AD0FE50 has the salt; AD15750 now contains unrelated
-        // global state (was used for the OLD FField name slot encryption).
-        constexpr uint64_t RVA_XOR_CONST = 0xAD0FE50;  // 20260421: 0xAD15750
+        // 20260428: XOR const relocated from AD15750 → AD0FE50 (lo8 + zero8).
+        // CL-1177146 (2026-04-30): relocated again to B7FF0E0; layout now lo8 + permuted-lo8
+        // (38 BA 6F 75 E8 89 57 36 | 57 36 E8 89 38 BA 6F 75) instead of lo8 + zero8.
+        // Reading 16 bytes still yields the canonical XOR const in the lo qword.
+        constexpr uint64_t RVA_XOR_CONST = 0xB7FF0E0;  // 20260428: 0xAD0FE50
         constexpr int      PSHUFLW_IMM   = 0x1E;
         constexpr int      ROL16_AMT     = 1;
         constexpr int      ROL64_AMT     = 32;
@@ -534,13 +537,19 @@ namespace Patch20260421 {
     //         if it holds a pointer (Class/Outer), lo64 = heap pointer.
     // =========================================================================
     namespace UObjSlot20260421 {
-        constexpr uint64_t RVA_SHUF_MASK = 0xAD128C0;  // 05 03 01 04 02 07 00 06
-        constexpr uint64_t RVA_XOR_CONST = 0xAD128D0;  // 09 43 BD C8 4B 4B BC FF
-        constexpr int      PSHUFLW_IMM   = 0xB1;
-        constexpr int      ROL32_AMT     = 15;
+        // Patch CL-1177146 (2026-04-30): pipeline simplified to PSHUFB(mask) → XOR(const_lo64).
+        // No ROL32 between PSHUFB and XOR; ROL64(32) applied only to NAME slot (post-XOR).
+        // PSHUFB mask @ RVA 0xAD93EF0 = 06 05 02 03 04 01 00 07 (verified IDA + live).
+        // XOR const  @ RVA 0xAD93F00 = 0x5EA772D07F910744 (lo64) (verified IDA + live).
+        constexpr uint64_t RVA_SHUF_MASK   = 0xAD93EF0;
+        constexpr uint64_t RVA_XOR_CONST   = 0xAD93F00;
+        constexpr uint64_t SLOT_XOR_CONST  = 0x5EA772D07F910744ULL;  // CL-1177146 live-verified
+        constexpr int      PSHUFLW_IMM     = 0xB1;
+        constexpr int      ROL32_AMT       = 0;       // CL-1177146: pipeline has NO rol32 step
+        constexpr int      ROL64_AMT       = 32;
         // Slot base offset and stride (same as older patches).
-        constexpr int      SLOT_BASE_OFF = 0x20;
-        constexpr int      SLOT_STRIDE   = 0x20;
+        constexpr int      SLOT_BASE_OFF   = 0x20;
+        constexpr int      SLOT_STRIDE     = 0x20;
     }
 
     // =========================================================================
@@ -552,32 +561,33 @@ namespace Patch20260421 {
     // The decrypted lo32 IS the comp_index directly (no high-half "Number").
     // =========================================================================
     namespace UObjSlot20260428 {
-        // 8-byte PSHUFB mask (from xmmword in .rdata — exact RVA TBD; bytes are:
-        //     01 06 00 04 07 03 02 05  (lo64; hi64 = 0))
-        // The MASK lives in the .rdata table that 20260421 used for AD128C0;
-        // the new mask bytes are different so the constant moved to a new RVA.
-        constexpr uint8_t SHUF_MASK_BYTES[8] = { 0x01, 0x06, 0x00, 0x04,
-                                                 0x07, 0x03, 0x02, 0x05 };
-        constexpr uint64_t XOR_SCALAR    = 0x4834C6DEA02581C7ULL;
-        constexpr int      ROL32_AMT     = 17;
+        // CL-1177146: 8-byte PSHUFB mask (bytes: 06 05 02 03 04 01 00 07; lo64).
+        // Was 01 06 00 04 07 03 02 05 on 20260428.
+        constexpr uint8_t SHUF_MASK_BYTES[8] = { 0x06, 0x05, 0x02, 0x03,
+                                                 0x04, 0x01, 0x00, 0x07 };
+        constexpr uint64_t XOR_SCALAR    = 0x5EA772D07F910744ULL;  // CL-1177146 live-verified (lo64 of xmm @ 0xAD93F00)
+        constexpr int      ROL32_AMT     = 0;        // CL-1177146: NO rol32 between PSHUFB and XOR
         constexpr int      ROL64_AMT     = 32;
         constexpr int      SLOT_BASE_OFF = 0x20;
         constexpr int      SLOT_STRIDE   = 0x20;
 
-        // Slot index hash constants (from ComputeHashAndIndex):
-        //   h = ROL32(lo, 25) → P*h + ADD
-        //   h = ROL32(h, 27)  → P*h + hi + ADD
-        //   h >>= 7; h = P*h + ADD
-        //   h >>= 5; v7 = P*h + ADD
-        //   slot_idx = ((v7 ^ HIWORD(v7)) & 3) ^ 2
+        // Slot index hash constants — verified IDA lf50 (sub_2CB4E0/sub_2D6900):
+        //   s1 = P * ROL32(lo, 24) + ADD
+        //   s2 = P * ROL32(s1, 25) + ADD
+        //   t  = hi + s2
+        //   s3 = P * ROL32(t, 24) + ADD
+        //   v3 = P * (s3 >> 7) + ADD
+        //   raw_idx   = ((u8(v3) ^ BYTE2(v3)) & 3)
+        //   name_slot = (raw_idx ^ 2) & 3
+        //   class_slot = raw_idx (no XOR fold)
+        //   outer_slot = (raw_idx + 1) & 3
         constexpr uint32_t HASH_PRIME = 0x01000193u;     // FNV32 prime (unchanged)
-        // Verified via C# reference (decimal = 290405715). Earlier incorrectly
-        // documented as 0x114E4953 which is the wrong hex; correct hex is 0x114F3D53.
-        constexpr uint32_t HASH_ADD   = 0x114F3D53u;
-        constexpr int      HASH_ROL1  = 25;
-        constexpr int      HASH_ROL2  = 27;
+        constexpr uint32_t HASH_ADD   = 0x8E195662u;     // CL-1177146 verified
+        constexpr int      HASH_ROL1  = 24;              // CL-1177146 verified
+        constexpr int      HASH_ROL2  = 25;              // CL-1177146 verified
+        constexpr int      HASH_ROL3  = 24;              // CL-1177146: third ROL on (t)
         constexpr int      HASH_SHR1  = 7;
-        constexpr int      HASH_SHR2  = 5;
+        constexpr int      HASH_SHR2  = 0;               // CL-1177146: only one SHR (was 5 on older patches)
     }
 
     // =========================================================================

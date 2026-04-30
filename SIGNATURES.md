@@ -472,6 +472,27 @@ Walk this table once to recover ~20 UObject method names: `AddToRoot`, `RemoveFr
 
 **Cross-patch trick:** search for each 8-byte XMM half independently. The pair `05 03 01 04 02 07 00 06 ?? ?? ?? ?? ?? ?? ?? ?? 09 43 BD C8 4B 4B BC FF` is a very strong structural fingerprint for the UObject slot pipeline.
 
+### 11.5 Cross-binary signatures (verified 20260421 + 20260428)
+
+These signatures were lifted by diffing the same function's body across `Arc_Raiders_Binary_20260421_213315.exe` (instance `zqxp`) and `pioneer_steam_1.26.x-CL-1169740_2026_04_29__23_00_83pct.exe` (instance `qf91`), then choosing an interior anchor that survived patch-day shape changes. Each one returns exactly one match on each binary.
+
+| Function | 20260421 RVA | 20260428 RVA | Cross-binary signature | Anchor type / notes |
+|---|---|---|---|---|
+| `GNamePool_InitPropertyTypeNames` | `0x230440` | `0x241D20` | `41 57 41 56 41 55 41 54 56 57 55 53 B8 ?? 10 00 00 E8 ?? ?? ?? ?? 48 29 C4 0F 29 B4 24 ?? ?? 00 00 48 89 CE 48 8B 05` | Function start. Wildcards: stack-alloc size byte (0x10B8 → 0x1088), alloca-call rel32, XMM save offset (0xA0 → 0x70). Replaces the brittle `mov eax,0x10B8` anchor in §11.1. |
+| `FName_CityHash64` | `0xC1960` (sig hits +21) | `0xf1540` (sig hits +25) | `48 B8 4F 40 90 2F 3B 6A E1 9A 41 83 FD 10 0F 87` | Body anchor — the CityHash kmul `mov rax, 0x9AE16A3B2F90404F` immediately followed by `cmp r13d, 0x10; ja near` size check. Caller must walk back to nearest preceding `41 57 41 56 41 55 41 54` 12-push prologue to find function start. |
+| `FStructProperty_LinkInternal_Real` | `0x45C6C0` (sig hits +38) | `0x495415` (sig hits +49) | `4C 8B 02 48 89 D1 48 89 C2 41 FF 90 98 01 00 00` | Body anchor — `mov r8, [rdx]; mov rcx, rdx; mov rdx, rax; call qword [r8+0x198]` vtable dispatch. Walk back to function start. **20260428 reads `[rcx+0x108]` instead of `[rcx+0xE8]` for `Struct` field — see `feedback_fstruct_offset_20260428.md`.** |
+
+**Functions where the original §11 sig dies on 20260428 and no cross-binary byte-sig is feasible** (shape change too large — needs xref-from-string anchor or RE work):
+- `FNameEntry_AppendNameToString` / `_WithNumber` / `GetPlainNameString` — header decrypt is now LCG-stateful (per `feedback_20260428_breakdown.md`); the `(hdr & 3) | ((hdr >> 5) & 0x3FC)` extractor pattern is gone.
+- `FProperty_GetNameCPP` — anchor `pshuflw xmm0, [rax+0x20], 0x4B` doesn't exist; new slot decrypt uses mask `01 06 00 04 07 03 02 05 → ROL32(17)`.
+- `FProperty_SetupOffset_case1` / `case2`, `FBoolProperty_LinkInternal`, `FMapProperty_LinkInternal` — struct-field offsets and vtable indices rotated together.
+- `ResolveNamePtrFull_Core_CIToEntry` — resolver was rewritten as LCG; no equivalent standalone function.
+- All `FUObjectArray_*` and `FChunkedFixedUObjectArray_*` — internal struct offsets `+0xD8`/`+0xDC`/`+0xE0` rotated; vt7 magic constant is per-variant. `F3 0F 7E 02 B8 ?? ?? ?? ?? 65 48 03 04 25 60 00 00 00` still hits 90+ vt7 variants — Unicorn emulation in `main.cpp` is the right answer here, not a byte sig.
+- `UObject_GetOuter` / `GetFName` / `GetWorld` / `GetPackage` / `GetPathNameHelper` — FNV+PSHUFB pipelines reshaped; vtable indices moved.
+- `FName_Init`, `UStruct_Link` — calling convention / arg count changed (`UStruct_Link` now takes 4 args via 4 register saves where 20260421 took 2).
+
+**Dumper relevance:** none of the §11.5 functions are read at runtime by the dumper today (`grep` shows `RVA_FNAME_CITYHASH64` is defined in `arc_decrypt.h` but never read). They're RE-time anchors used to recover other constants and offsets when patches break the pipeline. Keeping them patch-resilient saves ~1h of IDA pivoting per patch.
+
 ---
 
 ## 12. Investigation Methodology — How the Chains Were Found

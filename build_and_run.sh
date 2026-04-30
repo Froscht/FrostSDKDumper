@@ -114,6 +114,13 @@ build_dumper() {
             "$SCRIPT_DIR/probe_live_rvas.cpp" -lm 2>/dev/null \
             && info "Probe tool built: probe_live_rvas" || warn "probe_live_rvas build skipped"
     fi
+    if [[ -f "$SCRIPT_DIR/probe_uobject_fullname.cpp" ]]; then
+        g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 \
+            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+            -o "$SCRIPT_DIR/probe_uobject_fullname" \
+            "$SCRIPT_DIR/probe_uobject_fullname.cpp" -lcapstone -lunicorn -lm 2>/dev/null \
+            && info "Probe tool built: probe_uobject_fullname" || warn "probe_uobject_fullname build skipped"
+    fi
 }
 
 # ---------------------------------------------------------------------------

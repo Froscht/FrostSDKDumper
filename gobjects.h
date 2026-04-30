@@ -33,6 +33,7 @@
 #include <vector>
 #include <utility>
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 #include <immintrin.h>
 #include "memreader_iface.h"
@@ -404,6 +405,21 @@ namespace gobjects
         int            m_itemStride;
         std::vector<uint64_t> m_worldFallbackObjects;
 
+        // Pre-captured SIMD chunk_table-decrypt XOR key. When set (by
+        // main.cpp's uprobe shot at the chunk_table-decrypt function),
+        // bypasses the entire PEB sweep — feed it straight into the
+        // SIMD pipeline. Equals `*(gs:[0x60]) + 0x647A6348` as observed
+        // by the target. Wine PEB is stable per-session so one capture
+        // suffices for the entire run.
+        uint64_t       m_simdPebKey      = 0;
+        bool           m_simdPebKeyValid = false;
+    public:
+        void SetSimdPebKey(uint64_t key) {
+            m_simdPebKey = key;
+            m_simdPebKeyValid = true;
+        }
+    private:
+
         // SIMD tables (loaded during Init)
         alignas(16) uint8_t m_objXorKey[16];  // GUObjectArray XOR key (AD2FC50) — patch 20260414
         alignas(16) uint8_t m_elemMaskA[16]; // Element count ANDNOT mask (AD8EE10)
@@ -531,13 +547,140 @@ namespace gobjects
                         if (!m_reader.Read(obj0, &vt0, 8)) continue;
                         if (vt0 < vt_lo || vt0 >= vt_hi) continue;
 
-                        // Optional: chunk_ptr[0]-8 should hold the chunk
-                        // capacity (0x10000 = 65536). This is a second-tier
-                        // confirmation; if it doesn't match we still accept
-                        // the candidate (some chunk allocators may not use
-                        // the -8 header convention).
+                        // Strict per-chunk validation:
+                        //   (a) chunk[i] slot 0 reads a distinct UObject with
+                        //       a module-range vtable
+                        //   (b) all chunks are pairwise ≥ ITEMS_PER_CHUNK*STRIDE
+                        //       (1.25 MB) apart — they can't physically overlap
+                        //   (c) chunk[0] is a contiguous readable allocation
+                        //       of ≥ 1.25 MB AND a deep-sample of its items
+                        //       contains many UObject-shaped pointers
+                        // Live RE history:
+                        //   2026-04-29 #1: 0xC7C720 had {real, 0x800000002,
+                        //     real+0x10, …} — caught by (a).
+                        //   2026-04-29 #2: 0xC97C98 had distinct slot-0 objs
+                        //     but chunk[5]@0x19FF803F0 / chunk[7]@0x19FF80940
+                        //     were 1360 bytes apart, and chunk[0]'s 1.25 MB
+                        //     bulk read failed — caught by (b)/(c).
+                        constexpr uint32_t ITEMS_PER_CHUNK = 65536;
+                        constexpr uint32_t ITEM_STRIDE     = 20;
+                        constexpr uint64_t CHUNK_BYTES =
+                            static_cast<uint64_t>(ITEMS_PER_CHUNK) * ITEM_STRIDE;
+
+                        std::vector<uint64_t> cps(num_chunks, 0);
+                        for (uint32_t i = 0; i < num_chunks; ++i) {
+                            std::memcpy(&cps[i], buf.data() + off + 8ULL*i, 8);
+                        }
+
+                        // (a) distinct slot-0 UObjects
+                        std::unordered_set<uint64_t> chunk_objs;
+                        chunk_objs.reserve(num_chunks);
+                        bool ok_a = true;
+                        for (uint32_t i = 0; i < num_chunks && ok_a; ++i) {
+                            uint64_t obj_i = 0;
+                            if (!m_reader.Read(cps[i], &obj_i, 8) ||
+                                obj_i < 0x10000ULL || obj_i >= 0x800000000000ULL) {
+                                ok_a = false; break;
+                            }
+                            uint64_t vt_i = 0;
+                            if (!m_reader.Read(obj_i, &vt_i, 8) ||
+                                vt_i < vt_lo || vt_i >= vt_hi) {
+                                ok_a = false; break;
+                            }
+                            if (!chunk_objs.insert(obj_i).second) ok_a = false;
+                        }
+                        if (!ok_a) continue;
+
+                        // (b) pairwise non-overlap
+                        bool ok_b = true;
+                        for (uint32_t i = 0; i < num_chunks && ok_b; ++i) {
+                            for (uint32_t j = i+1; j < num_chunks; ++j) {
+                                uint64_t a = cps[i], b = cps[j];
+                                uint64_t diff = (a > b) ? (a - b) : (b - a);
+                                if (diff < CHUNK_BYTES) { ok_b = false; break; }
+                            }
+                        }
+                        if (!ok_b) continue;
+
+                        // (c) EVERY chunk (not just chunk[0]) must be a real
+                        // 1.25 MB allocation densely populated with
+                        // FUObjectItem-shaped entries. For each chunk:
+                        //   - probe the LAST item slot to confirm the full
+                        //     1.25 MB is readable (rejects bogus pointers
+                        //     into small allocations);
+                        //   - sample 32 items spread across the chunk;
+                        //     ≥ 30% must be valid UObjects with module-range
+                        //     vtables.
+                        // Real chunks consistently show > 90% valid; false
+                        // positives where slot 0 aliases a UObject usually
+                        // yield single-digit % — and chunks beyond the first
+                        // are completely unreadable garbage.
+                        // Live RE history:
+                        //   2026-04-30 #3: 0xCA817300 — chunk[0] passed the
+                        //     old chunk[0]-only deep-sample (1706/65536 = 2.6%
+                        //     >= 25% of 64-sample = 16 items by chance), but
+                        //     chunks 1 & 3 were unreadable, chunks 2 & 4 at
+                        //     0.1–0.7%. cap-8 = 0x8FFFFFFFF was nonsense.
+                        bool ok_c = true;
+                        constexpr int N_SAMPLES = 32;
+                        constexpr uint64_t LAST_ITEM_OFF =
+                            (ITEMS_PER_CHUNK - 1) * ITEM_STRIDE;
+                        uint8_t sample_buf[ITEM_STRIDE];
+                        for (uint32_t ci = 0; ci < num_chunks && ok_c; ++ci) {
+                            // (c.1) full-range readability — read the LAST
+                            // item slot of the chunk. If this fails the
+                            // chunk pointer is either bogus or the chunk
+                            // is much smaller than 1.25 MB.
+                            if (!m_reader.Read(cps[ci] + LAST_ITEM_OFF,
+                                               sample_buf, ITEM_STRIDE)) {
+                                ok_c = false;
+                                break;
+                            }
+                            // (c.2) deep sample — 32 spread evenly.
+                            int valid = 0, sampled = 0;
+                            for (int s = 0; s < N_SAMPLES; ++s) {
+                                uint64_t item_off = static_cast<uint64_t>(s) *
+                                    (ITEMS_PER_CHUNK / N_SAMPLES) * ITEM_STRIDE;
+                                if (!m_reader.Read(cps[ci] + item_off,
+                                                   sample_buf, ITEM_STRIDE)) continue;
+                                ++sampled;
+                                uint64_t obj = 0;
+                                std::memcpy(&obj, sample_buf, 8);
+                                if (obj < 0x10000ULL || obj >= 0x800000000000ULL) continue;
+                                uint64_t vt = 0;
+                                if (!m_reader.Read(obj, &vt, 8)) continue;
+                                if (vt >= vt_lo && vt < vt_hi) ++valid;
+                            }
+                            // ≥ 50% sampled AND ≥ 30% valid. The last chunk
+                            // is partially populated; relax to 10% if it's
+                            // the trailing chunk (ci == num_chunks-1).
+                            int min_valid_pct = (ci + 1 == num_chunks) ? 10 : 30;
+                            if (sampled < N_SAMPLES / 2 ||
+                                valid * 100 < sampled * min_valid_pct) {
+                                ok_c = false;
+                            }
+                        }
+                        if (!ok_c) continue;
+
+                        // (d) chunk_ptr[0]-8 sanity. Real allocators put the
+                        // chunk capacity (0x10000 = 65536) or a small heap
+                        // header there. Anything in the obviously-broken
+                        // range (e.g. 0x8FFFFFFFF) is the smoking gun for
+                        // a misaligned candidate. Permit "small" cap (≤ 1 MB)
+                        // and the legitimate sentinel (== ITEMS_PER_CHUNK);
+                        // reject everything else.
                         uint64_t cap = 0;
-                        if (cp0 >= 8) m_reader.Read(cp0 - 8, &cap, 8);
+                        if (cp0 >= 8 && !m_reader.Read(cp0 - 8, &cap, 8)) cap = 0;
+                        bool cap_plausible =
+                            cap == 0 ||
+                            cap == ITEMS_PER_CHUNK ||
+                            cap < 0x100000ULL;
+                        if (!cap_plausible) {
+                            std::printf("[canon28] heap-scan reject @ 0x%llX: cap-8=0x%llX implausible\n",
+                                (unsigned long long)(base_addr + off),
+                                (unsigned long long)cap);
+                            continue;
+                        }
                         std::printf("[canon28] heap-scan candidate @ 0x%llX: "
                                     "cp0=0x%llX cap-8=0x%llX obj0=0x%llX vt0=0x%llX\n",
                             (unsigned long long)(base_addr + off),
@@ -556,6 +699,20 @@ namespace gobjects
                                         int32_t& out_num_elements) {
             uint64_t base = m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE;
 
+            // CL-1177146 layout shift: NumElements is plain at +0x30 instead
+            // of the encrypted FChunkedFixedUObjectArray pipeline. Detect this
+            // up front by sanity-checking the value at +0x30 — if it looks
+            // like a plain UObject count, skip the encrypted-blob path entirely
+            // and let the structural-scan fallback do the work.
+            uint64_t NumAt30 = 0;
+            if (m_reader.Read(base + 0x30, &NumAt30, 8)) {
+                uint32_t Lo = static_cast<uint32_t>(NumAt30 & 0xFFFFFFFFu);
+                if ((NumAt30 >> 32) == 0 && Lo >= 1000 && Lo <= 2000000) {
+                    std::printf("[canon28] CL-1177146 layout detected (+0x30 plain NumElements=%u); skipping encrypted decrypt\n", Lo);
+                    return false;
+                }
+            }
+
             // Step 1: decrypt chunks_manager pointer.
             alignas(16) uint8_t blob[16] = {};
             if (!m_reader.Read(base + 0xB0, blob, 16)) {
@@ -563,8 +720,10 @@ namespace gobjects
                 return false;
             }
             uint64_t xor_const = 0;
-            if (!m_reader.Read(m_base + 0xAD0FE50, &xor_const, 8)) {
-                std::printf("[canon28] read XOR const @ 0xAD0FE50 failed\n");
+            constexpr uint64_t kXorConstRva = 0xB7FF0E0;
+            if (!m_reader.Read(m_base + kXorConstRva, &xor_const, 8)) {
+                std::printf("[canon28] read XOR const @ 0x%llX failed\n",
+                    (unsigned long long)kXorConstRva);
                 return false;
             }
 
@@ -667,8 +826,7 @@ namespace gobjects
                     (unsigned long long)RVA_CHUNK_TABLE_DECRYPT_FN);
             }
 
-            auto runSimdDecrypt = [&](uint64_t peb_addr) -> uint64_t {
-                if (!have_peb_const) return 0;
+            auto runSimdWithKey = [&](uint64_t key64) -> uint64_t {
                 uint16_t w[4];
                 std::memcpy(w, enc_table, 8);
                 // ROL16(13) per word — no shared helper for 16-bit rotates.
@@ -680,10 +838,13 @@ namespace gobjects
                 std::memcpy(d, shuf_w, 8);
                 d[0] = ArcDecrypt::ROL32(d[0], 10);
                 d[1] = ArcDecrypt::ROL32(d[1], 10);
-                uint64_t key64 = peb_addr + static_cast<uint64_t>(peb_add_const);
                 d[0] ^= static_cast<uint32_t>(key64);
                 d[1] ^= static_cast<uint32_t>(key64 >> 32);
                 return (static_cast<uint64_t>(d[1]) << 32) | d[0];
+            };
+            auto runSimdDecrypt = [&](uint64_t peb_addr) -> uint64_t {
+                if (!have_peb_const) return 0;
+                return runSimdWithKey(peb_addr + static_cast<uint64_t>(peb_add_const));
             };
 
             auto validateChunkTable = [&](uint64_t cand) -> bool {
@@ -700,7 +861,23 @@ namespace gobjects
                 return vt0 >= vt_lo && vt0 < vt_hi;
             };
 
-            if (have_peb_const) {
+            // ── Path (a0): pre-captured SIMD key (uprobe shot) ───────────
+            // If main.cpp captured the runtime XOR key by uprobing the
+            // target's chunk_table-decrypt function, plug it straight in.
+            // Bypasses every PEB-discovery heuristic.
+            if (m_simdPebKeyValid) {
+                uint64_t ct = runSimdWithKey(m_simdPebKey);
+                if (validateChunkTable(ct)) {
+                    chunk_table = ct;
+                    std::printf("[canon28] chunk_table = 0x%llX (uprobe-captured key 0x%llX)\n",
+                        (unsigned long long)ct, (unsigned long long)m_simdPebKey);
+                } else {
+                    std::printf("[canon28] uprobe key 0x%llX produced invalid chunk_table 0x%llX — falling through\n",
+                        (unsigned long long)m_simdPebKey, (unsigned long long)ct);
+                }
+            }
+
+            if (!chunk_table && have_peb_const) {
                 // Try cached PEB first, then full discovery list.
                 if (m_pebAddr) {
                     uint64_t ct = runSimdDecrypt(m_pebAddr);
@@ -710,25 +887,92 @@ namespace gobjects
                             (unsigned long long)ct, (unsigned long long)m_pebAddr);
                     }
                 }
-                // Sweep the standard PEB ranges page-by-page. The candidates
-                // listed in the IDA RE pass (0x7FFD0000 etc.) all fall inside
-                // these sweeps so a separate candidate list is redundant.
+                auto try_peb = [&](uint64_t cand) -> bool {
+                    uint64_t ct = runSimdDecrypt(cand);
+                    if (!validateChunkTable(ct)) return false;
+                    chunk_table = ct;
+                    m_pebAddr   = cand;
+                    return true;
+                };
+
+                // Sweep the legacy Windows PEB range first — cheap and
+                // sometimes still right on older Wine versions.
                 if (!chunk_table) {
-                    auto sweep = [&](uint64_t lo, uint64_t hi, uint64_t step) {
-                        for (uint64_t cand = lo; cand < hi; cand += step) {
-                            uint64_t ct = runSimdDecrypt(cand);
-                            if (validateChunkTable(ct)) {
-                                chunk_table = ct;
-                                m_pebAddr = cand;
-                                std::printf("[canon28] chunk_table = 0x%llX (PEB @ 0x%llX)\n",
-                                    (unsigned long long)ct, (unsigned long long)cand);
-                                return true;
+                    for (uint64_t c = 0x7FF00000; c < 0x7FFE0000; c += 0x10000) {
+                        if (try_peb(c)) {
+                            std::printf("[canon28] chunk_table = 0x%llX (PEB @ 0x%llX, legacy sweep)\n",
+                                (unsigned long long)chunk_table, (unsigned long long)c);
+                            break;
+                        }
+                    }
+                }
+                if (!chunk_table) {
+                    for (uint64_t c = 0x00010000; c < 0x00200000; c += 0x10000) {
+                        if (try_peb(c)) {
+                            std::printf("[canon28] chunk_table = 0x%llX (PEB @ 0x%llX, low sweep)\n",
+                                (unsigned long long)chunk_table, (unsigned long long)c);
+                            break;
+                        }
+                    }
+                }
+
+                // Modern Wine allocates the PEB at a randomized address
+                // outside the legacy ranges. Locate it by signature: the
+                // PEB is page-aligned (Wine allocates via wine_anon_mmap),
+                // and stores ImageBaseAddress at +0x10 — which equals our
+                // module base (0x140000000). So at exactly one offset per
+                // 4 KiB page we expect 8 bytes == m_base. Iterate page-by-
+                // page (not slot-by-slot) — 512× fewer comparisons. The
+                // SIMD decrypt + chunk_table validation disambiguates real
+                // PEB hits from any incidental page that happens to hold
+                // m_base at +0x10 (e.g. mirrored Ldr entries).
+                if (!chunk_table) {
+                    std::vector<Region> ranges;
+                    ranges.reserve(64);
+                    EnumerateRwHeapRegions(0x1000ULL, ~0ULL, ranges);
+                    const uint64_t CHUNK = 0x400000ULL;       // 4 MiB read
+                    const uint64_t PAGE  = 0x1000ULL;         // 4 KiB
+                    std::vector<uint8_t> buf(CHUNK);
+                    const uint64_t target = m_base;
+                    size_t cands_tried = 0;
+                    std::printf("[canon28] PEB sig-scan: %zu rw regions\n",
+                        ranges.size());
+                    for (const auto& rg : ranges) {
+                        if (chunk_table) break;
+                        // Skip the loaded module itself — its data section
+                        // contains many references to ImageBaseAddress that
+                        // are not PEBs and would inflate the candidate set.
+                        if (rg.lo >= m_base && rg.lo < m_base + 0x10000000ULL) continue;
+                        // Align region start to 4 KiB so the 0x10 offset
+                        // probe lands on the actual page header.
+                        uint64_t rg_lo = (rg.lo + (PAGE - 1)) & ~(PAGE - 1);
+                        for (uint64_t base_addr = rg_lo;
+                             base_addr < rg.hi && !chunk_table;
+                             base_addr += CHUNK) {
+                            uint64_t want = std::min<uint64_t>(CHUNK, rg.hi - base_addr);
+                            if (want < PAGE) break;
+                            if (!m_reader.Read(base_addr, buf.data(), want)) continue;
+                            // 1 probe per page at offset +0x10
+                            for (uint64_t poff = 0; poff + 0x18 <= want; poff += PAGE) {
+                                uint64_t v;
+                                std::memcpy(&v, buf.data() + poff + 0x10, 8);
+                                if (v != target) continue;
+                                uint64_t cand = base_addr + poff;
+                                ++cands_tried;
+                                if (try_peb(cand)) {
+                                    std::printf("[canon28] chunk_table = 0x%llX (PEB @ 0x%llX, sig-scan, %zu tried)\n",
+                                        (unsigned long long)chunk_table,
+                                        (unsigned long long)cand,
+                                        cands_tried);
+                                    break;
+                                }
                             }
                         }
-                        return false;
-                    };
-                    if (!sweep(0x7FF00000, 0x7FFE0000, 0x10000))
-                        sweep(0x00010000, 0x00200000, 0x10000);
+                    }
+                    if (!chunk_table) {
+                        std::printf("[canon28] PEB sig-scan tried %zu candidates, none decrypted to a valid chunk_table\n",
+                            cands_tried);
+                    }
                 }
             }
 
@@ -865,20 +1109,28 @@ namespace gobjects
             if (!canonical_ok) {
                 std::printf("[p28] canonical chunk walk failed, falling back to structural scan\n");
 
-                // Fallback path (legacy 20260428 behavior): use +0x38 as a hint
-                // and structural-scan the heap for FUObjectItem runs.
+                // CL-1177146 layout: NumElements is plain at +0x30 (was +0x38 in
+                // 20260428). Try both offsets to stay compatible across patches.
+                uint64_t num_at_30 = 0;
                 uint64_t num_at_38 = 0;
-                if (!m_reader.Read(base + 0x38, &num_at_38, 8)) {
-                    std::printf("[p28] read GUObjectArray+0x38 failed\n");
+                m_reader.Read(base + 0x30, &num_at_30, 8);
+                m_reader.Read(base + 0x38, &num_at_38, 8);
+                uint64_t num_plain = 0;
+                uint64_t num_off = 0;
+                auto Looks = [](uint64_t v) {
+                    uint32_t lo = static_cast<uint32_t>(v & 0xFFFFFFFFu);
+                    return lo >= 1000 && lo <= 2000000 && (v >> 32) == 0;
+                };
+                if (Looks(num_at_30)) { num_plain = num_at_30; num_off = 0x30; }
+                else if (Looks(num_at_38)) { num_plain = num_at_38; num_off = 0x38; }
+                else {
+                    std::printf("[p28] +0x30=0x%llX +0x38=0x%llX neither looks like plain NumElements\n",
+                        (unsigned long long)num_at_30, (unsigned long long)num_at_38);
                     return false;
                 }
-                max_elements = static_cast<int32_t>(num_at_38 & 0xFFFFFFFFu);
-                if (max_elements < 1000 || max_elements > 2000000 || (num_at_38 >> 32) != 0) {
-                    std::printf("[p28] +0x38 = 0x%llX doesn't look like plain NumElements\n",
-                        (unsigned long long)num_at_38);
-                    return false;
-                }
-                std::printf("[p28] NumElements (plain @ +0x38, fallback) = %d\n", max_elements);
+                max_elements = static_cast<int32_t>(num_plain & 0xFFFFFFFFu);
+                std::printf("[p28] NumElements (plain @ +0x%llX, fallback) = %d\n",
+                    (unsigned long long)num_off, max_elements);
 
                 if (!StructuralScanFUObjectItems(max_elements, objects)) {
                     std::printf("[p28] structural chunk scan failed\n");
@@ -936,25 +1188,28 @@ namespace gobjects
             };
 
             size_t pre = objects.size();
-            ScanByVtable(m_base + 0xAD6CB80, /*stride=*/0x130, objects);  // UScriptStruct
-            ScanByVtable(m_base + 0xAD6D440, /*stride=*/0x300, objects);  // UClass
-            ScanByVtable(m_base + 0xAD6D980, /*stride=*/0x200, objects);  // UFunction
-            ScanByVtable(m_base + 0xAD6FF30, /*stride=*/0x130, objects);  // UEnum
-            ScanByVtable(m_base + 0xB527FC0, /*stride=*/0x490, objects);  // BPGC
-            ScanByVtable(m_base + 0xB322870, /*stride=*/0x5D0, objects);  // WBPGC
-            ScanByVtable(m_base + 0xC0092B0, /*stride=*/0x490, objects);  // SMBPGC
-            ScanByVtable(m_base + 0xB4D5CC0, /*stride=*/0x7F0, objects);  // AnimBPGC
-            ScanByVtable(m_base + 0xB8A9180, /*stride=*/0x340, objects);  // ASClass
-            ScanByVtable(m_base + 0xB8B2420, /*stride=*/0x150, objects);  // ASStruct
-            // Heaviest 7 ASFunction subclasses (all stride 0x200) — cover ~12K
-            // of the 13K total. Remaining 16 subclasses are ≤250 instances each.
-            ScanByVtable(m_base + 0xB8ADCD0, /*stride=*/0x200, objects);  // ASFunction_NotThreadSafe_JIT
-            ScanByVtable(m_base + 0xB8AE100, /*stride=*/0x200, objects);  // ASFunction_NoParams_JIT
-            ScanByVtable(m_base + 0xB8AFE80, /*stride=*/0x200, objects);  // ASFunction_ByteArg_JIT
-            ScanByVtable(m_base + 0xB8B02B0, /*stride=*/0x200, objects);  // ASFunction_ReferenceArg_JIT
-            ScanByVtable(m_base + 0xB8B06E0, /*stride=*/0x200, objects);  // ASFunction_ObjectReturn_JIT
-            ScanByVtable(m_base + 0xB8AF1E0, /*stride=*/0x200, objects);  // ASFunction_FloatExtToDbl_JIT
-            ScanByVtable(m_base + 0xB8B17A0, /*stride=*/0x200, objects);  // ASFunction_ByteReturn_JIT
+            std::vector<VtableScanTarget> vt_targets = {
+                { m_base + 0xAD6CB80, 0x130 },  // UScriptStruct
+                { m_base + 0xAD6D440, 0x300 },  // UClass
+                { m_base + 0xAD6D980, 0x200 },  // UFunction
+                { m_base + 0xAD6FF30, 0x130 },  // UEnum
+                { m_base + 0xB527FC0, 0x490 },  // BPGC
+                { m_base + 0xB322870, 0x5D0 },  // WBPGC
+                { m_base + 0xC0092B0, 0x490 },  // SMBPGC
+                { m_base + 0xB4D5CC0, 0x7F0 },  // AnimBPGC
+                { m_base + 0xB8A9180, 0x340 },  // ASClass
+                { m_base + 0xB8B2420, 0x150 },  // ASStruct
+                // Heaviest 7 ASFunction subclasses (all stride 0x200) — cover
+                // ~12K of the 13K total. Remaining 16 subclasses ≤250 each.
+                { m_base + 0xB8ADCD0, 0x200 },  // ASFunction_NotThreadSafe_JIT
+                { m_base + 0xB8AE100, 0x200 },  // ASFunction_NoParams_JIT
+                { m_base + 0xB8AFE80, 0x200 },  // ASFunction_ByteArg_JIT
+                { m_base + 0xB8B02B0, 0x200 },  // ASFunction_ReferenceArg_JIT
+                { m_base + 0xB8B06E0, 0x200 },  // ASFunction_ObjectReturn_JIT
+                { m_base + 0xB8AF1E0, 0x200 },  // ASFunction_FloatExtToDbl_JIT
+                { m_base + 0xB8B17A0, 0x200 },  // ASFunction_ByteReturn_JIT
+            };
+            ScanByVtables(vt_targets, objects);
             std::printf("[p28] vtable scan added %zu UObject pointers (total %zu)\n",
                 objects.size() - pre, objects.size());
 
@@ -970,66 +1225,85 @@ namespace gobjects
         // to suppress incidental data-as-pointer false positives.
         std::unordered_set<uint64_t> m_knownTypeVtables;
 
-        // Scan all rw- heap regions (from /proc/<pid>/maps) for an exact 8-byte
-        // vtable pattern. For each hit, validate by re-reading +0x00 (defends
-        // against transient page-tear) and checking that a neighbor at
-        // ±neighbor_stride has ANY known metaclass vtable (suppresses lone
-        // false positives where the vtable address appears as data).
-        void ScanByVtable(uint64_t target_vt, uint32_t neighbor_stride,
-                          std::vector<uint64_t>& out_objects) {
-            if (m_pid <= 0 || target_vt == 0) return;
+        struct VtableScanTarget {
+            uint64_t target_vt;
+            uint32_t neighbor_stride;
+        };
+
+        // Scan all rw- heap regions (from /proc/<pid>/maps) once, matching
+        // every requested vtable in a single pass. For each hit, accept it
+        // if a neighbor at ±neighbor_stride holds ANY known metaclass vtable
+        // (suppresses lone vtable-as-data false positives). Neighbor reads
+        // are served from the in-memory chunk buffer when the neighbor lives
+        // in the current window — only cross-chunk edges fall back to a live
+        // read. This avoids the previous N-targets × full-heap re-scan and
+        // the per-hit small-read storm that stalled the game's mmap_lock.
+        void ScanByVtables(const std::vector<VtableScanTarget>& targets,
+                           std::vector<uint64_t>& out_objects) {
+            if (m_pid <= 0 || targets.empty()) return;
+
+            std::unordered_map<uint64_t, size_t> vt_to_idx;
+            vt_to_idx.reserve(targets.size() * 2);
+            for (size_t i = 0; i < targets.size(); ++i) {
+                if (targets[i].target_vt) vt_to_idx.emplace(targets[i].target_vt, i);
+            }
+            if (vt_to_idx.empty()) return;
 
             std::vector<Region> ranges;
             ranges.reserve(64);
             EnumerateRwHeapRegions(0x10000ULL, 0xC800000ULL, ranges);
 
             std::unordered_set<uint64_t> dedup(out_objects.begin(), out_objects.end());
+            std::vector<size_t> per_target_hits(targets.size(), 0);
 
-            // 4 MB chunks per the agent's spec — 8 MB caused short-read failures
-            // on /dev/memreader during testing.
+            // 4 MB chunks — 8 MB caused short-read failures on /dev/memreader.
             const uint64_t CHUNK = 0x400000ULL;
             std::vector<uint8_t> buf(CHUNK);
-            uint8_t target_bytes[8];
-            std::memcpy(target_bytes, &target_vt, 8);
 
-            size_t added = 0;
             for (const auto& rg : ranges) {
                 for (uint64_t base_addr = rg.lo; base_addr < rg.hi; base_addr += CHUNK) {
                     uint64_t want = std::min<uint64_t>(CHUNK, rg.hi - base_addr);
                     if (!m_reader.Read(base_addr, buf.data(), want)) continue;
-                    // Search at 8-byte alignment (UObject allocations are 0x10-aligned;
+                    const uint8_t* p = buf.data();
+
+                    // 8-byte aligned (UObject allocations are 0x10-aligned;
                     // vtable always lives at +0x00 with 8-byte alignment).
                     for (size_t off = 0; off + 8 <= want; off += 8) {
-                        if (std::memcmp(buf.data() + off, target_bytes, 8) != 0) continue;
+                        uint64_t v;
+                        std::memcpy(&v, p + off, 8);
+                        auto it = vt_to_idx.find(v);
+                        if (it == vt_to_idx.end()) continue;
+
                         uint64_t cand = base_addr + off;
+                        uint32_t stride = targets[it->second].neighbor_stride;
 
-                        // Re-read to defend against torn page during the chunk read.
-                        uint64_t vt0 = 0;
-                        if (!m_reader.Read(cand, &vt0, 8) || vt0 != target_vt) continue;
-
-                        // Neighbor check: ±neighbor_stride should hold ANY known
-                        // metaclass vtable (UScriptStruct/UClass/UEnum/UFunction/BPGC).
-                        // Loose check tolerates mixed-kind arenas while still
-                        // rejecting lone vtable-as-data false positives.
-                        auto neighbor_ok = [&](uint64_t addr) {
+                        auto neighbor_known = [&](uint64_t addr) -> bool {
                             uint64_t vt_n = 0;
-                            if (!m_reader.Read(addr, &vt_n, 8)) return false;
+                            if (addr >= base_addr && addr + 8 <= base_addr + want) {
+                                std::memcpy(&vt_n, p + (addr - base_addr), 8);
+                            } else if (!m_reader.Read(addr, &vt_n, 8)) {
+                                return false;
+                            }
                             return m_knownTypeVtables.count(vt_n) > 0;
                         };
-                        bool ok = false;
-                        if (neighbor_ok(cand + neighbor_stride))                       ok = true;
-                        if (!ok && cand >= neighbor_stride && neighbor_ok(cand - neighbor_stride)) ok = true;
+                        bool ok = neighbor_known(cand + stride);
+                        if (!ok && cand >= stride) ok = neighbor_known(cand - stride);
                         if (!ok) continue;
 
                         if (dedup.insert(cand).second) {
                             out_objects.push_back(cand);
-                            ++added;
+                            ++per_target_hits[it->second];
                         }
                     }
                 }
             }
-            std::printf("[p28] ScanByVtable(0x%llX, stride=0x%x): +%zu hits\n",
-                (unsigned long long)target_vt, neighbor_stride, added);
+
+            for (size_t i = 0; i < targets.size(); ++i) {
+                std::printf("[p28] ScanByVtable(0x%llX, stride=0x%x): +%zu hits\n",
+                    (unsigned long long)targets[i].target_vt,
+                    targets[i].neighbor_stride,
+                    per_target_hits[i]);
+            }
         }
 
         bool InitPatch20260421() {

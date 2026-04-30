@@ -39,6 +39,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <immintrin.h>
 #include <glob.h>
@@ -56,27 +57,44 @@ using FNameDecryptor = FName::FNameDecryptor;
 #include "sdk_generator.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PE binary path — glob the latest Arc_Raiders_Binary_*.exe so a new patch
-// dropped into the dumper directory is picked up without code changes.
-// Returns "" if nothing matches; callers treat that as "no PE fallback".
+// PE binary path — glob ARC binary files in the dumper directory and pick the
+// one with the most-recent mtime. Matches multiple naming schemes the user
+// has used historically: Arc_Raiders_Binary_*, pioneer_steam_*, ARC_RAIDERS_*,
+// *PagesDecrypted*. Returns "" if nothing matches; callers treat that as
+// "no PE fallback".
 // ─────────────────────────────────────────────────────────────────────────────
 static const std::string& GetPEBinaryPath() {
     static std::string cached = []() -> std::string {
         const char* dir = "/media/frost/Coding Stuf/Linux/FrostSDKDumper";
-        std::string pattern = std::string(dir) + "/Arc_Raiders_Binary_*.exe";
-        glob_t g{};
+        const char* patterns[] = {
+            "Arc_Raiders_Binary_*.exe",
+            "pioneer_steam_*.exe",
+            "ARC_RAIDERS_*.exe",
+            "*PagesDecrypted*.exe",
+            "*pct.exe",
+        };
         std::string best;
-        if (glob(pattern.c_str(), 0, nullptr, &g) == 0) {
-            for (size_t i = 0; i < g.gl_pathc; ++i) {
-                std::string p = g.gl_pathv[i];
-                if (p > best) best = p;   // lexicographic = chronological for YYYYMMDD names
+        time_t bestMtime = 0;
+        for (const char* pat : patterns) {
+            std::string fullPat = std::string(dir) + "/" + pat;
+            glob_t g{};
+            if (glob(fullPat.c_str(), 0, nullptr, &g) == 0) {
+                for (size_t i = 0; i < g.gl_pathc; ++i) {
+                    std::string p = g.gl_pathv[i];
+                    struct stat st{};
+                    if (stat(p.c_str(), &st) != 0) continue;
+                    if (st.st_mtime > bestMtime) {
+                        bestMtime = st.st_mtime;
+                        best = p;
+                    }
+                }
             }
+            globfree(&g);
         }
-        globfree(&g);
         if (!best.empty())
             std::printf("[pe] PE binary auto-selected: %s\n", best.c_str());
         else
-            std::printf("[pe] no Arc_Raiders_Binary_*.exe found in %s — PE fallback disabled\n", dir);
+            std::printf("[pe] no PE binary found in %s — PE fallback disabled\n", dir);
         return best;
     }();
     return cached;
@@ -282,10 +300,45 @@ public:
                     slot = dyn;
                 }
             };
-            apply("GObjectArray", ArcDecrypt::RVA_GOBJECT_ARRAY_BASE, scan.FindGObjectArrayRVA());
-            apply("GWorld",       ArcDecrypt::RVA_GWORLD,             scan.FindGWorldRVA());
-            apply("GNames",       ArcDecrypt::RVA_GNAMES_BASE,        scan.FindGNamesRVA());
-            apply("FNameKeyTbl",  ArcDecrypt::RVA_FNAME_KEY_TABLE,
+            auto applyTrusted = [](const char* name, uint64_t& slot, uint64_t dyn) {
+                constexpr uint64_t kTolerance = 0x1000000ULL;
+                if (!dyn) {
+                    std::printf("[sig] %-14s scan failed; using config 0x%llX\n",
+                        name, (unsigned long long)slot);
+                    return;
+                }
+                uint64_t Diff = dyn > slot ? dyn - slot : slot - dyn;
+                if (dyn == slot) {
+                    std::printf("[sig] %-14s 0x%llX (matches config)\n",
+                        name, (unsigned long long)dyn);
+                } else if (Diff > kTolerance) {
+                    std::printf("[sig] %-14s 0x%llX scan diverges from config 0x%llX (Δ=0x%llX); keeping config\n",
+                        name, (unsigned long long)dyn, (unsigned long long)slot,
+                        (unsigned long long)Diff);
+                } else {
+                    std::printf("[sig] %-14s 0x%llX → 0x%llX (patch drift — auto-fixed)\n",
+                        name, (unsigned long long)slot, (unsigned long long)dyn);
+                    slot = dyn;
+                }
+            };
+            auto applyStrict = [](const char* name, uint64_t& slot, uint64_t dyn) {
+                if (!dyn) {
+                    std::printf("[sig] %-14s scan failed; using config 0x%llX (strict)\n",
+                        name, (unsigned long long)slot);
+                    return;
+                }
+                if (dyn == slot) {
+                    std::printf("[sig] %-14s 0x%llX (matches config, strict)\n",
+                        name, (unsigned long long)dyn);
+                } else {
+                    std::printf("[sig] %-14s scan=0x%llX config=0x%llX (strict — keeping config)\n",
+                        name, (unsigned long long)dyn, (unsigned long long)slot);
+                }
+            };
+            applyTrusted("GObjectArray", ArcDecrypt::RVA_GOBJECT_ARRAY_BASE, scan.FindGObjectArrayRVA());
+            applyTrusted("GWorld",       ArcDecrypt::RVA_GWORLD,             scan.FindGWorldRVA());
+            applyTrusted("GNames",       ArcDecrypt::RVA_GNAMES_BASE,        scan.FindGNamesRVA());
+            applyStrict ("FNameKeyTbl",  ArcDecrypt::RVA_FNAME_KEY_TABLE,
                   scan.FindFNameKeyTableRVA(ArcDecrypt::RVA_FNAME_KEY_TABLE,
                                             ArcDecrypt::RVA_GNAMES_BASE));
             auto st = scan.FindObjArraySimdTables();
@@ -310,6 +363,20 @@ public:
         // Failures here are non-fatal: the static decrypt path keeps working,
         // we just lose the patch-resilient fallback.
         BootEmuFNameFallback();
+
+        // ── Optional: capture SIMD chunk_table-decrypt XOR key live ──────
+        // The chunk_table-decrypt function reads the Wine PEB pointer from
+        // gs:[0x60] and adds 0x647A6348. We can't read gs:[0x60] from
+        // outside without ptrace, and Wine's PEB layout is not Windows-
+        // canonical (sig-scan for *(PEB+0x10) == m_base only finds 1 hit
+        // and it's not the real PEB). Instead, set a uprobe right after
+        // the `add rax, gs:[0x60]` and capture the resulting rax — that
+        // IS the key we need. The game calls this function continuously
+        // (every chunks_manager+0xB0 read during GC / name resolution),
+        // so a 200 ms wait is more than enough. Best-effort: failure
+        // here just falls through to the existing PEB sweep + heap-scan
+        // probe, both of which still work.
+        CaptureSimdPebKey();
 
         // Canonical path: emulate chunks_manager vtable[7] (NOT VMProtected on
         // patch 20260421 despite earlier belief) to recover the real chunks-
@@ -340,6 +407,107 @@ public:
         // best on this build. Sets the FNameDecryptor primary so GetName tries
         // it first instead of walking the legacy candidate list every call.
         if (gobj_ok) CalibrateInlineHandleOffset();
+        return true;
+    }
+
+    // ── Capture SIMD chunk_table-decrypt XOR key via uprobe ──────────────
+    // Sig-scans the running module for the `mov eax, 0x647A6348; add rax,
+    // gs:[0x60]` sequence (RVA-stable across patches because both the
+    // imm32 and the gs:[0x60] read are load-bearing and unchanged since
+    // 20260421). Sets a uprobe right after the `add` so the kernel
+    // captures rax = peb_pointer + 0x647A6348 — exactly the key the SIMD
+    // pipeline XORs against. Polls briefly for a hit (the function runs
+    // continuously during normal play). On success, hands the key to
+    // GObjectArray; failure is non-fatal — we fall through to the
+    // existing PEB sweep + heap-scan probe.
+    bool CaptureSimdPebKey() {
+        if (m_reader.fd < 0) {
+            std::printf("[uprobe-key] /dev/memreader not open; skipping live key capture\n");
+            return false;
+        }
+
+        // Locate the chunk_table-decrypt function's mov+add pair.
+        // 14 bytes: B8 48 63 7A 64                  ; mov eax, 0x647A6348
+        //           65 48 03 04 25 60 00 00 00      ; add rax, gs:[0x60]
+        // The {imm32, gs-disp32 segment-relative add} combination is
+        // unique in the binary; 14 bytes is overkill but cheap.
+        SigScan::Scanner<KernelReader> scan(m_reader, MODULE_BASE, 0xE900000);
+        static SigScan::PEFileReader s_pe;
+        const std::string& pe_path = GetPEBinaryPath();
+        if (!pe_path.empty() && s_pe.Open(pe_path.c_str())) {
+            scan.SetPEFallback(&s_pe);
+        }
+        auto pat = SigScan::Pattern::Parse(
+            "B8 48 63 7A 64 65 48 03 04 25 60 00 00 00");
+        uint64_t mov_va = scan.Find(pat);
+        if (!mov_va) {
+            std::printf("[uprobe-key] sig-scan for chunk_table-decrypt prologue failed\n");
+            return false;
+        }
+        // Probe address = right after `add rax, gs:[0x60]` finishes
+        // (mov_va + 5 bytes mov + 9 bytes add = mov_va + 14). At this
+        // PC, rax holds peb + 0x647A6348.
+        uint64_t probe_va = mov_va + 14;
+        std::printf("[uprobe-key] mov+add prologue @ 0x%llX  probe @ 0x%llX\n",
+            (unsigned long long)mov_va, (unsigned long long)probe_va);
+
+        // Set the uprobe.
+        struct memreader_uprobe_request req = {};
+        req.pid       = m_pid;
+        req.address   = static_cast<unsigned long>(probe_va);
+        req.probe_id  = 0;
+        if (ioctl(m_reader.fd, MEMREADER_SET_UPROBE, &req) != 0) {
+            std::printf("[uprobe-key] SET_UPROBE failed: %s\n", strerror(errno));
+            return false;
+        }
+
+        // Poll for a hit. The chunk_table-decrypt is only called during
+        // GC sweeps (sub_398180 → vt[5]), which run every ~1–5 s during
+        // an active match. 5 s in 100 ms increments — exits early on the
+        // first hit. If we time out, the function genuinely isn't being
+        // called yet (loading screen, paused, alt-tabbed) and the caller
+        // falls through to the heap-scan path.
+        struct memreader_uprobe_hit hit_buf = {};
+        struct memreader_uprobe_hits hits_req = {};
+        hits_req.probe_id = 0;
+        hits_req.max_hits = 1;
+        hits_req.hits     = &hit_buf;
+        bool got_hit = false;
+        for (int attempt = 0; attempt < 50 && !got_hit; ++attempt) {
+            usleep(100 * 1000);
+            hits_req.num_hits = 0;
+            if (ioctl(m_reader.fd, MEMREADER_GET_UPROBE_HITS, &hits_req) == 0
+                && hits_req.num_hits > 0) {
+                got_hit = true;
+            }
+        }
+
+        // Disarm the uprobe regardless of outcome.
+        struct memreader_uprobe_request clr = {};
+        clr.pid      = m_pid;
+        clr.address  = static_cast<unsigned long>(probe_va);
+        clr.probe_id = 0;
+        ioctl(m_reader.fd, MEMREADER_CLEAR_UPROBE, &clr);
+
+        if (!got_hit) {
+            std::printf("[uprobe-key] no hits in 5000 ms — function not firing (paused / loading?)\n");
+            return false;
+        }
+
+        // The captured rax IS the SIMD key (peb + peb_add_const).
+        // Sanity check: high 32 bits should be plausibly within Wine's
+        // user space (anything below ~0x800000_00000000). If the captured
+        // value looks broken, log and bail rather than poison the SIMD
+        // path.
+        uint64_t key = hit_buf.rax;
+        if (key == 0 || key < 0x100000) {
+            std::printf("[uprobe-key] captured rax=0x%llX looks broken; ignoring\n",
+                (unsigned long long)key);
+            return false;
+        }
+        std::printf("[uprobe-key] captured rax=0x%llX (key for SIMD chunk_table decrypt)\n",
+            (unsigned long long)key);
+        m_gobj.SetSimdPebKey(key);
         return true;
     }
 
@@ -637,14 +805,23 @@ public:
             return vtbl >= MODULE_BASE && vtbl < MODULE_BASE + 0x10000000ULL;
         };
 
-        // ── Step 1: Get GWorld (single-deref) ────────────────────────────
+        // ── Step 1: Get GWorld (CL-1177146 needs double-deref) ───────────
         uint64_t gworld = 0;
-        if (!m_reader.Read(MODULE_BASE + ArcDecrypt::RVA_GWORLD, &gworld, 8) || !isValidPtr(gworld)) {
-            std::printf("[-] WorldTraversal: GWorld invalid (0x%llX)\n",
-                (unsigned long long)gworld);
+        uint64_t GWorldStage1 = 0;
+        if (!m_reader.Read(MODULE_BASE + ArcDecrypt::RVA_GWORLD, &GWorldStage1, 8) || !isValidPtr(GWorldStage1)) {
+            std::printf("[-] WorldTraversal: GWorld stage1 invalid (0x%llX)\n",
+                (unsigned long long)GWorldStage1);
             return false;
         }
-        std::printf("[+] WorldTraversal: GWorld = 0x%llX\n", (unsigned long long)gworld);
+        gworld = GWorldStage1;
+        uint64_t GWorldStage2 = 0;
+        if (m_reader.Read(GWorldStage1, &GWorldStage2, 8) && isValidPtr(GWorldStage2)) {
+            uint64_t Vtbl2 = 0;
+            if (m_reader.Read(GWorldStage2, &Vtbl2, 8) && Vtbl2 >= MODULE_BASE && Vtbl2 < MODULE_BASE + 0x10000000ULL)
+                gworld = GWorldStage2;
+        }
+        std::printf("[+] WorldTraversal: GWorld = 0x%llX (stage1=0x%llX)\n",
+            (unsigned long long)gworld, (unsigned long long)GWorldStage1);
 
         // ── Step 2: Collect levels ────────────────────────────────────────
         std::vector<uint64_t> levels;
@@ -892,6 +1069,179 @@ public:
     // ── Raw FProperty layout probe ────────────────────────────────────────
     // Finds /Script/CoreUObject.Vector in GObjects, then dumps raw bytes
     // from the first FProperty to diagnose FField layout.
+    void BruteForcePipelines(const uint8_t* Enc16) {
+        auto TryCi = [&](const char* Tag, uint32_t Ci) {
+            if (Ci <= 1 || Ci >= 0x4000000u) return;
+            uint64_t Ptr = m_fname.ResolveNamePtrFull(static_cast<int32_t>(Ci));
+            if (!Ptr) return;
+            std::string Nm = m_fname.DecryptNameString(Ptr);
+            if (Nm.empty()) return;
+            bool Ok = true;
+            for (char C : Nm) {
+                if (!((C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||
+                      (C >= '0' && C <= '9') || C == '_'))
+                { Ok = false; break; }
+            }
+            std::printf("    %-50s CI=%-10u name='%s'%s\n", Tag, Ci, Nm.c_str(),
+                        Ok ? " *MATCH*" : "");
+        };
+        auto Try64 = [&](const char* Tag, uint64_t Lo64Final, bool DoRol32) {
+            uint64_t Final = DoRol32 ? Rotl64(Lo64Final, 32) : Lo64Final;
+            uint32_t Ci = static_cast<uint32_t>(Final & 0xFFFFFFFFu);
+            TryCi(Tag, Ci);
+            if (DoRol32) {
+                uint32_t Hi = static_cast<uint32_t>(Final >> 32);
+                if (Hi != Ci) {
+                    char Buf[80];
+                    snprintf(Buf, sizeof(Buf), "%s[hi32]", Tag);
+                    TryCi(Buf, Hi);
+                }
+            }
+        };
+
+        __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Enc16));
+
+        alignas(16) uint8_t MaskUobjBuf[16] = {
+            0x06, 0x05, 0x02, 0x03, 0x04, 0x01, 0x00, 0x07,
+            0,0,0,0, 0,0,0,0
+        };
+        __m128i ShufUobj = _mm_load_si128(reinterpret_cast<const __m128i*>(MaskUobjBuf));
+        constexpr uint64_t FFieldXorLo = 0x36578989E8756FBAULL;
+
+        alignas(16) uint8_t Kxor8[16] = {
+            0x38, 0xBA, 0x6F, 0x75, 0xE8, 0x89, 0x57, 0x36,
+            0,0,0,0, 0,0,0,0
+        };
+        __m128i Xk8 = _mm_load_si128(reinterpret_cast<const __m128i*>(Kxor8));
+
+        alignas(16) uint8_t Kxor16[16] = {
+            0x38, 0xBA, 0x6F, 0x75, 0xE8, 0x89, 0x57, 0x36,
+            0x57, 0x36, 0xE8, 0x89, 0x38, 0xBA, 0x6F, 0x75
+        };
+        __m128i Xk16 = _mm_load_si128(reinterpret_cast<const __m128i*>(Kxor16));
+
+        auto RolE64 = [](__m128i Q, int N) {
+            return _mm_or_si128(_mm_slli_epi64(Q, N), _mm_srli_epi64(Q, 64 - N));
+        };
+        auto RolE16 = [](__m128i Q, int N) {
+            return _mm_or_si128(_mm_slli_epi16(Q, N), _mm_srli_epi16(Q, 16 - N));
+        };
+        auto Lo64Of = [](__m128i Q) {
+            uint64_t L; _mm_storel_epi64(reinterpret_cast<__m128i*>(&L), Q); return L;
+        };
+
+        Try64("A:UObj-PSHUFB+XOR(FF)+ROL64", Lo64Of(_mm_shuffle_epi8(V, ShufUobj)) ^ FFieldXorLo, true);
+        Try64("A2:UObj-PSHUFB+XOR(FF) noROL", Lo64Of(_mm_shuffle_epi8(V, ShufUobj)) ^ FFieldXorLo, false);
+        {
+            __m128i R1 = RolE64(V, 21);
+            __m128i Xo = _mm_xor_si128(R1, Xk8);
+            __m128i R2 = RolE16(Xo, 15);
+            Try64("B:ROL64(21)+XOR8+ROL16(15)+ROL64", Lo64Of(R2), true);
+        }
+        {
+            __m128i Sh = _mm_shufflelo_epi16(V, 0x1E);
+            __m128i Xo = _mm_xor_si128(Sh, Xk8);
+            __m128i R2 = RolE16(Xo, 1);
+            Try64("C:PSHUFLW(1E)+XOR8+ROL16(1)+ROL64", Lo64Of(R2), true);
+        }
+        {
+            __m128i Sh = _mm_shufflelo_epi16(V, 0xB1);
+            __m128i Xo = _mm_xor_si128(Sh, Xk8);
+            Try64("D:PSHUFLW(B1)+XOR8+ROL64", Lo64Of(Xo), true);
+        }
+        {
+            __m128i B = _mm_shuffle_epi8(V, ShufUobj);
+            __m128i Xo = _mm_xor_si128(B, Xk16);
+            Try64("E:PSHUFB+XOR16+ROL64", Lo64Of(Xo), true);
+        }
+        {
+            __m128i Xo = _mm_xor_si128(V, Xk16);
+            Try64("F:XOR16-only+ROL64", Lo64Of(Xo), true);
+        }
+        {
+            __m128i Xo = _mm_xor_si128(V, Xk16);
+            Try64("G:XOR16-only", Lo64Of(Xo), false);
+        }
+        {
+            __m128i R1 = RolE64(V, 21);
+            __m128i Xo = _mm_xor_si128(R1, Xk16);
+            __m128i R2 = RolE16(Xo, 15);
+            Try64("H:ROL64(21)+XOR16+ROL16(15)+ROL64", Lo64Of(R2), true);
+        }
+        {
+            __m128i Sh = _mm_shufflelo_epi16(V, 0x1E);
+            __m128i Xo = _mm_xor_si128(Sh, Xk16);
+            __m128i R2 = RolE16(Xo, 1);
+            Try64("I:PSHUFLW(1E)+XOR16+ROL16(1)+ROL64", Lo64Of(R2), true);
+        }
+        {
+            __m128i Sh = _mm_shufflelo_epi16(V, 0xB1);
+            __m128i Xo = _mm_xor_si128(Sh, Xk16);
+            Try64("J:PSHUFLW(B1)+XOR16+ROL64", Lo64Of(Xo), true);
+        }
+        {
+            __m128i Sh = _mm_shufflelo_epi16(V, 0xB1);
+            __m128i Xo = _mm_xor_si128(Sh, Xk16);
+            Try64("J2:PSHUFLW(B1)+XOR16 noROL", Lo64Of(Xo), false);
+        }
+        {
+            __m128i B = _mm_shuffle_epi8(V, ShufUobj);
+            __m128i Xo = _mm_xor_si128(B, Xk8);
+            Try64("K:PSHUFB+XOR8+ROL64", Lo64Of(Xo), true);
+        }
+        {
+            __m128i B = _mm_shuffle_epi8(V, ShufUobj);
+            __m128i Xo = _mm_xor_si128(B, Xk8);
+            Try64("K2:PSHUFB+XOR8 noROL", Lo64Of(Xo), false);
+        }
+        {
+            __m128i B = _mm_shuffle_epi8(V, ShufUobj);
+            __m128i Xo = _mm_xor_si128(B, Xk8);
+            __m128i R = RolE16(Xo, 1);
+            Try64("L:PSHUFB+XOR8+ROL16(1)+ROL64", Lo64Of(R), true);
+        }
+        {
+            __m128i B = _mm_shuffle_epi8(V, ShufUobj);
+            __m128i Xo = _mm_xor_si128(B, Xk8);
+            __m128i R = RolE16(Xo, 15);
+            Try64("M:PSHUFB+XOR8+ROL16(15)+ROL64", Lo64Of(R), true);
+        }
+        {
+            __m128i B = _mm_shuffle_epi8(V, ShufUobj);
+            __m128i Xo = _mm_xor_si128(B, Xk16);
+            __m128i R = RolE16(Xo, 1);
+            Try64("N:PSHUFB+XOR16+ROL16(1)+ROL64", Lo64Of(R), true);
+        }
+        {
+            __m128i B = _mm_shuffle_epi8(V, ShufUobj);
+            __m128i Xo = _mm_xor_si128(B, Xk16);
+            __m128i R = RolE16(Xo, 15);
+            Try64("O:PSHUFB+XOR16+ROL16(15)+ROL64", Lo64Of(R), true);
+        }
+        {
+            uint64_t Lo;
+            std::memcpy(&Lo, Enc16, 8);
+            Try64("P:raw lo64+XOR(FF)+ROL64", Lo ^ FFieldXorLo, true);
+        }
+        {
+            uint64_t Lo;
+            std::memcpy(&Lo, Enc16, 8);
+            Try64("P2:raw lo64+XOR(FF)", Lo ^ FFieldXorLo, false);
+        }
+        {
+            uint64_t Hi;
+            std::memcpy(&Hi, Enc16 + 8, 8);
+            Try64("Q:raw hi64+XOR(FF)+ROL64", Hi ^ FFieldXorLo, true);
+        }
+        {
+            uint64_t Hi;
+            std::memcpy(&Hi, Enc16 + 8, 8);
+            Try64("Q2:raw hi64+XOR(FF)", Hi ^ FFieldXorLo, false);
+        }
+    }
+
+    static uint64_t Rotl64(uint64_t X, int N) { return (X << N) | (X >> (64 - N)); }
+
     void ProbeFField() {
         std::cout << "\n=== ProbeFField ===\n";
 
@@ -899,6 +1249,46 @@ public:
             std::cerr << "[-] GObjects not initialized\n"; return;
         }
         int32_t obj_count = m_gobj.GetNumElements();
+
+        std::printf("[scan] looking for objects with non-empty ChildProperties chain...\n");
+        int Hits = 0;
+        int Inspected = 0;
+        for (int32_t I = 0; I < obj_count && Hits < 8; ++I) {
+            uint64_t Obj = m_gobj.GetObjectPtr(I);
+            if (!Obj) continue;
+            ++Inspected;
+            uint64_t FfHead = 0;
+            m_reader.Read(Obj + ArcDecrypt::Offsets::UStruct::ChildProperties, &FfHead, 8);
+            if (!FfHead || FfHead < 0x100000ULL || FfHead >= 0x800000000000ULL) continue;
+            uint64_t Vt = 0;
+            m_reader.Read(FfHead, &Vt, 8);
+            if (Vt < MODULE_BASE || Vt >= MODULE_BASE + 0xE9D0000ULL) continue;
+            uint64_t Salt = 0;
+            m_reader.Read(FfHead + 0x78, &Salt, 8);
+            if (Salt != 0x893BCE4393840650ULL) continue;
+            std::printf("\n[hit %d] obj=0x%llX FF=0x%llX salt=0x%llX\n",
+                        Hits, (unsigned long long)Obj,
+                        (unsigned long long)FfHead, (unsigned long long)Salt);
+            uint64_t Chain = FfHead;
+            std::unordered_set<uint64_t> Seen;
+            for (int W = 0; W < 4 && Chain; ++W) {
+                if (Seen.count(Chain)) break;
+                Seen.insert(Chain);
+                alignas(16) uint8_t Enc[16] = {};
+                m_reader.Read(Chain + 0x70, Enc, 16);
+                bool AllZero = true;
+                for (uint8_t B : Enc) if (B) { AllZero = false; break; }
+                std::printf("  FF[%d] @ 0x%llX  enc16=", W, (unsigned long long)Chain);
+                for (int B : Enc) std::printf("%02X ", (uint8_t)B);
+                std::printf("  zero=%d\n", AllZero ? 1 : 0);
+                if (!AllZero) BruteForcePipelines(Enc);
+                uint64_t Next = 0;
+                m_reader.Read(Chain + 0x48, &Next, 8);
+                Chain = Next;
+            }
+            ++Hits;
+        }
+        std::printf("[scan] done; inspected=%d hits=%d\n\n", Inspected, Hits);
 
         const char* targets[] = {
             "Vector", "Rotator",
@@ -988,8 +1378,13 @@ public:
                   if (pfc) m_reader.Read(pfc + ArcDecrypt::Offsets::FFieldClass::ElementSize, &elem_size, 4); }
                 m_reader.Read(chain + ArcDecrypt::Offsets::FProperty::ArrayDim, &array_dim, 4);
 
-                uint8_t np[16] = {};
+                alignas(16) uint8_t np[16] = {};
                 m_reader.Read(chain + ArcDecrypt::Offsets::FField::NamePrivate, np, 16);
+
+                std::printf("  [enc16] ");
+                for (int B = 0; B < 16; ++B) std::printf("%02X ", np[B]);
+                std::printf("\n");
+                BruteForcePipelines(np);
 
                 int32_t ci_v = m_fname.DecryptFFieldNameCI(chain);
                 std::printf("  [!] DecryptFFieldNameCI = CI=%d\n", ci_v);

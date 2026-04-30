@@ -112,6 +112,10 @@ public:
 
     // FFieldClass* → FProperty type name (authoritative, since all FProps share vtable)
     std::unordered_map<uint64_t, std::string> m_fclass_to_type;
+
+    std::unordered_map<int32_t, std::string> m_type_idx_to_name;
+    std::unordered_set<std::string> m_canonical_property_type_names;
+    bool m_dynamic_type_table_loaded = false;
     // Sets populated during property walk: every FStructProperty.Struct value is
     // a UScriptStruct address; every FEnumProperty.Enum value is a UEnum.
     // Used in classification to mark these UObjects as struct/enum even when
@@ -320,7 +324,7 @@ public:
                 std::string pname = m_fname.GetFFieldName(ff);
                 if (!pname.empty()) {
                     auto kit = known.find(pname);
-                    if (kit != known.end()) {
+                    if (kit != known.end() && IsCanonicalPropertyTypeName(kit->second)) {
                         std::string type_str = "F" + kit->second;
                         uint64_t fc = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
                         if (fc && !m_fclass_to_type.count(fc))
@@ -450,6 +454,88 @@ public:
 
         m_vtables_discovered = true;
     }
+
+    // ── Patch 20260430 / CL-1177146: dynamic FProperty-type-index → FName CI table ──
+    // The game maintains a flat uint32_t[703] table inside the GNamePool struct.
+    // On CL-1177146 the GNamePool base moved to module+0xDBB3F80 and the table
+    // sits at struct-offset 0x2540 (= dword index 2384), so the absolute RVA is
+    //   0xDBB3F80 + 0x2540 = 0xDBB64C0.
+    //
+    // Reader function `sub_231DA0(out, idx)` does:
+    //   *out = *((_DWORD *)&unk_DBB3F80 + idx + 2384);
+    // Caller `sub_46D480` compares the result directly against an int32 CompIndex
+    // (`*((_DWORD *)a2 + 2)` from a property descriptor) — so entries are still
+    // plain FName CompIndex values, no extra transform required.
+    //
+    // Length verified from the pool ctor (sub_2334A0):
+    //   merge_out_clusters(a1 + 9536, 0, 2812)  → buffer size = 2812 bytes = 703 DWORDs
+    // (9536 = 0x2540 — same struct offset as the reader)
+    bool LoadDynamicPropertyTypeTable() {
+        constexpr uint64_t TABLE_RVA = 0xDBB64C0;
+        constexpr size_t   TABLE_LEN = 703;
+        m_type_idx_to_name.clear();
+        m_canonical_property_type_names.clear();
+        std::vector<uint32_t> handles(TABLE_LEN, 0);
+        if (!m_reader.Read(MODULE_BASE + TABLE_RVA, handles.data(), TABLE_LEN * sizeof(uint32_t))) {
+            std::printf("[ptable] failed to read property-type table @ 0x%llX\n",
+                (unsigned long long)(MODULE_BASE + TABLE_RVA));
+            return false;
+        }
+        size_t Decoded = 0;
+        size_t Nonzero = 0;
+        for (size_t I = 0; I < TABLE_LEN; ++I) {
+            uint32_t H = handles[I];
+            if (!H) continue;
+            ++Nonzero;
+            int32_t Ci = static_cast<int32_t>(H);
+            std::string Name = m_fname.CompIndexToNameLenient(Ci);
+            if (Name.empty()) continue;
+            bool NameOk = !Name.empty();
+            for (char C : Name) {
+                if (!((C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||
+                      (C >= '0' && C <= '9') || C == '_')) {
+                    NameOk = false; break;
+                }
+            }
+            if (!NameOk) continue;
+            m_type_idx_to_name[static_cast<int32_t>(I)] = Name;
+            m_canonical_property_type_names.insert(Name);
+            ++Decoded;
+        }
+        std::printf("[ptable] dynamic property-type table: %zu/%zu non-zero handles, %zu decoded names\n",
+            Nonzero, TABLE_LEN, Decoded);
+        m_dynamic_type_table_loaded = (Decoded >= 8);
+        if (m_dynamic_type_table_loaded) {
+            size_t Shown = 0;
+            std::vector<std::pair<int32_t, std::string>> Sorted(
+                m_type_idx_to_name.begin(), m_type_idx_to_name.end());
+            std::sort(Sorted.begin(), Sorted.end());
+            std::printf("[ptable] sample entries:");
+            for (const auto& [Idx, Nm] : Sorted) {
+                if (Shown++ >= 12) break;
+                std::printf(" [%d]=%s", Idx, Nm.c_str());
+            }
+            std::printf("\n");
+        }
+        return m_dynamic_type_table_loaded;
+    }
+
+    bool IsCanonicalPropertyTypeName(const std::string& Name) const {
+        if (!m_dynamic_type_table_loaded) return true;
+        if (Name.empty()) return false;
+        if (m_canonical_property_type_names.count(Name)) return true;
+        if (Name.size() > 1 && Name[0] == 'F' &&
+            m_canonical_property_type_names.count(Name.substr(1))) {
+            return true;
+        }
+        return false;
+    }
+
+    const std::unordered_map<int32_t, std::string>& GetTypeIdxToName() const {
+        return m_type_idx_to_name;
+    }
+
+    bool DynamicPropertyTypeTableLoaded() const { return m_dynamic_type_table_loaded; }
 
     // ── Patch 20260421: hardcoded FFieldClass* → type-name map ──────────
     // Obtained by scanning live .data for the FFieldClass signature
@@ -1287,7 +1373,7 @@ public:
                 }
             }
         }
-        std::printf("[sdk] CDO-based metaclass detection: +%zu class, +%zu struct, +%zu enum\n",
+        std::printf("[sdk] CDO-based metaclass detection: +%zu class, +%zu struct, +%zu enum (fallback; zero = Pass-1 covered all)\n",
             added_cls, added_ss, added_en);
 
         // ── Pass 3: probe every distinct ClassPrivate target by name ──
@@ -1319,7 +1405,7 @@ public:
                 }
             }
         }
-        std::printf("[sdk] Pass-3 (live-name metaclass probe): +%zu class, +%zu struct, +%zu enum\n",
+        std::printf("[sdk] Pass-3 (live-name metaclass probe): +%zu class, +%zu struct, +%zu enum (fallback; zero = Pass-1 covered all)\n",
             p3_cls, p3_ss, p3_en);
 
         if (!classAddr) {
@@ -1662,9 +1748,23 @@ public:
                 total_fn, m_owner_to_funcs.size());
         }
 
+        // ── Patch 20260430 / CL-1177146 PRIMARY: read property-type table at module+0xDBB64C0
+        //    dynamically and decode each non-zero FName handle. Provides the
+        //    canonical set of property type names (e.g. "BoolProperty",
+        //    "DoubleProperty", "ArrayProperty") used to validate FFieldClass
+        //    name reads downstream.
+        bool DynamicOk = LoadDynamicPropertyTypeTable();
+        if (!DynamicOk) {
+            std::printf("[ptable] dynamic load failed — relying on hardcoded map only\n");
+        }
+
         // ── Seed hardcoded FFieldClass→type map BEFORE auto-discovery so
         //    Tier-1 name-heuristic mistakes cannot overwrite authoritative
-        //    data. See SeedHardcodedFClassMap_20260421() for the source.
+        //    data. Always run because the hardcoded map keys (FField+0x88
+        //    type-global pointers) are not derivable from the dynamic table
+        //    alone — the dynamic table indexes by EClassCastFlags-style ID,
+        //    not by global pointer. Use it as fallback when the dynamic
+        //    pipeline cannot resolve a particular fclass_ptr.
         SeedHardcodedFClassMap_20260421();
 
         // ── Auto-discover vtable-to-type mappings (replaces bootstrap + sweep) ──
