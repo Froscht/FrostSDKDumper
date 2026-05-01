@@ -295,18 +295,36 @@ public:
     // a pointer (GetClassPrivate / GetAllClassCandidates) re-swap halves.
     uint64_t DecryptUObjSlotNew(const uint8_t enc[16]) const {
         using namespace ArcDecrypt::Patch20260421::UObjSlot20260428;
-        alignas(16) static constexpr uint8_t KShufMask[16] = {
-            SHUF_MASK_BYTES[0], SHUF_MASK_BYTES[1], SHUF_MASK_BYTES[2], SHUF_MASK_BYTES[3],
-            SHUF_MASK_BYTES[4], SHUF_MASK_BYTES[5], SHUF_MASK_BYTES[6], SHUF_MASK_BYTES[7],
-            0,0,0,0, 0,0,0,0
-        };
+        const auto& Disc = AutoDiscovery::g_DiscoveredUObjSlot;
+
+        // Auto-discovered values take priority. If discovery hasn't run or
+        // failed, fall back to compile-time constants from arc_decrypt.h.
+        alignas(16) uint8_t KShufMask[16] = {};
+        uint64_t XorVal;
+        int      Rol64Amt;
+        if (Disc.Valid) {
+            std::memcpy(KShufMask, Disc.ShufMaskBytes, 8);
+            XorVal   = Disc.XorScalar;
+            Rol64Amt = Disc.Rol64Amount;
+        } else {
+            const uint8_t kFallback[8] = {
+                SHUF_MASK_BYTES[0], SHUF_MASK_BYTES[1], SHUF_MASK_BYTES[2], SHUF_MASK_BYTES[3],
+                SHUF_MASK_BYTES[4], SHUF_MASK_BYTES[5], SHUF_MASK_BYTES[6], SHUF_MASK_BYTES[7],
+            };
+            std::memcpy(KShufMask, kFallback, 8);
+            XorVal   = XOR_SCALAR;
+            Rol64Amt = ROL64_AMT;
+        }
+
         __m128i V   = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
         __m128i Shm = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(KShufMask));
         __m128i B   = _mm_shuffle_epi8(V, Shm);
         uint64_t Lo;
         _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), B);
-        uint64_t Raw = Lo ^ XOR_SCALAR;
-        return (Raw << 32) | (Raw >> 32);
+        uint64_t Raw = Lo ^ XorVal;
+        // ROL64 by Rol64Amt (typically 32 — swaps hi/lo halves)
+        if (Rol64Amt == 0) return Raw;
+        return (Raw << Rol64Amt) | (Raw >> (64 - Rol64Amt));
     }
 
     // ── FField NamePrivate slot decrypt (patch CL-1177146) ───────────────
@@ -314,21 +332,32 @@ public:
     // FBoolProperty %s size %d." error path). It loads FField+0x70 and runs:
     //   1. ROL32(_, 13) per uint32-lane  (PSLLD 13 | PSRLD 19)
     //   2. take lo64
-    //   3. XOR with 0x9A492C85DDF6F193ULL
+    //   3. XOR with 0x9A492C85DDF6F193ULL  (auto-discovered at runtime)
     //   4. ROL64(_, 7)
     //   → result u64 = (Number << 32) | CI ; CI in lo32.
-    // Pipeline differs from UObject 4-slot (which uses PSHUFB+XOR+ROL64(32)) and
-    // from 20260428 FField (which used ROL64(21)+XOR+ROL16(15)+ROL64(32)).
+    //
+    // The XOR const, ROL32 amount, and ROL64 amount are auto-discovered
+    // by AutoDiscovery::DiscoverFFieldNameDecrypt (see auto_discovery.h)
+    // via live FField slot inspection (no sig-scan needed — the const
+    // falls out of the data math). The hardcoded fallback below is the
+    // CL-1177146 value, used until discovery has run.
     static constexpr uint64_t FFIELD_NAME_XOR_CL1177146 = 0x9A492C85DDF6F193ULL;
     uint64_t DecryptFFieldNameSlot(const uint8_t enc[16]) const {
+        const auto& Disc = AutoDiscovery::g_DiscoveredFFieldName;
+        const uint64_t XorConst = Disc.Valid ? Disc.XorConst : FFIELD_NAME_XOR_CL1177146;
+        const int      Rol32Amt = Disc.Valid ? Disc.Rol32Amount : 13;
+        const int      Rol64Amt = Disc.Valid ? Disc.Rol64Amount : 7;
+
         __m128i V    = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-        // ROL32(13) per uint32-lane
-        __m128i Rot  = _mm_or_si128(_mm_slli_epi32(V, 13), _mm_srli_epi32(V, 19));
+        // ROL32(N) per uint32-lane
+        __m128i Rot  = _mm_or_si128(
+            _mm_slli_epi32(V, Rol32Amt),
+            _mm_srli_epi32(V, 32 - Rol32Amt));
         uint64_t Lo;
         _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Rot);
-        uint64_t Xored = Lo ^ FFIELD_NAME_XOR_CL1177146;
-        // ROL64 by 7
-        return (Xored << 7) | (Xored >> 57);
+        uint64_t Xored = Lo ^ XorConst;
+        // ROL64 by N
+        return (Xored << Rol64Amt) | (Xored >> (64 - Rol64Amt));
     }
 
     // ── UObject FName accessor (patch 20260428) ──────────────────────────
@@ -948,18 +977,27 @@ public:
     //   to a real /Script/X or /Game/X UPackage (chain terminates at a
     //   UPackage vtable, never stalls on a non-package UObject).
     //
-    // The UPACKAGE_VT_RVA constant is patch-specific (0xAD8AE70 on
-    // 20260428, 0xADBC9A0 on CL-1177146). Keep it here as a named offset so
-    // future patches only need to update one place. Without the correct value,
-    // GetPackagePtr never recognizes that the outer chain has reached a real
-    // UPackage and instead stalls at the UPackage METACLASS UClass — whose
-    // own NamePrivate is literally "Package", causing every recovered class to
-    // bucket into `/Script/Package.X`.
-    static constexpr uint64_t UPACKAGE_VT_RVA = 0xADBC9A0ULL;
+    // The UPACKAGE_VT_RVA is auto-discovered at runtime via AutoDiscovery::
+    // DiscoverEngineVTables (name-clusters: any UObject whose name starts
+    // with "/" is a UPackage; the cluster's vtable IS UPACKAGE_VT_RVA). The
+    // hardcoded fallback 0xADBC9A0 is the CL-1177146 value, used only when
+    // discovery hasn't run yet (e.g. during the very first GetPackagePtr
+    // call before the post-init Phase-1 hook fires).
+    //
+    // Without the correct value, GetPackagePtr never recognizes that the
+    // outer chain has reached a real UPackage and instead stalls at the
+    // UPackage METACLASS UClass — whose own NamePrivate is literally
+    // "Package", causing every recovered class to bucket into
+    // `/Script/Package.X`.
+    static constexpr uint64_t UPACKAGE_VT_RVA_FALLBACK = 0xADBC9A0ULL;
+    static uint64_t UPackageVtRva() {
+        uint64_t Rva = AutoDiscovery::g_DiscoveredVTables.PackageRVA;
+        return Rva ? Rva : UPACKAGE_VT_RVA_FALLBACK;
+    }
 
     uint64_t GetPackagePtr(uint64_t obj_ptr) {
         if (!obj_ptr || !m_keyLoaded) return 0;
-        const uint64_t upkg_vt = m_base + UPACKAGE_VT_RVA;
+        const uint64_t upkg_vt = m_base + UPackageVtRva();
         const uint64_t mod_lo  = m_base;
         const uint64_t mod_hi  = m_base + 0x10000000ULL;
 

@@ -48,6 +48,9 @@
 #include "memreader_iface.h"
 #include "arc_decrypt.h"
 #include "sig_scan.h"
+#include "sig_scanner_v2.h"
+#include "insn_decoder.h"
+#include "func_analyzer.h"
 #include "emu_engine.h"
 #include "emu_fname.h"
 #include "find_fname_func.h"
@@ -258,6 +261,7 @@ public:
     // can hit them on demand. Null if boot failed (static path still works).
     std::unique_ptr<EmuEngine> m_emuEngine;
     std::unique_ptr<EmuFName>  m_emuFName;
+    SigScanV2::Scanner         m_sigScanner;  // Zydis-aware module cache for autodiscovery
 
     SDKDumper(int pid)
         : MODULE_BASE(FindModuleBase(pid)),
@@ -271,13 +275,71 @@ public:
         if (!m_reader.Open(m_pid)) return false;
         std::cout << "[+] Opened /dev/memreader for PID " << m_pid << "\n";
 
+        // ── Phase 0: Module bounds (PE header parse) ────────────────────
+        // Replaces hardcoded module-size constants (0xE900000, 0xE9AF000)
+        // and section-range bounds in sig_scan.h. PE headers are stable —
+        // this never fails on a healthy module. Falls back to compile-time
+        // estimate (0xE900000) on read failure.
+        AutoDiscovery::g_DiscoveredBounds =
+            AutoDiscovery::DiscoverModuleBounds(m_reader, MODULE_BASE);
+        const uint64_t ModuleSize = AutoDiscovery::g_DiscoveredBounds.Valid
+            ? AutoDiscovery::g_DiscoveredBounds.ImageSize
+            : 0xE900000ULL;
+
+        // ── Phase 0b: SigScanV2 — full module cache + Zydis-aware scanner ──
+        // Replaces the page-streaming legacy SigScan for everything that
+        // needs Zydis disassembly. The legacy SigScan stays around for the
+        // first 6 anchors (GObjectArray, GWorld, GNames, key table, SIMD
+        // tables) since those are deeply baked into init.
+        if (!m_sigScanner.Initialize(m_reader, MODULE_BASE)) {
+            std::printf("[autodisc] SigScanV2 init failed — Zydis-driven phases disabled\n");
+        } else {
+            // Re-derive bounds from the scanner's section table — more accurate
+            // than the standalone PE parse (catches multi-`.data` segments etc.).
+            AutoDiscovery::g_DiscoveredBounds =
+                AutoDiscovery::DiscoverModuleBoundsFromScanner(m_sigScanner);
+
+            // ── Phase 3: FProperty Offset_Internal XOR key ─────────────
+            // Sig-scan + Zydis-validate the offset reader fn shape. Runs
+            // here because it doesn't depend on FName / GObjects.
+            AutoDiscovery::g_DiscoveredFProperty =
+                AutoDiscovery::DiscoverFPropertyOffsetXor(m_sigScanner);
+            if (AutoDiscovery::g_DiscoveredFProperty.Valid) {
+                uint32_t Hard = ArcDecrypt::Patch20260421::g_PropertyOffsetXor;
+                uint32_t Live = AutoDiscovery::g_DiscoveredFProperty.XorKey;
+                if (Live == Hard) {
+                    std::printf("[autodisc] FProperty Offset XOR matches constant 0x%08X\n", Live);
+                } else {
+                    std::printf("[autodisc] FProperty Offset XOR drift: 0x%08X → 0x%08X (auto-fixed)\n",
+                        Hard, Live);
+                    ArcDecrypt::Patch20260421::g_PropertyOffsetXor = Live;
+                }
+            }
+
+            // ── Phase 4: UObject 4-slot decrypt SIMD constants ─────────
+            // Locate the slot decrypt fn body via PSHUFB+PXOR rip-rel pair,
+            // extract the .rdata table RVAs and the scalar XOR const.
+            AutoDiscovery::g_DiscoveredUObjSlot =
+                AutoDiscovery::DiscoverUObjSlotDecrypt(m_sigScanner, m_reader);
+            if (AutoDiscovery::g_DiscoveredUObjSlot.Valid) {
+                using namespace ArcDecrypt::Patch20260421::UObjSlot20260428;
+                uint64_t Live = AutoDiscovery::g_DiscoveredUObjSlot.XorScalar;
+                if (Live == XOR_SCALAR)
+                    std::printf("[autodisc] UObj slot XOR scalar matches constant 0x%016llX\n",
+                        (unsigned long long)Live);
+                else
+                    std::printf("[autodisc] UObj slot XOR scalar drift: 0x%016llX → 0x%016llX (auto-fixed)\n",
+                        (unsigned long long)XOR_SCALAR, (unsigned long long)Live);
+            }
+        }
+
         // ── Signature scan — patch-resilient RVA auto-discovery ─────────
         // Hardcoded RVAs in arc_decrypt.h are the primary source and remain
         // correct for the current patch. The scanner runs alongside and
         // overwrites any RVA it resolves to a different value (i.e. after
         // a future patch). Scan failures fall back to the hardcoded value.
         {
-            SigScan::Scanner<KernelReader> scan(m_reader, MODULE_BASE, 0xE900000);
+            SigScan::Scanner<KernelReader> scan(m_reader, MODULE_BASE, ModuleSize);
             static SigScan::PEFileReader s_pe;
             const std::string& pe_path = GetPEBinaryPath();
             if (!pe_path.empty() && s_pe.Open(pe_path.c_str())) {
@@ -407,6 +469,60 @@ public:
         // best on this build. Sets the FNameDecryptor primary so GetName tries
         // it first instead of walking the legacy candidate list every call.
         if (gobj_ok) CalibrateInlineHandleOffset();
+
+        // ── Phase 1: auto-discover engine type-pool vtables ─────────────
+        // With FName resolution working and the seed object list populated
+        // (canonical vtable[7] OR structural fallback), cluster all sampled
+        // UObjects by vtable[0] and identify each kind via name oracles.
+        // Replaces the 13 hardcoded vtable RVAs in main.cpp/gobjects.h —
+        // patch-resilient. After discovery, re-run vtable scan to pick up
+        // heap arena hits (UScriptStruct, UEnum, BPGCs) that the canonical
+        // walk misses.
+        if (gobj_ok && AutoDiscovery::g_DiscoveredBounds.Valid) {
+            AutoDiscovery::NameResolver Resolver = [this](uint64_t Obj) -> std::string {
+                return m_fname.GetName(Obj);
+            };
+            AutoDiscovery::g_DiscoveredVTables = AutoDiscovery::DiscoverEngineVTables(
+                m_gobj.GetSeedObjects(), Resolver, m_reader, MODULE_BASE,
+                AutoDiscovery::g_DiscoveredBounds);
+            // Re-run the heap vtable scan with the (possibly fresh) discovered
+            // map. Idempotent — duplicates against the seed list are dropped.
+            m_gobj.RunDiscoveredVtableScan();
+
+            // ── Phase 2: FField NamePrivate XOR const (live extraction) ──
+            // Pick a few UScriptStructs from the seed list (whose vtable
+            // matches the discovered ScriptStructRVA) and use them to
+            // probe the NamePrivate XOR const without any sig-scan.
+            if (AutoDiscovery::g_DiscoveredVTables.ScriptStructRVA) {
+                std::vector<uint64_t> uss_samples;
+                uint64_t want_vt = MODULE_BASE +
+                    AutoDiscovery::g_DiscoveredVTables.ScriptStructRVA;
+                for (uint64_t obj : m_gobj.GetSeedObjects()) {
+                    if (uss_samples.size() >= 32) break;
+                    uint64_t vt = 0;
+                    if (!m_reader.Read(obj, &vt, 8)) continue;
+                    if (vt == want_vt) uss_samples.push_back(obj);
+                }
+                AutoDiscovery::g_DiscoveredFFieldName =
+                    AutoDiscovery::DiscoverFFieldNameDecrypt(
+                        m_reader, MODULE_BASE, uss_samples);
+                if (AutoDiscovery::g_DiscoveredFFieldName.Valid) {
+                    uint64_t Live = AutoDiscovery::g_DiscoveredFFieldName.XorConst;
+                    uint64_t Hard = FNameDecryptor::FFIELD_NAME_XOR_CL1177146;
+                    if (Live == Hard) {
+                        std::printf("[autodisc] FField NamePrivate XOR matches constant 0x%016llX\n",
+                            (unsigned long long)Live);
+                    } else {
+                        std::printf("[autodisc] FField NamePrivate XOR drift: 0x%016llX → 0x%016llX (auto-fixed)\n",
+                            (unsigned long long)Hard, (unsigned long long)Live);
+                    }
+                }
+            }
+        }
+
+        // (FProperty Offset_Internal XOR key auto-discovery already ran
+        // inside the SigScanV2 init block above; the discovered value is in
+        // ArcDecrypt::Patch20260421::g_PropertyOffsetXor.)
         return true;
     }
 
@@ -426,11 +542,18 @@ public:
             return false;
         }
 
-        // Locate the chunk_table-decrypt function's mov+add pair.
-        // 14 bytes: B8 48 63 7A 64                  ; mov eax, 0x647A6348
-        //           65 48 03 04 25 60 00 00 00      ; add rax, gs:[0x60]
-        // The {imm32, gs-disp32 segment-relative add} combination is
-        // unique in the binary; 14 bytes is overkill but cheap.
+        // Locate any chunk_table-decrypt function — there are 90-108 vt[N]
+        // dispatch variants per binary, all sharing the same prologue idiom:
+        //   F3 0F 7E 02              movq xmm0, [rdx]              ; load 8B blob
+        //   B8 ?? ?? ?? ??           mov  eax, imm32               ; per-binary PEB add const
+        //   65 48 03 04 25 60 00 00 00  add  rax, gs:[0x60]        ; PEB load
+        //
+        // Cross-patch verified 2026-05-01: the original sig with hardcoded
+        // imm32 (`B8 48 63 7A 64 ...`) only fires on the ONE binary it was
+        // extracted from; the imm32 rotates per build. The structural anchor
+        // below (movq xmm0,[rdx] + 14-byte PEB-load pair) hits 90-108×
+        // across all 6 tested binaries — any single hit is a valid uprobe
+        // target since every variant returns the same key.
         SigScan::Scanner<KernelReader> scan(m_reader, MODULE_BASE, 0xE900000);
         static SigScan::PEFileReader s_pe;
         const std::string& pe_path = GetPEBinaryPath();
@@ -438,16 +561,17 @@ public:
             scan.SetPEFallback(&s_pe);
         }
         auto pat = SigScan::Pattern::Parse(
-            "B8 48 63 7A 64 65 48 03 04 25 60 00 00 00");
-        uint64_t mov_va = scan.Find(pat);
-        if (!mov_va) {
+            "F3 0F 7E 02 B8 ?? ?? ?? ?? 65 48 03 04 25 60 00 00 00");
+        uint64_t hit_va = scan.Find(pat);
+        if (!hit_va) {
             std::printf("[uprobe-key] sig-scan for chunk_table-decrypt prologue failed\n");
             return false;
         }
-        // Probe address = right after `add rax, gs:[0x60]` finishes
-        // (mov_va + 5 bytes mov + 9 bytes add = mov_va + 14). At this
-        // PC, rax holds peb + 0x647A6348.
-        uint64_t probe_va = mov_va + 14;
+        // The MOV starts 4 bytes into the match (after movq xmm0,[rdx]).
+        // Probe address = right after `add rax, gs:[0x60]` finishes:
+        //   hit + 4 (movq) + 5 (mov eax,imm32) + 9 (add rax,gs:[0x60]) = hit + 18.
+        uint64_t mov_va   = hit_va + 4;
+        uint64_t probe_va = hit_va + 18;
         std::printf("[uprobe-key] mov+add prologue @ 0x%llX  probe @ 0x%llX\n",
             (unsigned long long)mov_va, (unsigned long long)probe_va);
 
@@ -677,10 +801,44 @@ public:
                         (unsigned long long)ArcDecrypt::Patch20260421::ENTRY_HANDLE_XOR);
         }
 
+        // ── Phase 5: FNamePool resolver constants (Zydis instruction walk)
+        // Decode the FName function body and dump every imm64 / pshuflw imm /
+        // rol imm / .rdata-LEA target. The dumper currently uses these as
+        // forensic info only (to spot drift); future work can structurally
+        // bind them to FNamePool20260428 constants.
+        if (AutoDiscovery::g_DiscoveredBounds.Valid) {
+            AutoDiscovery::g_DiscoveredFName =
+                AutoDiscovery::DiscoverFNameResolverConsts(m_sigScanner, fname_rva);
+
+            // ── Phase 6: GNamePool RVA via FName-fn call-chain walk ──
+            // Replaces the dead Apr-14-only `add rdi, 0xC0` AOB. Recursively
+            // follows the first load-bearing call from the FName outer fn
+            // through Stage2_XOR → Core_BlockFNV (depth 2 on CL-1177146)
+            // and picks the most-referenced .data LEA target — that's
+            // GNamePool. Patch-resilient: works regardless of which
+            // pipeline-shape generation the FName resolver uses.
+            AutoDiscovery::g_DiscoveredGNames =
+                AutoDiscovery::DiscoverGNamesViaFNameWalk(m_sigScanner, fname_rva);
+            if (AutoDiscovery::g_DiscoveredGNames.Valid) {
+                uint64_t Hard = ArcDecrypt::RVA_GNAMES_BASE;
+                uint64_t Live = AutoDiscovery::g_DiscoveredGNames.GNamesRva;
+                if (Live == Hard) {
+                    std::printf("[autodisc] GNamePool RVA matches constant 0x%llX\n",
+                        (unsigned long long)Live);
+                } else {
+                    std::printf("[autodisc] GNamePool RVA drift: 0x%llX → 0x%llX (auto-fixed via FName-walk)\n",
+                        (unsigned long long)Hard, (unsigned long long)Live);
+                    ArcDecrypt::RVA_GNAMES_BASE = Live;
+                }
+            }
+        }
+
         // 2. Boot Unicorn with PE-on-disk fallback for VMProtect-cold pages.
         const std::string& pe_path = GetPEBinaryPath();
         m_emuEngine = std::make_unique<EmuEngine>();
-        if (!m_emuEngine->Initialize(&m_reader, MODULE_BASE, 0xE9AF000,
+        const uint64_t EmuMapSize = AutoDiscovery::g_DiscoveredBounds.Valid
+            ? AutoDiscovery::g_DiscoveredBounds.ImageSize : 0xE9AF000ULL;
+        if (!m_emuEngine->Initialize(&m_reader, MODULE_BASE, EmuMapSize,
                                      pe_path.empty() ? nullptr : pe_path.c_str())) {
             std::printf("[emu-auto] EmuEngine init failed — fallback disabled\n");
             m_emuEngine.reset();
@@ -742,7 +900,9 @@ public:
 
         EmuEngine eng;
         const std::string& pe_path = GetPEBinaryPath();
-        if (!eng.Initialize(&m_reader, MODULE_BASE, 0xE9AF000,
+        const uint64_t EmuMapSize = AutoDiscovery::g_DiscoveredBounds.Valid
+            ? AutoDiscovery::g_DiscoveredBounds.ImageSize : 0xE9AF000ULL;
+        if (!eng.Initialize(&m_reader, MODULE_BASE, EmuMapSize,
                             pe_path.empty() ? nullptr : pe_path.c_str())) return false;
         eng.PreMapRange(chunks_mgr & ~0xFFFULL, 0x4000);
         eng.PreMapRange(vt7 & ~0xFFFULL, 0x4000);

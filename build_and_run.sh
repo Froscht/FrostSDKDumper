@@ -85,10 +85,19 @@ ensure_kmod() {
 # ---------------------------------------------------------------------------
 build_dumper() {
     info "Building FrostDumper ..."
+    # Build Zydis (amalgamated C source) — used by auto_discovery.h /
+    # insn_decoder.h for instruction-stream parsing. Cached in build/.
+    if [[ ! -f "$SCRIPT_DIR/build/Zydis.o" ]] || \
+       [[ "$SCRIPT_DIR/zydis/Zydis.c" -nt "$SCRIPT_DIR/build/Zydis.o" ]]; then
+        info "Compiling Zydis ..."
+        mkdir -p "$SCRIPT_DIR/build"
+        gcc -O2 -c "$SCRIPT_DIR/zydis/Zydis.c" -I"$SCRIPT_DIR/zydis" \
+            -o "$SCRIPT_DIR/build/Zydis.o" || error "Zydis build failed"
+    fi
     g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 \
-        -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+        -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/zydis" -I"$SCRIPT_DIR/../KernelDriver/include" \
         -o "$BINARY" \
-        "$SCRIPT_DIR/main.cpp" \
+        "$SCRIPT_DIR/main.cpp" "$SCRIPT_DIR/build/Zydis.o" \
         -lcapstone -lunicorn -lm
     info "Binary built: $BINARY"
 

@@ -38,6 +38,7 @@
 #include <immintrin.h>
 #include "memreader_iface.h"
 #include "arc_decrypt.h"
+#include "auto_discovery.h"
 
 namespace gobjects
 {
@@ -226,6 +227,84 @@ namespace gobjects
             m_initialized = true;
             std::printf("[+] GObjectArray (world fallback): %d objects\n", m_numElements);
             return true;
+        }
+
+        // Read-only access to the seed object list. Used by AutoDiscovery to
+        // cluster vtables before the vtable scan runs.
+        const std::vector<uint64_t>& GetSeedObjects() const {
+            return m_worldFallbackObjects;
+        }
+
+        // Run the engine-vtable scan against the current seed list, expanding
+        // it with hits from heap arenas not tracked by the FUObjectItem array
+        // (UScriptStruct + UEnum + extra BPGCs etc.). Uses the auto-discovered
+        // vtable map when valid, otherwise the compile-time fallback list.
+        // Safe to call from either canonical (vtable[7]) or structural paths
+        // — dedups against the existing seed set internally.
+        size_t RunDiscoveredVtableScan() {
+            if (!m_useWorldFallback || m_worldFallbackObjects.empty()) return 0;
+
+            const auto& Disc = AutoDiscovery::g_DiscoveredVTables;
+            const bool UseDiscovered = Disc.Valid();
+
+            std::vector<VtableScanTarget> vt_targets;
+            m_knownTypeVtables.clear();
+
+            auto AddIf = [&](uint64_t Rva) {
+                if (Rva) m_knownTypeVtables.insert(m_base + Rva);
+            };
+            auto AddTargetIf = [&](uint64_t Va, uint32_t Stride) {
+                if (Va && Stride) vt_targets.push_back({Va, Stride});
+            };
+
+            if (UseDiscovered) {
+                std::printf("[vt-rescan] using auto-discovered vtable map\n");
+                AddIf(Disc.ScriptStructRVA); AddIf(Disc.ClassNativeRVA);
+                AddIf(Disc.FunctionRVA);     AddIf(Disc.EnumRVA);
+                AddIf(Disc.PackageRVA);      AddIf(Disc.BPGCRVA);
+                AddIf(Disc.WBPGCRVA);        AddIf(Disc.SMBPGCRVA);
+                AddIf(Disc.AnimBPGCRVA);     AddIf(Disc.ASClassRVA);
+                AddIf(Disc.ASStructRVA);
+                for (uint64_t Rva : Disc.ASFunctionRVAs) AddIf(Rva);
+
+                AddTargetIf(Disc.ScriptStructRVA ? m_base + Disc.ScriptStructRVA : 0, Disc.ScriptStructStride);
+                AddTargetIf(Disc.ClassNativeRVA  ? m_base + Disc.ClassNativeRVA  : 0, Disc.ClassNativeStride);
+                AddTargetIf(Disc.FunctionRVA     ? m_base + Disc.FunctionRVA     : 0, Disc.FunctionStride);
+                AddTargetIf(Disc.EnumRVA         ? m_base + Disc.EnumRVA         : 0, Disc.EnumStride);
+                AddTargetIf(Disc.BPGCRVA         ? m_base + Disc.BPGCRVA         : 0, Disc.BPGCStride);
+                AddTargetIf(Disc.WBPGCRVA        ? m_base + Disc.WBPGCRVA        : 0, Disc.WBPGCStride);
+                AddTargetIf(Disc.AnimBPGCRVA     ? m_base + Disc.AnimBPGCRVA     : 0, Disc.AnimBPGCStride);
+                AddTargetIf(Disc.SMBPGCRVA       ? m_base + Disc.SMBPGCRVA       : 0, Disc.SMBPGCStride);
+                AddTargetIf(Disc.ASClassRVA      ? m_base + Disc.ASClassRVA      : 0, Disc.ASClassStride);
+                AddTargetIf(Disc.ASStructRVA     ? m_base + Disc.ASStructRVA     : 0, Disc.ASStructStride);
+                for (uint64_t Rva : Disc.ASFunctionRVAs)
+                    AddTargetIf(m_base + Rva, Disc.ASFunctionStride);
+            } else {
+                std::printf("[vt-rescan] auto-discovery unavailable; using compile-time fallback\n");
+                m_knownTypeVtables = {
+                    m_base + 0xAD9DC20, m_base + 0xAD9E500, m_base + 0xAD9EA70,
+                    m_base + 0xADA1140, m_base + 0xADBC9A0, m_base + 0xB5653C0,
+                    m_base + 0xB35B400, m_base + 0xB512510, m_base + 0xB7BBCF0,
+                    m_base + 0xB8ED140, m_base + 0xB8F6920, m_base + 0xB8EDA70,
+                    m_base + 0xB8EDEC0,
+                };
+                vt_targets = {
+                    { m_base + 0xAD9DC20, 0x130 }, { m_base + 0xAD9E500, 0x300 },
+                    { m_base + 0xAD9EA70, 0x200 }, { m_base + 0xADA1140, 0x130 },
+                    { m_base + 0xB5653C0, 0x490 }, { m_base + 0xB35B400, 0x5D0 },
+                    { m_base + 0xB512510, 0x7F0 }, { m_base + 0xB7BBCF0, 0x490 },
+                    { m_base + 0xB8ED140, 0x340 }, { m_base + 0xB8F6920, 0x150 },
+                    { m_base + 0xB8EDA70, 0x200 }, { m_base + 0xB8EDEC0, 0x200 },
+                };
+            }
+
+            size_t pre = m_worldFallbackObjects.size();
+            ScanByVtables(vt_targets, m_worldFallbackObjects);
+            size_t added = m_worldFallbackObjects.size() - pre;
+            m_numElements = static_cast<int32_t>(m_worldFallbackObjects.size());
+            std::printf("[vt-rescan] vtable scan added %zu UObjects (new total %zu)\n",
+                added, m_worldFallbackObjects.size());
+            return added;
         }
 
         // ── Canonical chunks-array enumeration (patch 20260421 vtable[7] path) ─
@@ -1180,37 +1259,88 @@ namespace gobjects
             //   ASStruct LevelSequenceListEntry etc      → 0xB8F6920 ASStruct
             //   AS-bound Tick (MainMenuCarouselWidget)   → 0xB8EDA70 ASFunction-A
             //   AS-bound Destruct                        → 0xB8EDEC0 ASFunction-B
-            m_knownTypeVtables = {
-                m_base + 0xAD9DC20,  // UScriptStruct
-                m_base + 0xAD9E500,  // UClass (native)
-                m_base + 0xAD9EA70,  // UFunction
-                m_base + 0xADA1140,  // UEnum
-                m_base + 0xADBC9A0,  // UPackage
-                m_base + 0xB5653C0,  // UBlueprintGeneratedClass
-                m_base + 0xB35B400,  // UWidgetBlueprintGeneratedClass
-                m_base + 0xB512510,  // UAnimBlueprintGeneratedClass
-                m_base + 0xB7BBCF0,  // USkeletalMeshBlueprintGeneratedClass
-                m_base + 0xB8ED140,  // UASClass (AngelScript)
-                m_base + 0xB8F6920,  // UASStruct (AngelScript)
-                m_base + 0xB8EDA70,  // ASFunction subclass A (Tick-shape)
-                m_base + 0xB8EDEC0,  // ASFunction subclass B (Destruct-shape)
+            //
+            // CL-1177146+ — these RVAs are auto-discovered at runtime via
+            // AutoDiscovery::DiscoverEngineVTables (called from main.cpp before
+            // this method). When the discovered map is valid, it overrides the
+            // hardcoded list below — patch-resilient. The hardcoded values are
+            // only the fallback for first-run-on-stale-patch.
+            const auto& Disc = AutoDiscovery::g_DiscoveredVTables;
+            const bool UseDiscovered = Disc.Valid();
+
+            auto AddIf = [&](std::unordered_set<uint64_t>& Set, uint64_t Rva) {
+                if (Rva) Set.insert(m_base + Rva);
+            };
+            auto AddTargetIf = [](std::vector<VtableScanTarget>& Targets,
+                                  uint64_t Va, uint32_t Stride) {
+                if (Va && Stride) Targets.push_back({Va, Stride});
             };
 
+            std::vector<VtableScanTarget> vt_targets;
+            m_knownTypeVtables.clear();
+
+            if (UseDiscovered) {
+                std::printf("[p28] using auto-discovered vtable map\n");
+                AddIf(m_knownTypeVtables, Disc.ScriptStructRVA);
+                AddIf(m_knownTypeVtables, Disc.ClassNativeRVA);
+                AddIf(m_knownTypeVtables, Disc.FunctionRVA);
+                AddIf(m_knownTypeVtables, Disc.EnumRVA);
+                AddIf(m_knownTypeVtables, Disc.PackageRVA);
+                AddIf(m_knownTypeVtables, Disc.BPGCRVA);
+                AddIf(m_knownTypeVtables, Disc.WBPGCRVA);
+                AddIf(m_knownTypeVtables, Disc.SMBPGCRVA);
+                AddIf(m_knownTypeVtables, Disc.AnimBPGCRVA);
+                AddIf(m_knownTypeVtables, Disc.ASClassRVA);
+                AddIf(m_knownTypeVtables, Disc.ASStructRVA);
+                for (uint64_t Rva : Disc.ASFunctionRVAs)
+                    AddIf(m_knownTypeVtables, Rva);
+
+                AddTargetIf(vt_targets, Disc.ScriptStructRVA ? m_base + Disc.ScriptStructRVA : 0, Disc.ScriptStructStride);
+                AddTargetIf(vt_targets, Disc.ClassNativeRVA  ? m_base + Disc.ClassNativeRVA  : 0, Disc.ClassNativeStride);
+                AddTargetIf(vt_targets, Disc.FunctionRVA     ? m_base + Disc.FunctionRVA     : 0, Disc.FunctionStride);
+                AddTargetIf(vt_targets, Disc.EnumRVA         ? m_base + Disc.EnumRVA         : 0, Disc.EnumStride);
+                AddTargetIf(vt_targets, Disc.BPGCRVA         ? m_base + Disc.BPGCRVA         : 0, Disc.BPGCStride);
+                AddTargetIf(vt_targets, Disc.WBPGCRVA        ? m_base + Disc.WBPGCRVA        : 0, Disc.WBPGCStride);
+                AddTargetIf(vt_targets, Disc.AnimBPGCRVA     ? m_base + Disc.AnimBPGCRVA     : 0, Disc.AnimBPGCStride);
+                AddTargetIf(vt_targets, Disc.SMBPGCRVA       ? m_base + Disc.SMBPGCRVA       : 0, Disc.SMBPGCStride);
+                AddTargetIf(vt_targets, Disc.ASClassRVA      ? m_base + Disc.ASClassRVA      : 0, Disc.ASClassStride);
+                AddTargetIf(vt_targets, Disc.ASStructRVA     ? m_base + Disc.ASStructRVA     : 0, Disc.ASStructStride);
+                for (uint64_t Rva : Disc.ASFunctionRVAs)
+                    AddTargetIf(vt_targets, m_base + Rva, Disc.ASFunctionStride);
+            } else {
+                std::printf("[p28] auto-discovery unavailable; using compile-time vtable list\n");
+                m_knownTypeVtables = {
+                    m_base + 0xAD9DC20,  // UScriptStruct
+                    m_base + 0xAD9E500,  // UClass (native)
+                    m_base + 0xAD9EA70,  // UFunction
+                    m_base + 0xADA1140,  // UEnum
+                    m_base + 0xADBC9A0,  // UPackage
+                    m_base + 0xB5653C0,  // UBlueprintGeneratedClass
+                    m_base + 0xB35B400,  // UWidgetBlueprintGeneratedClass
+                    m_base + 0xB512510,  // UAnimBlueprintGeneratedClass
+                    m_base + 0xB7BBCF0,  // USkeletalMeshBlueprintGeneratedClass
+                    m_base + 0xB8ED140,  // UASClass (AngelScript)
+                    m_base + 0xB8F6920,  // UASStruct (AngelScript)
+                    m_base + 0xB8EDA70,  // ASFunction subclass A (Tick-shape)
+                    m_base + 0xB8EDEC0,  // ASFunction subclass B (Destruct-shape)
+                };
+                vt_targets = {
+                    { m_base + 0xAD9DC20, 0x130 },
+                    { m_base + 0xAD9E500, 0x300 },
+                    { m_base + 0xAD9EA70, 0x200 },
+                    { m_base + 0xADA1140, 0x130 },
+                    { m_base + 0xB5653C0, 0x490 },
+                    { m_base + 0xB35B400, 0x5D0 },
+                    { m_base + 0xB512510, 0x7F0 },
+                    { m_base + 0xB7BBCF0, 0x490 },
+                    { m_base + 0xB8ED140, 0x340 },
+                    { m_base + 0xB8F6920, 0x150 },
+                    { m_base + 0xB8EDA70, 0x200 },
+                    { m_base + 0xB8EDEC0, 0x200 },
+                };
+            }
+
             size_t pre = objects.size();
-            std::vector<VtableScanTarget> vt_targets = {
-                { m_base + 0xAD9DC20, 0x130 },  // UScriptStruct
-                { m_base + 0xAD9E500, 0x300 },  // UClass (native)
-                { m_base + 0xAD9EA70, 0x200 },  // UFunction
-                { m_base + 0xADA1140, 0x130 },  // UEnum
-                { m_base + 0xB5653C0, 0x490 },  // BPGC
-                { m_base + 0xB35B400, 0x5D0 },  // WBPGC
-                { m_base + 0xB512510, 0x7F0 },  // AnimBPGC
-                { m_base + 0xB7BBCF0, 0x490 },  // SMBPGC
-                { m_base + 0xB8ED140, 0x340 },  // ASClass
-                { m_base + 0xB8F6920, 0x150 },  // ASStruct
-                { m_base + 0xB8EDA70, 0x200 },  // ASFunction-A
-                { m_base + 0xB8EDEC0, 0x200 },  // ASFunction-B
-            };
             ScanByVtables(vt_targets, objects);
             std::printf("[p28] vtable scan added %zu UObject pointers (total %zu)\n",
                 objects.size() - pre, objects.size());

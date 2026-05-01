@@ -529,6 +529,11 @@ namespace Patch20260421 {
     //   real   = bswap32(stored) ^ 0x59B8C401  (equivalent: bswap32(stored ^ 0x01C4B859))
     // stored=0x01C4B859 (sentinel) decrypts to 0.
     // =========================================================================
+    // Runtime-overridable XOR key for FProperty::Offset_Internal decrypt.
+    // Set by AutoDiscovery::DiscoverFPropertyOffsetXor at init time. Falls
+    // back to the CL-1177146 verified value when discovery hasn't run.
+    inline uint32_t g_PropertyOffsetXor = 0x40277448u;
+
     inline uint32_t DecryptPropertyOffsetNew(uint32_t stored) {
         // CL-1177146: matches IDA decompile of FProperty_OffsetReader
         // (sub_353900): `bswap32(*(DWORD*)(i+0xC4) ^ 0x40277448)`.
@@ -536,7 +541,7 @@ namespace Patch20260421 {
         // Older form `bswap32(stored) ^ 0x40277448` was wrong: that XOR-then-bswap
         // is only equivalent to bswap-then-XOR when the key is its own bswap, which
         // 0x40277448 (= bswap 0x48742740) is NOT.
-        return __builtin_bswap32(stored ^ 0x40277448u);
+        return __builtin_bswap32(stored ^ g_PropertyOffsetXor);
     }
 
     // =========================================================================
