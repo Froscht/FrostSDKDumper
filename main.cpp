@@ -262,6 +262,8 @@ public:
     std::unique_ptr<EmuEngine> m_emuEngine;
     std::unique_ptr<EmuFName>  m_emuFName;
     SigScanV2::Scanner         m_sigScanner;  // Zydis-aware module cache for autodiscovery
+    SigScan::PEFileReader      m_sigPe;       // shared PE fallback for legacy SigScan (open once)
+    bool                       m_sigPeReady = false;
 
     SDKDumper(int pid)
         : MODULE_BASE(FindModuleBase(pid)),
@@ -331,6 +333,26 @@ public:
                     std::printf("[autodisc] UObj slot XOR scalar drift: 0x%016llX → 0x%016llX (auto-fixed)\n",
                         (unsigned long long)XOR_SCALAR, (unsigned long long)Live);
             }
+
+            // ── Phase 7: FFieldClass NamePrivate decode pipeline ───────
+            // Sig-scan for the inlined FFieldClass NamePrivate decode body
+            // (PSRLD 0x1D + PSLLD 3 + POR + PSHUFLW 0x72 + PXOR rip-rel)
+            // and Zydis-walk-back to extract NamePrivate offset, FFieldClass
+            // pointer offset, and live XOR const RVA. Resolves the type-name
+            // gap (~80K properties on CL-1177146 fall back to generic Prop_<n>
+            // names without this — the dumper has only 53 FFieldClass→type
+            // mappings via vtable scan).
+            AutoDiscovery::g_DiscoveredFFieldClassName =
+                AutoDiscovery::DiscoverFFieldClassNameDecrypt(
+                    m_sigScanner, m_reader, MODULE_BASE);
+            if (AutoDiscovery::g_DiscoveredFFieldClassName.Valid) {
+                std::printf("[autodisc] FFieldClass NamePrivate auto-discovered: "
+                            "name_off=+0x%X fclass_off=+0x%X xor_lo64=0x%016llX (%d sites)\n",
+                    AutoDiscovery::g_DiscoveredFFieldClassName.NamePrivateOffset,
+                    AutoDiscovery::g_DiscoveredFFieldClassName.FFieldClassOffset,
+                    (unsigned long long)AutoDiscovery::g_DiscoveredFFieldClassName.XorLo64,
+                    AutoDiscovery::g_DiscoveredFFieldClassName.ConsensusSiteCount);
+            }
         }
 
         // ── Signature scan — patch-resilient RVA auto-discovery ─────────
@@ -340,10 +362,15 @@ public:
         // a future patch). Scan failures fall back to the hardcoded value.
         {
             SigScan::Scanner<KernelReader> scan(m_reader, MODULE_BASE, ModuleSize);
-            static SigScan::PEFileReader s_pe;
+            // Open the shared PE-on-disk fallback exactly once (m_sigPe lives
+            // for the SDKDumper lifetime). Reused later by CaptureSimdPebKey
+            // — avoids opening + parsing the 240MB binary three times.
             const std::string& pe_path = GetPEBinaryPath();
-            if (!pe_path.empty() && s_pe.Open(pe_path.c_str())) {
-                scan.SetPEFallback(&s_pe);
+            if (!m_sigPeReady && !pe_path.empty() && m_sigPe.Open(pe_path.c_str())) {
+                m_sigPeReady = true;
+            }
+            if (m_sigPeReady) {
+                scan.SetPEFallback(&m_sigPe);
                 std::printf("[sig] PE fallback enabled: %s\n", pe_path.c_str());
             }
 
@@ -398,7 +425,11 @@ public:
                 }
             };
             applyTrusted("GObjectArray", ArcDecrypt::RVA_GOBJECT_ARRAY_BASE, scan.FindGObjectArrayRVA());
-            applyTrusted("GWorld",       ArcDecrypt::RVA_GWORLD,             scan.FindGWorldRVA());
+            // GWorld auto-discovery moved to Phase 0.5 — the legacy sigscan
+            // here picks a sibling global within tolerance and silently
+            // overwrites the working RVA. Phase 0.5 sigscans for the canonical
+            // double-deref shape and live-validates each candidate via UWorld
+            // → PersistentLevel → Actors, so it can never substitute garbage.
             applyTrusted("GNames",       ArcDecrypt::RVA_GNAMES_BASE,        scan.FindGNamesRVA());
             applyStrict ("FNameKeyTbl",  ArcDecrypt::RVA_FNAME_KEY_TABLE,
                   scan.FindFNameKeyTableRVA(ArcDecrypt::RVA_FNAME_KEY_TABLE,
@@ -409,6 +440,46 @@ public:
             apply("ElemMaskB",    ArcDecrypt::RVA_ELEM_MASK_B,       st.elem_mask_b);
             apply("ElemXorKey",   ArcDecrypt::RVA_ELEM_XOR_KEY,      st.elem_xor_key);
             apply("CIdxXor1",     ArcDecrypt::RVA_CIDX_XOR1,         scan.FindCIdxXor1RVA());
+        }
+
+        // ── Phase 0.5: full GWorld discovery (sigscan → live-validate) ──
+        // Replaces the legacy `applyTrusted("GWorld", ...)` auto-fix which
+        // overwrote the working 0xDFDB4D8 with a wrong 0xE07CFD8 because the
+        // sigscan picked a sibling global within tolerance. Now we:
+        //   1. Sig-scan for the canonical UE5 double-deref load
+        //      (`mov rax, [rip+gworld]; mov rax, [rax]`)
+        //   2. Validate EACH candidate by walking UWorld → PL → Actors and
+        //      cross-checking Levels[0] == PL
+        //   3. Pick the candidate with the most actors
+        //   4. If none validate (game in menu), Valid stays false and we
+        //      keep the compile-time RVA_GWORLD untouched.
+        if (m_sigPeReady) {
+            AutoDiscovery::g_DiscoveredWorld = AutoDiscovery::DiscoverGWorld(
+                m_sigScanner, m_reader, MODULE_BASE,
+                AutoDiscovery::g_DiscoveredBounds);
+        }
+        if (AutoDiscovery::g_DiscoveredWorld.Valid) {
+            uint64_t Hard = ArcDecrypt::RVA_GWORLD;
+            uint64_t Live = AutoDiscovery::g_DiscoveredWorld.GWorldRva;
+            if (Live == Hard) {
+                std::printf("[autodisc] GWorld RVA matches constant 0x%llX\n",
+                    (unsigned long long)Live);
+            } else {
+                std::printf("[autodisc] GWorld RVA drift: 0x%llX → 0x%llX (live-validated, auto-fixed)\n",
+                    (unsigned long long)Hard, (unsigned long long)Live);
+                ArcDecrypt::RVA_GWORLD = Live;
+            }
+            uint32_t HardPL = (uint32_t)ArcDecrypt::Offsets::UWorld::PersistentLevel;
+            uint32_t LivePL = AutoDiscovery::g_DiscoveredWorld.PersistentLevelOffset;
+            if (LivePL == HardPL)
+                std::printf("[autodisc] UWorld::PersistentLevel matches constant 0x%X\n", LivePL);
+            else
+                std::printf("[autodisc] UWorld::PersistentLevel drift: 0x%X → 0x%X (probe-found)\n",
+                    HardPL, LivePL);
+        } else {
+            std::printf("[autodisc] GWorld phase did not validate (expected if game is in main menu); "
+                        "keeping compile-time RVA 0x%llX\n",
+                (unsigned long long)ArcDecrypt::RVA_GWORLD);
         }
 
         // Init FName key table + SIMD tables
@@ -469,6 +540,28 @@ public:
         // best on this build. Sets the FNameDecryptor primary so GetName tries
         // it first instead of walking the legacy candidate list every call.
         if (gobj_ok) CalibrateInlineHandleOffset();
+
+        // ── Phase 0.6: FName sanity check on the actor sample ───────────
+        // Runs after FName boot + GObjects + handle calibration. If the
+        // actor sample resolves to plausible names, FName is healthy and
+        // we can trust it for Phase 1. If it fails, the SDK dump that
+        // follows would be near-empty / garbage anyway, so log loudly
+        // (we still continue — a static-only fallback may produce some
+        // partial output).
+        if (AutoDiscovery::g_DiscoveredWorld.Valid) {
+            AutoDiscovery::NameResolver SanityResolver = [this](uint64_t Obj) -> std::string {
+                return m_fname.GetName(Obj);
+            };
+            AutoDiscovery::g_DiscoveredFNameSanity =
+                AutoDiscovery::ValidateFNameOnActors(
+                    AutoDiscovery::g_DiscoveredWorld.Actors, SanityResolver);
+            if (!AutoDiscovery::g_DiscoveredFNameSanity.Valid) {
+                std::printf("[!] FName sanity check FAILED on actor sample — "
+                            "downstream Phase 1 / SDK dump quality will be poor. "
+                            "Investigate FName pipeline (key table, SIMD const, "
+                            "entry handle XOR, slot decrypt).\n");
+            }
+        }
 
         // ── Phase 1: auto-discover engine type-pool vtables ─────────────
         // With FName resolution working and the seed object list populated
@@ -555,10 +648,10 @@ public:
         // across all 6 tested binaries — any single hit is a valid uprobe
         // target since every variant returns the same key.
         SigScan::Scanner<KernelReader> scan(m_reader, MODULE_BASE, 0xE900000);
-        static SigScan::PEFileReader s_pe;
-        const std::string& pe_path = GetPEBinaryPath();
-        if (!pe_path.empty() && s_pe.Open(pe_path.c_str())) {
-            scan.SetPEFallback(&s_pe);
+        // Reuse the dumper-wide PE-on-disk fallback (already opened by the
+        // earlier signature-scan block in Init()).
+        if (m_sigPeReady) {
+            scan.SetPEFallback(&m_sigPe);
         }
         auto pat = SigScan::Pattern::Parse(
             "F3 0F 7E 02 B8 ?? ?? ?? ?? 65 48 03 04 25 60 00 00 00");
@@ -817,8 +910,22 @@ public:
             // and picks the most-referenced .data LEA target — that's
             // GNamePool. Patch-resilient: works regardless of which
             // pipeline-shape generation the FName resolver uses.
+            // Build the exclude-zone list before calling Phase 6.
+            // The keystream / FName key table sits at RVA_FNAME_KEY_TABLE - 0xF8.
+            // It's referenced 13× from the entry decoder loop on CL-1177146,
+            // would out-vote the real FNamePool (4 refs) without exclusion.
+            std::vector<AutoDiscovery::GNamesExcludeZone> ExcludeZones;
+            {
+                AutoDiscovery::GNamesExcludeZone z;
+                z.CenterRva = ArcDecrypt::RVA_FNAME_KEY_TABLE > 0xF8u
+                    ? (ArcDecrypt::RVA_FNAME_KEY_TABLE - 0xF8u)
+                    : ArcDecrypt::RVA_FNAME_KEY_TABLE;
+                z.Radius = 0x200;
+                ExcludeZones.push_back(z);
+            }
             AutoDiscovery::g_DiscoveredGNames =
-                AutoDiscovery::DiscoverGNamesViaFNameWalk(m_sigScanner, fname_rva);
+                AutoDiscovery::DiscoverGNamesViaFNameWalk(
+                    m_sigScanner, fname_rva, ExcludeZones);
             if (AutoDiscovery::g_DiscoveredGNames.Valid) {
                 uint64_t Hard = ArcDecrypt::RVA_GNAMES_BASE;
                 uint64_t Live = AutoDiscovery::g_DiscoveredGNames.GNamesRva;

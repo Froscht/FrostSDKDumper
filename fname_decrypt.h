@@ -555,11 +555,60 @@ private:
 public:
 
     // ── FFieldClass → type name comp_index ───────────────────────────────
-    // FFieldClass does not store a plain FName at a discoverable offset in the known
-    // 128-byte layout.  Type identification is done via vtable-to-type map in the
-    // SDK generator (AutoDiscoverVTables).  This function is kept as a no-op fallback.
-    int32_t DecryptFFieldClassNameCI(uint64_t /*fclass_addr*/) {
-        return 0;
+    // Verified against 20260421 IDA in FProperty_GetNameCPP @ 0x3AFE70:
+    //   pshuflw xmm0, [fclass+NamePrivateOff], 0x4B
+    //   ROL32(xmm0, 3) per uint32 lane     (PSLLD 3 | PSRLD 0x1D)
+    //   pshuflw xmm0, xmm0, 0x72
+    //   pxor    xmm0, [rip+xmmword_XOR_CONST]
+    //   movq    rax, xmm0                  (lo64)
+    //   rol     rax, 0x20                  (ROL64(32))
+    //   → result lo32 = CompIndex of type name (e.g. "BoolProperty")
+    //
+    // All parameters auto-discovered at runtime via Phase 7
+    // (AutoDiscovery::DiscoverFFieldClassNameDecrypt). Returns 0 if Phase 7
+    // didn't run / didn't validate — caller falls back to the legacy
+    // vtable-to-type map.
+    int32_t DecryptFFieldClassNameCI(uint64_t fclass_addr) {
+        const auto& Disc = AutoDiscovery::g_DiscoveredFFieldClassName;
+        if (!Disc.Valid) return 0;
+        if (!fclass_addr) return 0;
+
+        alignas(16) uint8_t enc[16] = {};
+        if (!m_reader.Read(fclass_addr + Disc.NamePrivateOffset, enc, 16)) return 0;
+        // Skip all-zero (uninitialized) — produces a garbage CI.
+        bool nonzero = false;
+        for (int i = 0; i < 16; ++i) if (enc[i]) { nonzero = true; break; }
+        if (!nonzero) return 0;
+
+        // Step 1: PSHUFLW imm1 (0x4B by default).
+        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
+        __m128i s1;
+        switch (Disc.PshuflwImm1) {
+            case 0x4B: s1 = _mm_shufflelo_epi16(v, 0x4B); break;
+            default:   s1 = _mm_shufflelo_epi16(v, 0x4B); break;
+        }
+        // Step 2: ROL32(N) per uint32 lane.
+        const int rol32 = Disc.Rol32Amount ? Disc.Rol32Amount : 3;
+        __m128i rot = _mm_or_si128(
+            _mm_slli_epi32(s1, rol32),
+            _mm_srli_epi32(s1, 32 - rol32));
+        // Step 3: PSHUFLW imm2 (0x72 by default).
+        __m128i s2;
+        switch (Disc.PshuflwImm2) {
+            case 0x72: s2 = _mm_shufflelo_epi16(rot, 0x72); break;
+            default:   s2 = _mm_shufflelo_epi16(rot, 0x72); break;
+        }
+        // Step 4: scalar XOR with discovered lo64 const.
+        uint64_t lo;
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo), s2);
+        uint64_t xored = lo ^ Disc.XorLo64;
+        // Step 5: ROL64(32 by default).
+        const int rol64 = Disc.Rol64Amount ? Disc.Rol64Amount : 32;
+        uint64_t rolled = (xored << rol64) | (xored >> (64 - rol64));
+
+        uint32_t ci = static_cast<uint32_t>(rolled);
+        if (ci < 2 || ci > 0x2000000u) return 0;
+        return static_cast<int32_t>(ci);
     }
 
     // ── Step 4-7: comp_index → FNameEntry heap address (patch 20260421) ──

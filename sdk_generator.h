@@ -118,6 +118,14 @@ public:
     bool m_dynamic_type_table_loaded = false;
     std::unordered_set<uint64_t> m_observed_fclass_ptrs;
     int32_t m_fclass_typeidx_offset = -1;
+    // FFieldClass NamePrivate slot offset, calibrated at runtime. -1 = not yet
+    // calibrated / no offset works. Probed via the same FField NamePrivate
+    // decode pipeline (PSHUFLW(0x4B) → ROL32(3) → PSHUFLW(0x72) → XOR → ROL64(32))
+    // — shape verified on 20260421 IDA in FProperty_GetNameCPP @ 0x3AFE70 reading
+    // FFieldClass+0x20. The slot offset moves between patches; calibration tries
+    // 16-byte-aligned offsets 0x10..0x80 and picks the one that resolves the most
+    // FFieldClasses to canonical property-type names.
+    int32_t m_fclass_nameslot_offset = -1;
     // Sets populated during property walk: every FStructProperty.Struct value is
     // a UScriptStruct address; every FEnumProperty.Enum value is a UEnum.
     // Used in classification to mark these UObjects as struct/enum even when
@@ -684,6 +692,203 @@ public:
             size_t Shown = 0;
             for (const auto& [Tn, Cnt] : Sorted) {
                 if (Shown++ >= 12) break;
+                std::printf(" %s=%zu", Tn.c_str(), Cnt);
+            }
+            std::printf("\n");
+        }
+        return Added;
+    }
+
+    // ── FFieldClass NamePrivate-slot calibration & seeding ──────────────
+    // Parallel path to the typeidx-based seeding above. Reasoning: on UE5
+    // builds where FFieldClass has an FName slot (verified 20260421 IDA in
+    // FProperty_GetNameCPP @ 0x3AFE70 reading FFieldClass+0x20), we can read
+    // the type name DIRECTLY without needing a separate uint32 typeidx field
+    // or the 703-entry property-type table.
+    //
+    // Strategy: probe each 16-byte-aligned offset 0x10..0x80 on observed
+    // FFieldClasses, decrypt 16 bytes via the FField NamePrivate pipeline
+    // (already auto-discovered + working on this build), resolve the result
+    // CompIndex to a name string. Pick the offset that produces the most
+    // canonical property-type names (BoolProperty, IntProperty, ...). The
+    // threshold gates against false positives at noise offsets.
+    int32_t CalibrateFClassNameSlotOffset() {
+        if (m_observed_fclass_ptrs.empty()) {
+            std::printf("[fcname-cal] no observed FFieldClass pointers — pre-pass must run first\n");
+            return -1;
+        }
+        if (m_canonical_property_type_names.empty()) {
+            std::printf("[fcname-cal] no canonical property-type names — ptable must be loaded\n");
+            return -1;
+        }
+
+        // Sample up to 200 FFieldClasses to keep calibration fast.
+        std::vector<uint64_t> Sample(m_observed_fclass_ptrs.begin(), m_observed_fclass_ptrs.end());
+        if (Sample.size() > 200) Sample.resize(200);
+
+        struct Score { int32_t Off; int32_t Hits; std::string Best; };
+        std::vector<Score> Scores;
+
+        for (int32_t Off = 0x10; Off <= 0x80; Off += 8) {
+            int32_t Hits = 0;
+            std::string FirstHitName;
+            for (uint64_t Fc : Sample) {
+                alignas(16) uint8_t Enc[16] = {};
+                if (!m_reader.Read(Fc + static_cast<uint64_t>(Off), Enc, 16)) continue;
+                // All-zero slot is uninitialized — skip.
+                bool NonZero = false;
+                for (int B = 0; B < 16; ++B) if (Enc[B]) { NonZero = true; break; }
+                if (!NonZero) continue;
+                uint64_t Dec = m_fname.DecryptFFieldNameSlot(Enc);
+                uint32_t Lo = static_cast<uint32_t>(Dec);
+                if (Lo < 2 || Lo > 0x2000000u) continue;
+                std::string Name = m_fname.CompIndexToName(static_cast<int32_t>(Lo));
+                if (Name.empty()) continue;
+                // Match against canonical type names — try with and without
+                // the leading 'F' prefix that some builds use ("BoolProperty"
+                // vs "FBoolProperty").
+                bool Match = m_canonical_property_type_names.count(Name) > 0;
+                if (!Match && Name.size() > 1 && Name[0] == 'F')
+                    Match = m_canonical_property_type_names.count(Name.substr(1)) > 0;
+                if (!Match && !Name.empty())
+                    Match = m_canonical_property_type_names.count("F" + Name) > 0;
+                if (!Match) continue;
+                ++Hits;
+                if (FirstHitName.empty()) FirstHitName = Name;
+            }
+            Scores.push_back({Off, Hits, FirstHitName});
+        }
+
+        std::sort(Scores.begin(), Scores.end(),
+            [](const Score& A, const Score& B) { return A.Hits > B.Hits; });
+
+        if (Scores.empty() || Scores[0].Hits == 0) {
+            std::printf("[fcname-cal] no offset produced any canonical type-name match — pipeline likely different on this build\n");
+            return -1;
+        }
+
+        const Score& Best = Scores[0];
+        // Threshold: require ≥30% of sampled FFieldClasses to resolve to a
+        // canonical name. Below that, the offset is probably noise.
+        const int32_t Required = static_cast<int32_t>(Sample.size()) * 30 / 100;
+        if (Best.Hits < Required) {
+            std::printf("[fcname-cal] best offset +0x%X hits=%d/%zu < %d (30%%) — too weak; skipping\n",
+                Best.Off, Best.Hits, Sample.size(), Required);
+            // Still log top 5 for debugging.
+            for (size_t I = 0; I < Scores.size() && I < 5; ++I) {
+                std::printf("[fcname-cal]   +0x%X hits=%d  example=%s\n",
+                    Scores[I].Off, Scores[I].Hits, Scores[I].Best.c_str());
+            }
+            return -1;
+        }
+
+        m_fclass_nameslot_offset = Best.Off;
+        std::printf("[fcname-cal] FFieldClass NamePrivate offset = +0x%X  hits=%d/%zu (example=%s)\n",
+            Best.Off, Best.Hits, Sample.size(), Best.Best.c_str());
+        return Best.Off;
+    }
+
+    size_t SeedFClassMapByNameSlot() {
+        if (m_fclass_nameslot_offset < 0) return 0;
+        if (m_observed_fclass_ptrs.empty()) return 0;
+
+        size_t Examined = 0, Already = 0, ReadFail = 0, BadCi = 0, NoName = 0;
+        size_t NotCanonical = 0, Added = 0;
+        std::unordered_map<std::string, size_t> AddedByType;
+
+        for (uint64_t Fc : m_observed_fclass_ptrs) {
+            ++Examined;
+            if (m_fclass_to_type.count(Fc)) { ++Already; continue; }
+            alignas(16) uint8_t Enc[16] = {};
+            if (!m_reader.Read(Fc + static_cast<uint64_t>(m_fclass_nameslot_offset), Enc, 16)) {
+                ++ReadFail; continue;
+            }
+            bool NonZero = false;
+            for (int B = 0; B < 16; ++B) if (Enc[B]) { NonZero = true; break; }
+            if (!NonZero) { ++BadCi; continue; }
+            uint64_t Dec = m_fname.DecryptFFieldNameSlot(Enc);
+            uint32_t Lo = static_cast<uint32_t>(Dec);
+            if (Lo < 2 || Lo > 0x2000000u) { ++BadCi; continue; }
+            std::string Name = m_fname.CompIndexToName(static_cast<int32_t>(Lo));
+            if (Name.empty()) { ++NoName; continue; }
+            // Prefer the canonical "F"-prefixed form.
+            std::string Canonical;
+            if (m_canonical_property_type_names.count(Name)) {
+                Canonical = "F" + Name;
+            } else if (Name.size() > 1 && Name[0] == 'F' &&
+                       m_canonical_property_type_names.count(Name.substr(1))) {
+                Canonical = Name;
+            } else if (m_canonical_property_type_names.count("F" + Name)) {
+                Canonical = "F" + Name;
+            } else {
+                ++NotCanonical; continue;
+            }
+            m_fclass_to_type[Fc] = Canonical;
+            ++Added;
+            ++AddedByType[Canonical];
+        }
+
+        std::printf("[fcname-seed] examined=%zu already=%zu read_fail=%zu bad_ci=%zu "
+                    "no_name=%zu non_canonical=%zu added=%zu\n",
+            Examined, Already, ReadFail, BadCi, NoName, NotCanonical, Added);
+        if (Added > 0) {
+            std::vector<std::pair<std::string, size_t>> Sorted(AddedByType.begin(), AddedByType.end());
+            std::sort(Sorted.begin(), Sorted.end(),
+                [](const auto& A, const auto& B) { return A.second > B.second; });
+            std::printf("[fcname-seed] new mappings by type:");
+            size_t Shown = 0;
+            for (const auto& [Tn, Cnt] : Sorted) {
+                if (Shown++ >= 15) break;
+                std::printf(" %s=%zu", Tn.c_str(), Cnt);
+            }
+            std::printf("\n");
+        }
+        return Added;
+    }
+
+    // ── Phase 7 seeder: use auto-discovered FFieldClass NamePrivate decoder ─
+    // The Phase 7 sig-scan extracts the FULL pipeline (PSHUFLW imms, ROL32
+    // amount, ROL64 amount, XOR const, name slot offset) from the inlined
+    // decode bodies in the live binary. m_fname.DecryptFFieldClassNameCI
+    // applies that pipeline. This is the authoritative path on CL-1177146
+    // where the FField NamePrivate pipeline (used by SeedFClassMapByNameSlot)
+    // doesn't match — FFieldClass has its own shape.
+    size_t SeedFClassMapViaPhase7() {
+        if (!AutoDiscovery::g_DiscoveredFFieldClassName.Valid) return 0;
+        if (m_observed_fclass_ptrs.empty()) return 0;
+
+        size_t Examined = 0, Already = 0, NoCi = 0, NoName = 0, Added = 0;
+        std::unordered_map<std::string, size_t> AddedByType;
+
+        for (uint64_t Fc : m_observed_fclass_ptrs) {
+            ++Examined;
+            if (m_fclass_to_type.count(Fc)) { ++Already; continue; }
+            int32_t Ci = m_fname.DecryptFFieldClassNameCI(Fc);
+            if (Ci <= 0) { ++NoCi; continue; }
+            std::string Name = m_fname.CompIndexToName(Ci);
+            if (Name.empty()) { ++NoName; continue; }
+            // Prefer canonical "F"-prefixed form to match the rest of the SDK.
+            std::string Canonical = Name;
+            if (!Name.empty() && Name[0] != 'F' &&
+                m_canonical_property_type_names.count(Name))
+            {
+                Canonical = "F" + Name;
+            }
+            m_fclass_to_type[Fc] = Canonical;
+            ++Added;
+            ++AddedByType[Canonical];
+        }
+
+        std::printf("[fcname-p7] examined=%zu already=%zu no_ci=%zu no_name=%zu added=%zu\n",
+            Examined, Already, NoCi, NoName, Added);
+        if (Added > 0) {
+            std::vector<std::pair<std::string, size_t>> Sorted(AddedByType.begin(), AddedByType.end());
+            std::sort(Sorted.begin(), Sorted.end(),
+                [](const auto& A, const auto& B) { return A.second > B.second; });
+            std::printf("[fcname-p7] new mappings by type:");
+            size_t Shown = 0;
+            for (const auto& [Tn, Cnt] : Sorted) {
+                if (Shown++ >= 15) break;
                 std::printf(" %s=%zu", Tn.c_str(), Cnt);
             }
             std::printf("\n");
@@ -1988,6 +2193,33 @@ public:
             size_t DynAdded = SeedDynamicFClassMap();
             std::printf("[fcmap-dyn] dynamic seeding produced %zu new FFieldClass mappings (total=%zu)\n",
                 DynAdded, m_fclass_to_type.size());
+
+            // Parallel path: probe FFieldClass NamePrivate slot directly. On
+            // builds where FFieldClass has an FName at a discoverable offset
+            // (verified 20260421), this resolves the type name without a
+            // typeidx lookup table — works even when the typeidx calibration
+            // fails (which happens when FFieldClass has no uint32 typeidx
+            // field, e.g. CL-1177146).
+            CalibrateFClassNameSlotOffset();
+            size_t NameAdded = SeedFClassMapByNameSlot();
+            if (NameAdded > 0) {
+                std::printf("[fcname-seed] FName-slot seeding produced %zu new FFieldClass mappings (total=%zu)\n",
+                    NameAdded, m_fclass_to_type.size());
+            }
+
+            // Phase 7 path: if FFieldClass NamePrivate decode auto-discovered
+            // its full pipeline (PSHUFLW + ROL32 + PSHUFLW + XOR + ROL64),
+            // use m_fname.DecryptFFieldClassNameCI directly on every observed
+            // FFieldClass pointer. This bypasses the offset-only calibration
+            // above (which assumes the FField NamePrivate pipeline shape;
+            // FFieldClass uses a different shape).
+            if (AutoDiscovery::g_DiscoveredFFieldClassName.Valid) {
+                size_t Phase7Added = SeedFClassMapViaPhase7();
+                if (Phase7Added > 0) {
+                    std::printf("[fcname-p7] Phase 7 decoder seeded %zu new FFieldClass mappings (total=%zu)\n",
+                        Phase7Added, m_fclass_to_type.size());
+                }
+            }
         }
 
         // ── Pass 2: iterate objects — include all type objects ──────────────────
