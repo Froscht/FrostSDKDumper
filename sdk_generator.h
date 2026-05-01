@@ -846,27 +846,108 @@ public:
         return Added;
     }
 
-    // ── Phase 7 seeder: use auto-discovered FFieldClass NamePrivate decoder ─
-    // The Phase 7 sig-scan extracts the FULL pipeline (PSHUFLW imms, ROL32
-    // amount, ROL64 amount, XOR const, name slot offset) from the inlined
-    // decode bodies in the live binary. m_fname.DecryptFFieldClassNameCI
-    // applies that pipeline. This is the authoritative path on CL-1177146
-    // where the FField NamePrivate pipeline (used by SeedFClassMapByNameSlot)
-    // doesn't match — FFieldClass has its own shape.
-    size_t SeedFClassMapViaPhase7() {
-        if (!AutoDiscovery::g_DiscoveredFFieldClassName.Valid) return 0;
+    // ── CastFlags-based seeder: resolve FFieldClass by CastFlags bitmask ─
+    // FFieldClass+0x10 holds a 64-bit CastFlags bitmask, unique per property
+    // type (FBoolProperty=0x28001, etc.). Verified via:
+    //   - constructor sub_3E80E0: stores arg4 (e.g. 0x28001 for FBoolProperty)
+    //     at FFieldClass+0x10
+    //   - chain walker: `*(QWORD)(FField+144 [ClassPrivate] + 16) & MASK`
+    //
+    // Every FFieldClass type has unique CastFlags. The 55 vtable-Tier-1
+    // mappings give us 55 known (FFieldClass*, name) pairs. Read CastFlags
+    // for each → build (CastFlags → name) map → resolve all unmapped
+    // FFieldClasses by their CastFlags. No SIMD pipeline, no FName decode,
+    // no XOR keys needed.
+    size_t SeedFClassMapByCastFlags() {
         if (m_observed_fclass_ptrs.empty()) return 0;
+        if (m_fclass_to_type.empty())       return 0;
 
-        size_t Examined = 0, Already = 0, NoCi = 0, NoName = 0, Added = 0;
+        // Build (CastFlags → name) from already-mapped FFieldClasses.
+        std::unordered_map<uint64_t, std::string> CastFlagsToName;
+        std::unordered_map<uint64_t, int>         CastFlagsConflicts;
+        for (const auto& [Fc, Name] : m_fclass_to_type) {
+            uint64_t CastFlags = 0;
+            if (!m_reader.Read(Fc + 0x10, &CastFlags, 8)) continue;
+            if (CastFlags == 0) continue;
+            auto It = CastFlagsToName.find(CastFlags);
+            if (It == CastFlagsToName.end()) {
+                CastFlagsToName[CastFlags] = Name;
+            } else if (It->second != Name) {
+                ++CastFlagsConflicts[CastFlags];
+            }
+        }
+        std::printf("[fcflags] built %zu unique CastFlags from %zu mapped FFieldClasses (%zu conflicts)\n",
+            CastFlagsToName.size(), m_fclass_to_type.size(), CastFlagsConflicts.size());
+
+        if (CastFlagsToName.empty()) return 0;
+
+        // Resolve unmapped FFieldClasses by CastFlags.
+        size_t Examined = 0, Already = 0, NoCastFlags = 0;
+        size_t Conflict = 0, NoMatch = 0, Added = 0;
         std::unordered_map<std::string, size_t> AddedByType;
 
         for (uint64_t Fc : m_observed_fclass_ptrs) {
             ++Examined;
             if (m_fclass_to_type.count(Fc)) { ++Already; continue; }
-            int32_t Ci = m_fname.DecryptFFieldClassNameCI(Fc);
-            if (Ci <= 0) { ++NoCi; continue; }
-            std::string Name = m_fname.CompIndexToName(Ci);
+            uint64_t CastFlags = 0;
+            if (!m_reader.Read(Fc + 0x10, &CastFlags, 8)) { ++NoCastFlags; continue; }
+            if (CastFlags == 0) { ++NoCastFlags; continue; }
+            // Skip ambiguous CastFlags (multiple names mapped to same value).
+            auto Cf = CastFlagsConflicts.find(CastFlags);
+            if (Cf != CastFlagsConflicts.end()) { ++Conflict; continue; }
+            auto It = CastFlagsToName.find(CastFlags);
+            if (It == CastFlagsToName.end()) { ++NoMatch; continue; }
+            m_fclass_to_type[Fc] = It->second;
+            ++Added;
+            ++AddedByType[It->second];
+        }
+
+        std::printf("[fcflags] examined=%zu already=%zu no_castflags=%zu conflict=%zu no_match=%zu added=%zu\n",
+            Examined, Already, NoCastFlags, Conflict, NoMatch, Added);
+        if (Added > 0) {
+            std::vector<std::pair<std::string, size_t>> Sorted(AddedByType.begin(), AddedByType.end());
+            std::sort(Sorted.begin(), Sorted.end(),
+                [](const auto& A, const auto& B) { return A.second > B.second; });
+            std::printf("[fcflags] new mappings by type:");
+            size_t Shown = 0;
+            for (const auto& [Tn, Cnt] : Sorted) {
+                if (Shown++ >= 15) break;
+                std::printf(" %s=%zu", Tn.c_str(), Cnt);
+            }
+            std::printf("\n");
+        }
+        return Added;
+    }
+
+    // ── Phase 7 seeder: use auto-discovered FFieldClass NamePrivate decoder ─
+    // The Phase 7 sig-scan extracts the FULL pipeline (XOR const, name slot
+    // offset, shift/shuffle imms) from the inlined FFieldClass NamePrivate
+    // decode in the live binary. This recovers the FName HANDLE (not CI) —
+    // we then run it through the existing DecryptByHandle path to get a
+    // type name string directly.
+    size_t SeedFClassMapViaPhase7() {
+        if (!AutoDiscovery::g_DiscoveredFFieldClassName.Valid) return 0;
+        if (m_observed_fclass_ptrs.empty()) return 0;
+
+        size_t Examined = 0, Already = 0, NoHandle = 0, NoName = 0;
+        size_t NotCanonical = 0, Added = 0;
+        std::unordered_map<std::string, size_t> AddedByType;
+
+        for (uint64_t Fc : m_observed_fclass_ptrs) {
+            ++Examined;
+            if (m_fclass_to_type.count(Fc)) { ++Already; continue; }
+            uint64_t Handle = m_fname.DecryptFFieldClassNameSlot(Fc);
+            if (!Handle) { ++NoHandle; continue; }
+            std::string Name = m_fname.DecryptByHandle(Handle);
             if (Name.empty()) { ++NoName; continue; }
+            // Sanity: type name should be a short identifier.
+            if (Name.size() > 64) { ++NotCanonical; continue; }
+            bool ok = true;
+            for (char c : Name) {
+                if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                      (c >= '0' && c <= '9') || c == '_')) { ok = false; break; }
+            }
+            if (!ok) { ++NotCanonical; continue; }
             // Prefer canonical "F"-prefixed form to match the rest of the SDK.
             std::string Canonical = Name;
             if (!Name.empty() && Name[0] != 'F' &&
@@ -879,8 +960,8 @@ public:
             ++AddedByType[Canonical];
         }
 
-        std::printf("[fcname-p7] examined=%zu already=%zu no_ci=%zu no_name=%zu added=%zu\n",
-            Examined, Already, NoCi, NoName, Added);
+        std::printf("[fcname-p7] examined=%zu already=%zu no_handle=%zu no_name=%zu non_canonical=%zu added=%zu\n",
+            Examined, Already, NoHandle, NoName, NotCanonical, Added);
         if (Added > 0) {
             std::vector<std::pair<std::string, size_t>> Sorted(AddedByType.begin(), AddedByType.end());
             std::sort(Sorted.begin(), Sorted.end(),
@@ -2219,6 +2300,18 @@ public:
                     std::printf("[fcname-p7] Phase 7 decoder seeded %zu new FFieldClass mappings (total=%zu)\n",
                         Phase7Added, m_fclass_to_type.size());
                 }
+            }
+
+            // CastFlags path: read FFieldClass+0x10 (uint64 CastFlags bitmask),
+            // build a (CastFlags → name) map from the 55 already-mapped
+            // FFieldClasses, then resolve every unmapped observed FFieldClass
+            // by its CastFlags. Independent of FName decryption — uses only
+            // the property type's unique bitflags. Closes the bulk of the
+            // FFieldClass mapping gap on CL-1177146 (~700+ unmapped objs).
+            size_t CfAdded = SeedFClassMapByCastFlags();
+            if (CfAdded > 0) {
+                std::printf("[fcflags] CastFlags seeding produced %zu new FFieldClass mappings (total=%zu)\n",
+                    CfAdded, m_fclass_to_type.size());
             }
         }
 

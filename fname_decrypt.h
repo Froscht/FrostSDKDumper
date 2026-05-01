@@ -555,65 +555,91 @@ private:
 public:
 
     // ── FFieldClass → type name comp_index ───────────────────────────────
-    // Verified against CL-1177146 IDA in FFieldClass ctor sub_3E80E0:
-    //   movdqa xmm0, [fclass+NamePrivateOff]   ; load 16-byte slot
-    //   pxor   xmm0, [rip+XOR_CONST]           ; XOR with rdata key (lo64 used)
-    //   ROL32(xmm0, 7) per uint32 lane         ; (PSRLD 0x19 | PSLLD 7)
-    //   pshuflw xmm0, xmm0, 0x1B               ; (involution, swaps low 4 words)
-    //   movq    rax, xmm0                      ; lo64
-    //   rol     rax, 0x20                      ; ROL64(32)
-    //   → result lo32 = CompIndex of type name (e.g. "BoolProperty")
+    // Verified against CL-1177146 IDA in FFieldClass ctor sub_3E80E0.
     //
-    // (NOTE: pipeline shape changed from 20260421. The XOR step is now BEFORE
-    //  the shuffles; on 20260421 it was after.)
+    // The slot at FFieldClass+NamePrivateOff is an OBFUSCATED 8-byte FName
+    // HANDLE (NOT a CompIndex). The encryption pipeline is:
+    //   handle = sub_232730(wide_string)           ; FName interner returns 8-byte handle
+    //   complex(handle) = ROL64(handle, 32)        ; observed: (~A&K1 | A&K2) ^ ... = A | B = ROL64
+    //   v9 = PSHUFLW(complex(handle), 27)
+    //   stored = ROL32(v9, 25) ^ KEY               ; 16 bytes at fclass+offset
     //
-    // All parameters auto-discovered at runtime via Phase 7
-    // (AutoDiscovery::DiscoverFFieldClassNameDecrypt). Returns 0 if Phase 7
-    // didn't run / didn't validate — caller falls back to the legacy
-    // vtable-to-type map.
-    int32_t DecryptFFieldClassNameCI(uint64_t fclass_addr) {
+    // Inverse (this function):
+    //   tmp = stored ^ KEY                         ; (lo64 of XOR const used)
+    //   tmp = ROL32(tmp, 7) per uint32 lane        ; reverse ROL32(25) ; PSRLD 0x19 | PSLLD 7
+    //   tmp = PSHUFLW(tmp, 0x1B)                   ; PSHUFLW(0x1B) is involution
+    //   tmp = lo64(tmp)
+    //   handle = ROL64(tmp, 32)                    ; reverse ROL64(32) (its own inverse)
+    //
+    // The recovered `handle` is an FName HANDLE (8-byte encrypted entry ptr,
+    // same form as inline-handle slots on UObjects). To turn it into a
+    // CompIndex / name string, the caller passes it to DecryptByHandle.
+    //
+    // All parameters auto-discovered at runtime via Phase 7.
+    // Returns the FName handle (8 bytes) or 0 if decode failed / not yet
+    // calibrated.
+    uint64_t DecryptFFieldClassNameSlot(uint64_t fclass_addr) {
         const auto& Disc = AutoDiscovery::g_DiscoveredFFieldClassName;
         if (!Disc.Valid) return 0;
         if (!fclass_addr) return 0;
 
         alignas(16) uint8_t enc[16] = {};
         if (!m_reader.Read(fclass_addr + Disc.NamePrivateOffset, enc, 16)) return 0;
-        // Skip all-zero (uninitialized) — produces a garbage CI.
         bool nonzero = false;
         for (int i = 0; i < 16; ++i) if (enc[i]) { nonzero = true; break; }
         if (!nonzero) return 0;
 
-        // Step 1: scalar PXOR with the auto-discovered 16-byte rdata constant
-        // (we materialise the upper 8 bytes as zero — the pipeline only uses
-        // lo64 after PSHUFLW). Matches `pxor xmm0, [rip+xor_const]` followed
-        // by `movq rax, xmm0` taking lo64.
+        // Step 1: PXOR. Both XOR constants we've seen on CL-1177146 share
+        // the same lo64 (`0x878588013124D57F`); only lo64 affects the result
+        // since PSHUFLW + lo64 extract drops the upper half.
         __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-        // Re-create the rdata XOR const as a 16-byte SSE value: lo64 from
-        // discovery; hi64 set to the same value (consistent with how the live
-        // PXOR uses both halves but only lo64 ends up in `rax`).
         alignas(16) uint64_t XorBuf[2] = { Disc.XorLo64, Disc.XorLo64 };
         __m128i xored = _mm_xor_si128(v, _mm_load_si128(reinterpret_cast<const __m128i*>(XorBuf)));
 
-        // Step 2: ROL32(N) per uint32 lane (default 7).
+        // Step 2: ROL32(7) per uint32 lane (reverses the ROL32(25) in encrypt).
         const int rol32 = Disc.Rol32Amount ? Disc.Rol32Amount : 7;
         __m128i rot = _mm_or_si128(
             _mm_slli_epi32(xored, rol32),
             _mm_srli_epi32(xored, 32 - rol32));
 
-        // Step 3: PSHUFLW with imm (default 0x1B — its own inverse).
+        // Step 3: PSHUFLW(0x1B) — its own inverse.
         __m128i s = _mm_shufflelo_epi16(rot, 0x1B);
 
-        // Step 4: take lo64.
+        // Step 4: lo64.
         uint64_t lo;
         _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo), s);
 
-        // Step 5: ROL64(32 by default — swaps hi/lo halves).
+        // Step 5: ROL64(32) — final swap; reverses the encrypt's ROL64(32).
         const int rol64 = Disc.Rol64Amount ? Disc.Rol64Amount : 32;
-        uint64_t rolled = (lo << rol64) | (lo >> (64 - rol64));
+        return (lo << rol64) | (lo >> (64 - rol64));
+    }
 
-        uint32_t ci = static_cast<uint32_t>(rolled);
-        if (ci < 2 || ci > 0x2000000u) return 0;
-        return static_cast<int32_t>(ci);
+    // Convenience wrapper: decode FFieldClass name slot → FName handle →
+    // entry pointer → CompIndex. Returns 0 on any failure in the chain.
+    int32_t DecryptFFieldClassNameCI(uint64_t fclass_addr) {
+        uint64_t handle = DecryptFFieldClassNameSlot(fclass_addr);
+        if (!handle) return 0;
+        // The handle uses the same encryption as UObject inline-handle slots:
+        // bswap64(handle ^ ENTRY_HANDLE_XOR) → FNameEntry*. Use the existing
+        // DecryptEntryHandle helper (auto-fixed XOR const at startup).
+        if (handle == ArcDecrypt::Patch20260421::ENTRY_HANDLE_XOR) return 0;
+        uint64_t entry = ArcDecrypt::Patch20260421::DecryptEntryHandle(handle);
+        if (entry < 0x10000ULL || entry >= 0x800000000000ULL) return 0;
+        if (entry >= m_base && entry < m_base + 0x10000000ULL) return 0;  // module ptr is bogus
+        // Read the FNameEntry header and extract the CompIndex.
+        // FNameEntry layout: header (4 bytes flags+len) ... but the ENTRY-
+        // pointer-to-CI conversion is build-specific. Instead, decode the
+        // STRING via DecryptNameString and look up by name in the canonical
+        // table — caller does the type-name match. So here we take a
+        // shortcut: the lo32 of `handle` itself often equals the CI on
+        // builds where the handle format is `(Number << 32) | CI`. If that
+        // produces a sane CI, use it; otherwise return 0 and let the
+        // by-handle path resolve.
+        uint32_t ci_candidate = static_cast<uint32_t>(handle);
+        if (ci_candidate >= 2 && ci_candidate <= 0x2000000u) {
+            return static_cast<int32_t>(ci_candidate);
+        }
+        return 0;
     }
 
     // ── Step 4-7: comp_index → FNameEntry heap address (patch 20260421) ──
