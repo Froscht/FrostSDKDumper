@@ -1615,47 +1615,45 @@ inline GNamesDiscovery DiscoverGNamesViaFNameWalk(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 7: FFieldClass NamePrivate decode pipeline (sig-scan + Zydis walk)
+// Phase 7: FFieldClass NamePrivate decode pipeline (CL-1177146 verified)
 //
-// FFieldClass on UE5 builds embeds an FName slot at a discoverable offset.
-// On 20260421 IDA in FProperty_GetNameCPP @ 0x3AFE70:
+// FFieldClass on CL-1177146 stores its type-name FName at +0x40, encrypted.
+// Verified IDA in `sub_3E80E0` (FFieldClass constructor; 8 callers = 8 type
+// globals like FBoolProperty/FStructProperty). The decode pipeline (32 inlined
+// sites across the binary):
 //
-//   48 8B 41 30                    mov rax, [rcx+0x30]   ; FProperty.FFieldClass*
-//   F2 0F 70 40 20 4B              pshuflw xmm0, [rax+0x20], 0x4B
-//                                                           ^^^^ FFieldClass NamePrivate offset
-//   ...                            (junk: arg shuffle, movdqa)
-//   66 0F 72 D1 1D                 psrld xmm1, 0x1D
-//   66 0F 72 F0 03                 pslld xmm0, 3        ; together = ROL32(3) per uint32 lane
-//   66 0F EB C1                    por   xmm0, xmm1
-//   F2 0F 70 C0 72                 pshuflw xmm0, xmm0, 0x72
-//   66 0F EF 05 ?? ?? ?? ??        pxor  xmm0, [rip+disp32]   ; XOR const RVA
-//   66 48 0F 7E C0                 movq  rax, xmm0
-//   48 C1 C0 20                    rol   rax, 0x20      ; ROL64(32)
+//   66 0F 6F 46 40                 movdqa xmm0, [rsi+0x40]   ; load FFieldClass+0x40
+//   66 0F EF 05 ?? ?? ?? ??        pxor   xmm0, [rip+xor_const]
+//   66 0F 6F C8                    movdqa xmm1, xmm0
+//   66 0F 72 D1 19                 psrld  xmm1, 0x19         ; (right 25)
+//   66 0F 72 F0 07                 pslld  xmm0, 7            ; together = ROL32(7) per uint32 lane
+//   66 0F EB C1                    por    xmm0, xmm1
+//   F2 0F 70 C0 1B                 pshuflw xmm0, xmm0, 0x1B
+//   66 48 0F 7E C0                 movq   rax, xmm0          ; lo64
+//   48 C1 C0 20                    rol    rax, 0x20          ; ROL64(32)
 //
-// Pipeline result: lo32 = CompIndex (Number in hi32 typically 0).
+// (NOTE: 20260421 pipeline differed — was PSHUFLW(0x4B) + ROL32(3) +
+//  PSHUFLW(0x72) + XOR + ROL64(32). The shape changed completely on CL-1177146.)
+//
+// Result: lo32 = CompIndex of the type name (e.g. "BoolProperty").
 //
 // Anchor strategy:
-//   1. Sig-scan the SIMD body shape (PSRLD 0x1D + PSLLD 3 + POR + PSHUFLW 0x72
-//      + PXOR rip-rel) — verified 25 inlined sites on 20260421, all targeting
-//      the same .rdata constant (`xmmword_ACF8900` = RVA 0xACF8900). High
-//      consensus = patch-resilient.
-//   2. For each hit, resolve the PXOR rip-rel target → XOR const RVA.
-//   3. Histogram the targets — the mode is the FFieldClass XOR const.
-//   4. Walk back via Zydis from each hit to find the PSHUFLW load
-//      `F2 0F 70 ?? disp8 4B` and extract disp8 = FFieldClass NamePrivate offset.
-//   5. Walk further back to find the FFieldClass-pointer load
-//      `48 8B ?? disp8` and extract disp8 = FProperty FFieldClass offset.
-//   6. Read 16 bytes at the discovered XOR const RVA → that's the live
-//      decrypt key (16 bytes, lo64 used in the scalar XOR step).
+//   1. Sig-scan the body shape `PSRLD 0x19 + PSLLD 7 + POR + PSHUFLW 0x1B`
+//      (19 bytes). Verified 33 sites on CL-1177146.
+//   2. For each hit, walk back 12 bytes to find the PXOR rip-rel; resolve its
+//      target → XOR const RVA. Mode-pick across all sites.
+//   3. Walk further back ~5 bytes to find the MOVDQA xmm0, [reg+disp8] load
+//      (encoding `66 0F 6F XX disp8`). Extract disp8 = FFieldClass NamePrivate
+//      offset (always +0x40 on CL-1177146 per consensus).
+//   4. Live-read 16 bytes at the discovered XOR const RVA → store lo64.
 // ─────────────────────────────────────────────────────────────────────────────
 struct FFieldClassNameParams {
     uint64_t XorConstRva           = 0;     // rdata RVA of 16-byte XOR const
     uint64_t XorLo64               = 0;     // first 8 bytes of XOR const (live-read)
-    uint32_t FFieldClassOffset     = 0;     // FProperty → FFieldClass*
-    uint32_t NamePrivateOffset     = 0;     // FFieldClass → NamePrivate slot
-    uint8_t  PshuflwImm1           = 0x4B;  // 75
-    uint8_t  PshuflwImm2           = 0x72;  // 114
-    uint8_t  Rol32Amount           = 3;
+    uint32_t FFieldClassOffset     = 0;     // FProperty → FFieldClass* (separate; not from this sig)
+    uint32_t NamePrivateOffset     = 0;     // FFieldClass → NamePrivate slot (typically 0x40)
+    uint8_t  PshuflwImm            = 0x1B;  // 27 (involution)
+    uint8_t  Rol32Amount           = 7;
     uint8_t  Rol64Amount           = 32;
     int      ConsensusSiteCount    = 0;
     bool     Valid                 = false;
@@ -1667,99 +1665,55 @@ inline FFieldClassNameParams DiscoverFFieldClassNameDecrypt(
 {
     FFieldClassNameParams out;
 
-    // Sig: PSRLD 0x1D + PSLLD 3 + POR + PSHUFLW 0x72 + PXOR rip-rel.
-    // 23 bytes, very specific to the FFieldClass NamePrivate decode.
+    // Sig: `psrld xmm1, 0x19; pslld xmm0, 7; por xmm0, xmm1; pshuflw xmm0, xmm0, 0x1B`
+    // 19 bytes. Verified 33 inlined sites on CL-1177146.
+    //
+    // Layout BEFORE this signature in each site (exactly 17 bytes preceding):
+    //   `66 0F 6F XX disp8`               (5)  movdqa xmm0, [reg+disp8]   ← name slot load
+    //   `66 0F EF 05 disp32`              (8)  pxor   xmm0, [rip+disp32]  ← XOR const
+    //   `66 0F 6F C8`                     (4)  movdqa xmm1, xmm0
     static constexpr const char* kSig =
-        "66 0F 72 D1 1D 66 0F 72 F0 03 66 0F EB C1 F2 0F 70 C0 72 66 0F EF 05";
+        "66 0F 72 D1 19 66 0F 72 F0 07 66 0F EB C1 F2 0F 70 C0 1B";
     auto hits = scanner.ScanSection(kSig, ".text");
     std::printf("[autodisc-fcname] FFieldClass decode pipeline sig hits: %zu\n", hits.size());
     if (hits.empty()) return out;
 
-    InsnDecoder dec;
-
     // Histograms across all hits.
     std::unordered_map<uint64_t, int> xorRvaCounts;
     std::unordered_map<uint32_t, int> nameOffCounts;
-    std::unordered_map<uint32_t, int> fclassOffCounts;
     int validatedSites = 0;
 
     for (uint64_t hitRva : hits) {
-        // Step 1: PXOR rip-rel target. The PXOR is the final 8 bytes of the sig
-        // (4 opcode + 4 disp32). Hit starts at `66 0F 72 D1 1D`, the PXOR is
-        // at hit + 19, ends at hit + 27.
         const uint8_t* p = scanner.GetLocalPtr(hitRva);
         if (!p) continue;
+
+        // Walk back exactly 12 bytes — that's where PXOR + MOVDQA sit:
+        //   hit - 12: 66 0F EF 05 disp32  (PXOR rip-rel, 8 bytes total)
+        //   hit -  4: 66 0F 6F C8         (MOVDQA xmm1, xmm0, 4 bytes)
+        //   hit:      66 0F 72 D1 19 ...  (sig start)
+        // PXOR opcode `66 0F EF 05`, then disp32. Validate prefix.
+        const uint8_t* pxor = p - 12;
+        if (pxor[0] != 0x66 || pxor[1] != 0x0F || pxor[2] != 0xEF || pxor[3] != 0x05) continue;
         int32_t disp = 0;
-        std::memcpy(&disp, p + 19 + 4, 4);  // PXOR opcode 4 bytes + disp32
-        uint64_t xorRva = (hitRva + 27) + (int64_t)disp;
+        std::memcpy(&disp, pxor + 4, 4);
+        uint64_t xorRva = (hitRva - 12 + 8) + (int64_t)disp;  // PXOR end is at hit-4
         if (!scanner.IsRDataRVA(xorRva)) continue;
 
-        // Step 2: walk back ~24 bytes via Zydis to find
-        //   F2 0F 70 ?? disp8 4B   ; pshuflw xmmN, [reg+disp8], 0x4B
-        // The PSHUFLW imm = 0x4B (75) is the giveaway.
-        //
-        // We brute-force decode at every possible boundary in [hit-24, hit-6].
-        uint32_t namePrivateOff = 0;
-        bool foundNameLoad = false;
-        for (int back = 24; back >= 6 && !foundNameLoad; --back) {
-            uint64_t startRva = hitRva - back;
-            const uint8_t* lp = scanner.GetLocalPtr(startRva);
-            if (!lp) continue;
-            // Walk the decoded instruction stream looking for a PSHUFLW with
-            // memory operand (load form) and imm 0x4B.
-            auto insns = dec.Decode(lp, back, startRva);
-            for (size_t i = 0; i < insns.size(); ++i) {
-                const auto& ins = insns[i];
-                if (ins.type != INSN_PSHUFLW) continue;
-                if (!ins.hasImm8 || ins.imm8 != 0x4B) continue;
-                // Manually parse the PSHUFLW prefix to find a [reg+disp8] form.
-                // Encoding: F2 0F 70 modrm [disp] imm8
-                //   modrm 0x40..0x47 = [reg+disp8] dest reg in low 3 bits of modrm
-                //   F2 0F 70 40 disp8 imm8 = pshuflw xmm0, [rax+disp8], imm8
-                // Length = 6 (3 opcode + 1 modrm + 1 disp8 + 1 imm8)
-                if (ins.length != 6) continue;
-                const uint8_t* ip = lp + (ins.rva - startRva);
-                uint8_t modrm = ip[3];
-                if ((modrm & 0xC0) != 0x40) continue;  // require mod=01 ([reg+disp8])
-                int8_t  d8     = (int8_t)ip[4];
-                if (d8 < 0 || d8 > 0x80) continue;
-                namePrivateOff = (uint32_t)d8;
-                foundNameLoad = true;
-                break;
-            }
-        }
-        if (!foundNameLoad) continue;
-
-        // Step 3: walk further back ~16 bytes to find the FFieldClass-pointer
-        // load `mov rN, [rM+disp8]` (REX.W=1, opcode 0x8B).
-        // Encoding: 48 8B modrm disp8 = mov reg64, [reg64+disp8] (length 4)
-        // The disp8 is the FProperty.FFieldClass offset (0x30 on 20260421).
-        uint32_t fclassOff = 0;
-        bool foundFcLoad = false;
-        // Look in the 16 bytes BEFORE the PSHUFLW load, which sits at hit-back.
-        for (int extraBack = 4; extraBack <= 32 && !foundFcLoad; extraBack += 1) {
-            uint64_t fcLoadRva = hitRva - 24 - extraBack;
-            const uint8_t* fp = scanner.GetLocalPtr(fcLoadRva);
-            if (!fp) continue;
-            // Look for `48 8B modrm disp8` exact length 4.
-            if (fp[0] != 0x48 || fp[1] != 0x8B) continue;
-            uint8_t modrm = fp[2];
-            if ((modrm & 0xC0) != 0x40) continue;  // mod=01
-            int8_t d8 = (int8_t)fp[3];
-            if (d8 < 0 || d8 > 0x100) continue;
-            fclassOff = (uint32_t)d8;
-            foundFcLoad = true;
-            break;
-        }
-        // FFieldClass offset is best-effort — if it can't be found via the
-        // simple back-walk (multiple register variants, register reuse, etc.),
-        // we still want to record xorRva and nameOff. The fclassOff is later
-        // used as a hint; the dumper can probe FProperty for it independently.
+        // Walk back further — 5 bytes before the PXOR is the MOVDQA load:
+        //   `66 0F 6F XX disp8`  →  movdqa xmm0, [reg+disp8]
+        // The disp8 (last byte) is FFieldClass NamePrivate offset.
+        const uint8_t* movdqa = pxor - 5;
+        if (movdqa[0] != 0x66 || movdqa[1] != 0x0F || movdqa[2] != 0x6F) continue;
+        uint8_t modrm = movdqa[3];
+        // mod=01 ([reg+disp8]), reg field = xmm0 (000), rm = source register (any)
+        if ((modrm & 0xC0) != 0x40) continue;
+        if ((modrm & 0x38) != 0x00) continue;  // dest must be xmm0 to match pipeline
+        uint8_t namePrivateOff = movdqa[4];
+        if (namePrivateOff > 0x80) continue;  // sanity bound
 
         ++validatedSites;
         ++xorRvaCounts[xorRva];
         ++nameOffCounts[namePrivateOff];
-        if (foundFcLoad) ++fclassOffCounts[fclassOff];
     }
 
     if (validatedSites < 3) {
@@ -1784,13 +1738,7 @@ inline FFieldClassNameParams DiscoverFFieldClassNameDecrypt(
     out.NamePrivateOffset = bestNameOff;
     out.ConsensusSiteCount = validatedSites;
 
-    if (!fclassOffCounts.empty()) {
-        auto [bestFcOff, fcHits] = pick_mode(fclassOffCounts);
-        out.FFieldClassOffset = bestFcOff;
-    }
-
-    // Live-read the 16-byte XOR const from .rdata (we only need lo64 for the
-    // scalar XOR step in DecryptFFieldClassNameSlot).
+    // Live-read the 16-byte XOR const from .rdata.
     uint8_t xorBytes[16] = {};
     if (reader.Read(module_base + bestXor, xorBytes, 16)) {
         std::memcpy(&out.XorLo64, xorBytes, 8);
@@ -1801,16 +1749,15 @@ inline FFieldClassNameParams DiscoverFFieldClassNameDecrypt(
         return out;
     }
 
-    out.PshuflwImm1 = 0x4B;
-    out.PshuflwImm2 = 0x72;
-    out.Rol32Amount = 3;
+    out.PshuflwImm  = 0x1B;
+    out.Rol32Amount = 7;
     out.Rol64Amount = 32;
     out.Valid       = true;
 
     std::printf("[autodisc-fcname] consensus across %d sites: xor_rva=0x%llX (lo64=0x%016llX, %d×) "
-                "name_off=+0x%X (%d×) fclass_off=+0x%X\n",
+                "name_off=+0x%X (%d×)\n",
         validatedSites, (unsigned long long)bestXor, (unsigned long long)out.XorLo64,
-        xorHits, out.NamePrivateOffset, nameHits, out.FFieldClassOffset);
+        xorHits, out.NamePrivateOffset, nameHits);
     return out;
 }
 

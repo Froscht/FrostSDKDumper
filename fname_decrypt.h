@@ -555,14 +555,17 @@ private:
 public:
 
     // ── FFieldClass → type name comp_index ───────────────────────────────
-    // Verified against 20260421 IDA in FProperty_GetNameCPP @ 0x3AFE70:
-    //   pshuflw xmm0, [fclass+NamePrivateOff], 0x4B
-    //   ROL32(xmm0, 3) per uint32 lane     (PSLLD 3 | PSRLD 0x1D)
-    //   pshuflw xmm0, xmm0, 0x72
-    //   pxor    xmm0, [rip+xmmword_XOR_CONST]
-    //   movq    rax, xmm0                  (lo64)
-    //   rol     rax, 0x20                  (ROL64(32))
+    // Verified against CL-1177146 IDA in FFieldClass ctor sub_3E80E0:
+    //   movdqa xmm0, [fclass+NamePrivateOff]   ; load 16-byte slot
+    //   pxor   xmm0, [rip+XOR_CONST]           ; XOR with rdata key (lo64 used)
+    //   ROL32(xmm0, 7) per uint32 lane         ; (PSRLD 0x19 | PSLLD 7)
+    //   pshuflw xmm0, xmm0, 0x1B               ; (involution, swaps low 4 words)
+    //   movq    rax, xmm0                      ; lo64
+    //   rol     rax, 0x20                      ; ROL64(32)
     //   → result lo32 = CompIndex of type name (e.g. "BoolProperty")
+    //
+    // (NOTE: pipeline shape changed from 20260421. The XOR step is now BEFORE
+    //  the shuffles; on 20260421 it was after.)
     //
     // All parameters auto-discovered at runtime via Phase 7
     // (AutoDiscovery::DiscoverFFieldClassNameDecrypt). Returns 0 if Phase 7
@@ -580,31 +583,33 @@ public:
         for (int i = 0; i < 16; ++i) if (enc[i]) { nonzero = true; break; }
         if (!nonzero) return 0;
 
-        // Step 1: PSHUFLW imm1 (0x4B by default).
+        // Step 1: scalar PXOR with the auto-discovered 16-byte rdata constant
+        // (we materialise the upper 8 bytes as zero — the pipeline only uses
+        // lo64 after PSHUFLW). Matches `pxor xmm0, [rip+xor_const]` followed
+        // by `movq rax, xmm0` taking lo64.
         __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-        __m128i s1;
-        switch (Disc.PshuflwImm1) {
-            case 0x4B: s1 = _mm_shufflelo_epi16(v, 0x4B); break;
-            default:   s1 = _mm_shufflelo_epi16(v, 0x4B); break;
-        }
-        // Step 2: ROL32(N) per uint32 lane.
-        const int rol32 = Disc.Rol32Amount ? Disc.Rol32Amount : 3;
+        // Re-create the rdata XOR const as a 16-byte SSE value: lo64 from
+        // discovery; hi64 set to the same value (consistent with how the live
+        // PXOR uses both halves but only lo64 ends up in `rax`).
+        alignas(16) uint64_t XorBuf[2] = { Disc.XorLo64, Disc.XorLo64 };
+        __m128i xored = _mm_xor_si128(v, _mm_load_si128(reinterpret_cast<const __m128i*>(XorBuf)));
+
+        // Step 2: ROL32(N) per uint32 lane (default 7).
+        const int rol32 = Disc.Rol32Amount ? Disc.Rol32Amount : 7;
         __m128i rot = _mm_or_si128(
-            _mm_slli_epi32(s1, rol32),
-            _mm_srli_epi32(s1, 32 - rol32));
-        // Step 3: PSHUFLW imm2 (0x72 by default).
-        __m128i s2;
-        switch (Disc.PshuflwImm2) {
-            case 0x72: s2 = _mm_shufflelo_epi16(rot, 0x72); break;
-            default:   s2 = _mm_shufflelo_epi16(rot, 0x72); break;
-        }
-        // Step 4: scalar XOR with discovered lo64 const.
+            _mm_slli_epi32(xored, rol32),
+            _mm_srli_epi32(xored, 32 - rol32));
+
+        // Step 3: PSHUFLW with imm (default 0x1B — its own inverse).
+        __m128i s = _mm_shufflelo_epi16(rot, 0x1B);
+
+        // Step 4: take lo64.
         uint64_t lo;
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo), s2);
-        uint64_t xored = lo ^ Disc.XorLo64;
-        // Step 5: ROL64(32 by default).
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo), s);
+
+        // Step 5: ROL64(32 by default — swaps hi/lo halves).
         const int rol64 = Disc.Rol64Amount ? Disc.Rol64Amount : 32;
-        uint64_t rolled = (xored << rol64) | (xored >> (64 - rol64));
+        uint64_t rolled = (lo << rol64) | (lo >> (64 - rol64));
 
         uint32_t ci = static_cast<uint32_t>(rolled);
         if (ci < 2 || ci > 0x2000000u) return 0;
