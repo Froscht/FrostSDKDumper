@@ -1006,9 +1006,15 @@ public:
         for (uint64_t Fc : m_observed_fclass_ptrs) {
             ++Examined;
             if (m_fclass_to_type.count(Fc)) { ++Already; continue; }
-            uint64_t Handle = m_fname.DecryptFFieldClassNameSlot(Fc);
-            if (!Handle) { ++NoHandle; continue; }
-            std::string Name = m_fname.DecryptByHandle(Handle);
+            // CL-1177146: post-PSHUFLW result has the CI in (lo64 >> 32),
+            // i.e. the upper 32 bits of the lower 64. ROL64(32) moves it
+            // into the low 32, where DecryptFFieldClassNameCI extracts it.
+            // The "DecryptByHandle" path treats the same value as an
+            // encrypted heap pointer, which fails because it's a small CI.
+            // Use CompIndexToName instead — that's the correct lookup.
+            int32_t Ci = m_fname.DecryptFFieldClassNameCI(Fc);
+            if (Ci <= 0) { ++NoHandle; continue; }
+            std::string Name = m_fname.CompIndexToNameLenient(Ci);
             if (Name.empty()) { ++NoName; continue; }
             // Sanity: type name should be a short identifier.
             if (Name.size() > 64) { ++NotCanonical; continue; }

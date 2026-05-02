@@ -1957,14 +1957,15 @@ inline std::vector<FFieldClassGlobal> DiscoverFFieldClassGlobals(
         callSitesFound, patternMatched, stringsResolved);
 
     if (!out.empty()) {
-        std::printf("[autodisc-fcglobals] sample mappings:");
-        size_t shown = 0;
-        for (const auto& g : out) {
-            if (shown++ >= 8) break;
-            std::printf(" %s@0x%llX", g.TypeName.c_str(),
-                (unsigned long long)g.TargetRva);
+        // Build deduped (RVA → name) summary for the log.
+        std::unordered_map<uint64_t, std::string> Unique;
+        for (const auto& g : out) Unique[g.TargetRva] = g.TypeName;
+        std::vector<std::pair<uint64_t, std::string>> Sorted(Unique.begin(), Unique.end());
+        std::sort(Sorted.begin(), Sorted.end());
+        std::printf("[autodisc-fcglobals] %zu unique mappings (sorted by RVA):\n", Sorted.size());
+        for (const auto& [rva, name] : Sorted) {
+            std::printf("  0x%07llX  %s\n", (unsigned long long)rva, name.c_str());
         }
-        std::printf("\n");
     }
     return out;
 }
