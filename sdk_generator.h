@@ -158,6 +158,29 @@ public:
         return v;
     }
 
+    // ── ReadFFieldClassPtr ───────────────────────────────────────────────
+    // Read an FField's ClassPrivate (FFieldClass*) with patch-aware probing.
+    //   CL-1177146: ClassPrivate is at +0x90 (live-verified — see
+    //   /tmp/probe_ff_classpriv probe results).
+    //   Older patches: +0x88 was used.
+    // Validates the result lies within the module .data section
+    // (where all FFieldClass globals are statically allocated). Returns 0
+    // when neither candidate falls in .data — that signals the FField
+    // pointer itself is garbage (chain-walker overshoot into uninit heap).
+    //
+    // .data range (CL-1177146): MODULE_BASE + [0xDAF3000 .. 0xE25C000)
+    uint64_t ReadFFieldClassPtr(uint64_t ff) {
+        constexpr uint64_t kDataLo = 0xDAF3000ULL;
+        constexpr uint64_t kDataHi = 0xE25C000ULL;
+        uint64_t lo = MODULE_BASE + kDataLo;
+        uint64_t hi = MODULE_BASE + kDataHi;
+        uint64_t fc = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
+        if (fc >= lo && fc < hi) return fc;
+        uint64_t fc2 = Read<uint64_t>(ff + 0x88);
+        if (fc2 >= lo && fc2 < hi) return fc2;
+        return 0;
+    }
+
     // ── Identify FProperty subtype by reading its vtable pointer ────────
     // Reads the vtable from ff_addr+FField::VTable, converts to an RVA,
     // and looks it up in m_vtable_to_type.  Falls back to ElementSize heuristic.
@@ -1311,11 +1334,11 @@ public:
                 pr.name = buf;
             }
 
-            pr.fclass_ptr = Read<uint64_t>(ff + 0x88);
-            if (!pr.fclass_ptr) {
-                pr.fclass_ptr = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
-            }
-            if (pr.fclass_ptr > 0x10000ULL && pr.fclass_ptr < 0x800000000000ULL) {
+            // ClassPrivate (FFieldClass*) — patch-aware probe + .data-bounded
+            // validation. Returns 0 when neither +0x90 nor +0x88 lies in the
+            // module .data section (signals chain walker overshoot).
+            pr.fclass_ptr = ReadFFieldClassPtr(ff);
+            if (pr.fclass_ptr) {
                 m_observed_fclass_ptrs.insert(pr.fclass_ptr);
             }
 
@@ -1414,10 +1437,8 @@ public:
                     ipr.ff_addr    = inner_ptr;
                     ipr.name       = pr.name + "__Item";
                     ipr.is_param   = is_param;
-                    ipr.fclass_ptr = Read<uint64_t>(inner_ptr + 0x88);
-                    if (!ipr.fclass_ptr || !m_fclass_to_type.count(ipr.fclass_ptr))
-                        ipr.fclass_ptr = Read<uint64_t>(inner_ptr + ArcDecrypt::Offsets::FField::ClassPrivate);
-                    if (ipr.fclass_ptr > 0x10000ULL && ipr.fclass_ptr < 0x800000000000ULL)
+                    ipr.fclass_ptr = ReadFFieldClassPtr(inner_ptr);
+                    if (ipr.fclass_ptr)
                         m_observed_fclass_ptrs.insert(ipr.fclass_ptr);
                     {
                         auto ifc_it = m_fclass_to_type.find(ipr.fclass_ptr);
@@ -1450,10 +1471,8 @@ public:
                     epr.ff_addr    = elem_ptr;
                     epr.name       = pr.name + "__Elem";
                     epr.is_param   = is_param;
-                    epr.fclass_ptr = Read<uint64_t>(elem_ptr + 0x88);
-                    if (!epr.fclass_ptr)
-                        epr.fclass_ptr = Read<uint64_t>(elem_ptr + ArcDecrypt::Offsets::FField::ClassPrivate);
-                    if (epr.fclass_ptr > 0x10000ULL && epr.fclass_ptr < 0x800000000000ULL)
+                    epr.fclass_ptr = ReadFFieldClassPtr(elem_ptr);
+                    if (epr.fclass_ptr)
                         m_observed_fclass_ptrs.insert(epr.fclass_ptr);
                     {
                         auto efc_it = m_fclass_to_type.find(epr.fclass_ptr);
@@ -1487,10 +1506,8 @@ public:
                     mpr.ff_addr    = mp;
                     mpr.name       = pr.name + suffix;
                     mpr.is_param   = is_param;
-                    mpr.fclass_ptr = Read<uint64_t>(mp + 0x88);
-                    if (!mpr.fclass_ptr)
-                        mpr.fclass_ptr = Read<uint64_t>(mp + ArcDecrypt::Offsets::FField::ClassPrivate);
-                    if (mpr.fclass_ptr > 0x10000ULL && mpr.fclass_ptr < 0x800000000000ULL)
+                    mpr.fclass_ptr = ReadFFieldClassPtr(mp);
+                    if (mpr.fclass_ptr)
                         m_observed_fclass_ptrs.insert(mpr.fclass_ptr);
                     {
                         auto mfc_it = m_fclass_to_type.find(mpr.fclass_ptr);
