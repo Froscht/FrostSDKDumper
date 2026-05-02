@@ -107,6 +107,7 @@ Cross-checked against IDA `FField_ChainWalker_verified_20260430` @ 0x353F40 and 
 | UStruct::ChildProperties | +0xD0 | **+0x100** | native UClass / UScriptStruct |
 | (BPGC PropertyLink fallback) | — | **+0xB8** | when +0x100 is null — see §3.2 |
 | Salt sentinel | +0x78 (`0x893BCE...`) | (none / 0) | sentinel removed |
+| UEnum::Names (TArray<TPair<FName,int64>>) | +0xA8 | **+0xB0** | live-probed; +0xA0/+0xA8 = CppType FString, +0xB0/+0xB8 = Names array. Stride 16 (FName lo32 + Number + int64 value) |
 
 ### 3.1 FProperty::Offset_Internal encoding
 
@@ -272,12 +273,14 @@ The Tier-1 dynamic AutoDiscoverVTables walks `m_known_addrs` at runtime and find
 | Engine vtables (round 2) | 16,273 | 10,459 | 2,802 | 49,002 | 143,172 | — |
 | All BPGC vtables + UPackage vt | 16,241 | 10,459 | 2,805 | 49,037 | 143,470 | 10,422 |
 | Offset broad-scan + chain fallback (round 3) | 15,294 | 9,115 | 973 | 76,862 | **204,060** | **4,893** |
+| FField +0x90 fix + .data filter + UEnum +0xB0 (round 4) | 14,600 | 9,259 | **1,491** | 45,947 | 171,367 | — |
+| Phase 8 relaxed pattern (round 5, current) | 14,600 | 9,259 | 1,491 | 46,016 | 171,425 | — |
 | Reference target | 21,453 | 9,355 | 2,340 | 41,093 | 275,843 | — |
 
 Notes:
-- Functions over-shoot target (76K vs 41K) because PropertyLink walk inflates param chains. Acceptable trade-off; cosmetic.
-- Enums dropped to 973 in round 3 due to a different game session — class/enum count varies by what's loaded.
-- Of the remaining 4,893 empty bodies, many are *intentionally* empty in UE5 (SoundCues, sound triggers, abstract bases like `AIDataProvider`).
+- Round 4: round-3's 204K count was inflated by PropertyLink walks pulling in inherited params; round 4's 171K with proper FField+0x90 ClassPrivate read is closer to ground truth. Enums recovered from 973 → 1,491 by fixing UEnum::Names offset.
+- Round 5: relaxed Phase 8 pattern picks up the 26 unmatched call sites, finding 12 additional FFieldClass globals (FEnumProperty, FMapProperty, FSetProperty, FDoubleProperty, FInt16Property, FOptionalProperty, FFieldPathProperty, FClassPtrProperty, FSoftClassProperty, FMulticastInlineDelegateProperty, FMulticastSparseDelegateProperty, alt FObjectProperty slot). FProperty_Unknown count crashes from 13,599 → 745 (94.5% reduction).
+- Functions over-shoot target (~46K vs 41K) due to BPGC PropertyLink param-chain walk. Acceptable trade-off.
 
 ### Per-vtable scan results (round 2)
 
