@@ -1888,10 +1888,29 @@ inline std::vector<FFieldClassGlobal> DiscoverFFieldClassGlobals(
     std::printf("[autodisc-fcglobals] sub_3E80E0 fn start = 0x%llX (magic @ 0x%llX)\n",
         (unsigned long long)fnStart, (unsigned long long)magicRva);
 
+    // Helper: read a UTF-16LE wide string starting at .rdata RVA. Returns
+    // empty string on invalid bounds / non-printable / too-long.
+    auto readWideName = [&](uint64_t nameRva) -> std::string {
+        if (!bounds.InRData(nameRva)) return {};
+        const uint8_t* nameBytes = rdataPtr(nameRva);
+        if (!nameBytes) return {};
+        std::string name;
+        for (int i = 0; i < 64; ++i) {
+            uint16_t wc = 0;
+            std::memcpy(&wc, nameBytes + i * 2, 2);
+            if (wc == 0) break;
+            if (wc < 0x20 || wc >= 0x7F) return {};
+            name += (char)wc;
+        }
+        if (name.size() < 2) return {};
+        return name;
+    };
+
     // Step 3: scan all of .text for `E8 disp32` whose target == fnStart.
     int callSitesFound  = 0;
     int patternMatched  = 0;
     int stringsResolved = 0;
+    int relaxedAdded    = 0;
 
     for (uint64_t off = 0; off + 5 < bounds.TextSize; ++off) {
         if (textBuf[off] != 0xE8) continue;
@@ -1902,59 +1921,96 @@ inline std::vector<FFieldClassGlobal> DiscoverFFieldClassGlobals(
         if (target != fnStart) continue;
         ++callSitesFound;
 
-        // Step 4: validate the 26-byte arg-setup pattern.
-        if (off < 26) continue;
-        const uint8_t* setup = &textBuf[off - 26];
-
+        // Step 4: validate the 26-byte arg-setup pattern (strict).
         // setup[0..6]:   48 8D 0D disp32   ; lea rcx, [rip+disp32]   (target FFieldClass*)
         // setup[7..13]:  48 8D 15 disp32   ; lea rdx, [rip+disp32]   (type name)
         // setup[14..19]: 41 B8 imm32       ; mov r8d, flags
         // setup[20..25]: 41 B9 imm32       ; mov r9d, castflags
-        if (setup[0]  != 0x48 || setup[1]  != 0x8D || setup[2]  != 0x0D) continue;
-        if (setup[7]  != 0x48 || setup[8]  != 0x8D || setup[9]  != 0x15) continue;
-        if (setup[14] != 0x41 || setup[15] != 0xB8) continue;
-        if (setup[20] != 0x41 || setup[21] != 0xB9) continue;
-        ++patternMatched;
+        bool strict = false;
+        if (off >= 26) {
+            const uint8_t* s = &textBuf[off - 26];
+            strict = (s[0] == 0x48 && s[1] == 0x8D && s[2] == 0x0D &&
+                      s[7] == 0x48 && s[8] == 0x8D && s[9] == 0x15 &&
+                      s[14] == 0x41 && s[15] == 0xB8 &&
+                      s[20] == 0x41 && s[21] == 0xB9);
+        }
+
+        if (strict) {
+            const uint8_t* setup = &textBuf[off - 26];
+            int32_t dispRcx = 0, dispRdx = 0;
+            uint32_t flags = 0, castFlags = 0;
+            std::memcpy(&dispRcx,   setup + 3,  4);
+            std::memcpy(&dispRdx,   setup + 10, 4);
+            std::memcpy(&flags,     setup + 16, 4);
+            std::memcpy(&castFlags, setup + 22, 4);
+
+            uint64_t setupRva  = callRva - 26;
+            uint64_t targetRva = (setupRva + 7) + (int64_t)dispRcx;
+            uint64_t nameRva   = (setupRva + 14) + (int64_t)dispRdx;
+            if (!bounds.InData(targetRva)) continue;
+            std::string name = readWideName(nameRva);
+            if (name.empty()) continue;
+            ++patternMatched;
+            ++stringsResolved;
+
+            FFieldClassGlobal g;
+            g.TargetRva = targetRva;
+            g.TypeName  = std::move(name);
+            g.Flags     = flags;
+            g.CastFlags = castFlags;
+            out.push_back(std::move(g));
+            continue;
+        }
+
+        // Relaxed pass: many sites pass an extra stack arg (5th arg via
+        // `mov [rsp+0x20], rax` after `lea rax`), which shifts the LEA rcx /
+        // LEA rdx out of the strict 26-byte window. Scan back up to 64 bytes
+        // for the LAST `48 8D 0D disp32` (lea rcx) followed within 16 bytes
+        // by a `48 8D 15 disp32` (lea rdx) before the CALL.
+        const uint64_t scanBack = (off >= 64) ? 64 : off;
+        const uint8_t* p = &textBuf[off - scanBack];
+        int leaRcxIdx = -1;
+        for (int64_t i = (int64_t)scanBack - 7; i >= 0; --i) {
+            if (p[i] == 0x48 && p[i+1] == 0x8D && p[i+2] == 0x0D) {
+                leaRcxIdx = (int)i;
+                break;
+            }
+        }
+        if (leaRcxIdx < 0) continue;
+        // Find lea rdx within next [+7..+22] bytes.
+        int leaRdxIdx = -1;
+        for (int j = leaRcxIdx + 7; j <= leaRcxIdx + 22 && j + 7 <= (int)scanBack; ++j) {
+            if (p[j] == 0x48 && p[j+1] == 0x8D && p[j+2] == 0x15) {
+                leaRdxIdx = j;
+                break;
+            }
+        }
+        if (leaRdxIdx < 0) continue;
 
         int32_t dispRcx = 0, dispRdx = 0;
-        uint32_t flags = 0, castFlags = 0;
-        std::memcpy(&dispRcx,   setup + 3,  4);
-        std::memcpy(&dispRdx,   setup + 10, 4);
-        std::memcpy(&flags,     setup + 16, 4);
-        std::memcpy(&castFlags, setup + 22, 4);
+        std::memcpy(&dispRcx, p + leaRcxIdx + 3, 4);
+        std::memcpy(&dispRdx, p + leaRdxIdx + 3, 4);
 
-        uint64_t setupRva  = callRva - 26;
-        uint64_t targetRva = (setupRva + 7) + (int64_t)dispRcx;       // lea rcx
-        uint64_t nameRva   = (setupRva + 14) + (int64_t)dispRdx;      // lea rdx
-
+        uint64_t leaRcxRva = (callRva - scanBack) + leaRcxIdx;
+        uint64_t leaRdxRva = (callRva - scanBack) + leaRdxIdx;
+        uint64_t targetRva = (leaRcxRva + 7) + (int64_t)dispRcx;
+        uint64_t nameRva   = (leaRdxRva + 7) + (int64_t)dispRdx;
         if (!bounds.InData(targetRva)) continue;
-        if (!bounds.InRData(nameRva))  continue;
-
-        // Read the wide string from .rdata.
-        const uint8_t* nameBytes = rdataPtr(nameRva);
-        if (!nameBytes) continue;
-        std::string name;
-        bool nameOk = true;
-        for (int i = 0; i < 64; ++i) {
-            uint16_t wc = 0;
-            std::memcpy(&wc, nameBytes + i * 2, 2);
-            if (wc == 0) break;
-            if (wc < 0x20 || wc >= 0x7F) { nameOk = false; break; }
-            name += (char)wc;
-        }
-        if (!nameOk || name.size() < 2) continue;
+        std::string name = readWideName(nameRva);
+        if (name.empty()) continue;
         ++stringsResolved;
+        ++relaxedAdded;
 
         FFieldClassGlobal g;
         g.TargetRva = targetRva;
         g.TypeName  = std::move(name);
-        g.Flags     = flags;
-        g.CastFlags = castFlags;
+        g.Flags     = 0;       // not extracted in relaxed mode
+        g.CastFlags = 0;       // not extracted in relaxed mode
         out.push_back(std::move(g));
     }
 
-    std::printf("[autodisc-fcglobals] CALL sites: %d  pattern-matched: %d  resolved: %d\n",
-        callSitesFound, patternMatched, stringsResolved);
+    std::printf("[autodisc-fcglobals] CALL sites: %d  strict: %d  relaxed: %d  resolved: %d\n",
+        callSitesFound, patternMatched, relaxedAdded, stringsResolved);
 
     if (!out.empty()) {
         // Build deduped (RVA → name) summary for the log.
