@@ -212,7 +212,12 @@ namespace Offsets {
         constexpr uint64_t MinAlignment    = 0x0F8;  // unchanged
     }
     namespace UEnum {
-        constexpr uint64_t Names = 0xA8;  // 20260428: shifted from 0xB0; +0xA0 holds CppType FString. Names[i].lo32 is direct FNamePool index (no obfuscation).
+        // CL-1177146: Names @ +0xB0. Live-probed on 5 enum objects:
+        //   +0xA0/+0xA8 = CppType FString (Data ptr, Num, Max)
+        //   +0xB0/+0xB8 = Names TArray<TPair<FName,int64>> (Data ptr, Num, Max)
+        //   +0xE0 = UEnum vtable (RVA 0xADA1140 on CL-1177146)
+        // 20260428 had Names @ +0xA8.
+        constexpr uint64_t Names = 0xB0;
     }
     namespace UFunction {
         constexpr uint64_t VTable        = 0x000;
