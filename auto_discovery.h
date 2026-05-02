@@ -51,6 +51,7 @@
 #include "sig_scanner_v2.h"
 #include "insn_decoder.h"
 #include "func_analyzer.h"
+#include "pe_reader.h"
 
 namespace AutoDiscovery {
 
@@ -1762,6 +1763,213 @@ inline FFieldClassNameParams DiscoverFFieldClassNameDecrypt(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Phase 8: FFieldClass global table extraction (FFieldClass ctor caller scan)
+//
+// Each property type (FBoolProperty, FIntProperty, ...) has a thread-local-
+// init function that calls the FFieldClass constructor `sub_3E80E0` with:
+//   arg1 (rcx) = LEA static slot in .data (FFieldClass*)  ← global pointer
+//   arg2 (rdx) = LEA wide string in .rdata               ← type name
+//   arg3 (r8d) = imm32 flags
+//   arg4 (r9d) = imm32 CastFlags
+//   arg5,6 on stack = parent FFieldClass*, ctor function ptr
+//
+// Most init functions are tiny (0x9f-0xab bytes) with a fixed 26-byte arg
+// setup pattern preceding the call:
+//   48 8D 0D disp32   lea rcx, [rip+target]
+//   48 8D 15 disp32   lea rdx, [rip+wide_string]
+//   41 B8 imm32       mov r8d, flags
+//   41 B9 imm32       mov r9d, castflags
+//   E8 disp32         call sub_3E80E0
+//
+// Strategy:
+//   1. Sigscan for sub_3E80E0's unique constant `49 BA 06 08 0E 0C 16 10 1E 1C`
+//      (movabs r10, 0x1C1E10160C0E0806 — the magic init value written at +0).
+//      → 1 hit, ~0x31 bytes into sub_3E80E0. Walk back through prologue to
+//      find function start.
+//   2. Sigscan all of .text for `E8 disp32` whose target == sub_3E80E0 start.
+//   3. For each CALL site, validate the 26-byte LEA+MOV pattern and extract:
+//      - target FFieldClass* RVA   (from lea rcx)
+//      - type name wide string RVA (from lea rdx) → read UTF-16LE
+//   4. Return the list of (target_rva, type_name) pairs.
+//
+// The dumper consumes these by dereferencing each target_rva at runtime to
+// get the heap FFieldClass* (set by sub_3E80E0 during init), then maps
+// that heap pointer → type_name in m_fclass_to_type. This bypasses the
+// FName decode pipeline entirely — the type names come straight out of
+// the binary's .rdata.
+// ─────────────────────────────────────────────────────────────────────────────
+struct FFieldClassGlobal {
+    uint64_t    TargetRva = 0;     // .data RVA holding the heap FFieldClass*
+    std::string TypeName;          // e.g. "FBoolProperty"
+    uint32_t    Flags     = 0;     // arg3 (rare types vary)
+    uint32_t    CastFlags = 0;     // arg4 (CastFlags bitmask)
+};
+
+inline std::vector<FFieldClassGlobal> DiscoverFFieldClassGlobals(
+    SigScan::PEFileReader& pe, const ModuleBounds& bounds)
+{
+    std::vector<FFieldClassGlobal> out;
+
+    if (!pe.IsOpen()) {
+        std::printf("[autodisc-fcglobals] PE on-disk reader not open — skipping\n");
+        return out;
+    }
+
+    // sub_3E80E0 is VMProtected in the live module dump (bytes don't match
+    // on-disk PE), so we MUST read from the on-disk binary for static
+    // analysis. The (target_rva, type_name) pairs extracted are stable —
+    // only the dereference at module_base+target_rva needs live memory.
+    //
+    // Read all of .text into a buffer for fast scanning.
+    std::vector<uint8_t> textBuf(bounds.TextSize, 0);
+    if (!pe.ReadAtRVA((uint32_t)bounds.TextRva, textBuf.data(), bounds.TextSize)) {
+        std::printf("[autodisc-fcglobals] could not read .text from on-disk PE\n");
+        return out;
+    }
+
+    auto inText = [&](uint64_t rva) {
+        return rva >= bounds.TextRva && rva < bounds.TextEnd();
+    };
+    auto textPtr = [&](uint64_t rva) -> const uint8_t* {
+        if (!inText(rva)) return nullptr;
+        return textBuf.data() + (rva - bounds.TextRva);
+    };
+
+    // Read .rdata too (for wide string resolution).
+    std::vector<uint8_t> rdataBuf(bounds.RDataSize, 0);
+    pe.ReadAtRVA((uint32_t)bounds.RDataRva, rdataBuf.data(), bounds.RDataSize);
+
+    auto inRData = [&](uint64_t rva) {
+        return rva >= bounds.RDataRva && rva < bounds.RDataEnd();
+    };
+    auto rdataPtr = [&](uint64_t rva) -> const uint8_t* {
+        if (!inRData(rva)) return nullptr;
+        return rdataBuf.data() + (rva - bounds.RDataRva);
+    };
+
+    // Step 1: find sub_3E80E0 via its unique magic constant
+    //   `49 BA 06 08 0E 0C 16 10 1E 1C` (movabs r10, 0x1C1E10160C0E0806).
+    static const uint8_t kMagic[10] = {
+        0x49, 0xBA, 0x06, 0x08, 0x0E, 0x0C, 0x16, 0x10, 0x1E, 0x1C
+    };
+    uint64_t magicRva = 0;
+    for (uint64_t i = 0; i + 10 <= bounds.TextSize; ++i) {
+        if (std::memcmp(textBuf.data() + i, kMagic, 10) == 0) {
+            magicRva = bounds.TextRva + i;
+            break;
+        }
+    }
+    if (!magicRva) {
+        std::printf("[autodisc-fcglobals] sub_3E80E0 magic const not found in on-disk .text\n");
+        return out;
+    }
+
+    // Step 2: walk back from magic to find function start.
+    // Prologue typically starts with `56 57 53 48 81 EC ...`. Search for
+    // CC-padding boundary (CC byte followed by valid push-reg).
+    uint64_t fnStart = 0;
+    for (int back = 0x10; back <= 0x100; ++back) {
+        uint64_t rva = magicRva - back;
+        const uint8_t* p = textPtr(rva);
+        if (!p || p == textBuf.data()) continue;
+        if (p[-1] != 0xCC) continue;
+        // Common 64-bit prologue first bytes:
+        if (p[0] != 0x56 && p[0] != 0x57 && p[0] != 0x53 &&
+            p[0] != 0x55 && p[0] != 0x40 && p[0] != 0x48 &&
+            p[0] != 0x41 && p[0] != 0x4C) continue;
+        fnStart = rva;
+        break;
+    }
+    if (!fnStart) {
+        std::printf("[autodisc-fcglobals] could not locate sub_3E80E0 fn start "
+                    "(magic at 0x%llX)\n", (unsigned long long)magicRva);
+        return out;
+    }
+    std::printf("[autodisc-fcglobals] sub_3E80E0 fn start = 0x%llX (magic @ 0x%llX)\n",
+        (unsigned long long)fnStart, (unsigned long long)magicRva);
+
+    // Step 3: scan all of .text for `E8 disp32` whose target == fnStart.
+    int callSitesFound  = 0;
+    int patternMatched  = 0;
+    int stringsResolved = 0;
+
+    for (uint64_t off = 0; off + 5 < bounds.TextSize; ++off) {
+        if (textBuf[off] != 0xE8) continue;
+        int32_t disp = 0;
+        std::memcpy(&disp, &textBuf[off + 1], 4);
+        uint64_t callRva = bounds.TextRva + off;
+        uint64_t target  = callRva + 5 + (int64_t)disp;
+        if (target != fnStart) continue;
+        ++callSitesFound;
+
+        // Step 4: validate the 26-byte arg-setup pattern.
+        if (off < 26) continue;
+        const uint8_t* setup = &textBuf[off - 26];
+
+        // setup[0..6]:   48 8D 0D disp32   ; lea rcx, [rip+disp32]   (target FFieldClass*)
+        // setup[7..13]:  48 8D 15 disp32   ; lea rdx, [rip+disp32]   (type name)
+        // setup[14..19]: 41 B8 imm32       ; mov r8d, flags
+        // setup[20..25]: 41 B9 imm32       ; mov r9d, castflags
+        if (setup[0]  != 0x48 || setup[1]  != 0x8D || setup[2]  != 0x0D) continue;
+        if (setup[7]  != 0x48 || setup[8]  != 0x8D || setup[9]  != 0x15) continue;
+        if (setup[14] != 0x41 || setup[15] != 0xB8) continue;
+        if (setup[20] != 0x41 || setup[21] != 0xB9) continue;
+        ++patternMatched;
+
+        int32_t dispRcx = 0, dispRdx = 0;
+        uint32_t flags = 0, castFlags = 0;
+        std::memcpy(&dispRcx,   setup + 3,  4);
+        std::memcpy(&dispRdx,   setup + 10, 4);
+        std::memcpy(&flags,     setup + 16, 4);
+        std::memcpy(&castFlags, setup + 22, 4);
+
+        uint64_t setupRva  = callRva - 26;
+        uint64_t targetRva = (setupRva + 7) + (int64_t)dispRcx;       // lea rcx
+        uint64_t nameRva   = (setupRva + 14) + (int64_t)dispRdx;      // lea rdx
+
+        if (!bounds.InData(targetRva)) continue;
+        if (!bounds.InRData(nameRva))  continue;
+
+        // Read the wide string from .rdata.
+        const uint8_t* nameBytes = rdataPtr(nameRva);
+        if (!nameBytes) continue;
+        std::string name;
+        bool nameOk = true;
+        for (int i = 0; i < 64; ++i) {
+            uint16_t wc = 0;
+            std::memcpy(&wc, nameBytes + i * 2, 2);
+            if (wc == 0) break;
+            if (wc < 0x20 || wc >= 0x7F) { nameOk = false; break; }
+            name += (char)wc;
+        }
+        if (!nameOk || name.size() < 2) continue;
+        ++stringsResolved;
+
+        FFieldClassGlobal g;
+        g.TargetRva = targetRva;
+        g.TypeName  = std::move(name);
+        g.Flags     = flags;
+        g.CastFlags = castFlags;
+        out.push_back(std::move(g));
+    }
+
+    std::printf("[autodisc-fcglobals] CALL sites: %d  pattern-matched: %d  resolved: %d\n",
+        callSitesFound, patternMatched, stringsResolved);
+
+    if (!out.empty()) {
+        std::printf("[autodisc-fcglobals] sample mappings:");
+        size_t shown = 0;
+        for (const auto& g : out) {
+            if (shown++ >= 8) break;
+            std::printf(" %s@0x%llX", g.TypeName.c_str(),
+                (unsigned long long)g.TargetRva);
+        }
+        std::printf("\n");
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Globals — populated by main.cpp::Init() during the discovery phase, read
 // at decrypt sites (gobjects.h, fname_decrypt.h, arc_decrypt.h).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1775,5 +1983,6 @@ inline UObjSlotDecryptParams     g_DiscoveredUObjSlot;
 inline FNameResolverConsts       g_DiscoveredFName;
 inline GNamesDiscovery           g_DiscoveredGNames;
 inline FFieldClassNameParams     g_DiscoveredFFieldClassName;
+inline std::vector<FFieldClassGlobal> g_DiscoveredFClassGlobals;
 
 }  // namespace AutoDiscovery

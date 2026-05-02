@@ -846,6 +846,53 @@ public:
         return Added;
     }
 
+    // ── Phase 8 seeder: directly map static FFieldClass globals → name ─
+    // Phase 8 (DiscoverFFieldClassGlobals) extracted (target_rva, type_name)
+    // pairs by scanning callers of the FFieldClass constructor. Critically:
+    // the target_rva IS the FFieldClass STRUCT itself (a .data static
+    // allocation), NOT a pointer-holding slot. The constructor writes the
+    // FFieldClass fields into that .data slot in-place, so at runtime
+    // m_observed_fclass_ptrs sees `module_base + target_rva` directly when
+    // walking FProperty.ClassPrivate — no extra dereference.
+    size_t SeedFClassMapFromGlobals() {
+        const auto& Globals = AutoDiscovery::g_DiscoveredFClassGlobals;
+        if (Globals.empty()) return 0;
+
+        size_t Examined = 0, AlreadyMapped = 0, Conflict = 0, Added = 0;
+        std::unordered_map<std::string, size_t> AddedByType;
+
+        for (const auto& G : Globals) {
+            ++Examined;
+            uint64_t StaticAddr = MODULE_BASE + G.TargetRva;
+            auto It = m_fclass_to_type.find(StaticAddr);
+            if (It != m_fclass_to_type.end()) {
+                if (It->second != G.TypeName) ++Conflict;
+                else                            ++AlreadyMapped;
+                continue;
+            }
+            m_fclass_to_type[StaticAddr] = G.TypeName;
+            ++Added;
+            ++AddedByType[G.TypeName];
+        }
+
+        std::printf("[fcglob-seed] examined=%zu already=%zu conflict=%zu added=%zu\n",
+            Examined, AlreadyMapped, Conflict, Added);
+        if (Added > 0) {
+            std::vector<std::pair<std::string, size_t>> Sorted(
+                AddedByType.begin(), AddedByType.end());
+            std::sort(Sorted.begin(), Sorted.end(),
+                [](const auto& A, const auto& B) { return A.second > B.second; });
+            std::printf("[fcglob-seed] new mappings by type:");
+            size_t Shown = 0;
+            for (const auto& [Tn, Cnt] : Sorted) {
+                if (Shown++ >= 15) break;
+                std::printf(" %s=%zu", Tn.c_str(), Cnt);
+            }
+            std::printf("\n");
+        }
+        return Added;
+    }
+
     // ── CastFlags-based seeder: resolve FFieldClass by CastFlags bitmask ─
     // FFieldClass+0x10 holds a 64-bit CastFlags bitmask, unique per property
     // type (FBoolProperty=0x28001, etc.). Verified via:
@@ -2288,6 +2335,16 @@ public:
                     NameAdded, m_fclass_to_type.size());
             }
 
+            // Phase 8 path: dereference each (target_rva, type_name) tuple
+            // extracted from FFieldClass init callers — direct map of static
+            // .data globals to type names. Bypasses FName decryption entirely.
+            // Runs FIRST so its mappings feed the CastFlags seeder below.
+            size_t Phase8Added = SeedFClassMapFromGlobals();
+            if (Phase8Added > 0) {
+                std::printf("[fcglob-seed] Phase 8 globals produced %zu new FFieldClass mappings (total=%zu)\n",
+                    Phase8Added, m_fclass_to_type.size());
+            }
+
             // Phase 7 path: if FFieldClass NamePrivate decode auto-discovered
             // its full pipeline (PSHUFLW + ROL32 + PSHUFLW + XOR + ROL64),
             // use m_fname.DecryptFFieldClassNameCI directly on every observed
@@ -2303,10 +2360,9 @@ public:
             }
 
             // CastFlags path: read FFieldClass+0x10 (uint64 CastFlags bitmask),
-            // build a (CastFlags → name) map from the 55 already-mapped
-            // FFieldClasses, then resolve every unmapped observed FFieldClass
-            // by its CastFlags. Independent of FName decryption — uses only
-            // the property type's unique bitflags. Closes the bulk of the
+            // build a (CastFlags → name) map from the now ~30-50 mapped
+            // FFieldClasses (after Phase 8), then resolve every unmapped
+            // observed FFieldClass by its CastFlags. Closes the bulk of the
             // FFieldClass mapping gap on CL-1177146 (~700+ unmapped objs).
             size_t CfAdded = SeedFClassMapByCastFlags();
             if (CfAdded > 0) {

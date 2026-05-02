@@ -288,6 +288,19 @@ public:
             ? AutoDiscovery::g_DiscoveredBounds.ImageSize
             : 0xE900000ULL;
 
+        // ── Open the on-disk PE early ──────────────────────────────────
+        // Phase 8 (FFieldClass globals) needs PE-on-disk because the
+        // FFieldClass ctor sub_3E80E0 is VMProtected: live module bytes
+        // don't match the PE. Hoisting m_sigPe init here lets every later
+        // phase use the on-disk fallback without waiting for the legacy
+        // sigscan block.
+        {
+            const std::string& pe_path = GetPEBinaryPath();
+            if (!m_sigPeReady && !pe_path.empty() && m_sigPe.Open(pe_path.c_str())) {
+                m_sigPeReady = true;
+            }
+        }
+
         // ── Phase 0b: SigScanV2 — full module cache + Zydis-aware scanner ──
         // Replaces the page-streaming legacy SigScan for everything that
         // needs Zydis disassembly. The legacy SigScan stays around for the
@@ -352,6 +365,25 @@ public:
                     AutoDiscovery::g_DiscoveredFFieldClassName.FFieldClassOffset,
                     (unsigned long long)AutoDiscovery::g_DiscoveredFFieldClassName.XorLo64,
                     AutoDiscovery::g_DiscoveredFFieldClassName.ConsensusSiteCount);
+            }
+
+            // ── Phase 8: enumerate FFieldClass init callers → (RVA, name) ─
+            // Reads from the on-disk PE (NOT the live module) because
+            // sub_3E80E0 is VMProtected: live memory has different bytes
+            // than the PE on disk. The .data target RVA is what matters at
+            // runtime; we just need static analysis to extract it.
+            if (m_sigPeReady) {
+                AutoDiscovery::g_DiscoveredFClassGlobals =
+                    AutoDiscovery::DiscoverFFieldClassGlobals(
+                        m_sigPe, AutoDiscovery::g_DiscoveredBounds);
+            }
+            if (!AutoDiscovery::g_DiscoveredFClassGlobals.empty()) {
+                std::printf("[autodisc] FFieldClass globals discovered: %zu (%s, %s, ...)\n",
+                    AutoDiscovery::g_DiscoveredFClassGlobals.size(),
+                    AutoDiscovery::g_DiscoveredFClassGlobals[0].TypeName.c_str(),
+                    AutoDiscovery::g_DiscoveredFClassGlobals.size() > 1
+                        ? AutoDiscovery::g_DiscoveredFClassGlobals[1].TypeName.c_str()
+                        : "—");
             }
         }
 
