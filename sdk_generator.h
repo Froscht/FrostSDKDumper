@@ -762,7 +762,14 @@ public:
                 bool NonZero = false;
                 for (int B = 0; B < 16; ++B) if (Enc[B]) { NonZero = true; break; }
                 if (!NonZero) continue;
-                uint64_t Dec = m_fname.DecryptFFieldNameSlot(Enc);
+                // FFieldClass uses a different decode pipeline than FField
+                // (XOR(all-FF) → ROL32(7) → PSHUFLW(0x1B) → ROL64(32) — see
+                // fname_decrypt.h::DecryptFFieldClassNameSlotFromBytes vs
+                // DecryptFFieldNameSlot). The previous call to
+                // DecryptFFieldNameSlot here applied the FField pipeline to
+                // FFieldClass slots, producing garbage CIs; calibration would
+                // report "no offset produced any canonical type-name match".
+                uint64_t Dec = m_fname.DecryptFFieldClassNameSlotFromBytes(Enc);
                 uint32_t Lo = static_cast<uint32_t>(Dec);
                 if (Lo < 2 || Lo > 0x2000000u) continue;
                 std::string Name = m_fname.CompIndexToName(static_cast<int32_t>(Lo));
@@ -791,13 +798,21 @@ public:
         }
 
         const Score& Best = Scores[0];
-        // Threshold: require ≥30% of sampled FFieldClasses to resolve to a
-        // canonical name. Below that, the offset is probably noise.
-        const int32_t Required = static_cast<int32_t>(Sample.size()) * 30 / 100;
-        if (Best.Hits < Required) {
-            std::printf("[fcname-cal] best offset +0x%X hits=%d/%zu < %d (30%%) — too weak; skipping\n",
-                Best.Off, Best.Hits, Sample.size(), Required);
-            // Still log top 5 for debugging.
+        // Threshold: require ≥15% of sampled FFieldClasses to resolve to a
+        // canonical name AND a clean separation from the runner-up (best ≥
+        // 5× runner-up). The observed FFieldClass set includes non-property
+        // types (FField, FFieldPathProperty parent, etc.) that legitimately
+        // won't match canonical-property-type names; the previous 30% bar
+        // rejected real offsets when the property:non-property ratio was low.
+        // The runner-up gate replaces the absolute threshold as the noise
+        // filter — a real offset produces sharp clustering, noise offsets
+        // are flat.
+        const int32_t Required = static_cast<int32_t>(Sample.size()) * 15 / 100;
+        const int32_t RunnerUp = (Scores.size() > 1) ? Scores[1].Hits : 0;
+        const bool ClearWinner = Best.Hits >= 5 * std::max(1, RunnerUp);
+        if (Best.Hits < Required || !ClearWinner) {
+            std::printf("[fcname-cal] best offset +0x%X hits=%d/%zu (need >=%d, runner-up=%d) — too weak; skipping\n",
+                Best.Off, Best.Hits, Sample.size(), Required, RunnerUp);
             for (size_t I = 0; I < Scores.size() && I < 5; ++I) {
                 std::printf("[fcname-cal]   +0x%X hits=%d  example=%s\n",
                     Scores[I].Off, Scores[I].Hits, Scores[I].Best.c_str());
@@ -829,7 +844,8 @@ public:
             bool NonZero = false;
             for (int B = 0; B < 16; ++B) if (Enc[B]) { NonZero = true; break; }
             if (!NonZero) { ++BadCi; continue; }
-            uint64_t Dec = m_fname.DecryptFFieldNameSlot(Enc);
+            // FFieldClass pipeline (see calibration note above), NOT FField.
+            uint64_t Dec = m_fname.DecryptFFieldClassNameSlotFromBytes(Enc);
             uint32_t Lo = static_cast<uint32_t>(Dec);
             if (Lo < 2 || Lo > 0x2000000u) { ++BadCi; continue; }
             std::string Name = m_fname.CompIndexToName(static_cast<int32_t>(Lo));

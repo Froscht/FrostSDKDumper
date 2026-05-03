@@ -91,6 +91,37 @@ inline void ApplyOffset(const char* name, uint64_t& slot, uint64_t found,
     }
 }
 
+// Same as ApplyOffset, but also factors in the compile-time slot's own
+// probe score: if compile-time scores ≥ keep_threshold × winner_score,
+// keep compile-time. Used by probes where multiple offsets can produce
+// plausible chains (FField::Next via RefLink/DestructorLink, etc.) and
+// drifting silently is more dangerous than missing a real drift.
+inline void ApplyOffsetSticky(const char* name, uint64_t& slot, uint64_t found,
+                              int found_hits, int slot_hits, int total,
+                              int min_hits, double keep_threshold = 0.7)
+{
+    if (found == 0 || found_hits < min_hits) {
+        std::printf("[autoff] %-32s probe weak (best=0x%llX hits=%d/%d, need %d) — keeping 0x%llX\n",
+            name, (unsigned long long)found, found_hits, total, min_hits, (unsigned long long)slot);
+        return;
+    }
+    if (found == slot) {
+        std::printf("[autoff] %-32s matches constant 0x%llX (%d/%d hits)\n",
+            name, (unsigned long long)found, found_hits, total);
+        return;
+    }
+    if (slot_hits >= (int)(found_hits * keep_threshold)) {
+        std::printf("[autoff] %-32s probe found 0x%llX (%d hits) but compile-time 0x%llX scores %d hits (%.0f%%) — keeping\n",
+            name, (unsigned long long)found, found_hits,
+            (unsigned long long)slot, slot_hits, 100.0 * slot_hits / found_hits);
+        return;
+    }
+    std::printf("[autoff] %-32s drift: 0x%llX (%d) → 0x%llX (%d) (auto-fixed)\n",
+        name, (unsigned long long)slot, slot_hits,
+        (unsigned long long)found, found_hits);
+    slot = found;
+}
+
 inline std::vector<uint64_t> FilterByVtable(
     const std::vector<uint64_t>& objs, IMemoryReader& reader,
     uint64_t want_vt_va, size_t max_n)
@@ -243,11 +274,15 @@ inline void ProbeChildPropertiesAndClassPrivate(Context& ctx,
                 joint_hits);
     auto [cp_best, cp_hits] = PickMode(cp_counts);
     auto [cpriv_best, cpriv_hits] = PickMode(cpriv_counts);
-    ApplyOffset("UStruct::ChildProperties", ArcDecrypt::Offsets::UStruct::ChildProperties,
-                cp_best, cp_hits, (int)ustructs.size(), 5);
+    const uint64_t cp_slot = ArcDecrypt::Offsets::UStruct::ChildProperties;
+    const uint64_t cpriv_slot = ArcDecrypt::Offsets::FField::ClassPrivate;
+    int cp_slot_hits = cp_counts.count(cp_slot) ? cp_counts[cp_slot] : 0;
+    int cpriv_slot_hits = cpriv_counts.count(cpriv_slot) ? cpriv_counts[cpriv_slot] : 0;
+    ApplyOffsetSticky("UStruct::ChildProperties", ArcDecrypt::Offsets::UStruct::ChildProperties,
+                      cp_best, cp_hits, cp_slot_hits, (int)ustructs.size(), 5);
     ArcDecrypt::Offsets::UStruct::Children = ArcDecrypt::Offsets::UStruct::ChildProperties;
-    ApplyOffset("FField::ClassPrivate", ArcDecrypt::Offsets::FField::ClassPrivate,
-                cpriv_best, cpriv_hits, (int)ustructs.size(), 5);
+    ApplyOffsetSticky("FField::ClassPrivate", ArcDecrypt::Offsets::FField::ClassPrivate,
+                      cpriv_best, cpriv_hits, cpriv_slot_hits, (int)ustructs.size(), 5);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -259,6 +294,7 @@ inline void ProbeChildPropertiesAndClassPrivate(Context& ctx,
 // ─────────────────────────────────────────────────────────────────
 inline void ProbeFFieldNext(Context& ctx, const std::vector<uint64_t>& ustructs) {
     if (ustructs.empty() || ctx.fclass_to_type.empty()) return;
+    const uint64_t slot_off = ArcDecrypt::Offsets::FField::Next;
     std::unordered_map<uint64_t, int> chain_total;
     for (uint64_t uss : ustructs) {
         uint64_t head = 0;
@@ -282,8 +318,9 @@ inline void ProbeFFieldNext(Context& ctx, const std::vector<uint64_t>& ustructs)
         }
     }
     auto [best, score] = PickMode(chain_total);
-    ApplyOffset("FField::Next", ArcDecrypt::Offsets::FField::Next,
-                best, score, (int)ustructs.size(), 10);
+    int slot_score = chain_total.count(slot_off) ? chain_total[slot_off] : 0;
+    ApplyOffsetSticky("FField::Next", ArcDecrypt::Offsets::FField::Next,
+                      best, score, slot_score, (int)ustructs.size(), 10);
 }
 
 // (FField::ClassPrivate is discovered jointly with ChildProperties — see
@@ -324,8 +361,10 @@ inline void ProbeFFieldNamePrivate(Context& ctx, const std::vector<uint64_t>& us
         if (hi_cnt >= 3) off_score[off] = hi_cnt;
     }
     auto [best, hits] = PickMode(off_score);
-    ApplyOffset("FField::NamePrivate", ArcDecrypt::Offsets::FField::NamePrivate,
-                best, hits, (int)ffields.size(), 10);
+    const uint64_t slot_off = ArcDecrypt::Offsets::FField::NamePrivate;
+    int slot_hits = off_score.count(slot_off) ? off_score[slot_off] : 0;
+    ApplyOffsetSticky("FField::NamePrivate", ArcDecrypt::Offsets::FField::NamePrivate,
+                      best, hits, slot_hits, (int)ffields.size(), 10);
     ArcDecrypt::Offsets::FField::NameEncrypted = ArcDecrypt::Offsets::FField::NamePrivate;
 }
 
@@ -553,8 +592,10 @@ inline void ProbeUFunctionInternals(Context& ctx, const std::vector<uint64_t>& f
             }
         }
         auto [best, hits] = PickMode(counts);
-        ApplyOffset("UFunction::NativeFunc", ArcDecrypt::Offsets::UFunction::NativeFunc,
-                    best, hits, (int)functions.size(), 10);
+        const uint64_t slot = ArcDecrypt::Offsets::UFunction::NativeFunc;
+        int slot_hits = counts.count(slot) ? counts[slot] : 0;
+        ApplyOffsetSticky("UFunction::NativeFunc", ArcDecrypt::Offsets::UFunction::NativeFunc,
+                          best, hits, slot_hits, (int)functions.size(), 10);
     }
 
     // FunctionFlags — u32 with sane FUNC_* bits.
@@ -573,8 +614,10 @@ inline void ProbeUFunctionInternals(Context& ctx, const std::vector<uint64_t>& f
             }
         }
         auto [best, hits] = PickMode(counts);
-        ApplyOffset("UFunction::FunctionFlags", ArcDecrypt::Offsets::UFunction::FunctionFlags,
-                    best, hits, (int)functions.size(), 10);
+        const uint64_t slot = ArcDecrypt::Offsets::UFunction::FunctionFlags;
+        int slot_hits = counts.count(slot) ? counts[slot] : 0;
+        ApplyOffsetSticky("UFunction::FunctionFlags", ArcDecrypt::Offsets::UFunction::FunctionFlags,
+                          best, hits, slot_hits, (int)functions.size(), 10);
     }
 
     // NumParms is intentionally NOT probed.
@@ -647,7 +690,8 @@ inline void ProbeFPropertySubPointers(Context& ctx, const std::vector<uint64_t>&
             }
         }
         auto [best, hits] = PickMode(counts);
-        ApplyOffset(label, slot, best, hits, (int)ffs.size(), min_hits);
+        int slot_hits = counts.count(slot) ? counts[slot] : 0;
+        ApplyOffsetSticky(label, slot, best, hits, slot_hits, (int)ffs.size(), min_hits);
     };
 
     auto probe_to_ffield = [&](const std::vector<uint64_t>& ffs,
@@ -670,7 +714,8 @@ inline void ProbeFPropertySubPointers(Context& ctx, const std::vector<uint64_t>&
             }
         }
         auto [best, hits] = PickMode(counts);
-        ApplyOffset(label, slot, best, hits, (int)ffs.size(), min_hits);
+        int slot_hits = counts.count(slot) ? counts[slot] : 0;
+        ApplyOffsetSticky(label, slot, best, hits, slot_hits, (int)ffs.size(), min_hits);
     };
 
     uint64_t struct_vt = ctx.vtables.ScriptStructRVA ? (ctx.module_base + ctx.vtables.ScriptStructRVA) : 0;
@@ -759,24 +804,48 @@ inline void ProbeFPropertyScalars(Context& ctx, const std::vector<uint64_t>& ust
                     best, hits, (int)ffields.size(), min_hits);
     }
 
-    // ElementSize — small, power-of-2 or struct-stride
+    // ElementSize — small, power-of-2 or struct-stride. Distinguished from
+    // ArrayDim by DISPERSION: real ElementSize varies per property type
+    // (1 byte for bool, 4 for int/float, 12 for FVector, etc.) while ArrayDim
+    // is almost always 1. Without this gate, both probes pick the SAME offset
+    // (e.g. +0xF0 — the ArrayDim slot — passes the value filter because 1
+    // is in the accepted set).
     {
-        std::unordered_map<uint64_t, int> counts;
+        const uint64_t arrayDimOff = ArcDecrypt::Offsets::FProperty::ArrayDim;
+        std::unordered_map<uint64_t, std::unordered_map<uint32_t, int>> off_values;
+        std::unordered_map<uint64_t, int> off_passes;
         for (uint64_t ff : ffields) {
             for (uint64_t off = 0xC0; off <= 0x100; off += 4) {
+                if (off == arrayDimOff) continue;  // mutual exclusion
                 uint32_t v = 0;
                 if (!R(*ctx.reader, ff + off, v)) continue;
-                // Accepted sizes (covers bool/byte/short/int/long/double/Vector*/struct)
                 if (v != 1 && v != 2 && v != 4 && v != 8 && v != 12 && v != 16 &&
                     v != 24 && v != 32 && v != 40 && v != 48 && v != 64 && v != 96 &&
                     v != 128 && v != 256) continue;
-                counts[off]++;
+                off_values[off][v]++;
+                off_passes[off]++;
             }
         }
-        auto [best, hits] = PickMode(counts);
+        // Score = passes × distinct_values. ElementSize has multiple sizes
+        // observed across property types. A field that's always 1 (or always
+        // some other constant) gets distinct=1 and loses to a varied field.
+        uint64_t best = 0; int best_score = 0; int best_passes = 0; int best_distinct = 0;
+        for (auto& [off, vmap] : off_values) {
+            int passes = off_passes[off];
+            int distinct = (int)vmap.size();
+            if (distinct < 2) continue;  // single-valued offsets are flag-like
+            int score = passes * distinct;
+            if (score > best_score) {
+                best_score = score; best = off; best_passes = passes; best_distinct = distinct;
+            }
+        }
+        if (best) {
+            std::printf("[autoff] FProperty::ElementSize         candidate +0x%llX  distinct=%d passes=%d\n",
+                (unsigned long long)best, best_distinct, best_passes);
+        }
         int min_hits = std::max(50, (int)ffields.size() / 2);
         ApplyOffset("FProperty::ElementSize", ArcDecrypt::Offsets::FProperty::ElementSize,
-                    best, hits, (int)ffields.size(), min_hits);
+                    best, best_passes, (int)ffields.size(), min_hits);
     }
 }
 

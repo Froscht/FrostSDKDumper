@@ -595,13 +595,13 @@ public:
     // All parameters auto-discovered at runtime via Phase 7.
     // Returns the FName handle (8 bytes) or 0 if decode failed / not yet
     // calibrated.
-    uint64_t DecryptFFieldClassNameSlot(uint64_t fclass_addr) {
+    // Pure SIMD pipeline — operates on raw 16-byte slot bytes. Used by the
+    // sdk_generator FFieldClass calibration loop which needs to test multiple
+    // offsets without re-reading per offset, and by DecryptFFieldClassNameSlot
+    // below.
+    uint64_t DecryptFFieldClassNameSlotFromBytes(const uint8_t enc[16]) const {
         const auto& Disc = AutoDiscovery::g_DiscoveredFFieldClassName;
         if (!Disc.Valid) return 0;
-        if (!fclass_addr) return 0;
-
-        alignas(16) uint8_t enc[16] = {};
-        if (!m_reader.Read(fclass_addr + Disc.NamePrivateOffset, enc, 16)) return 0;
         bool nonzero = false;
         for (int i = 0; i < 16; ++i) if (enc[i]) { nonzero = true; break; }
         if (!nonzero) return 0;
@@ -631,27 +631,26 @@ public:
         return (lo << rol64) | (lo >> (64 - rol64));
     }
 
+    uint64_t DecryptFFieldClassNameSlot(uint64_t fclass_addr) {
+        const auto& Disc = AutoDiscovery::g_DiscoveredFFieldClassName;
+        if (!Disc.Valid) return 0;
+        if (!fclass_addr) return 0;
+
+        alignas(16) uint8_t enc[16] = {};
+        if (!m_reader.Read(fclass_addr + Disc.NamePrivateOffset, enc, 16)) return 0;
+        return DecryptFFieldClassNameSlotFromBytes(enc);
+    }
+
     // Convenience wrapper: decode FFieldClass name slot → FName handle →
     // entry pointer → CompIndex. Returns 0 on any failure in the chain.
     int32_t DecryptFFieldClassNameCI(uint64_t fclass_addr) {
         uint64_t handle = DecryptFFieldClassNameSlot(fclass_addr);
         if (!handle) return 0;
-        // The handle uses the same encryption as UObject inline-handle slots:
-        // bswap64(handle ^ ENTRY_HANDLE_XOR) → FNameEntry*. Use the existing
-        // DecryptEntryHandle helper (auto-fixed XOR const at startup).
-        if (handle == ArcDecrypt::Patch20260421::ENTRY_HANDLE_XOR) return 0;
-        uint64_t entry = ArcDecrypt::Patch20260421::DecryptEntryHandle(handle);
-        if (entry < 0x10000ULL || entry >= 0x800000000000ULL) return 0;
-        if (entry >= m_base && entry < m_base + 0x10000000ULL) return 0;  // module ptr is bogus
-        // Read the FNameEntry header and extract the CompIndex.
-        // FNameEntry layout: header (4 bytes flags+len) ... but the ENTRY-
-        // pointer-to-CI conversion is build-specific. Instead, decode the
-        // STRING via DecryptNameString and look up by name in the canonical
-        // table — caller does the type-name match. So here we take a
-        // shortcut: the lo32 of `handle` itself often equals the CI on
-        // builds where the handle format is `(Number << 32) | CI`. If that
-        // produces a sane CI, use it; otherwise return 0 and let the
-        // by-handle path resolve.
+        // FFieldClass handle layout on CL-1177146 is `(Number << 32) | CI`
+        // (post-decode), NOT an encrypted entry-pointer. Don't run it through
+        // DecryptEntryHandle — that's for inline UObject handle slots and
+        // its validation rejects valid CIs whose `bswap64(handle ^ XOR)`
+        // happens to land in the module range. Just take the lo32 directly.
         uint32_t ci_candidate = static_cast<uint32_t>(handle);
         if (ci_candidate >= 2 && ci_candidate <= 0x2000000u) {
             return static_cast<int32_t>(ci_candidate);

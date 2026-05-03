@@ -946,6 +946,352 @@ inline VTableMap DiscoverEngineVTables(const std::vector<uint64_t>& objects,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Phase 1.5: Engine type-pool vtable discovery via wide-string anchor
+//
+// Phase 1 (name-cluster) fails when live FName resolution is weak — too few
+// canonical names match per cluster, gates reject real vtables. Phase 1.5
+// runs as a fallback: it anchors on the kind's UTF-16 wide string in .rdata
+// (e.g. L"ScriptStruct") and walks the containing function looking for the
+// vtable write.
+//
+// Two patterns observed across CL-1177146:
+//   A. Z_Construct shape (ScriptStruct/Function/Class):
+//        lea rXX, [rip + L"<Kind>"]      ; wide-string LEA
+//        ...
+//        lea rax, [rip + class_ctor]      ; class-constructor function ptr
+//        mov [reg + 0x140], rax           ; UClass.ClassConstructor
+//      → Class-ctor function (small, <0x200 bytes) writes the vtable as:
+//        lea rax, [rip + vtable]
+//        mov [rdi], rax
+//
+//   B. Self-contained shape (Enum/Package):
+//        lea rXX, [rip + L"<Kind>"]      ; in registration callsite
+//        ...
+//        lea rax, [rip + vtable]          ; direct vtable LEA
+//        mov [rdi], rax                   ; vtable write at offset 0
+//
+// Algorithm per kind:
+//   1. Find UTF-16 L"<Kind>\0\0" in .rdata.
+//   2. Find LEA xrefs to it in .text (sigscan `48 8D ?? d32` where d32 →
+//      string RVA).
+//   3. For each xref's containing function, scan ≤0x300 bytes forward for:
+//      (a) Direct vtable write `48 8D 05 d32 48 89 ??` where d32 → .rdata
+//          AND first qword at d32 → .text (vtable[0] is dtor).
+//      (b) Class-ctor pointer write `48 8D 05 d32 48 89 ?? 40 01 00 00`
+//          (mov [reg+0x140], rax) where d32 → .text. Recurse 1 level into
+//          the target function and apply (a).
+//   4. Mode-pick across xrefs.
+//
+// This is patch-resilient: the wide strings, vtable-write idiom, and
+// UClass.ClassConstructor offset (0x140) are all UE5-stable. UnrealHeaderTool
+// emits these patterns mechanically from UCLASS macros every build.
+// ─────────────────────────────────────────────────────────────────────────────
+struct EngineVTableAnchorResult {
+    uint64_t ScriptStructRVA = 0;
+    uint64_t ClassNativeRVA  = 0;
+    uint64_t FunctionRVA     = 0;
+    uint64_t EnumRVA         = 0;
+    uint64_t PackageRVA      = 0;
+
+    int      Found           = 0;  // count of resolved kinds (max 5)
+};
+
+inline EngineVTableAnchorResult DiscoverEngineVTablesByWideStringAnchor(
+    const SigScanV2::Scanner& scanner, IMemoryReader& reader,
+    uint64_t module_base, const ModuleBounds& bounds)
+{
+    EngineVTableAnchorResult out;
+    if (!bounds.Valid) return out;
+
+    // Helper: validate a candidate vtable RVA. Engine type-pool vtables
+    // (UScriptStruct/UClass/UFunction/UEnum/UPackage) are LARGE — typically
+    // 100+ qword entries each pointing into .text (the class's virtual
+    // method table). Property class globals (FEnumProperty etc.) and other
+    // small structures share the "first qword → .text" pattern but have far
+    // fewer text entries. Require ≥24 text-pointer entries in the first
+    // 0x200 bytes (64 qwords) to filter out non-pool .rdata structures.
+    auto density_score = [&](uint64_t vt_rva) -> int {
+        if (!bounds.InRData(vt_rva)) return 0;
+        uint64_t first_qword = 0;
+        if (!reader.Read(module_base + vt_rva, &first_qword, 8)) return 0;
+        if (first_qword < module_base) return 0;
+        uint64_t first_rva = first_qword - module_base;
+        if (!bounds.InText(first_rva)) return 0;
+        // Read 0x200 bytes (64 qwords) and count text-pointer entries.
+        // Engine type-pool vtables (UClass, UScriptStruct, UFunction, UEnum,
+        // UPackage) all have ≥10 text-pointer entries in their first 0x200
+        // bytes; many have 30+. Property-class globals and other small
+        // structures have <8.
+        uint64_t qbuf[64] = {};
+        if (!reader.Read(module_base + vt_rva, qbuf, sizeof(qbuf))) return 0;
+        int textCount = 0;
+        for (int i = 0; i < 64; ++i) {
+            if (!qbuf[i]) continue;
+            if (qbuf[i] < module_base) continue;
+            uint64_t r = qbuf[i] - module_base;
+            if (bounds.InText(r)) ++textCount;
+        }
+        return textCount;
+    };
+    auto looks_like_vtable = [&](uint64_t vt_rva) -> bool {
+        return density_score(vt_rva) >= 10;
+    };
+
+    // Helper: scan `window` bytes from `fn_start_rva` for RIP-relative LEAs
+    // followed shortly by a same-register MOV that stores the LEA target
+    // into memory. The LEA can use ANY 64-bit destination register (rax,
+    // rcx, rdx, rbx, rsi, rdi, rsp/rbp impossible due to ModR/M, r8-r15
+    // via REX.R bit).
+    //
+    // require_140=true variant additionally requires the MOV's disp32
+    // immediate to equal 0x140 (UClass.ClassConstructor offset = 320).
+    //
+    // Returns the LEA-target RVAs in code order (so callers can pick "first"
+    // or "last" to handle Package's intermediate→final two-write shape).
+    auto scan_lea_mov_targets = [&](uint64_t fn_start_rva, size_t window,
+                                    bool require_140 = false) -> std::vector<uint64_t> {
+        std::vector<uint64_t> hits;
+        const uint8_t* p = scanner.GetLocalPtr(fn_start_rva);
+        if (!p) return hits;
+        size_t bound = window;
+        if (fn_start_rva + window > bounds.TextEnd())
+            bound = bounds.TextEnd() - fn_start_rva;
+        // Detect function end: stop at first `C3` (retn) followed by a `CC`
+        // (int3 padding) within the next 16 bytes. MSVC-style stack-cookie
+        // emit interleaves `retn ; call __security_check_cookie ; int3` —
+        // the CC isn't immediately after the retn. Plain `C3 CC` (no
+        // cookie) and `CC CC` runs are both subsumed by this rule.
+        // Without this, the scan walks PAST a small class-ctor (e.g.
+        // sub_389E94 / UEnum) into the next function and "last write"
+        // semantics pick up unrelated vtables (ADA18A0 from sub_38A000).
+        for (size_t s = 0; s + 1 < bound; ++s) {
+            if (p[s] == 0xC3) {
+                // Look ahead ≤16 bytes for a CC.
+                size_t look = std::min<size_t>(16, bound - s);
+                for (size_t t = 1; t < look; ++t) {
+                    if (p[s+t] == 0xCC) { bound = s + 1; goto bound_set; }
+                }
+            }
+            if (p[s] == 0xCC && p[s+1] == 0xCC) { bound = s; break; }
+        }
+        bound_set: ;
+        for (size_t i = 0; i + 10 <= bound; ++i) {
+            // REX.W prefix: 0x48 (low reg) or 0x4C (high reg via REX.R).
+            if (p[i] != 0x48 && p[i] != 0x4C) continue;
+            if (p[i+1] != 0x8D) continue;            // LEA opcode
+            uint8_t modrm = p[i+2];
+            // mod=00 + rm=101 → RIP-relative disp32.
+            if ((modrm & 0xC7) != 0x05) continue;
+            // Extract destination register. reg field = (modrm >> 3) & 7,
+            // extended by REX.R (high bit of REX byte).
+            uint8_t lea_dst = ((modrm >> 3) & 7) | ((p[i] & 4) ? 8 : 0);
+            int32_t disp = 0;
+            std::memcpy(&disp, p + i + 3, 4);
+            uint64_t target = (fn_start_rva + i + 7) + (int64_t)disp;
+
+            // Look for a MOV [mem], <lea_dst> within the next ~16 bytes.
+            // MOV r/m64, r64 with REX.W: opcode 0x89, REX prefix 0x48..0x4F.
+            // ModR/M's reg field is the SOURCE register; rm field/SIB is dest.
+            // We accept any addressing form for the destination — `[reg]`,
+            // `[reg+disp8]`, `[reg+disp32]`, etc.
+            bool matched = false;
+            uint64_t mov_disp_imm = 0;
+            for (size_t j = i + 7; j + 3 <= bound && j < i + 7 + 24; ++j) {
+                if ((p[j] & 0xF0) != 0x40) continue;       // not REX
+                if (!(p[j] & 0x08)) continue;              // need REX.W=1
+                if (p[j+1] != 0x89) continue;              // not MOV r/m, r64
+                uint8_t mr = p[j+2];
+                uint8_t mov_src = ((mr >> 3) & 7) | ((p[j] & 4) ? 8 : 0);
+                if (mov_src != lea_dst) continue;
+                // mod==00,01,10 = memory dest (mod==11 is reg-reg, skip).
+                uint8_t mod = mr >> 6;
+                if (mod == 3) continue;
+                // For require_140 we need to read the MOV's disp32. Decode
+                // the operand size to find it.
+                uint8_t rm = mr & 7;
+                size_t op_pos = j + 3;
+                // SIB byte if rm == 4 (mod != 11).
+                if (rm == 4) {
+                    if (op_pos >= bound) break;
+                    ++op_pos;  // skip SIB
+                }
+                // Special case: mod==00 + rm==101 = RIP-rel — skip (MOV from
+                // REG into [rip+disp32] is rare and not what we want).
+                if (mod == 0 && rm == 5) continue;
+                if (mod == 1) {
+                    if (op_pos >= bound) break;
+                    mov_disp_imm = (int8_t)p[op_pos];
+                    op_pos += 1;
+                } else if (mod == 2) {
+                    if (op_pos + 4 > bound) break;
+                    int32_t d = 0;
+                    std::memcpy(&d, p + op_pos, 4);
+                    mov_disp_imm = (uint64_t)(int64_t)d;
+                    op_pos += 4;
+                }
+                if (require_140 && mov_disp_imm != 0x140) continue;
+                matched = true;
+                break;
+            }
+            if (matched) hits.push_back(target);
+        }
+        return hits;
+    };
+
+    // Build the UTF-16 (LE) byte pattern for a wide string + NUL.
+    auto wide_pattern = [](const char* kind) -> std::vector<uint8_t> {
+        std::vector<uint8_t> bytes;
+        for (const char* c = kind; *c; ++c) {
+            bytes.push_back(static_cast<uint8_t>(*c));
+            bytes.push_back(0x00);
+        }
+        // Trailing NUL terminator.
+        bytes.push_back(0x00);
+        bytes.push_back(0x00);
+        return bytes;
+    };
+
+    // Helper: locate the start of the function containing the given xref RVA
+    // by walking back to the previous CC padding (or .text section start).
+    auto walk_to_fn_start = [&](uint64_t xref_rva) -> uint64_t {
+        const uint8_t* p = scanner.GetLocalPtr(xref_rva);
+        if (!p) return 0;
+        uint64_t lo = bounds.TextRva;
+        // Walk back ≤0x800 bytes looking for runs of 0xCC (function padding)
+        // immediately followed by a function prologue byte.
+        for (size_t back = 1; back < 0x800 && xref_rva - back > lo; ++back) {
+            const uint8_t* q = scanner.GetLocalPtr(xref_rva - back);
+            if (!q) break;
+            if (q[0] == 0xCC && q[1] != 0xCC) {
+                // skip CC padding
+                return xref_rva - back + 1;
+            }
+        }
+        return 0;
+    };
+
+    // Resolve the vtable for one kind.
+    auto resolve_kind = [&](const char* kind) -> uint64_t {
+        std::vector<uint8_t> wpat = wide_pattern(kind);
+        // Find .rdata occurrences of the wide string.
+        std::string rdataSig;
+        char buf[8];
+        for (size_t i = 0; i < wpat.size(); ++i) {
+            std::snprintf(buf, sizeof(buf), "%02X", wpat[i]);
+            if (i) rdataSig += ' ';
+            rdataSig += buf;
+        }
+        auto strHits = scanner.ScanSection(rdataSig.c_str(), ".rdata");
+        if (strHits.empty()) {
+            std::printf("[autodisc-vt-anchor] %s: wide string not found in .rdata\n", kind);
+            return 0;
+        }
+
+        // For each wide-string occurrence, scan .text for `48 8D ?? d32` LEAs
+        // whose disp32 → that string. Record xref RVAs.
+        std::vector<uint64_t> xref_rvas;
+        // The LEA `48 8D ?? d32` is 7 bytes. Mod-RM byte's reg field varies
+        // (rax/rcx/rdx/rsi/rdi/r8/...), but the mod=00 + rm=101 (RIP-rel)
+        // requires modrm byte AND 0xC7 == 0x05.
+        // We do a coarse byte sweep over .text; for each candidate, decode the
+        // disp32 and check if it points to one of the string RVAs.
+        const uint8_t* tx_ptr = scanner.GetLocalPtr(bounds.TextRva);
+        if (!tx_ptr) return 0;
+        size_t tx_size = bounds.TextSize;
+        for (size_t i = 0; i + 7 <= tx_size; ++i) {
+            if (tx_ptr[i] != 0x48 || tx_ptr[i+1] != 0x8D) continue;
+            uint8_t modrm = tx_ptr[i+2];
+            if ((modrm & 0xC7) != 0x05) continue;  // not RIP-rel
+            int32_t disp = 0;
+            std::memcpy(&disp, tx_ptr + i + 3, 4);
+            uint64_t target = (bounds.TextRva + i + 7) + (int64_t)disp;
+            for (uint64_t s : strHits) {
+                if (target == s) {
+                    xref_rvas.push_back(bounds.TextRva + i);
+                    break;
+                }
+            }
+        }
+        if (xref_rvas.empty()) {
+            std::printf("[autodisc-vt-anchor] %s: no LEA xrefs to %zu wide-string occurrences\n",
+                kind, strHits.size());
+            return 0;
+        }
+
+        // For each xref site, find the containing function and scan it for
+        // vtable writes / class-ctor pointer writes. Per xref site, only
+        // count the LAST direct-write candidate (handles Package's two-write
+        // shape: intermediate UObject vtable then final UPackage vtable;
+        // last write is the keep). For class-ctor recursion, also keep only
+        // the last write found inside the recursed body.
+        std::unordered_map<uint64_t, int> vtCounts;
+        for (uint64_t xref : xref_rvas) {
+            // Pivot scan around the xref site itself rather than from the
+            // function start. Big outer functions (e.g. the 16KB Enum
+            // registration helper) would push fn_start far back; scanning
+            // forward 0x400 from there could overshoot or miss the xref's
+            // immediate context. Anchoring at the xref keeps focus on the
+            // local construct that actually uses the wide string.
+            uint64_t scan_lo = xref;
+            size_t   scan_sz = 0x300;
+
+            // Pattern A — direct vtable write inside this fn. Keep last only.
+            uint64_t lastDirect = 0;
+            for (uint64_t cand : scan_lea_mov_targets(scan_lo, scan_sz, false)) {
+                if (looks_like_vtable(cand)) lastDirect = cand;
+            }
+            if (lastDirect) ++vtCounts[lastDirect];
+
+            // Pattern B — class-ctor pointer write at +0x140; recurse 1 lvl.
+            for (uint64_t ctor_rva : scan_lea_mov_targets(scan_lo, scan_sz, true)) {
+                if (!bounds.InText(ctor_rva)) continue;
+                uint64_t lastSub = 0;
+                for (uint64_t cand : scan_lea_mov_targets(ctor_rva, 0x200, false)) {
+                    if (looks_like_vtable(cand)) lastSub = cand;
+                }
+                // Weight class-ctor matches double — they're more specific
+                // than self-contained matches.
+                if (lastSub) vtCounts[lastSub] += 2;
+            }
+        }
+        if (vtCounts.empty()) {
+            std::printf("[autodisc-vt-anchor] %s: no vtable candidates from %zu xrefs\n",
+                kind, xref_rvas.size());
+            return 0;
+        }
+        // Score = (xref count) × 100 + density. Density tiebreak picks the
+        // FAT engine pool vtable over thin look-alikes (FEnumProperty
+        // globals etc. that share the prefix shape but only have ~3-5
+        // text-pointer entries vs UEnum's 30+).
+        uint64_t bestVt = 0;
+        int bestScore = 0;
+        int bestDensity = 0;
+        for (const auto& [vt, c] : vtCounts) {
+            int density = density_score(vt);
+            int total = c * 100 + density;
+            if (total > bestScore) {
+                bestScore = total; bestVt = vt; bestDensity = density;
+            }
+        }
+        std::printf("[autodisc-vt-anchor] %s: vtable_rva=0x%llX (xref_count=%d, density=%d, %zu candidates from %zu xrefs)\n",
+            kind, (unsigned long long)bestVt, bestScore / 100, bestDensity,
+            vtCounts.size(), xref_rvas.size());
+        return bestVt;
+    };
+
+    out.ScriptStructRVA = resolve_kind("ScriptStruct");
+    out.ClassNativeRVA  = resolve_kind("Class");
+    out.FunctionRVA     = resolve_kind("Function");
+    out.EnumRVA         = resolve_kind("Enum");
+    out.PackageRVA      = resolve_kind("Package");
+    out.Found = (out.ScriptStructRVA ? 1 : 0) + (out.ClassNativeRVA ? 1 : 0) +
+                (out.FunctionRVA ? 1 : 0) + (out.EnumRVA ? 1 : 0) +
+                (out.PackageRVA ? 1 : 0);
+    std::printf("[autodisc-vt-anchor] resolved %d/5 engine vtables\n", out.Found);
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Phase 2: FField NamePrivate decrypt (live data math, no fn parse)
 // ─────────────────────────────────────────────────────────────────────────────
 struct FFieldNameDecryptParams {
@@ -1058,95 +1404,56 @@ inline FPropertyDecryptParams DiscoverFPropertyOffsetXor(
 {
     FPropertyDecryptParams out;
 
-    auto hits = scanner.ScanSection("35 ?? ?? ?? ?? 0F C8", ".text");
-    std::printf("[autodisc-fprop] xor+bswap sig hits: %zu\n", hits.size());
+    // ENCODE-side anchor: FProperty_SetupOffset writes the encrypted offset.
+    // The pipeline is `xor eax, imm32 ; bswap eax ; mov [reg+disp32], eax`
+    // where disp32 is the FProperty Offset_Internal slot (0xC4 on CL-1177146,
+    // 0xB4 on 20260428, etc.). Decode is `bswap32(stored ^ key)` where the
+    // imm32 here equals bswap32(key) (because `bswap32(real ^ key) =
+    // bswap32(real) ^ bswap32(key)`, so storing `bswap32(real ^ key)` after
+    // an `xor + bswap` requires the imm to be bswap32 of the decode key).
+    //
+    // Decode-site sigscan was previously tried but the decoders use a
+    // dynamically-computed register XOR (the key is generated via FNV+SIMD
+    // per-call), not an imm32 — so it can't be matched bytewise. The encode
+    // site is the cleanest anchor: 5 sites on lh74, 0x48742740 imm =
+    // bswap32(0x40277448).
+    auto hits = scanner.ScanSection(
+        "35 ?? ?? ?? ?? 0F C8 89 ?? ?? ?? 00 00", ".text");
+    std::printf("[autodisc-fprop] encode sig hits (xor+bswap+mov[reg+disp32]): %zu\n",
+        hits.size());
 
-    InsnDecoder dec;
     // Histogram of (offset, xor_key) pairs across all validated hits — the
-    // mode is the property offset reader's parameters.
+    // mode is the property offset writer's parameters.
     std::unordered_map<uint64_t, int> pairCounts;  // (offset<<32)|xor_key
     uint64_t firstValidatedRva = 0;
 
     for (uint64_t rva : hits) {
-        // Decode the xor+bswap pair (7 bytes).
         const uint8_t* p = scanner.GetLocalPtr(rva);
         if (!p) continue;
-        auto xorBswap = dec.Decode(p, 7, rva);
-        if (xorBswap.size() < 2) continue;
-        if (xorBswap[0].type != INSN_XOR_EAX) continue;
-        if (xorBswap[1].type != INSN_BSWAP)   continue;
-        uint32_t xor_key = xorBswap[0].imm32;
+        // Layout per the sigscan template:
+        //   p[0]    = 0x35           XOR EAX opcode
+        //   p[1..4] = imm32          XOR key (encoded — bswap32 of decode key)
+        //   p[5..6] = 0F C8          BSWAP EAX
+        //   p[7]    = 0x89           MOV r/m32, r32 opcode
+        //   p[8]    = ModR/M         must be mod=10 + reg=000 (eax) + rm!=100,101
+        //   p[9..12]= disp32         FProperty Offset_Internal slot
+        if (p[0] != 0x35 || p[5] != 0x0F || p[6] != 0xC8 || p[7] != 0x89) continue;
+        uint8_t modrm = p[8];
+        if ((modrm & 0xC0) != 0x80) continue;  // need mod=10 (disp32 form)
+        if ((modrm & 0x38) != 0x00) continue;  // need src reg = eax
+        uint8_t rm = modrm & 0x07;
+        if (rm == 4 || rm == 5) continue;       // no SIB, no RIP-rel
+        uint32_t xor_imm = 0;
+        std::memcpy(&xor_imm, p + 1, 4);
+        uint32_t disp32 = 0;
+        std::memcpy(&disp32, p + 9, 4);
+        if (xor_imm == 0u || xor_imm == 0xFFFFFFFFu) continue;
+        if (disp32 < 0x80 || disp32 > 0x140) continue;
 
-        // Walk backwards up to 16 bytes via brute-force Zydis decode at every
-        // possible boundary, looking for a memory load whose disp is the
-        // FProperty offset field. The instruction lengths we expect:
-        //   8B 81 disp32       (mov eax, [rcx+disp32])         = 6 bytes
-        //   0F B7 87 disp32    (movzx eax, [rdi+disp32])       = 7 bytes
-        //   0F B7 47 disp8     (movzx eax, [rdi+disp8])        = 4 bytes
-        //   8B 41 disp8        (mov eax, [rcx+disp8])          = 3 bytes
-        //   ...etc
-        uint32_t offset_field = 0;
-        bool foundLoad = false;
-        for (int back = 16; back >= 3; --back) {
-            uint64_t loadRva = rva - back;
-            if (loadRva < scanner.ModuleSize() == false) continue;
-            const uint8_t* lp = scanner.GetLocalPtr(loadRva);
-            if (!lp) continue;
-            auto loadInsn = dec.Decode(lp, back, loadRva);
-            if (loadInsn.empty()) continue;
-            // Must perfectly tile back to the xor.
-            uint64_t totalLen = 0;
-            for (const auto& ins : loadInsn) totalLen += ins.length;
-            if (totalLen != (uint64_t)back) continue;
-            // Last instruction must be a memory load with a disp.
-            const auto& last = loadInsn.back();
-            // Acceptable load shapes: MOV reg, mem ; MOVZX reg, m16
-            // (Zydis maps both to INSN_MOV_REG since we don't track movzx
-            // separately — but the disp is recorded the same way).
-            if (last.type != INSN_MOV_REG) continue;
-            if (last.hasRipRel) continue;  // we want [reg+disp], not RIP-rel
-            // Extract disp by parsing the ModR/M ourselves — Zydis stores it
-            // in disp32 but only when hasRipRel is true. For [reg+disp] we
-            // need to fish it out of the bytes.
-            uint32_t disp = 0;
-            if (last.length == 7 && lp[totalLen - last.length] == 0x0F &&
-                lp[totalLen - last.length + 1] == 0xB7)
-            {
-                // movzx r32, m16: 0F B7 modrm disp32
-                std::memcpy(&disp, lp + totalLen - 4, 4);
-            } else if (last.length == 6 &&
-                lp[totalLen - last.length] == 0x8B)
-            {
-                // mov r32, m32: 8B modrm disp32
-                std::memcpy(&disp, lp + totalLen - 4, 4);
-            } else if (last.length == 4 && lp[totalLen - last.length] == 0x0F &&
-                lp[totalLen - last.length + 1] == 0xB7)
-            {
-                // movzx r32, m16 disp8
-                disp = lp[totalLen - 1];
-            } else if (last.length == 3 && lp[totalLen - last.length] == 0x8B) {
-                // mov r32, m32 disp8
-                disp = lp[totalLen - 1];
-            } else {
-                continue;  // unhandled load shape
-            }
-            if (disp >= 0x1000) continue;
-            offset_field = disp;
-            foundLoad = true;
-            break;
-        }
-        if (!foundLoad) continue;
-
-        // Range gate: FProperty/FField fields cluster in 0x80..0x140 across
-        // all UE5 patches we've tested. Anything outside is some other
-        // class's encrypted-field getter that just happens to share the
-        // xor+bswap shape — would corrupt downstream decryption silently.
-        if (offset_field < 0x80 || offset_field > 0x140) continue;
-
-        // Sanity: reject obviously-degenerate XOR keys.
-        if (xor_key == 0u || xor_key == 0xFFFFFFFFu) continue;
-
-        uint64_t key = ((uint64_t)offset_field << 32) | xor_key;
+        // Decode-form key = bswap32(imm32). The dumper's decryption uses
+        // `real = bswap32(stored ^ key)` so we expose the key in that form.
+        uint32_t decode_key = __builtin_bswap32(xor_imm);
+        uint64_t key = ((uint64_t)disp32 << 32) | decode_key;
         if (pairCounts.empty()) firstValidatedRva = rva;
         ++pairCounts[key];
     }

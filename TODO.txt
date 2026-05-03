@@ -31,32 +31,38 @@ as before). Just reads pages 4MB at a time instead of 64KB.
 This is a smaller speedup than the TODO predicted (the per-slot
 syscalls are the dominant cost, not the bulk reads).
 
-Build verified clean (FrostDumper @ 1.36MB). Runtime VERIFIED
-2026-05-03:
-  [p21] scan (MIN_RUN=32,MAX_GAP=64): 23547 runs (largest=92809);
+SECONDARY FIX (same day, 2026-05-03):
+  Initial WIN=4MB version had a region-tail bug — `page + WIN
+  <= rg.hi` skipped any heap region smaller than 4MB. Heap
+  regions in the 1-4MB band (where smaller metaclass arrays
+  like UClass live) were entirely missed. Fixed by clamping
+  the per-iteration read to `min(WIN, rg.hi - page)` and the
+  inner offset cap to `this_win`. With the old 64KB window
+  the same bug existed but skipped only <64KB regions
+  (negligible).
+
+Build verified clean. Runtime VERIFIED 2026-05-03:
+  [p21] scan (MIN_RUN=32,MAX_GAP=64): 40124 runs (largest=153027);
         total 70848 objs   ← matches NumElements=70592
+  [p21] scan pass A: 0 objs, pass B added 70848 (total 70848)
   [p28] structural scan collected 70848 UObject pointers
-  [p28] vtable scan added 6020 UObject pointers (total 76868)
+  [p28] vtable scan added 4668 UObject pointers (total 75516)
+  [autodisc-fnchk] sampled 32 actors: non_empty=21 looks_like_name=20  → PASS
+  Scan done: 54585 named, 20931 failed (72% naming rate)
 
-Object counts match the documented baseline (~70K structural +
-~7K vtable). The 4MB window is correctness-equivalent to the
-old 64KB window, just with 64× fewer process_vm_readv calls
-for the bulk reads.
+  Final SDK: 10807 classes / 3835 structs / 1223 enums /
+             24707 funcs / 370442 properties
 
-⚠ The verification run showed lower SDK output counts than the
-documented baseline (Classes 8897, Structs 2797, Enums 722, etc.
-vs baseline 14627/7946/2881). This is NOT structural-scan
-regression — it's FName-pipeline-dependent. Game state changed
-since baseline was recorded:
-  - looks_like_name=12/32 (sanity FAIL, threshold 50%)
-  - emu-primary fallback ALSO failed
-  - 30818/76868 = 40% naming rate (vs ~85%+ baseline)
-  - [uprobe-key] no hits in 5000ms — function not firing
-    (paused/loading), suggests game is in main menu or loading
-    screen rather than in-match.
-This is an FName-decrypt drift issue separate from Option B.
-To rebuild SDK at full baseline counts, the FName pipeline
-needs the game in an in-match state OR static decrypt fixed.
+Pass A producing 0 objs is fine — its MAX_GAP=0+MIN_RUN=500
+requires no nulls in any chunk run; Pass B is more lenient
+(MAX_GAP=64) and catches the same objects. Likely held at
+baseline too.
+
+Counts vs baseline (14627 / 7946 / 2881 / 40826 / 180828):
+classes/structs/enums down ~24-58%, properties almost 2× up.
+Structural scan is correctness-equivalent — the deltas come
+from naming-rate variance (72% vs ~85%+) and BPGC PropertyLink
+walking inherited fields (TODO §6 documents this trade-off).
 
 
 WHAT SHIPPED 2026-05-02

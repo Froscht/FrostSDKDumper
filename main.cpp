@@ -693,6 +693,110 @@ public:
             }
         }
 
+        // ── Phase 0.7: UWorld map-state classification ──────────────────
+        // FName resolution quality is dramatically lower in main-menu /
+        // loading state than in-match (≥85% naming rate vs ~40-72%). The
+        // dumper still produces output but it's degraded — and degraded
+        // FName cascades into wrong cluster scoring (Phase 1), missing
+        // FFieldClass canonical-name matches (Phase 7), and incomplete
+        // SDK structs/classes. Resolve UWorld's FName and classify per UE
+        // convention: empty name OR contains Menu/Lobby/Loading/Title/
+        // Frontend → main-menu state. Log loudly so the user knows the
+        // dump quality is environmental, not a code bug.
+        //
+        // Classification logic mirrors NewESP's arc_pointer_cache.cpp:55-95.
+        // Resolve UWorld pointer: prefer the auto-discovered Valid path; fall
+        // back to reading the compile-time RVA (may still be correct on a
+        // patch where Phase 0.5's stricter validator rejected all candidates
+        // even though the hardcoded slot still works).
+        uint64_t UWorldPtr = 0;
+        if (AutoDiscovery::g_DiscoveredWorld.Valid &&
+            AutoDiscovery::g_DiscoveredWorld.GWorldAbs)
+        {
+            UWorldPtr = AutoDiscovery::g_DiscoveredWorld.GWorldAbs;
+        } else {
+            // Try compile-time GWorld RVAs as a fallback. NewESP's verified
+            // CL-1177146 value is 0xE07CFD8; the FrostSDKDumper compile-time
+            // is 0xDFDB4D8 (older patch). Try both, with both single and
+            // double deref. UE5 typically uses double-deref (the .data slot
+            // holds a pointer-to-pointer to keep the UWorld pointer stable
+            // across hot-reload).
+            const uint64_t kCandidateRvas[] = {
+                ArcDecrypt::RVA_GWORLD,   // current dumper compile-time
+                0xE07CFD8ULL,             // NewESP-verified CL-1177146
+            };
+            auto LooksLikeUWorld = [&](uint64_t Ptr) -> bool {
+                if (!Ptr || Ptr < 0x10000ULL || Ptr >= 0x800000000000ULL) return false;
+                uint64_t Vt = 0;
+                if (!m_reader.Read(Ptr, &Vt, 8)) return false;
+                return Vt >= MODULE_BASE && Vt < MODULE_BASE + 0x10000000ULL;
+            };
+            for (uint64_t Rva : kCandidateRvas) {
+                uint64_t Slot = 0;
+                if (!m_reader.Read(MODULE_BASE + Rva, &Slot, 8) || !Slot) continue;
+                // Single-deref: slot itself IS the UWorld*.
+                if (LooksLikeUWorld(Slot)) {
+                    UWorldPtr = Slot;
+                    std::printf("[autodisc-mapstate] resolved UWorld via single-deref @ RVA 0x%llX -> 0x%llX\n",
+                        (unsigned long long)Rva, (unsigned long long)UWorldPtr);
+                    break;
+                }
+                // Double-deref: slot points to a heap location holding the
+                // real UWorld* (NewESP / older UE5 layout).
+                uint64_t Inner = 0;
+                if (m_reader.Read(Slot, &Inner, 8) && LooksLikeUWorld(Inner)) {
+                    UWorldPtr = Inner;
+                    std::printf("[autodisc-mapstate] resolved UWorld via double-deref @ RVA 0x%llX -> 0x%llX -> 0x%llX\n",
+                        (unsigned long long)Rva,
+                        (unsigned long long)Slot, (unsigned long long)UWorldPtr);
+                    break;
+                }
+            }
+        }
+        if (UWorldPtr)
+        {
+            std::string MapName = m_fname.GetName(UWorldPtr);
+            auto ContainsCi = [&](const char* needle) -> bool {
+                size_t n = std::strlen(needle);
+                if (MapName.size() < n) return false;
+                for (size_t i = 0; i + n <= MapName.size(); ++i) {
+                    bool ok = true;
+                    for (size_t j = 0; j < n; ++j) {
+                        char a = MapName[i+j], b = needle[j];
+                        if (a >= 'A' && a <= 'Z') a = char(a - 'A' + 'a');
+                        if (b >= 'A' && b <= 'Z') b = char(b - 'A' + 'a');
+                        if (a != b) { ok = false; break; }
+                    }
+                    if (ok) return true;
+                }
+                return false;
+            };
+            bool InMatch = !MapName.empty()
+                        && !ContainsCi("Menu")
+                        && !ContainsCi("Lobby")
+                        && !ContainsCi("Loading")
+                        && !ContainsCi("Title")
+                        && !ContainsCi("Frontend");
+            if (InMatch) {
+                std::printf("[autodisc-mapstate] UWorld map = '%s' (in-match — SDK quality optimal)\n",
+                    MapName.c_str());
+            } else {
+                std::printf("\n");
+                std::printf("[!] ====================================================================\n");
+                std::printf("[!] WARNING: UWorld in main-menu / loading state\n");
+                std::printf("[!]   Map name: '%s'\n", MapName.c_str());
+                std::printf("[!]   FName resolution quality is significantly degraded in this state.\n");
+                std::printf("[!]   Expected naming rate: 30-70%% (vs 85%%+ in-match).\n");
+                std::printf("[!]   SDK output will have ~30-50%% of baseline class/struct/enum counts.\n");
+                std::printf("[!]   To get a full-quality dump: launch a match, then re-run the dumper.\n");
+                std::printf("[!] ====================================================================\n");
+                std::printf("\n");
+            }
+        } else {
+            std::printf("[autodisc-mapstate] UWorld unavailable (Phase 0.5 + compile-time RVA both empty) — game likely in main-menu / loading\n");
+            std::printf("[!] SDK quality will be reduced. To get baseline counts: launch a match first.\n");
+        }
+
         // ── Phase 1: auto-discover engine type-pool vtables ─────────────
         // With FName resolution working and the seed object list populated
         // (canonical vtable[7] OR structural fallback), cluster all sampled
@@ -708,6 +812,38 @@ public:
             AutoDiscovery::g_DiscoveredVTables = AutoDiscovery::DiscoverEngineVTables(
                 m_gobj.GetSeedObjects(), Resolver, m_reader, MODULE_BASE,
                 AutoDiscovery::g_DiscoveredBounds);
+
+            // ── Phase 1.5: wide-string anchor fallback ─────────────────────
+            // Phase 1 needs FName resolution AND enough sampled instances to
+            // form per-kind clusters above the count gate. When either fails
+            // (e.g. game in a sparse state, or naming-rate degraded), the
+            // engine-core kinds (ScriptStruct/Class/Function/Enum/Package)
+            // come back NOT FOUND. Phase 1.5 anchors on the kind's UTF-16
+            // wide string in .rdata and walks the function body for the
+            // vtable-write idiom — patch-resilient, doesn't depend on FName.
+            {
+                auto& VT = AutoDiscovery::g_DiscoveredVTables;
+                bool needAnchor = !VT.ScriptStructRVA || !VT.ClassNativeRVA ||
+                                  !VT.FunctionRVA    || !VT.EnumRVA ||
+                                  !VT.PackageRVA;
+                if (needAnchor) {
+                    std::printf("[autodisc] Phase 1.5 (wide-string anchor) — Phase 1 left engine roots NOT FOUND\n");
+                    auto anchor = AutoDiscovery::DiscoverEngineVTablesByWideStringAnchor(
+                        m_sigScanner, m_reader, MODULE_BASE,
+                        AutoDiscovery::g_DiscoveredBounds);
+                    if (!VT.ScriptStructRVA && anchor.ScriptStructRVA)
+                        VT.ScriptStructRVA = anchor.ScriptStructRVA;
+                    if (!VT.ClassNativeRVA  && anchor.ClassNativeRVA)
+                        VT.ClassNativeRVA  = anchor.ClassNativeRVA;
+                    if (!VT.FunctionRVA     && anchor.FunctionRVA)
+                        VT.FunctionRVA     = anchor.FunctionRVA;
+                    if (!VT.EnumRVA         && anchor.EnumRVA)
+                        VT.EnumRVA         = anchor.EnumRVA;
+                    if (!VT.PackageRVA      && anchor.PackageRVA)
+                        VT.PackageRVA      = anchor.PackageRVA;
+                }
+            }
+
             // Re-run the heap vtable scan with the (possibly fresh) discovered
             // map. Idempotent — duplicates against the seed list are dropped.
             m_gobj.RunDiscoveredVtableScan();

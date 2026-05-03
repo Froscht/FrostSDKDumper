@@ -1559,13 +1559,19 @@ namespace gobjects
             };
 
             for (const auto& rg : ranges) {
-                for (uint64_t page = rg.lo; page + WIN <= rg.hi; page += WIN) {
-                    if (!m_reader.Read(page, buf.data(), WIN)) { flush(); continue; }
+                for (uint64_t page = rg.lo; page < rg.hi; page += WIN) {
+                    // Clamp to the region tail so regions smaller than WIN
+                    // (and the final partial chunk of any region) still get
+                    // scanned. The previous `page + WIN <= rg.hi` loop
+                    // condition skipped entire 1-4MB heap regions where
+                    // metaclass chunks (UClass arrays etc.) live.
+                    uint64_t this_win = (rg.hi - page < WIN) ? (rg.hi - page) : WIN;
+                    if (!m_reader.Read(page, buf.data(), this_win)) { flush(); continue; }
                     size_t start_off = 0;
                     if (cur_count && (page % STRIDE)) {
                         start_off = (STRIDE - (page - cur_start) % STRIDE) % STRIDE;
                     }
-                    for (size_t off = start_off; off + STRIDE <= WIN; off += STRIDE) {
+                    for (size_t off = start_off; off + STRIDE <= this_win; off += STRIDE) {
                         uint64_t obj_ptr = 0;
                         std::memcpy(&obj_ptr, buf.data() + off, 8);
                         bool ok = is_heap(obj_ptr);
