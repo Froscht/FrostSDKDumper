@@ -1534,7 +1534,13 @@ namespace gobjects
                 ranges.push_back({0x100000000ULL, 0x400000000ULL});
             }
 
-            const uint64_t WIN = 0x10000ULL;
+            // 4MB scan window: 64× fewer process_vm_readv calls for the
+            // bulk page reads vs the old 64KB window. The per-slot vtable
+            // check inside the inner loop stays — dropping it for speed
+            // collapsed counts (Pass A's MAX_GAP=0 splits real chunks at
+            // null slots; without vtable filtering, runs are formed on
+            // noise heap-pointer arrays instead of real FUObjectItem chunks).
+            const uint64_t WIN = 0x400000ULL;
             std::vector<uint8_t> buf(WIN);
             uint64_t cur_start = 0;
             uint32_t cur_count = 0;

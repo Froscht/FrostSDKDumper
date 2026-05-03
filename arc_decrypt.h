@@ -91,173 +91,102 @@ inline int32_t DecryptUPropertyOffset(uint32_t stored) {
 // =============================================================================
 // 3. Key Structure Offsets (patch 20260409)
 // =============================================================================
+// =============================================================================
+// Offsets — RUNTIME-MUTABLE GLOBALS.
+//
+// Every member here is `inline` (not `constexpr`) so AutoOffsets::DiscoverAll()
+// can overwrite the compile-time defaults at startup with values probed from
+// live data. The defaults are the last-verified CL-1177146 values; on a new
+// patch the probe phase walks each candidate offset, scores it against type-
+// shape oracles (heap-ptr / module-ptr / TArray-shape / parent-backref / etc.),
+// and writes the consensus winner here. All ~108 read sites consume these
+// directly so no consumer-side change is needed when the layout shifts.
+// =============================================================================
 namespace Offsets {
     namespace UObject {
-        constexpr uint64_t VTable       = 0x00;
-        constexpr uint64_t InternalIndex= 0x0C; // plain uint32 at obj+0x0C (was 0x90 encrypted, patch 20260409)
-        constexpr uint64_t FieldsSlots  = 0x20; // slots at obj+0x20,+0x40,+0x60,+0x80 (stride 0x20)
+        inline uint64_t VTable       = 0x00;
+        inline uint64_t InternalIndex= 0x0C;
+        inline uint64_t FieldsSlots  = 0x20;
     }
     namespace FField {
-        // Patch CL-1177146 (20260430): UStruct linked-list walker sub_353F40
-        // verified — reads `*(QWORD*)(node + 128)` (= +0x80) for Next, and
-        // `*(QWORD*)(node + 144)` (= +0x90) then `[+0x10]` for class flags.
-        // So ClassPrivate (FFieldClass*) is at +0x90 (was +0x20 on 20260428).
-        // Status flag byte at +0xBB confirmed (`test byte ptr [rcx+0BBh], 20h`).
-        // FProperty offset stays at +0xC4 (verified via FProperty_OffsetReader
-        // @ 0x353900: `bswap32(*(DWORD*)(i+0xC4) ^ 0x40277448)`).
-        //   +0x00  vtable
-        //   +0x80  Next (FField*) — confirmed via chain walker
-        //   +0x90  ClassPrivate (FFieldClass*) — confirmed via chain walker
-        //          flag mask 0x8000002008001 read from `[+0x90][+0x10]`.
-        //   +0xA8..+0x118  NamePrivate slot — exact offset auto-probed at
-        //          runtime by FNameDecryptor::DecryptFFieldNameCI (the chain
-        //          walker doesn't itself read the FField name; closest static
-        //          evidence is the layout shift of Next by +0x38, suggesting
-        //          NamePrivate moved 0x70 → 0xA8 by the same delta).
-        //   +0xBB  status flag byte
-        //   +0xC4  encrypted FProperty Offset_Internal (XOR 0x40277448)
-        //   +0x120 (deref) → +0x160 = owner FName u64 (used by
-        //          FProperty_OffsetReader to register property under owner name)
-        //   +0x100 (on the UStruct holding this FField) ChildProperties head
-        constexpr uint64_t VTable        = 0x00;
-        constexpr uint64_t ClassPrivate  = 0x90;   // CL-1177146: was 0x20 (live-verified module ptr)
-        constexpr uint64_t Next          = 0x80;   // CL-1177146: live-verified heap ptr to next FField
-        constexpr uint64_t Owner         = 0xA0;   // CL-1177146: live-verified (UStruct|1 tagged ptr)
-        constexpr uint64_t NameEncrypted = 0x70;   // CL-1177146: live-verified 16-byte SIMD NamePrivate slot
-        constexpr uint64_t NamePrivate   = 0x70;   // CL-1177146: live-verified 16-byte SIMD NamePrivate slot
-        constexpr uint64_t SaltSentinel  = 0x78;   // sentinel removed in CL-1177146
+        inline uint64_t VTable        = 0x00;
+        inline uint64_t ClassPrivate  = 0x90;
+        inline uint64_t Next          = 0x80;
+        inline uint64_t Owner         = 0xA0;
+        inline uint64_t NameEncrypted = 0x70;
+        inline uint64_t NamePrivate   = 0x70;
+        inline uint64_t SaltSentinel  = 0x78;
     }
     namespace FFieldClass {
-        // Confirmed from live FFieldClass objects (e.g. 0xBDF31C00), patch 20260402
-        constexpr uint64_t ElementSize  = 0x70;  // uint32 – per-class element size (e.g. 4, 8) — CONFIRMED from live reads of 0xBD5AF300 and 0xBDF31C00
-        // NamePrivate: no fixed SIMD slot found; type identified via vtable map instead
+        inline uint64_t ElementSize  = 0x70;
     }
     namespace FProperty {
-        // Patch CL-1177146: FProperty Offset_Internal moved to +0xC4 (was +0xB4
-        // on 20260428) and the XOR key changed to 0x40277448. Confirmed via
-        // sub_353900 / sub_353F40 chain reader: `_byteswap_ulong(*(DWORD*)(i+196)
-        // ^ 0x40277448)` — i.e. bswap32(stored ^ 0x40277448) gives the offset.
-        //
-        // PropertyFlags / ElementSize / ArrayDim still need verification; kept
-        // at 20260428 values until proven otherwise.
-        constexpr uint64_t ArrayDim        = 0xF0;        // CL-1177146: was 0xE0; live=1 on bool/single fields
-        constexpr uint64_t ElementSize     = 0xF8;        // CL-1177146: was 0xA0; live=1 on bools (1-byte)
-        constexpr uint64_t Offset_Internal = 0xC4;        // PRIMARY scan target; broad-scan +0xB0..+0xC8 for 48 74 27 ?? signature
-        constexpr uint32_t Offset_XOR      = 0x40277448u; // CL-1177146: was 0x34605D14
-        constexpr uint64_t PropertyFlags   = 0x98;        // CL-1177146: live=0x45 on bool, plausible
+        inline uint64_t ArrayDim        = 0xF0;
+        inline uint64_t ElementSize     = 0xF8;
+        inline uint64_t Offset_Internal = 0xC4;
+        inline uint32_t Offset_XOR      = 0x40277448u;
+        inline uint64_t PropertyFlags   = 0x98;
     }
     namespace FBoolProperty {
-        // TODO: re-verify for patch 20260402; previous values assumed UE5 default layout
-        constexpr uint64_t FieldSize  = 0x130;
-        constexpr uint64_t ByteOffset = 0x131;
-        constexpr uint64_t ByteMask   = 0x132;
-        constexpr uint64_t FieldMask  = 0x133;
+        inline uint64_t FieldSize  = 0x130;
+        inline uint64_t ByteOffset = 0x131;
+        inline uint64_t ByteMask   = 0x132;
+        inline uint64_t FieldMask  = 0x133;
     }
-    // Sub-property offsets for inner type resolution.
-    // Patch 20260428: ALL FProperty subclass sub-pointers shifted +0x20 from 20260421.
-    //   Inner/Key/Value/Element/Struct/PropertyClass: 0xE8 → 0x108
-    //   FArrayProperty::Inner / FMapProperty::ValueProp / FEnumProperty::Enum: 0xF0 → 0x110
-    // Verified via live probe on patch 20260428 across:
-    //   FObjectProperty (ACLDatabase, ActorSequencePlayer): +0x108 = PropertyClass UClass*
-    //   FInterfaceProperty (MovieSceneSequencePlayerObserver): +0x108 = InterfaceClass UClass*
-    //   FMapProperty: +0x108 = KeyProp, +0x110 = ValueProp
-    //   FEnumProperty: +0x108 = UnderlyingProp (FField*), +0x110 = Enum (UEnum*)
-    namespace FStructProperty  { constexpr uint64_t Struct        = 0x108; }
-    namespace FObjectProperty  { constexpr uint64_t PropertyClass = 0x108; }
+    namespace FStructProperty  { inline uint64_t Struct        = 0x108; }
+    namespace FObjectProperty  { inline uint64_t PropertyClass = 0x108; }
     namespace FEnumProperty    {
-        constexpr uint64_t UnderlyingProp = 0x108;  // FField*
-        constexpr uint64_t Enum           = 0x110;  // UEnum*
+        inline uint64_t UnderlyingProp = 0x108;
+        inline uint64_t Enum           = 0x110;
     }
-    namespace FArrayProperty   { constexpr uint64_t Inner         = 0x110; }
-    namespace FSetProperty     { constexpr uint64_t ElementProp   = 0x108; }
-    namespace FSoftObjectProperty { constexpr uint64_t PropertyClass = 0x108; }
+    namespace FArrayProperty   { inline uint64_t Inner         = 0x110; }
+    namespace FSetProperty     { inline uint64_t ElementProp   = 0x108; }
+    namespace FSoftObjectProperty { inline uint64_t PropertyClass = 0x108; }
     namespace FMapProperty {
-        constexpr uint64_t KeyProp   = 0x108;
-        constexpr uint64_t ValueProp = 0x110;
+        inline uint64_t KeyProp   = 0x108;
+        inline uint64_t ValueProp = 0x110;
     }
-    // Additional subclasses identified in IDA (shared parent FObjectPropertyBase):
-    // FWeakObjectProperty, FLazyObjectProperty, FInterfaceProperty → PropertyClass at +0xE8 (inherited).
-    // FDelegateProperty: SignatureFunction at +0xE8 (FName+UFunction* pair, ElementSize=40).
-    // FByteProperty: Enum (UEnum*) at +0xE8 (LinkInternal sub_47B4BC reads +0xE8).
-    // FSoftClassProperty: MetaClass offset needs separate verification (inherits SoftObjectProperty).
-    // FClassProperty: MetaClass offset needs separate verification (inherits ObjectProperty).
-    // Old UField/UProperty system (UObject subclasses, in GUObjectArray).
-    // Used by legacy structs: FVector, FRotator, FLinearColor, etc.
-    // Name: use GetCompIndex(obj)/GetName(obj) via UObject SIMD slot decrypt.
     namespace UField {
-        constexpr uint64_t Next            = 0x90;  // was 0x30 (patch 20260409)
+        inline uint64_t Next            = 0x90;
     }
     namespace UProperty {
-        constexpr uint64_t Next            = 0x90;  // same as UField::Next (was 0x30)
-        constexpr uint64_t Offset_Internal = 0x64;  // bswap32(stored) ^ 0xC43565C9 (confirmed sub_140441080)
-        constexpr uint64_t ElementSize     = 0x68;  // plain uint32 (= 8 for FVector doubles)
-        constexpr uint64_t ArrayDim        = 0x6C;  // plain uint32 (= 1 for FVector components)
-        constexpr uint64_t PropertyFlags   = 0x70;  // plain uint64
+        inline uint64_t Next            = 0x90;
+        inline uint64_t Offset_Internal = 0x64;
+        inline uint64_t ElementSize     = 0x68;
+        inline uint64_t ArrayDim        = 0x6C;
+        inline uint64_t PropertyFlags   = 0x70;
     }
     namespace UStruct {
-        // Patch CL-1177146 — verified via Function-metaclass UClass constructor
-        // sub_3564C0 (xref to L"Function" wide string) and DelegateFunction
-        // constructor sub_367AB0:
-        //   - sub_3564C0 sets *(DWORD*)(v1 + 216) = 352 → PropertiesSize = +0xD8,
-        //     and Function-class sizeof(UFunction) = 0x160 (=352).
-        //   - sub_3564C0 sets *(DWORD*)(v1 + 248) = 16 → MinAlignment = +0xF8.
-        //   - UObject ctor sub_4CC0B0 walks parent chain via *(QWORD*)(i + 176)
-        //     → SuperStruct = +0xB0 (was 0xA8 on 20260428).
-        //   - FField chain walker sub_353F40 reads *(QWORD*)(class + 256) = +0x100
-        //     for ChildProperties head.
-        constexpr uint64_t SuperStruct     = 0x0B0;  // CL-1177146: was 0xA8 (verified sub_4CC0B0)
-        constexpr uint64_t Children        = 0x100;  // CL-1177146: was 0xD0 on 20260428
-        constexpr uint64_t ChildProperties = 0x100;  // CL-1177146: was 0xD0 on 20260428
-        constexpr uint64_t PropertiesSize  = 0x0D8;  // CL-1177146: verified +216 in metaclass ctor
-        constexpr uint64_t MinAlignment    = 0x0F8;  // unchanged
+        inline uint64_t SuperStruct     = 0x0B0;
+        inline uint64_t Children        = 0x100;
+        inline uint64_t ChildProperties = 0x100;
+        inline uint64_t PropertiesSize  = 0x0D8;
+        inline uint64_t MinAlignment    = 0x0F8;
     }
     namespace UEnum {
-        // CL-1177146: Names @ +0xB0. Live-probed on 5 enum objects:
-        //   +0xA0/+0xA8 = CppType FString (Data ptr, Num, Max)
-        //   +0xB0/+0xB8 = Names TArray<TPair<FName,int64>> (Data ptr, Num, Max)
-        //   +0xE0 = UEnum vtable (RVA 0xADA1140 on CL-1177146)
-        // 20260428 had Names @ +0xA8.
-        constexpr uint64_t Names = 0xB0;
+        inline uint64_t Names = 0xB0;
     }
     namespace UFunction {
-        constexpr uint64_t VTable        = 0x000;
-        constexpr uint64_t NextPtr       = 0x098;
-        // CL-1177146 — verified via Function-metaclass UClass constructor
-        // sub_3564C0: sets *(DWORD*)(v1 + 216) = 352 → sizeof(UFunction) = 0x160.
-        // UFunction-specific fields must fit within 0x160 bytes; fields are placed
-        // in the [0x118..0x160] region (after UStruct ends ~0x118).
-        // The original FunctionFlags→NativeFunc delta was 0x28; with NativeFunc
-        // placed at 0x158 (last 8 bytes of UFunction), FunctionFlags = 0x130.
-        // 20260428 values: FunctionFlags=0x120, NativeFunc=0x148, NumParms=0xB0.
-        // 20260421 values: FunctionFlags=0x128, NativeFunc=0x1C8.
-        constexpr uint64_t FunctionFlags = 0x130;   // CL-1177146: was 0x120 (+0x10 shift)
-        constexpr uint64_t NativeFunc    = 0x158;   // CL-1177146: was 0x148 (+0x10 shift; last 8 bytes of UFunction)
-        constexpr uint64_t NumParms      = 0xE0;    // CL-1177146: was 0xB0 — u8 cross-check vs ChildProperties chain
+        inline uint64_t VTable        = 0x000;
+        inline uint64_t NextPtr       = 0x098;
+        inline uint64_t FunctionFlags = 0x130;
+        inline uint64_t NativeFunc    = 0x158;
+        inline uint64_t NumParms      = 0xE0;
     }
-    // UClass extends UStruct. Patch 20260428 stores the per-class function table
-    // as TMap<FName, UFunction*> at the offsets below (verified live across
-    // 6 vtable variants — native UClass, ASClass, BPGC, WBPGC, SMBPGC, AnimBPGC).
-    // Total recoverable: ~11K UFunctions across 4020 UClass-like objects.
     namespace UClass {
-        // 20260428: FuncMap @ +0x268. CL-1177146: pass5 still finds 30K functions at
-        // this offset, suggesting UClass-specific fields stayed (or shifted to a
-        // different value, but pass5's "looks_like_ufunc_struct" filter rejects
-        // garbage). Keep at 0x268 unless pass5 regresses.
-        constexpr uint64_t FuncMap_PairsData = 0x268;  // u64* heap ptr to TPair array
-        constexpr uint64_t FuncMap_Num       = 0x270;  // u32 entry count
-        constexpr uint64_t FuncMap_Max       = 0x274;  // u32 capacity
-        constexpr uint64_t FuncMap_PairStride = 24;    // bytes per TPair
-        // TPair layout: +0x00 FName (key), +0x08 UFunction* (value),
-        //               +0x10 HashNextId (i32), +0x14 HashIndex (i32)
-        constexpr uint64_t FuncMapPair_FName    = 0x00;
-        constexpr uint64_t FuncMapPair_UFunction = 0x08;
+        inline uint64_t FuncMap_PairsData = 0x268;
+        inline uint64_t FuncMap_Num       = 0x270;
+        inline uint64_t FuncMap_Max       = 0x274;
+        inline uint64_t FuncMap_PairStride = 24;
+        inline uint64_t FuncMapPair_FName    = 0x00;
+        inline uint64_t FuncMapPair_UFunction = 0x08;
     }
     namespace UWorld {
-        constexpr uint64_t PersistentLevel = 0x0F0;  // user-verified 20260414 (was 0x0F8)
-        constexpr uint64_t Levels          = 0x3B0;  // TArray<ULevel*>
+        inline uint64_t PersistentLevel = 0x0F0;
+        inline uint64_t Levels          = 0x3B0;
     }
     namespace USceneComponent {
-        constexpr uint64_t ComponentToWorld = 0x330;  // user-provided 20260414
+        inline uint64_t ComponentToWorld = 0x330;
     }
 }
 

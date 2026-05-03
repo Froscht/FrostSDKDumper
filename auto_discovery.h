@@ -2027,6 +2027,205 @@ inline std::vector<FFieldClassGlobal> DiscoverFFieldClassGlobals(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Phase 16: GUObjectArray field-layout auto-discovery
+//
+// Scan the first 0x180 bytes of GUObjectArray for:
+//   (a) a plausible NumElements u32 — value in [1000..2_000_000], hi32==0
+//   (b) a heap pointer to a chunks-array — validated by reading the first
+//       4 chunks and checking each chunk[0] is a heap pointer to a UObject
+//       (vtable in module range)
+//
+// Subsumes vt[7] emulation entirely on layouts where the chunks-array pointer
+// lives directly in GUObjectArray (e.g. CL-1177146's plain +0x30 NumElements
+// + chunks-array nearby). Falls through to vt[7]/structural-scan when the
+// pointer is encrypted or the layout is foreign.
+//
+// Layout-agnostic: works on any patch where chunks-array is a plain pointer
+// somewhere in the first 0x180 bytes — no SIMD, no Unicorn, no decrypt keys.
+// ─────────────────────────────────────────────────────────────────────────────
+struct GUObjectArrayLayout {
+    uint64_t StructAbs       = 0;     // module_base + RVA_GOBJECT_ARRAY_BASE
+    uint32_t NumElementsOff  = 0;     // offset of plain u32 NumElements
+    uint32_t NumElements     = 0;
+    uint64_t ChunksArrayPtr  = 0;     // heap ptr to chunks (qword[num_chunks])
+    int      NumChunks       = 0;
+    int      ValidChunksProbed = 0;   // how many chunk[0]→UObject probes passed
+    int      IndirectionDepth  = 0;   // 0=direct field, 1=via chunks_manager, 2=2-hop
+    std::vector<uint32_t> PathOffsets;  // offsets walked to reach chunks-array
+    bool     Valid           = false;
+};
+
+inline GUObjectArrayLayout DiscoverGUObjectArrayLayout(
+    IMemoryReader& reader, uint64_t module_base, uint64_t guobjarr_rva,
+    const ModuleBounds& bounds)
+{
+    GUObjectArrayLayout out;
+    out.StructAbs = module_base + guobjarr_rva;
+    if (!bounds.Valid) return out;
+
+    uint8_t buf[0x180] = {};
+    if (!reader.Read(out.StructAbs, buf, sizeof(buf))) {
+        std::printf("[autodisc-gobj] read GUObjectArray @ 0x%llX failed\n",
+            (unsigned long long)out.StructAbs);
+        return out;
+    }
+
+    // (a) Find the plain NumElements — pick the LARGEST plausible u32 in the
+    // struct. Multiple u32s may be in [1000..2M] range; the real NumElements
+    // is usually the most recent/largest.
+    int best_nm_off = -1;
+    uint32_t best_nm = 0;
+    for (size_t off = 0; off + 8 <= sizeof(buf); off += 4) {
+        uint64_t v = 0;
+        std::memcpy(&v, buf + off, 8);
+        if ((v >> 32) != 0) continue;
+        uint32_t lo = (uint32_t)v;
+        if (lo < 1000 || lo > 2'000'000) continue;
+        if (lo > best_nm) {
+            best_nm = lo;
+            best_nm_off = (int)off;
+        }
+    }
+    if (best_nm_off < 0) {
+        std::printf("[autodisc-gobj] no plausible NumElements found — layout is encrypted or foreign\n");
+        return out;
+    }
+    out.NumElementsOff = (uint32_t)best_nm_off;
+    out.NumElements    = best_nm;
+    int num_chunks = (best_nm + 0xFFFF) / 0x10000;
+    out.NumChunks = num_chunks;
+
+    auto IsHeapPtr = [](uint64_t p) {
+        return p > 0x10000ULL && p < 0x800000000000ULL;
+    };
+    auto InModule = [&](uint64_t p) {
+        return p >= module_base && p < module_base + bounds.ImageSize;
+    };
+    auto InText = [&](uint64_t p) {
+        return p >= module_base + bounds.TextRva && p < module_base + bounds.TextEnd();
+    };
+
+    // (b) Find the chunks-array pointer via depth-2 BFS.
+    //
+    // CL-1177146 hides chunks-array behind chunks_manager — a direct-field
+    // probe of GUObjectArray finds nothing. Walk through every heap pointer
+    // in GUObjectArray's struct; for each, treat it both as a candidate
+    // chunks-array AND as a candidate chunks_manager (whose own fields might
+    // contain the chunks-array). Up to 2 hops handles the canonical UE5
+    // FChunkedFixedUObjectArray-via-pointer-indirection layout plus older
+    // ARC encrypted layouts.
+    int probe_n = std::min(num_chunks, 4);
+    if (probe_n < 2) probe_n = 2;
+    auto ValidateAsChunksArray = [&](uint64_t ca) -> int {
+        // Read probe_n chunk pointers from the candidate array. Each chunk
+        // ptr must be heap; chunk[0] (= FUObjectItem.Object) must be heap
+        // UObject with module vtable.
+        int valid = 0;
+        for (int i = 0; i < probe_n; ++i) {
+            uint64_t chunk_ptr = 0;
+            if (!reader.Read(ca + (uint64_t)i * 8, &chunk_ptr, 8)) break;
+            if (!IsHeapPtr(chunk_ptr) || InModule(chunk_ptr)) break;
+            uint64_t obj = 0;
+            if (!reader.Read(chunk_ptr, &obj, 8)) break;
+            if (!IsHeapPtr(obj) || InModule(obj)) break;
+            uint64_t vt = 0;
+            if (!reader.Read(obj, &vt, 8)) break;
+            if (!InText(vt) && !InModule(vt)) break;
+            ++valid;
+        }
+        return valid;
+    };
+
+    struct QueueEntry {
+        uint64_t              addr;
+        int                   depth;
+        std::vector<uint32_t> path;   // offsets walked from GUObjectArray to here
+    };
+    std::vector<QueueEntry> queue;
+    std::unordered_set<uint64_t> visited;
+    queue.push_back({out.StructAbs, 0, {}});
+    visited.insert(out.StructAbs);
+
+    int      best_valid = 0;
+    uint64_t best_ca    = 0;
+    int      best_depth = 0;
+    std::vector<uint32_t> best_path;
+
+    constexpr int kMaxDepth = 2;
+    while (!queue.empty()) {
+        QueueEntry e = std::move(queue.front());
+        queue.erase(queue.begin());
+
+        uint8_t b[0x180] = {};
+        if (!reader.Read(e.addr, b, sizeof(b))) continue;
+
+        for (size_t off = 0; off + 8 <= sizeof(b); off += 8) {
+            uint64_t ptr = 0;
+            std::memcpy(&ptr, b + off, 8);
+            if (!IsHeapPtr(ptr) || InModule(ptr)) continue;
+
+            // Try this pointer AS chunks-array.
+            int valid = ValidateAsChunksArray(ptr);
+            if (valid >= 2 && (valid > best_valid ||
+                (valid == best_valid && e.depth < best_depth)))
+            {
+                best_valid = valid;
+                best_ca    = ptr;
+                best_depth = e.depth;
+                best_path  = e.path;
+                best_path.push_back((uint32_t)off);
+            }
+
+            // Queue for one more level of dereferencing (if budget allows).
+            if (e.depth + 1 <= kMaxDepth && visited.insert(ptr).second) {
+                QueueEntry nxt;
+                nxt.addr  = ptr;
+                nxt.depth = e.depth + 1;
+                nxt.path  = e.path;
+                nxt.path.push_back((uint32_t)off);
+                queue.push_back(std::move(nxt));
+            }
+        }
+    }
+
+    if (best_ca == 0) {
+        std::printf("[autodisc-gobj] NumElements=%u @ +0x%X, but no chunks-array pointer "
+                    "found within depth-%d indirection from GUObjectArray\n",
+            best_nm, (uint32_t)best_nm_off, kMaxDepth);
+        return out;
+    }
+
+    out.ChunksArrayPtr     = best_ca;
+    out.NumChunks          = num_chunks;
+    out.ValidChunksProbed  = best_valid;
+    out.IndirectionDepth   = best_depth;
+    out.PathOffsets        = best_path;
+    out.Valid              = true;
+
+    std::printf("[autodisc-gobj] GUObjectArray layout discovered:\n");
+    std::printf("[autodisc-gobj]   NumElements = %u (+0x%X)  num_chunks = %d\n",
+        best_nm, (uint32_t)best_nm_off, num_chunks);
+    std::printf("[autodisc-gobj]   chunks_array = 0x%llX (depth=%d, %d/%d chunks → UObject)\n",
+        (unsigned long long)best_ca, best_depth, best_valid, probe_n);
+    if (!best_path.empty()) {
+        std::printf("[autodisc-gobj]   path: GUObjectArray");
+        uint64_t cur = out.StructAbs;
+        for (size_t i = 0; i < best_path.size(); ++i) {
+            std::printf(" → +0x%X", best_path[i]);
+            if (i + 1 < best_path.size()) {
+                uint64_t next = 0;
+                if (reader.Read(cur + best_path[i], &next, 8)) {
+                    std::printf(" (=0x%llX)", (unsigned long long)next);
+                    cur = next;
+                }
+            }
+        }
+        std::printf("\n");
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Globals — populated by main.cpp::Init() during the discovery phase, read
 // at decrypt sites (gobjects.h, fname_decrypt.h, arc_decrypt.h).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2041,5 +2240,6 @@ inline FNameResolverConsts       g_DiscoveredFName;
 inline GNamesDiscovery           g_DiscoveredGNames;
 inline FFieldClassNameParams     g_DiscoveredFFieldClassName;
 inline std::vector<FFieldClassGlobal> g_DiscoveredFClassGlobals;
+inline GUObjectArrayLayout       g_DiscoveredGObjLayout;
 
 }  // namespace AutoDiscovery

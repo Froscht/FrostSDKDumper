@@ -1,0 +1,197 @@
+================================================================
+FrostSDKDumper — TODO (2026-05-03 → next session)
+================================================================
+
+WHAT SHIPPED 2026-05-03 (Option B — partial; only WIN bump kept)
+----------------------------------------------------------------
+gobjects.h::ScanPass — 1 change kept:
+  1. WIN bumped 0x10000 → 0x400000 (64KB → 4MB). 64× fewer
+     process_vm_readv calls for the bulk page reads.
+
+REVERTED (load-bearing):
+  - Per-slot vtable validation `m_reader.Read(obj_ptr, &vt, 8)`
+    inside the detection loop. Dropping it broke counts:
+      Classes 14627 → 9347, Structs 7946 → 5101,
+      Enums 2881 → 1186, Functions 40826 → 23295,
+      Properties 180828 → 330121 (UP — confirms BPGCs in
+      heavy-property regions dominated the cap, metaclass
+      chunks got crowded out).
+  - Sparse-density filter — added as predicted mitigation but
+    threshold was too leaky AND filter rejected real chunks:
+    Pass A (MAX_GAP=0) splits real chunks at legitimate null
+    slots without vtable filtering, so Pass A produced 21 noise
+    runs that all failed density. Pass B kept 22 of 92K+ runs
+    (largest=84733) but emitted only 46688 (vs ~70K NumElements).
+    Sample obj[0]=0x7B90CD00 with bytes "00 00 00 00 ... A0 51
+    91 4B 01 00 00 00 ..." — clearly not a UObject; structural
+    scan was harvesting heap noise.
+
+Final structural scan: still does per-slot vtable check (same
+as before). Just reads pages 4MB at a time instead of 64KB.
+This is a smaller speedup than the TODO predicted (the per-slot
+syscalls are the dominant cost, not the bulk reads).
+
+Build verified clean (FrostDumper @ 1.36MB). Runtime VERIFIED
+2026-05-03:
+  [p21] scan (MIN_RUN=32,MAX_GAP=64): 23547 runs (largest=92809);
+        total 70848 objs   ← matches NumElements=70592
+  [p28] structural scan collected 70848 UObject pointers
+  [p28] vtable scan added 6020 UObject pointers (total 76868)
+
+Object counts match the documented baseline (~70K structural +
+~7K vtable). The 4MB window is correctness-equivalent to the
+old 64KB window, just with 64× fewer process_vm_readv calls
+for the bulk reads.
+
+⚠ The verification run showed lower SDK output counts than the
+documented baseline (Classes 8897, Structs 2797, Enums 722, etc.
+vs baseline 14627/7946/2881). This is NOT structural-scan
+regression — it's FName-pipeline-dependent. Game state changed
+since baseline was recorded:
+  - looks_like_name=12/32 (sanity FAIL, threshold 50%)
+  - emu-primary fallback ALSO failed
+  - 30818/76868 = 40% naming rate (vs ~85%+ baseline)
+  - [uprobe-key] no hits in 5000ms — function not firing
+    (paused/loading), suggests game is in main menu or loading
+    screen rather than in-match.
+This is an FName-decrypt drift issue separate from Option B.
+To rebuild SDK at full baseline counts, the FName pipeline
+needs the game in an in-match state OR static decrypt fixed.
+
+
+WHAT SHIPPED 2026-05-02
+------------------
+1. arc_decrypt.h — Offsets:: namespace flipped from constexpr to inline
+   mutable globals so probe phases can overwrite at runtime. 108 consumer
+   sites unchanged. No constant-expression context broke.
+
+2. auto_offsets.h (NEW, ~600 lines) — Phase 9-15 live-probe layout discovery:
+   - Joint UStruct::ChildProperties + FField::ClassPrivate (FFieldClass-pointer
+     oracle distinguishes FFields from UObjects)
+   - FField::Next chain validation via LooksLikeFField
+   - FField::NamePrivate via hi64 dispersion
+   - UStruct::SuperStruct + PropertiesSize (with dispersion gate to reject
+     flag-like constants)
+   - UEnum::Names with FName-decode validation (rejected the 0xD8 false positive)
+   - UClass::FuncMap_*, UFunction::NativeFunc/FunctionFlags
+   - FProperty subclass sub-pointers bucketed by FFieldClass type
+   - FProperty::ArrayDim / ElementSize with high consensus floor
+   - NumParms probe DROPPED (no reliable oracle — chain length includes return
+     + locals, not just input params)
+
+3. fname_decrypt.h — added SetEmuPrimary(bool) flag. When set, CompIndexToName
+   / CompIndexToNameLenient / GetName route through Unicorn FIRST and use
+   static decrypt only as fallback. main.cpp::Init auto-flips it on if Phase 0.6
+   sanity check fails AND emu fallback is armed.
+
+4. main.cpp — Phase 0.6 sanity check now falls back to seed sample when GWorld
+   doesn't validate (game in main menu). Phase 2 (FFieldName XOR) falls back
+   to UClass samples when ScriptStruct vtable wasn't detected.
+
+5. main.cpp — TryInitViaVtable7 short-circuits when GUObjectArray+0x30 looks
+   like plain NumElements (CL-1177146 layout). Misleading "Vt7 failed" warning
+   replaced with clean "going straight to structural scan" message.
+
+6. auto_discovery.h — DiscoverGUObjectArrayLayout depth-2 BFS for chunks-array
+   pointer. Doesn't find it on CL-1177146 (chunks-array isn't statically stored
+   — recomputed per access via SIMD+vt[3] call).
+
+7. auto_chunks_emu.h (NEW, ~350 lines) — Tier 1 function-emulation discovery.
+   Finds candidate functions via rip-rel SIMD loads to GUObjectArray, walks
+   back to function start, emulates with insn limit, scans regs for chunks_mgr
+   candidates, then emulates vt[3]/vt[7]/vt[5] to get chunks_array.
+   STATUS: builds clean, runs cleanly, but DOES NOT FIND CHUNKS_ARRAY YET.
+
+8. IDA findings saved to memory:
+   - project_chunks_pipeline_cl1177146.md
+   - feedback_chunks_simd_sig_unstable.md (cross-build sig test: 196 hits on
+     CL-1177146, 0 on Apr-02/14/21 — confirms sig-based auto-discovery is
+     single-patch only)
+
+
+OPEN DECISION (pick one for next session)
+-----------------------------------------
+For STRUCTURAL-SCAN speedup beyond the 4MB-window win:
+  X — drop per-slot vtable check (TRIED 2026-05-03, FAILED — see above)
+  - Batch-validate obj pointers per run after detection. Collect heap-
+    shaped slots first (no vtable check), then for each run sort obj_ptrs
+    by address proximity and bulk-read groups via process_vm_readv with
+    multiple iovecs (1024 per syscall).
+  - Or: skip structural scan entirely when vtable scan can fully cover
+    the object set. Currently vtable scan only adds ~5K — but with
+    autodisc-vt's "ScriptStruct/Class/Function/Package NOT FOUND"
+    output it's leaving most metaclasses on the floor. Fix autodisc-vt's
+    cluster threshold drop ("kind=2 cluster_count=12 < min 20 — dropping").
+
+For the auto_chunks_emu.h Tier 1 path — three bugs still compound:
+  a) Cap of 12 functions — sub_4BD190 (the right one) is at RVA 0x4BD190,
+     past the last tried candidate at 0x32622C. Never reached.
+  b) Function-start walker lands inside instructions. Candidate RVAs like
+     0x2F7D16 are mid-function. Emulation starts on partial instruction →
+     "NULL deref at 0x0". Need prologue-byte validation after CC pad.
+  c) Functions have preset register state (xmm6 = xmmword_AD40D20 in
+     sub_4BD190 prologue). Starting from PSHUFLW gives wrong result for
+     these. Need to pre-load preceding MOVQ xmmN, [rip+const] sites.
+
+OPTION A — keep pushing emulation (~300 more lines):
+  - Lift cap, add prologue validation
+  - Zydis-walk to pre-load xmm regs from preceding instructions
+  - Handle per-function global guards (byte_DAF3D7C etc.)
+  - High risk: each future patch may add new entry conditions
+
+OPTION B — pivot to structural-scan speedup (~30 lines, RECOMMENDED):
+  - Bump scan window 64KB → 4MB (64× fewer syscalls)
+  - Drop per-slot vtable validation in detection loop (already validated
+    at emit, line 1604-1608 in gobjects.h)
+  - Drop 10-30s structural scan to ~1-2s
+  - Patch-resilient: depends only on FUObjectItem stride 20 + heap+module
+    vtable shape, constant across every UE5/ARC version
+
+  Files to touch: gobjects.h::ScanPass
+
+  Keep auto_chunks_emu.h as Tier 1 best-effort (it falls through cleanly
+  when it fails — no regression).
+
+
+KNOWN MINOR ISSUES (lower priority)
+-----------------------------------
+- Phase 3 (FProperty Offset XOR): "no validated load+xor+bswap sites in
+  plausible range". Compile-time const is correct on CL-1177146 so it's not
+  blocking, but on a future patch this would silently keep the wrong value.
+  Either loosen the range gate or add a plausibility cross-check.
+
+- Phase 1 vtable cluster scoring is flaky — sometimes finds Class but misses
+  ScriptStruct (or vice versa) depending on which names happen to resolve in
+  the random sample. Phase 2 fallback handles it but means probe quality
+  depends on luck.
+
+- Legacy SIMD tables (cidxXor1, blkSlotShuf, etc.) read OUT OF BOUNDS on
+  CL-1177146. They're stale 20260421 RVAs. The static FName path is degraded
+  but the inline-handle path + auto-extracted ENTRY_HANDLE_XOR keep it
+  partially working. Auto-flip to emu-primary handles the hard cases.
+
+
+CURRENT STATE — VERIFIED ON CL-1177146
+--------------------------------------
+- Build: clean, FrostDumper @ 1.4 MB
+- Run: produces SDK_Output.txt with 14627 classes, 7946 structs, 2881 enums,
+  40826 functions, 180828 properties (matches recent baselines)
+- Sanity check: PASS (32/32 names look like names) — emu-primary stays off
+- Auto-offsets: ChildProperties+ClassPrivate joint probe expected to converge,
+  PropertiesSize matches via dispersion gate, NumParms correctly skipped
+  (verify in next run output — last full output was before joint probe + UEnum
+  tightening landed)
+
+
+NEXT-SESSION QUICK START
+------------------------
+1. Run: sudo ./build_and_run.sh
+2. Check the [autoff] section near the end — every probe should report
+   "matches constant 0x...". If anything still drifts, the probe oracle
+   needs tightening.
+3. Check the [autoemu] section — currently fails cleanly, falls through.
+4. Decide: Option A vs B above.
+5. Memory pointers (auto-load):
+   - project_chunks_pipeline_cl1177146.md
+   - feedback_chunks_simd_sig_unstable.md
+   - Existing CLAUDE.md project doc covers everything else

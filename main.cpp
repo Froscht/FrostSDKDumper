@@ -57,6 +57,8 @@
 #include "gobjects.h"
 #include "fname_decrypt.h"
 using FNameDecryptor = FName::FNameDecryptor;
+#include "auto_offsets.h"
+#include "auto_chunks_emu.h"
 #include "sdk_generator.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -543,18 +545,67 @@ public:
         // probe, both of which still work.
         CaptureSimdPebKey();
 
-        // Canonical path: emulate chunks_manager vtable[7] (NOT VMProtected on
-        // patch 20260421 despite earlier belief) to recover the real chunks-
-        // array pointer, then enumerate every UObject via chunk indexing.
-        // Falls back to structural scan if emulation fails.
+        // ── GObjectArray init: 4-tier auto-discovery ─────────────────────
+        // Tier 1 (preferred): function-emulation discovery. Anchor on rip-rel
+        //                     load to GUObjectArray, walk back to fn start,
+        //                     emulate to extract chunks_manager, then emulate
+        //                     vt[N] for chunks_array. Patch-shape independent
+        //                     — Unicorn runs whatever SIMD ops the patch uses.
+        // Tier 2: GUObjectArray field-layout BFS — works only when chunks-
+        //         array is a static field (rare on encrypted patches).
+        // Tier 3: vt[7] emulation w/ compile-time constants — older patches.
+        // Tier 4: structural heap scan — last resort, slow but always works.
         m_gobj.SetPid(m_pid);
         bool gobj_ok = false;
-        if (TryInitViaVtable7()) {
+
+        // Tier 1: emulation discovery
+        {
+            const std::string& pe_path = GetPEBinaryPath();
+            const uint64_t EmuMapSize = AutoDiscovery::g_DiscoveredBounds.Valid
+                ? AutoDiscovery::g_DiscoveredBounds.ImageSize : 0xE9AF000ULL;
+            auto emu_result = AutoChunksEmu::Discover(
+                m_reader, MODULE_BASE, m_sigScanner,
+                AutoDiscovery::g_DiscoveredBounds,
+                pe_path.empty() ? nullptr : pe_path.c_str(),
+                EmuMapSize);
+            if (emu_result.Valid) {
+                if (m_gobj.InitFromChunksCanonical(emu_result.ChunksArray,
+                                                   emu_result.NumChunks,
+                                                   (int)emu_result.NumElements)) {
+                    std::cout << "[+] GObjectArray initialized via fn-emulation ("
+                              << m_gobj.GetNumElements() << " objects, decrypt fn @ rva=0x"
+                              << std::hex << emu_result.DecryptFnRva << std::dec
+                              << ", vt[" << emu_result.VtIndex << "])\n";
+                    gobj_ok = true;
+                }
+            }
+        }
+
+        // Tier 2: layout BFS
+        if (!gobj_ok) {
+            AutoDiscovery::g_DiscoveredGObjLayout =
+                AutoDiscovery::DiscoverGUObjectArrayLayout(
+                    m_reader, MODULE_BASE, ArcDecrypt::RVA_GOBJECT_ARRAY_BASE,
+                    AutoDiscovery::g_DiscoveredBounds);
+            if (AutoDiscovery::g_DiscoveredGObjLayout.Valid) {
+                const auto& L = AutoDiscovery::g_DiscoveredGObjLayout;
+                if (m_gobj.InitFromChunksCanonical(L.ChunksArrayPtr, L.NumChunks,
+                                                   (int)L.NumElements)) {
+                    std::cout << "[+] GObjectArray initialized via auto-discovered layout ("
+                              << m_gobj.GetNumElements() << " objects, no decrypt needed)\n";
+                    gobj_ok = true;
+                }
+            }
+        }
+
+        // Tier 3: vt[7] (older encrypted layouts)
+        if (!gobj_ok && TryInitViaVtable7()) {
             std::cout << "[+] GObjectArray initialized via canonical vtable[7] ("
                       << m_gobj.GetNumElements() << " objects)\n";
             gobj_ok = true;
-        } else {
-            std::cout << "[!] Vtable[7] canonical enum failed; falling back to structural scan\n";
+        }
+        if (!gobj_ok) {
+            std::cout << "[+] Going straight to structural scan (no auto-discoverable layout, vt[7] unavailable)\n";
             if (!m_gobj.Init()) {
                 std::cerr << "[-] GObjectArray direct init failed, trying world traversal...\n";
                 m_gobj.PrintDiagnostics();
@@ -573,25 +624,72 @@ public:
         // it first instead of walking the legacy candidate list every call.
         if (gobj_ok) CalibrateInlineHandleOffset();
 
-        // ── Phase 0.6: FName sanity check on the actor sample ───────────
-        // Runs after FName boot + GObjects + handle calibration. If the
-        // actor sample resolves to plausible names, FName is healthy and
-        // we can trust it for Phase 1. If it fails, the SDK dump that
-        // follows would be near-empty / garbage anyway, so log loudly
-        // (we still continue — a static-only fallback may produce some
-        // partial output).
-        if (AutoDiscovery::g_DiscoveredWorld.Valid) {
+        // ── Phase 0.6: FName sanity check ───────────────────────────────
+        // Runs after FName boot + GObjects + handle calibration. Prefers
+        // the validated GWorld actor sample (best signal: known-good live
+        // UObjects from a fresh tick), but falls back to the structural
+        // scan's seed list when the game is in main menu / no world loaded.
+        // Without the fallback the auto-flip would never fire on patch days
+        // where the user can't yet get into a match.
+        {
             AutoDiscovery::NameResolver SanityResolver = [this](uint64_t Obj) -> std::string {
                 return m_fname.GetName(Obj);
             };
-            AutoDiscovery::g_DiscoveredFNameSanity =
-                AutoDiscovery::ValidateFNameOnActors(
-                    AutoDiscovery::g_DiscoveredWorld.Actors, SanityResolver);
-            if (!AutoDiscovery::g_DiscoveredFNameSanity.Valid) {
-                std::printf("[!] FName sanity check FAILED on actor sample — "
-                            "downstream Phase 1 / SDK dump quality will be poor. "
-                            "Investigate FName pipeline (key table, SIMD const, "
-                            "entry handle XOR, slot decrypt).\n");
+            std::vector<uint64_t> SanitySample;
+            const char* SanitySource = "(none)";
+            if (AutoDiscovery::g_DiscoveredWorld.Valid &&
+                !AutoDiscovery::g_DiscoveredWorld.Actors.empty())
+            {
+                SanitySample = AutoDiscovery::g_DiscoveredWorld.Actors;
+                SanitySource = "GWorld actor sample";
+            } else {
+                // Pull a random-ish slice from the structural-scan seed list.
+                const auto& Seeds = m_gobj.GetSeedObjects();
+                size_t TakeN = std::min<size_t>(Seeds.size(), 64);
+                size_t Step = Seeds.size() / std::max<size_t>(TakeN, 1);
+                if (Step == 0) Step = 1;
+                for (size_t I = 0; I < Seeds.size() && SanitySample.size() < TakeN; I += Step) {
+                    if (Seeds[I]) SanitySample.push_back(Seeds[I]);
+                }
+                SanitySource = "GObjects seed sample (no GWorld)";
+            }
+
+            if (SanitySample.empty()) {
+                std::printf("[!] FName sanity check skipped — no objects to sample\n");
+            } else {
+                std::printf("[autodisc-fnchk] sanity sample source: %s (%zu objects)\n",
+                    SanitySource, SanitySample.size());
+                AutoDiscovery::g_DiscoveredFNameSanity =
+                    AutoDiscovery::ValidateFNameOnActors(SanitySample, SanityResolver);
+                if (!AutoDiscovery::g_DiscoveredFNameSanity.Valid) {
+                    std::printf("[!] FName sanity check FAILED — static decrypt "
+                                "pipeline is broken on this patch.\n");
+                    // Auto-flip to emu-primary mode if Unicorn FName fallback is
+                    // armed. The game's own FName function inside Unicorn doesn't
+                    // care about pipeline drift in FNamePool / FNameEntry — every
+                    // CompIndexToName / GetName routes through it instead. ~ms per
+                    // call (cached), but eliminates per-patch RE for the entire
+                    // FName resolver + entry decrypt subsystems.
+                    if (m_emuFName) {
+                        std::printf("[!] Flipping FNameDecryptor to EMU-PRIMARY mode "
+                                    "(Unicorn FName fallback is armed — using it as primary)\n");
+                        m_fname.SetEmuPrimary(true);
+                        AutoDiscovery::g_DiscoveredFNameSanity =
+                            AutoDiscovery::ValidateFNameOnActors(SanitySample, SanityResolver);
+                        if (!AutoDiscovery::g_DiscoveredFNameSanity.Valid) {
+                            std::printf("[!] Emu-primary sanity check ALSO failed — "
+                                        "Unicorn FName fn likely mis-located or its slot "
+                                        "decrypt drifted. SDK dump quality will be poor.\n");
+                        } else {
+                            std::printf("[+] Emu-primary sanity check PASSED — "
+                                        "all subsequent name resolution routes through Unicorn\n");
+                        }
+                    } else {
+                        std::printf("[!] Unicorn FName fallback NOT armed — cannot auto-flip. "
+                                    "Investigate FName pipeline (key table, SIMD const, "
+                                    "entry handle XOR, slot decrypt).\n");
+                    }
+                }
             }
         }
 
@@ -615,34 +713,65 @@ public:
             m_gobj.RunDiscoveredVtableScan();
 
             // ── Phase 2: FField NamePrivate XOR const (live extraction) ──
-            // Pick a few UScriptStructs from the seed list (whose vtable
-            // matches the discovered ScriptStructRVA) and use them to
-            // probe the NamePrivate XOR const without any sig-scan.
-            if (AutoDiscovery::g_DiscoveredVTables.ScriptStructRVA) {
+            // Pick a few objects with FField chains and probe the NamePrivate
+            // XOR const. UScriptStructs are the ideal source (their FFields
+            // live at +0x100 reliably), but Phase 1's vtable cluster scoring
+            // is sometimes flaky and labels Class but misses ScriptStruct.
+            // Fall back to UClass samples — they also have FField chains.
+            {
                 std::vector<uint64_t> uss_samples;
-                uint64_t want_vt = MODULE_BASE +
-                    AutoDiscovery::g_DiscoveredVTables.ScriptStructRVA;
-                for (uint64_t obj : m_gobj.GetSeedObjects()) {
-                    if (uss_samples.size() >= 32) break;
-                    uint64_t vt = 0;
-                    if (!m_reader.Read(obj, &vt, 8)) continue;
-                    if (vt == want_vt) uss_samples.push_back(obj);
+                uint64_t want_struct_vt = AutoDiscovery::g_DiscoveredVTables.ScriptStructRVA
+                    ? MODULE_BASE + AutoDiscovery::g_DiscoveredVTables.ScriptStructRVA : 0;
+                uint64_t want_class_vt  = AutoDiscovery::g_DiscoveredVTables.ClassNativeRVA
+                    ? MODULE_BASE + AutoDiscovery::g_DiscoveredVTables.ClassNativeRVA : 0;
+                if (want_struct_vt) {
+                    for (uint64_t obj : m_gobj.GetSeedObjects()) {
+                        if (uss_samples.size() >= 32) break;
+                        uint64_t vt = 0;
+                        if (!m_reader.Read(obj, &vt, 8)) continue;
+                        if (vt == want_struct_vt) uss_samples.push_back(obj);
+                    }
                 }
-                AutoDiscovery::g_DiscoveredFFieldName =
-                    AutoDiscovery::DiscoverFFieldNameDecrypt(
-                        m_reader, MODULE_BASE, uss_samples);
-                if (AutoDiscovery::g_DiscoveredFFieldName.Valid) {
-                    uint64_t Live = AutoDiscovery::g_DiscoveredFFieldName.XorConst;
-                    uint64_t Hard = FNameDecryptor::FFIELD_NAME_XOR_CL1177146;
-                    if (Live == Hard) {
-                        std::printf("[autodisc] FField NamePrivate XOR matches constant 0x%016llX\n",
-                            (unsigned long long)Live);
-                    } else {
-                        std::printf("[autodisc] FField NamePrivate XOR drift: 0x%016llX → 0x%016llX (auto-fixed)\n",
-                            (unsigned long long)Hard, (unsigned long long)Live);
+                // Fall back to UClass samples if no UScriptStruct samples found.
+                if (uss_samples.empty() && want_class_vt) {
+                    for (uint64_t obj : m_gobj.GetSeedObjects()) {
+                        if (uss_samples.size() >= 32) break;
+                        uint64_t vt = 0;
+                        if (!m_reader.Read(obj, &vt, 8)) continue;
+                        if (vt == want_class_vt) uss_samples.push_back(obj);
+                    }
+                    if (!uss_samples.empty()) {
+                        std::printf("[autodisc] Phase 2 falling back to UClass samples (no UScriptStruct vtable detected)\n");
+                    }
+                }
+                if (!uss_samples.empty()) {
+                    AutoDiscovery::g_DiscoveredFFieldName =
+                        AutoDiscovery::DiscoverFFieldNameDecrypt(
+                            m_reader, MODULE_BASE, uss_samples);
+                    if (AutoDiscovery::g_DiscoveredFFieldName.Valid) {
+                        uint64_t Live = AutoDiscovery::g_DiscoveredFFieldName.XorConst;
+                        uint64_t Hard = FNameDecryptor::FFIELD_NAME_XOR_CL1177146;
+                        if (Live == Hard) {
+                            std::printf("[autodisc] FField NamePrivate XOR matches constant 0x%016llX\n",
+                                (unsigned long long)Live);
+                        } else {
+                            std::printf("[autodisc] FField NamePrivate XOR drift: 0x%016llX → 0x%016llX (auto-fixed)\n",
+                                (unsigned long long)Hard, (unsigned long long)Live);
+                        }
                     }
                 }
             }
+
+            // ── Phase 9-15: live structure-offset probe (auto_offsets.h) ──
+            // With vtables (Phase 1), FField NamePrivate XOR (Phase 2), and
+            // FFieldClass globals (Phase 8) settled, every layout offset in
+            // arc_decrypt.h::Offsets:: can be re-derived from live data with
+            // zero hardcoded RVAs. Each probe scans a candidate offset range,
+            // scores against a type-shape oracle, and overwrites the global
+            // only on strong consensus. Failed probes leave the compile-time
+            // fallback intact and log loudly.
+            AutoOffsets::DiscoverAll(m_reader, MODULE_BASE,
+                                     m_gobj.GetSeedObjects(), m_fname);
         }
 
         // (FProperty Offset_Internal XOR key auto-discovery already ran
@@ -1015,6 +1144,26 @@ public:
     // xmm0.u64[0]. Then hand that off to GObjectArray for full enumeration.
     bool TryInitViaVtable7() {
         using namespace ArcDecrypt::Patch20260421;
+
+        // CL-1177146 layout detection: if NumElements is plain at +0x30, the
+        // encrypted chunks_manager pipeline is gone — vt[7] uses stale 20260421
+        // RVAs (RVA_GOBJ_PSHUFB_MASK / RVA_GOBJ_MAX_XOR_KEY) that decrypt to
+        // garbage on CL-1177146. Skip vt[7] entirely; structural scan handles
+        // this layout correctly.
+        {
+            uint64_t NumAt30 = 0;
+            if (m_reader.Read(MODULE_BASE + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE + 0x30,
+                              &NumAt30, 8))
+            {
+                uint32_t Lo = static_cast<uint32_t>(NumAt30 & 0xFFFFFFFFu);
+                if ((NumAt30 >> 32) == 0 && Lo >= 1000 && Lo <= 2000000) {
+                    std::printf("[vt7] CL-1177146 layout detected (+0x30 plain NumElements=%u); "
+                                "skipping vt[7] — structural scan handles this directly\n", Lo);
+                    return false;
+                }
+            }
+        }
+
         uint8_t enc[16] = {}, mask[8] = {};
         uint64_t xor_key = 0;
         if (!m_reader.Read(MODULE_BASE + RVA_GUOBJECT_ARRAY_NEW, enc, 16)) return false;

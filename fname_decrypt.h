@@ -199,6 +199,23 @@ public:
     void ClearEmuCache() { m_emuCache.clear(); }
     size_t EmuCacheSize() const { return m_emuCache.size(); }
 
+    // ── Emu-primary mode ────────────────────────────────────────────────────
+    // When set, CompIndexToName / CompIndexToNameLenient / GetName try the
+    // Unicorn-emulated game function FIRST and only fall back to the static
+    // SIMD pipeline if emu fails. Use this on patches where the static path
+    // is broken (FNamePool resolver shape changed, FNameEntry decrypt rotated,
+    // etc.) — wired up automatically by main.cpp::Init() when the Phase 0.6
+    // sanity check on actor names fails. Default = false (static primary).
+    void SetEmuPrimary(bool enabled) {
+        if (m_emuPrimary == enabled) return;
+        m_emuPrimary = enabled;
+        std::printf("[fname] emu-primary mode %s — %s\n",
+            enabled ? "ENABLED" : "DISABLED",
+            enabled ? "all CompIndex resolution routes through Unicorn first"
+                    : "static decrypt path is primary");
+    }
+    bool EmuPrimary() const { return m_emuPrimary; }
+
     // Emu-only path. Skips StaticResolve entirely — for callers that know
     // the static pipeline produces wrong-but-printable garbage on this
     // patch (e.g. UEnum::Names entries on patch 20260421 store an obfuscated
@@ -875,6 +892,27 @@ public:
             return printable * 5 >= static_cast<int>(s.size()) * 4;
         };
 
+        // Emu-primary path: skip every static FNameEntry/FNamePool-based
+        // resolver. Slot decrypt (GetCompIndex) is the only static piece left
+        // — and that's auto-discovered (Phase 4 + Phase 0 ENTRY_HANDLE_XOR
+        // extract), not patch-bound. Routing through CompIndexToNameLenient
+        // hits Unicorn for the actual CI→string lookup.
+        if (m_emuPrimary && m_emuFallback) {
+            int32_t comp = GetCompIndex(obj_ptr);
+            if (comp > 0) {
+                std::string out = CompIndexToNameLenient(comp);
+                if (isSaneName(out)) return out;
+            }
+            // Last-ditch: the inline-handle path (also static, but uses
+            // auto-extracted ENTRY_HANDLE_XOR — sometimes survives even when
+            // the FNamePool pipeline drifts).
+            if (m_primaryHandleOffset) {
+                std::string s = GetNameByHandle(obj_ptr, m_primaryHandleOffset);
+                if (isSaneName(s)) return s;
+            }
+            return {};
+        }
+
         // Patch 20260421 primary path: inline encrypted FName handle at
         // obj+0x28 → bswap64(h ^ sentinel) = FNameEntry*. Try the calibrated
         // primary offset first (set by SDKDumper::CalibrateInlineHandleOffset
@@ -907,7 +945,16 @@ public:
     // ── Resolve comp_index → string ──────────────────────────────────────
     // Strict: identifier-shaped only (alphanum + _:./- space). Used for
     // class/enum/struct names that go straight into the SDK output.
+    // When m_emuPrimary is set, hits Unicorn first and only falls back to
+    // the static SIMD pipeline if emu fails — used on patches where the
+    // FNamePool resolver / FNameEntry decrypt has drifted.
     std::string CompIndexToName(int32_t comp_index) {
+        if (m_emuPrimary) {
+            std::string e = TryEmuFallback(comp_index);
+            if (IsStrictName(e)) return e;
+            std::string s = StaticResolve(comp_index);
+            return IsStrictName(s) ? s : std::string{};
+        }
         std::string s = StaticResolve(comp_index);
         if (IsStrictName(s)) return s;
         std::string e = TryEmuFallback(comp_index);
@@ -917,6 +964,12 @@ public:
     // Lenient: any mostly-printable ASCII. Used for FField names which can
     // legitimately contain weirder characters.
     std::string CompIndexToNameLenient(int32_t comp_index) {
+        if (m_emuPrimary) {
+            std::string e = TryEmuFallback(comp_index);
+            if (IsLenientName(e)) return e;
+            std::string s = StaticResolve(comp_index);
+            return IsLenientName(s) ? s : std::string{};
+        }
         std::string s = StaticResolve(comp_index);
         if (IsLenientName(s)) return s;
         std::string e = TryEmuFallback(comp_index);
@@ -1230,6 +1283,7 @@ private:
     uint16_t       m_keyTable[256];
     EmuFallback    m_emuFallback;
     std::unordered_map<int32_t, std::string> m_emuCache;
+    bool           m_emuPrimary = false;       // see SetEmuPrimary()
     uint64_t       m_primaryHandleOffset = 0;  // 0 = no calibration yet, fall back to candidate list
     uint64_t       m_ffieldNameOff = 0;        // 0 = uncalibrated; first valid offset wins
 
