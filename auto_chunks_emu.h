@@ -88,9 +88,70 @@ inline bool IsHeapNonModule(uint64_t p, uint64_t base, uint64_t size) {
     return IsHeapPtr(p) && !InModule(p, base, size);
 }
 
-// Walk back from `code_rva` to find the function start (CC padding boundary).
-// Reuses FuncAnalyze::FindFunctionStart. Capped at 0x2000 bytes back.
+// Cheap prologue-shape check. Real x64 functions start with one of:
+//   push reg / sub rsp, imm / mov [rsp+X], reg / lea / mov rax, gs:[60h] /
+//   xor / or / and reg, reg / cmp / test / call / jmp short.
+// Embedded-CC false positives (CC inside an instruction encoding rather than
+// pad) typically land on bytes that don't match any valid x64 entrypoint.
+inline bool LooksLikePrologue(const uint8_t* p) {
+    if (!p) return false;
+    uint8_t b0 = p[0], b1 = p[1], b2 = p[2];
+    // push rbx/rbp/rsi/rdi (single byte 53/55/56/57)
+    if (b0 == 0x53 || b0 == 0x55 || b0 == 0x56 || b0 == 0x57) return true;
+    // push r12..r15 (41 5C/5D/5E/5F)
+    if (b0 == 0x41 && b1 >= 0x54 && b1 <= 0x57) return true;
+    // sub rsp, imm8: 48 83 EC ??
+    if (b0 == 0x48 && b1 == 0x83 && b2 == 0xEC) return true;
+    // sub rsp, imm32: 48 81 EC ?? ?? ?? ??
+    if (b0 == 0x48 && b1 == 0x81 && b2 == 0xEC) return true;
+    // mov [rsp+X], rXX: 48 89 5C/4C/54/74/7C 24 ??  (rbx/rcx/rdx/rsi/rdi)
+    if (b0 == 0x48 && b1 == 0x89 && (b2 == 0x5C || b2 == 0x4C || b2 == 0x54 ||
+        b2 == 0x74 || b2 == 0x7C) && p[3] == 0x24) return true;
+    // mov [rsp+X], r8..r15: 4C 89 ?? 24 ??
+    if (b0 == 0x4C && b1 == 0x89 && p[3] == 0x24) return true;
+    // mov rax, qword ptr gs:[60h]: 65 48 8B 04 25 60 00 00 00
+    if (b0 == 0x65 && b1 == 0x48 && b2 == 0x8B) return true;
+    // mov rax, gs:[60h]: 65 48 A1 ...
+    if (b0 == 0x65 && b1 == 0x48 && b2 == 0xA1) return true;
+    // mov reg, rcx (preserve ICALL arg): 48 89 C8/D1/...
+    if (b0 == 0x48 && b1 == 0x89 && b2 >= 0xC0 && b2 <= 0xCF) return true;
+    // mov rax, rcx (48 8B C1) — common entry-stub idiom
+    if (b0 == 0x48 && b1 == 0x8B && b2 == 0xC1) return true;
+    // xor eax, eax (33 C0) at function head — rare but valid
+    if (b0 == 0x33 && b1 == 0xC0) return true;
+    // jmp rel8 / rel32 — tail-call thunks
+    if (b0 == 0xE9 || b0 == 0xEB) return true;
+    // ret (C3) / ret imm16 (C2) — single-instruction stub
+    if (b0 == 0xC3 || b0 == 0xC2) return true;
+    // test reg, reg: 48 85 ??
+    if (b0 == 0x48 && b1 == 0x85) return true;
+    // mov rXX, [rcx]: 48 8B (commonly 48 8B 01/09/11/19/...)
+    if (b0 == 0x48 && b1 == 0x8B) return true;
+    // lea rax, [rip+...]: 48 8D 05 ?? ?? ?? ??
+    if (b0 == 0x48 && b1 == 0x8D) return true;
+    // and rsp, -16: 48 83 E4 F0 (alignment thunk)
+    if (b0 == 0x48 && b1 == 0x83 && b2 == 0xE4) return true;
+    return false;
+}
+
+// Walk back from `code_rva` to find the function start. Uses CC padding as
+// the boundary heuristic, then validates with LooksLikePrologue. If the
+// initial CC-walk lands on a byte that doesn't look like a valid x64
+// entrypoint (i.e. the CC was an embedded immediate, not real INT3 padding),
+// keep walking back to find the next CC.
 inline uint64_t WalkBackToFunctionStart(const SigScanV2::Scanner& scanner, uint64_t code_rva) {
+    uint64_t cur = code_rva;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        uint64_t fn = FuncAnalyze::FindFunctionStart(scanner, cur);
+        if (!fn || fn >= cur) return fn;  // walkback exhausted / no movement
+        const uint8_t* p = scanner.GetLocalPtr(fn);
+        if (LooksLikePrologue(p)) return fn;
+        // Bogus walkback (CC was embedded, not pad). Restart search from one
+        // byte before the rejected start so we look for an earlier CC.
+        if (fn == 0) return 0;
+        cur = fn - 1;
+    }
+    // Out of attempts — return the most recent CC-walkback result anyway.
     return FuncAnalyze::FindFunctionStart(scanner, code_rva);
 }
 
@@ -141,11 +202,33 @@ inline std::vector<uint64_t> FindGUObjectArrayLoaders(
     try_pat("F2 0F 70 2D ?? ?? ?? ?? ??", 4, 9);
     try_pat("F2 0F 70 35 ?? ?? ?? ?? ??", 4, 9);
     try_pat("F2 0F 70 3D ?? ?? ?? ?? ??", 4, 9);
-    // MOVDQU xmm, [rip+disp32]:  F3 0F 6F /r disp32 (8 bytes)
+    // MOVDQU xmm0..xmm7, [rip+disp32]:  F3 0F 6F /r disp32 (8 bytes)
     try_pat("F3 0F 6F 05 ?? ?? ?? ??", 4, 8);
     try_pat("F3 0F 6F 0D ?? ?? ?? ??", 4, 8);
     try_pat("F3 0F 6F 15 ?? ?? ?? ??", 4, 8);
     try_pat("F3 0F 6F 1D ?? ?? ?? ??", 4, 8);
+    try_pat("F3 0F 6F 25 ?? ?? ?? ??", 4, 8);
+    try_pat("F3 0F 6F 2D ?? ?? ?? ??", 4, 8);
+    try_pat("F3 0F 6F 35 ?? ?? ?? ??", 4, 8);
+    try_pat("F3 0F 6F 3D ?? ?? ?? ??", 4, 8);
+    // MOVAPS xmm0..xmm7, [rip+disp32]:  0F 28 /r disp32 (7 bytes)
+    try_pat("0F 28 05 ?? ?? ?? ??", 3, 7);
+    try_pat("0F 28 0D ?? ?? ?? ??", 3, 7);
+    try_pat("0F 28 15 ?? ?? ?? ??", 3, 7);
+    try_pat("0F 28 1D ?? ?? ?? ??", 3, 7);
+    try_pat("0F 28 25 ?? ?? ?? ??", 3, 7);
+    try_pat("0F 28 2D ?? ?? ?? ??", 3, 7);
+    try_pat("0F 28 35 ?? ?? ?? ??", 3, 7);
+    try_pat("0F 28 3D ?? ?? ?? ??", 3, 7);
+    // MOVUPS xmm0..xmm7, [rip+disp32]:  0F 10 /r disp32 (7 bytes)
+    try_pat("0F 10 05 ?? ?? ?? ??", 3, 7);
+    try_pat("0F 10 0D ?? ?? ?? ??", 3, 7);
+    try_pat("0F 10 15 ?? ?? ?? ??", 3, 7);
+    try_pat("0F 10 1D ?? ?? ?? ??", 3, 7);
+    try_pat("0F 10 25 ?? ?? ?? ??", 3, 7);
+    try_pat("0F 10 2D ?? ?? ?? ??", 3, 7);
+    try_pat("0F 10 35 ?? ?? ?? ??", 3, 7);
+    try_pat("0F 10 3D ?? ?? ?? ??", 3, 7);
 
     // Dedup & sort
     std::sort(hits.begin(), hits.end());
@@ -360,16 +443,24 @@ inline Result Discover(IMemoryReader& reader, uint64_t module_base,
 
     // Build distinct function-start list from hits (many hits may map to
     // the same function via multiple SIMD loads in its body).
+    //
+    // Cap at 256 distinct fn_starts. The previous 12-cap stopped before
+    // reaching the documented chunks-manager fn at RVA 0x4BD190 — hits
+    // are processed in ascending order and 12 unique walkbacks were filled
+    // by lower-RVA candidates (most of them embedded-CC false positives).
+    // 256 covers the full search range; each emulation is fast (~60 insns).
     std::vector<uint64_t> fn_starts;
     std::unordered_set<uint64_t> seen;
+    size_t walkback_failed = 0, walkback_dup = 0;
     for (uint64_t rva : hits) {
         uint64_t fn = WalkBackToFunctionStart(scanner, rva);
-        if (!fn) continue;
-        if (!seen.insert(fn).second) continue;
+        if (!fn) { ++walkback_failed; continue; }
+        if (!seen.insert(fn).second) { ++walkback_dup; continue; }
         fn_starts.push_back(fn);
-        if (fn_starts.size() >= 12) break;
+        if (fn_starts.size() >= 256) break;
     }
-    std::printf("[autoemu] %zu distinct candidate functions (capped 12)\n", fn_starts.size());
+    std::printf("[autoemu] %zu distinct candidate functions (cap=256, walkback_failed=%zu, dup=%zu)\n",
+        fn_starts.size(), walkback_failed, walkback_dup);
 
     EmuEngine emu;
     if (!emu.Initialize(&reader, module_base, emu_map_size, pe_path)) {

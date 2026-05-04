@@ -2205,14 +2205,42 @@ public:
                     uint64_t entry = pairs_data + (uint64_t)i * ArcDecrypt::Offsets::UClass::FuncMap_PairStride;
                     uint64_t ufunc = Read<uint64_t>(entry + ArcDecrypt::Offsets::UClass::FuncMapPair_UFunction);
                     if (ufunc <= 0x10000 || ufunc >= 0x800000000000ULL) continue;
+                    // Pass 5 was admitting any pointer in the value slot — TMap
+                    // iteration walks pairs by index without skipping unoccupied
+                    // hash slots, so ~half the slots produce garbage pointers.
+                    // Apply the same gates Passes 3/4 use:
+                    //   1. vtable must be a known UFunction vtable (Pass 1+3
+                    //      seeded ufunc_vtbls with all real subclasses).
+                    //   2. structural shape must match (looks_like_ufunc_struct
+                    //      verifies UStruct fields are sane).
+                    //   3. FunctionFlags must be non-zero and reasonable.
+                    // Without these, Pass 5 alone admitted ~23K functions, ~22K
+                    // of them garbage TMap-slot fragments. With the gates in
+                    // place, real entries still admit (since their vtables are
+                    // already in ufunc_vtbls from Pass 1) and total functions
+                    // converge near the 41K target.
+                    uint64_t ufunc_vt = Read<uint64_t>(ufunc);
+                    if (!ufunc_vtbls.count(ufunc_vt)) continue;
+                    if (!looks_like_ufunc_struct(ufunc)) continue;
+                    uint32_t ufunc_flags = Read<uint32_t>(ufunc + ArcDecrypt::Offsets::UFunction::FunctionFlags);
+                    if (ufunc_flags == 0 || ufunc_flags > 0x10000000u) continue;
                     if (found_set.count(ufunc)) {
-                        // Already enumerated; reassign owner to this UClass if
-                        // currently bucketed under owner=0 (orphan) or wrong owner.
+                        // Already enumerated. Only ADOPT from owner=0 (orphan
+                        // bucket); never poach from another real class. UE5's
+                        // FuncMap on a child class also lists inherited Blueprint
+                        // events whose UFunction pointer is the parent's stub
+                        // (e.g. UPawn::ReceivePossessed shows up in BP_Trader_X's
+                        // FuncMap). Unconditional reassignment moved base-class
+                        // funcs onto whichever child was iterated last, so UPawn
+                        // lost ReceiveUnpossessed/Possessed/Restarted/ControllerChanged
+                        // to a random Trader BP. With this guard, the function
+                        // stays attributed to its first-seen owner (which is the
+                        // base class on Pass 1's metaclass-based discovery).
                         bool any = false;
                         for (auto& [own, fns] : m_owner_to_funcs) {
                             auto it2 = std::find(fns.begin(), fns.end(), ufunc);
                             if (it2 != fns.end()) {
-                                if (own != obj_ptr) {
+                                if (own == 0 && own != obj_ptr) {
                                     fns.erase(it2);
                                     m_owner_to_funcs[obj_ptr].push_back(ufunc);
                                 }
@@ -2464,33 +2492,49 @@ public:
             else if (class_cls) { is_class_by_cls = true; cls = class_cls; }
             if (!cls) cls = m_fname.GetClassPrivate(obj_ptr);  // fallback for legacy paths
 
-            // Path C: heuristic — Names array at +0xA8 (UEnum::Names)
-            // Only apply when not already classified as a type
+            // Path C: heuristic — Names array at UEnum::Names offset.
+            // Only apply when not already classified as a type. The previous
+            // implementation validated only the FIRST entry; that let through
+            // UBoneWeightsAsset (TArray<TPair<FName,FVector2D>> at the same
+            // offset — first entry "Root" with weight 0 passes, later entries
+            // contain float-bit ints like 0x3F800000_3F800000 = 4.57e18) and
+            // UAnimNotifyState_SetGameplayTags (single-entry TArray with a
+            // gameplay-tag hash = 31780 as its value). Now validate ALL
+            // entries (capped at 16) and require values within typical enum
+            // range; reject single-entry pseudo-enums with non-zero values.
             bool _is_type_by_ref_check = allTypeAddrs.count(obj_ptr) > 0;
             if (!is_class_by_cls && !is_scriptstruct && !is_enum && !_is_type_by_ref_check) {
                 uint64_t names_ptr = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names);
                 uint32_t names_cnt = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 8);
                 uint32_t names_max = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 12);
-                // CDOs (Default__X) are never enums — skip the heuristic
-                // for them to keep struct/class CDOs from being misdetected.
                 bool is_cdo = short_name.rfind("Default__", 0) == 0;
                 if (!is_cdo &&
                     names_ptr > 0x10000 && names_ptr < 0x7FFFFFFFFFFFULL &&
-                    names_cnt > 0 && names_cnt < 4096 &&
-                    names_max >= names_cnt && names_max < 4096) {
-                    // Patch 20260421: entries are {uint32 CI, uint32 Num,
-                    // int64 value} stride 16 (per IDA UEnum_GetValueByName
-                    // at 0x3E44E0). The CI is obfuscated but always non-zero
-                    // for a live enum; Num is almost always 0; values fit in
-                    // a sane range. Random heap pages rarely satisfy all three.
-                    int32_t  first_ci  = Read<int32_t>(names_ptr + 0);
-                    uint32_t first_num = Read<uint32_t>(names_ptr + 4);
-                    int64_t  first_val = Read<int64_t>(names_ptr + 8);
-                    if (first_ci > 0 && (uint32_t)first_ci < 0x1FFFFFFFu &&
-                        first_num < 0x1000 &&
-                        first_val > -0x100000 && first_val < 0x100000) {
-                        is_enum = true;
+                    names_cnt > 0 && names_cnt < 256 &&
+                    names_max >= names_cnt && names_max < 256) {
+                    bool plausible = true;
+                    uint32_t probe_n = names_cnt < 16 ? names_cnt : 16;
+                    for (uint32_t j = 0; j < probe_n; ++j) {
+                        uint64_t ep   = names_ptr + (uint64_t)j * 16;
+                        int32_t  ci   = Read<int32_t>(ep + 0);
+                        uint32_t num  = Read<uint32_t>(ep + 4);
+                        int64_t  val  = Read<int64_t>(ep + 8);
+                        if (!(ci > 0 && (uint32_t)ci < 0x1FFFFFFFu) ||
+                            num >= 0x100 ||
+                            !(val > -0x10000 && val < 0x10000)) {
+                            plausible = false;
+                            break;
+                        }
                     }
+                    // Single-entry "enums" with a non-zero value are almost
+                    // always misclassified data assets (e.g. AnimNotifyState
+                    // with a single gameplay-tag hash). Real single-entry
+                    // enums start at 0.
+                    if (plausible && names_cnt == 1 &&
+                        Read<int64_t>(names_ptr + 8) != 0) {
+                        plausible = false;
+                    }
+                    if (plausible) is_enum = true;
                 }
                 // Heuristic for structs: name starts with character (not /), has small props_size
                 if (!is_enum && !short_name.empty() && short_name[0] != 'C' &&
@@ -2521,37 +2565,85 @@ public:
 
             // ─── UEnum ────────────────────────────────────────────────────────
             if (is_enum) {
+                uint64_t names_ptr = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names);
+                uint32_t names_cnt = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 8);
+                uint32_t names_max = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 12);
+
+                // Even objects classified as enum by Path A (class candidate
+                // matches enumAddrs) can be misclassified — GetAllClassCandidates
+                // probes 4 slots and one may collide with an enum metaclass for
+                // unrelated objects (e.g. /Script/Angelscript.AnimNotifyState_*).
+                // Apply the same shape gate as Path C: validate entries' value
+                // ranges and reject single-entry pseudo-enums with non-zero vals.
+                bool shape_ok = false;
+                if (names_ptr > 0x10000 && names_ptr < 0x7FFFFFFFFFFFULL &&
+                    names_cnt > 0 && names_cnt < 256 &&
+                    names_max >= names_cnt && names_max < 256) {
+                    shape_ok = true;
+                    uint32_t probe_n = names_cnt < 16 ? names_cnt : 16;
+                    uint32_t resolved = 0;
+                    for (uint32_t j = 0; j < probe_n; ++j) {
+                        uint64_t ep   = names_ptr + (uint64_t)j * 16;
+                        int32_t  ci   = Read<int32_t>(ep + 0);
+                        uint32_t num  = Read<uint32_t>(ep + 4);
+                        int64_t  val  = Read<int64_t>(ep + 8);
+                        if (!(ci > 0 && (uint32_t)ci < 0x1FFFFFFFu) ||
+                            num >= 0x100 ||
+                            !(val > -0x10000 && val < 0x10000)) {
+                            shape_ok = false;
+                            break;
+                        }
+                        // Real enum entries' CIs all resolve via the name pool.
+                        // Misclassified data assets (UClass +0xB0 = SuperStruct
+                        // ptr; AnimNotifyState_SetGameplayTags has 5 slots with
+                        // only one valid CI) typically have most entries fail.
+                        std::string ev = m_fname.CompIndexToNameLenient(ci);
+                        if (!ev.empty() && ev.find('?') == std::string::npos) {
+                            ++resolved;
+                        }
+                    }
+                    if (shape_ok) {
+                        // Require ALL probed entries to resolve via the FName
+                        // pool. Real enums hit 100% (CL-1177146 FName lookup is
+                        // reliable); pseudo-enums (UClass/UAngelscriptClass +0xB0
+                        // = SuperStruct ptr; CDA76AC0 had cnt=2 with one slot
+                        // resolving "Camera.State" and another with garbage CI)
+                        // fail. The 50% threshold tried earlier let CDA76AC0
+                        // through because need=(2+1)/2=1 was satisfied by the
+                        // single chance hit.
+                        if (resolved < probe_n) shape_ok = false;
+                    }
+                    // Reject single-entry "enums" — real enums almost always
+                    // have ≥ 2 entries (Type::None / EXyz_MAX pair etc.).
+                    // 1-entry pseudo-enums are nearly all misclassifications
+                    // (UClass +0xB0 = SuperStruct ptr happens to point at a
+                    // heap region with one resolvable FName slot by chance).
+                    if (shape_ok && names_cnt < 2) {
+                        shape_ok = false;
+                    }
+                }
+                if (!shape_ok) continue;
+
                 EnumRecord erec{};
                 erec.addr    = obj_ptr;
                 erec.name    = short_name;
                 erec.package = pkg;
 
-                uint64_t names_ptr = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names);
-                uint32_t names_cnt = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 8);
-
-                if (names_ptr && names_cnt > 0 && names_cnt < 4096) {
-                    // Patch 20260428: entries are TPair<FName, int64> stride 16:
-                    //   +0  uint32  FName.lo32 = direct FNamePool index (no obfuscation)
-                    //   +4  uint32  FName.Number (typically 0 for enum entries)
-                    //   +8  int64   enum value
-                    // CompIndexToNameLenient does the FNamePool walk and is the
-                    // correct path. DecryptCIByEmu was a 20260421 workaround that
-                    // produces garbage on this patch.
-                    for (uint32_t j = 0; j < names_cnt; ++j) {
-                        uint64_t ep  = names_ptr + (uint64_t)j * 16;
-                        int32_t  ci  = Read<int32_t>(ep + 0);
-                        int64_t  val = Read<int64_t>(ep + 8);
-                        std::string ev = m_fname.CompIndexToNameLenient(ci);
-                        if (ev.empty()) continue;
-                        if (ev.find('?') != std::string::npos) continue;
-                        size_t cc = ev.find("::");
-                        if (cc != std::string::npos) ev = ev.substr(cc + 2);
-                        erec.entries.push_back({ev, val});
-                    }
+                // Patch 20260428: entries are TPair<FName, int64> stride 16:
+                //   +0  uint32  FName.lo32 = direct FNamePool index (no obfuscation)
+                //   +4  uint32  FName.Number (typically 0 for enum entries)
+                //   +8  int64   enum value
+                for (uint32_t j = 0; j < names_cnt; ++j) {
+                    uint64_t ep  = names_ptr + (uint64_t)j * 16;
+                    int32_t  ci  = Read<int32_t>(ep + 0);
+                    int64_t  val = Read<int64_t>(ep + 8);
+                    std::string ev = m_fname.CompIndexToNameLenient(ci);
+                    if (ev.empty()) continue;
+                    if (ev.find('?') != std::string::npos) continue;
+                    size_t cc = ev.find("::");
+                    if (cc != std::string::npos) ev = ev.substr(cc + 2);
+                    erec.entries.push_back({ev, val});
                 }
-                // Emit the enum even with no entries — a typed UEnum is still
-                // useful for SDK consumers; missing entries are a decode issue,
-                // not a "this isn't an enum" signal.
                 result.enums.push_back(std::move(erec));
                 continue;
             }
@@ -2596,7 +2688,17 @@ public:
             // collapses identical FFields and the per-class emit (own-by-walk)
             // is preserved per call site. Matches reference dumpers for game
             // BPGCs that otherwise emit empty bodies.
-            static constexpr uint64_t kChainOffs[] = { 0x100, 0xB8, 0x118 };
+            // Live-probed offsets where FField chain heads land on CL-1177146.
+            // Beyond the documented +0x100/+0xB8/+0x118/+0x190 set, native UClass
+            // also stores heap-shaped FField pointers at +0xC8/+0xD8/+0x108/+0x138
+            // (verified by reading 512 bytes at /Script/Engine.Pawn — +0x100 was
+            // empty, but +0xB8/+0xC8/+0xD8/+0x108/+0x138 all held FField heads).
+            // walk_chain validates each via ReadPropertyChain's ghost-FField guard,
+            // so bogus offsets walk an empty chain harmlessly. ff_addr dedup
+            // collapses identical fields walked via multiple heads.
+            static constexpr uint64_t kChainOffs[] = {
+                0x100, 0xB8, 0xC8, 0xD8, 0x108, 0x118, 0x138, 0x190
+            };
             auto walk_chain = [&](uint64_t chain_head) {
                 if (chain_head <= 0x10000 || chain_head >= 0x7FFFFFFFFFFFULL) return;
                 uint64_t cpvt = Read<uint64_t>(chain_head);
@@ -2620,10 +2722,17 @@ public:
                     }
                 }
             };
+            // Walk ALL chain heads (was: first-non-empty-wins). Native UClass
+            // has own properties at +0x100; BPGCs and engine-generated classes
+            // store own+inherited at +0xB8 (PropertyLink); +0x118 (RefLink) and
+            // +0x190 (DestructorLink) are alternative chain heads. ff_addr dedup
+            // keeps duplicates out — each unique FField contributes once. The
+            // previous "first wins" gate left native UClass walks blind to
+            // PropertyLink, which carries inherited fields the reference SDK
+            // counts per-class.
             for (uint64_t off : kChainOffs) {
                 uint64_t head = Read<uint64_t>(obj_ptr + off);
                 walk_chain(head);
-                if (!best_at_ff.empty()) break;  // first non-empty chain wins
             }
             for (auto& [ff, p] : best_at_ff)
                 rec.properties.push_back(std::move(p));

@@ -115,6 +115,63 @@ WHAT SHIPPED 2026-05-02
      single-patch only)
 
 
+WHAT SHIPPED 2026-05-04 (Option A — Tier 1 emulation now works)
+---------------------------------------------------------------
+auto_chunks_emu.h:
+  1. Cap lifted 12 → 256 distinct fn_starts. The original cap stopped
+     the search at RVA 0x32786A — far short of any chunks-pipeline fn.
+     With 256, hit-process counters now show: 256 distinct, 182 dup,
+     0 walkback_failed.
+  2. Walkback validation: WalkBackToFunctionStart now checks the
+     CC-walkback result against LooksLikePrologue (push reg / sub rsp /
+     mov [rsp+X], rXX / lea / mov rax,rcx / etc.). On reject, retries
+     up to 6× with the previous CC. Removes embedded-CC false starts
+     (e.g. 0x2C93EB landed inside a `cmp byte ptr [rip+disp32], imm`
+     instruction's disp32). Strict prologue check costs ~nothing — the
+     subsequent ~300-µs emulation per candidate dwarfs it.
+  3. SIMD pattern coverage extended: MOVDQU /r=25/2D/35/3D (xmm4-7),
+     MOVAPS /r=05..3D, MOVUPS /r=05..3D. Previous patterns missed any
+     load into xmm4-xmm7 that wasn't MOVDQA/MOVQ/PSHUFLW.
+
+  Result on 6093 (in-match):
+    [autoemu] 789 rip-rel loaders found targeting GUObjectArray's first 0x180 bytes
+    [autoemu] 256 distinct candidate functions (cap=256, walkback_failed=0, dup=182)
+    [autoemu] candidate fn @ rva=0x422856 — emulating
+    [autoemu]   1 chunks_manager candidate(s): 0x297F0F10
+    [autoemu] SUCCESS — chunks_manager=0x297F0F10 chunks_array=0x6AE53D60 vt[3] blob_off=+0x90
+    [canon] chunk[0] @ 0x7B470008: 65536 non-null, 65536 valid-vtable
+    [canon] chunk[1] @ 0x7B5C0008: 60335 non-null, 60335 valid-vtable
+    [canon] canonical enumeration: 125871 unique UObjects (expected ~70592)
+
+  The fn that produced success was 0x422856 — NOT the documented
+  sub_4BD190 from project memory. Both functions read the same
+  GUObjectArray+0x10 blob via PSHUFLW(0x39)+XOR(AD40D20)+ROL32(15) and
+  emit chunks_manager via vt[3]. 0x422856 is a simpler caller (less
+  call-chain noise before the SIMD pipeline) so emulation reaches the
+  output without short-circuiting on intercepted-CALL zero returns.
+
+  Game state: in-match (UWorld='PracticeRangeArray'). FName resolution
+  is at full quality here; main-menu state cuts it to ~80%.
+
+  Final SDK: 18284 classes / 10915 structs / 3045 enums / 55615 funcs
+             / 198847 properties.  126775 named, 251 failed (99.8%).
+  After enum-gate tightening (sdk_generator.h Path A/C):
+             18284 / 10915 / 2878 / 55354 / 198772.
+  Removed ~167 pseudo-enums (UBoneWeightsAsset BWA_HM_*,
+  UAngelscriptClass AnimNotifyState_SetGameplayTags*, and similar
+  data-asset misclassifications). Real enums (ETeleportType,
+  EAttachmentRule, EBlendMode, EObjectTypeQuery, etc.) intact.
+
+  Comparison vs prior in-main-menu run (11233/4163/1130/24686/122090):
+    classes +63%, structs +163%, enums +169%, functions +125%, props +63%.
+    Naming rate jumped 80% → 99.8% — partly from in-match state, partly
+    from canonical chunks doubling object count from 70k → 127k.
+
+  Reference target (CLAUDE.md §6 "Reference"): 21453/9355/2340/41093/275843.
+    Structs/enums/functions now exceed reference (PropertyLink-walk
+    inflation expected); classes at 85% of target, properties at 72%.
+
+
 OPEN DECISION (pick one for next session)
 -----------------------------------------
 For STRUCTURAL-SCAN speedup beyond the 4MB-window win:
@@ -122,41 +179,28 @@ For STRUCTURAL-SCAN speedup beyond the 4MB-window win:
   - Batch-validate obj pointers per run after detection. Collect heap-
     shaped slots first (no vtable check), then for each run sort obj_ptrs
     by address proximity and bulk-read groups via process_vm_readv with
-    multiple iovecs (1024 per syscall).
-  - Or: skip structural scan entirely when vtable scan can fully cover
-    the object set. Currently vtable scan only adds ~5K — but with
-    autodisc-vt's "ScriptStruct/Class/Function/Package NOT FOUND"
-    output it's leaving most metaclasses on the floor. Fix autodisc-vt's
-    cluster threshold drop ("kind=2 cluster_count=12 < min 20 — dropping").
+    multiple iovecs (1024 per syscall). Less critical now that autoemu
+    canonical walk covers the path.
 
-For the auto_chunks_emu.h Tier 1 path — three bugs still compound:
-  a) Cap of 12 functions — sub_4BD190 (the right one) is at RVA 0x4BD190,
-     past the last tried candidate at 0x32622C. Never reached.
-  b) Function-start walker lands inside instructions. Candidate RVAs like
-     0x2F7D16 are mid-function. Emulation starts on partial instruction →
-     "NULL deref at 0x0". Need prologue-byte validation after CC pad.
-  c) Functions have preset register state (xmm6 = xmmword_AD40D20 in
-     sub_4BD190 prologue). Starting from PSHUFLW gives wrong result for
-     these. Need to pre-load preceding MOVQ xmmN, [rip+const] sites.
+Class vtable still NOT FOUND in autodisc-vt cluster (compile-time
+0xAD9E500 is correct — wide-string anchor finds it). The cluster gate
+drops it because the ClassNative oracle name list doesn't match enough
+of the live UClass instance set in PracticeRangeArray map. Loosen the
+oracle (more names) or lower the floor for kind=KCLASS_NATIVE.
 
-OPTION A — keep pushing emulation (~300 more lines):
-  - Lift cap, add prologue validation
-  - Zydis-walk to pre-load xmm regs from preceding instructions
-  - Handle per-function global guards (byte_DAF3D7C etc.)
-  - High risk: each future patch may add new entry conditions
+WBPGC autodisc found 0xC199910 not 0xB35B400 — but compile-time
+fallback list still has 0xB35B400 from CLAUDE.md, and the live
+0xC199910 isn't seeded into knownTypeVtables. Investigate whether
+0xC199910 is the new patch-shifted WBPGC or a sibling type
+(WidgetBlueprintGeneratedClass subclass).
 
-OPTION B — pivot to structural-scan speedup (~30 lines, RECOMMENDED):
-  - Bump scan window 64KB → 4MB (64× fewer syscalls)
-  - Drop per-slot vtable validation in detection loop (already validated
-    at emit, line 1604-1608 in gobjects.h)
-  - Drop 10-30s structural scan to ~1-2s
-  - Patch-resilient: depends only on FUObjectItem stride 20 + heap+module
-    vtable shape, constant across every UE5/ARC version
-
-  Files to touch: gobjects.h::ScanPass
-
-  Keep auto_chunks_emu.h as Tier 1 best-effort (it falls through cleanly
-  when it fails — no regression).
+OPTION C — PE on-disk fallback for autoemu cold-page recovery.
+The current autoemu only succeeds when the candidate fn's pages are
+fault-resolvable from live memory. Some candidate fns end up on
+VMProtect cold pages where process_vm_readv returns zero. The
+EmuEngine PE-on-disk fallback isn't currently set up
+("[pe] no PE binary found ... — PE fallback disabled"). Pointing it
+at the actual binary in the Wine prefix would expand coverage.
 
 
 KNOWN MINOR ISSUES (lower priority)
@@ -177,26 +221,38 @@ KNOWN MINOR ISSUES (lower priority)
   partially working. Auto-flip to emu-primary handles the hard cases.
 
 
-CURRENT STATE — VERIFIED ON CL-1177146
---------------------------------------
-- Build: clean, FrostDumper @ 1.4 MB
-- Run: produces SDK_Output.txt with 14627 classes, 7946 structs, 2881 enums,
-  40826 functions, 180828 properties (matches recent baselines)
-- Sanity check: PASS (32/32 names look like names) — emu-primary stays off
-- Auto-offsets: ChildProperties+ClassPrivate joint probe expected to converge,
-  PropertiesSize matches via dispersion gate, NumParms correctly skipped
-  (verify in next run output — last full output was before joint probe + UEnum
-  tightening landed)
+CURRENT STATE — VERIFIED ON CL-1177146 (2026-05-04)
+---------------------------------------------------
+- Build: clean, FrostDumper @ ~1.4 MB
+- Run (in-match map=PracticeRangeArray, PID 6093):
+    Final SDK: 18284 classes / 10915 structs / 2878 enums /
+               55354 functions / 198772 properties
+    Naming: 126775 named, 251 failed (99.8%)
+- Sanity check: PASS (32/32 names look like names)
+- Auto-offsets: every probe matches its compile-time constant
+  (SuperStruct +0xB0, PropertiesSize +0xD8, UEnum::Names +0xB0,
+  FunctionFlags +0x130, ArrayDim +0xF0, ElementSize +0xF8,
+  Offset_Internal XOR 0x40277448, NamePrivate slot XOR
+  0x5EA772D07F910744, FFieldClass NamePrivate +0x40)
+- Autoemu Tier 1: SUCCESS via fn @ rva=0x422856, vt[3], blob_off=+0x90
+- Wide-string vtable anchor: finds all 4 engine roots
+  (ScriptStruct/Class/Function/Enum) via .rdata UTF-16 kind strings
 
 
 NEXT-SESSION QUICK START
 ------------------------
-1. Run: sudo ./build_and_run.sh
-2. Check the [autoff] section near the end — every probe should report
+1. Run: sudo ./build_and_run.sh <PID>
+2. Check the [autoemu] section — should print SUCCESS line with
+   chunks_manager / chunks_array / vt[N] / blob_off. If it falls
+   through, look at which fn_starts were tried (cap=256 should cover
+   most cases on CL-1177146; future patches may need pattern updates
+   in FindGUObjectArrayLoaders).
+3. Check the [autoff] section near the end — every probe should report
    "matches constant 0x...". If anything still drifts, the probe oracle
    needs tightening.
-3. Check the [autoemu] section — currently fails cleanly, falls through.
-4. Decide: Option A vs B above.
+4. Run again in main-menu state to confirm autoemu still works there
+   (FName resolution will be degraded to ~80% but autoemu shouldn't
+   regress — it doesn't depend on map state).
 5. Memory pointers (auto-load):
    - project_chunks_pipeline_cl1177146.md
    - feedback_chunks_simd_sig_unstable.md
