@@ -1307,19 +1307,29 @@ public:
                 uint64_t cls_ptr = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
                 if (cls_ptr != 0 &&
                     (cls_ptr < 0x100000ULL || cls_ptr >= 0x800000000000ULL)) break;
-                // Sample the +0xB0..+0xCB region for any of the two known
-                // CL-1177146 offset-sentinel positions (+0xC4 and +0xC8 both
-                // observed live for different FProperty subclasses).
-                alignas(16) uint8_t name_enc[16] = {};
-                m_reader.Read(ff + ArcDecrypt::Offsets::FField::NameEncrypted, name_enc, 16);
-                bool name_zero = true;
-                for (uint8_t b : name_enc) if (b) { name_zero = false; break; }
-                uint32_t raw_off_c4 = Read<uint32_t>(ff + 0xC4);
-                uint32_t raw_off_c8 = Read<uint32_t>(ff + 0xC8);
-                bool any_offset_sentinel =
-                    (raw_off_c4 == 0 || raw_off_c4 == 0x40277448u || raw_off_c4 == 0x145D6034u) &&
-                    (raw_off_c8 == 0 || raw_off_c8 == 0x40277448u || raw_off_c8 == 0x145D6034u);
-                if (name_zero && any_offset_sentinel) break;
+                // Ghost-FField guard. CL-1177678 native UClass stores its
+                // UField chain (UFunction list) at offsets like +0xC8/+0xD8,
+                // and BPGC SuperStruct lands at +0xB8 — both can pass the
+                // module-range vtable check but are NOT FFields. Real FFields
+                // always have a populated NamePrivate slot (the FName
+                // obfuscation pipeline produces non-zero bytes even for
+                // CI=0 / FName::None). All-zero NamePrivate at BOTH the
+                // auto-discovered offset AND the hardcoded +0x30 means the
+                // candidate is either uninitialized memory or a UField/
+                // UObject masquerading as an FField — break.
+                // Two-offset check: auto-disc may drift NamePrivate to a
+                // wrong offset; +0x30 is the verified CL-1177678 slot, so
+                // we OR the two probes — break only if BOTH are zero.
+                auto AnyNonZero = [&](uint64_t off) {
+                    alignas(16) uint8_t enc[16] = {};
+                    m_reader.Read(ff + off, enc, 16);
+                    for (uint8_t b : enc) if (b) return true;
+                    return false;
+                };
+                bool slot_present =
+                    AnyNonZero(ArcDecrypt::Offsets::FField::NameEncrypted) ||
+                    AnyNonZero(0x30);
+                if (!slot_present) break;
             }
 
             PropertyRecord pr{};
@@ -1394,25 +1404,34 @@ public:
             // for UE5 property offsets) and validate via the decoded value.
             {
                 pr.offset = 0;
-                alignas(8) uint8_t probe[28] = {};
-                m_reader.Read(ff + 0xB0, probe, 28);  // scan +0xB0..+0xCB
+                // CL-1177678: Offset_Internal moved to +0x88 (bool) / +0x8C
+                // (other) — broad-scan in +0x70..+0xA8 to catch both.
+                // XOR key auto-discovered at runtime (was 0x40277448 on
+                // CL-1177146, drifted to 0xCCCCACBB on CL-1177678).
+                alignas(8) uint8_t probe[64] = {};
+                m_reader.Read(ff + 0x70, probe, 64);  // scan +0x70..+0xAF
+                const uint32_t live_xor = ArcDecrypt::Patch20260421::g_PropertyOffsetXor;
+                // Sentinel for offset=0 = bswap32(live_xor) == raw bytes of live_xor.
+                // Match the low 2 bytes of live_xor (stable for offsets < 0x10000).
+                const uint8_t k0 = static_cast<uint8_t>(live_xor & 0xFF);
+                const uint8_t k1 = static_cast<uint8_t>((live_xor >> 8) & 0xFF);
                 bool found = false;
-                for (int dx = 0; dx + 4 <= 28 && !found; ++dx) {
-                    if (probe[dx]     != 0x48) continue;  // low byte of XOR key (stable for offset < 0x100000)
-                    if (probe[dx + 1] != 0x74) continue;  // 2nd byte (stable for offset < 0x1000000 — beyond practical UE5 props)
+                for (int dx = 0; dx + 4 <= 64 && !found; ++dx) {
+                    if (probe[dx]     != k0) continue;
+                    if (probe[dx + 1] != k1) continue;
                     uint32_t stored;
                     std::memcpy(&stored, probe + dx, 4);
-                    uint32_t real = __builtin_bswap32(stored ^ 0x40277448u);
+                    uint32_t real = __builtin_bswap32(stored ^ live_xor);
                     if (real <= 0x100000u) {
                         pr.offset = real;
                         found = true;
                     }
                 }
-                // Fallback to fixed primary offset.
                 if (!found) {
+                    // Try fixed offset +0x88 (CL-1177678 primary).
                     uint32_t stored_off = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::Offset_Internal);
-                    pr.offset = ArcDecrypt::Patch20260421::DecryptPropertyOffsetNew(stored_off);
-                    if (pr.offset > 0x100000) pr.offset = 0;
+                    uint32_t real = __builtin_bswap32(stored_off ^ live_xor);
+                    if (real <= 0x100000u) pr.offset = real;
                 }
             }
 
@@ -2696,8 +2715,17 @@ public:
             // walk_chain validates each via ReadPropertyChain's ghost-FField guard,
             // so bogus offsets walk an empty chain harmlessly. ff_addr dedup
             // collapses identical fields walked via multiple heads.
+            // CL-1177678: ChildProperties (FField head) moved to +0xB0
+            // (verified live: Actor@0x2A5A9700+0xB0 = 0xBEECD000 → FField with
+            // Owner=Actor|1, Pawn@0x75B71600+0xB0 = 0xC1165B00 → FField with
+            // Owner=Pawn|1, ARFilter@0x8B9F4DE0+0xB0 = 0xA1B36600 → FField).
+            // +0xB8 stays for UScriptStruct alt-heads / CL-1177146 fallback.
+            // Other offsets retained as broad-scan fallbacks; the tightened
+            // ghost-FField guard (NamePrivate at +0x30 must be non-zero)
+            // rejects UField/UFunction lists that get caught at +0xB8 on
+            // native UClass.
             static constexpr uint64_t kChainOffs[] = {
-                0x100, 0xB8, 0xC8, 0xD8, 0x108, 0x118, 0x138, 0x190
+                0xB0, 0x100, 0xB8, 0xC8, 0xD8, 0x108, 0x118, 0x138, 0x190
             };
             auto walk_chain = [&](uint64_t chain_head) {
                 if (chain_head <= 0x10000 || chain_head >= 0x7FFFFFFFFFFFULL) return;

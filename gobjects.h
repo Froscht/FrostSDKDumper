@@ -263,19 +263,27 @@ namespace gobjects
             // engine coverage.
             struct Vt { uint64_t Rva; uint32_t Stride; };
             static constexpr Vt CompileTime[] = {
-                { 0xAD9DC20, 0x130 },  // UScriptStruct
-                { 0xAD9E500, 0x300 },  // UClass (native)
-                { 0xAD9EA70, 0x200 },  // UFunction
-                { 0xADA1140, 0x130 },  // UEnum
-                { 0xADBC9A0, 0x000 },  // UPackage
-                { 0xB5653C0, 0x490 },  // BPGC
-                { 0xB35B400, 0x5D0 },  // WBPGC
-                { 0xB512510, 0x7F0 },  // AnimBPGC
-                { 0xB7BBCF0, 0x490 },  // SMBPGC
-                { 0xB8ED140, 0x340 },  // ASClass
-                { 0xB8F6920, 0x150 },  // ASStruct
-                { 0xB8EDA70, 0x200 },  // ASFunction-A
-                { 0xB8EDEC0, 0x200 },  // ASFunction-B
+                { 0xAD9DC20, 0x130 },  // UScriptStruct  (CL-1177146)
+                { 0xAD9E500, 0x300 },  // UClass         (CL-1177146)
+                { 0xAD9EA70, 0x200 },  // UFunction      (CL-1177146)
+                { 0xADA1140, 0x130 },  // UEnum          (CL-1177146)
+                { 0xADBC9A0, 0x000 },  // UPackage       (CL-1177146)
+                { 0xB5653C0, 0x490 },  // BPGC           (CL-1177146)
+                { 0xB35B400, 0x5D0 },  // WBPGC          (CL-1177146)
+                { 0xB512510, 0x7F0 },  // AnimBPGC       (CL-1177146)
+                { 0xB7BBCF0, 0x490 },  // SMBPGC         (CL-1177146)
+                { 0xB8ED140, 0x340 },  // ASClass        (CL-1177146)
+                { 0xB8F6920, 0x150 },  // ASStruct       (CL-1177146)
+                { 0xB8EDA70, 0x200 },  // ASFunction-A   (CL-1177146)
+                { 0xB8EDEC0, 0x200 },  // ASFunction-B   (CL-1177146)
+                { 0xADF4820, 0x130 },  // UScriptStruct  (CL-1177678)
+                { 0xB63A840, 0x300 },  // UClass         (CL-1177678)
+                { 0xB940DC0, 0x200 },  // UFunction      (CL-1177678)
+                { 0xADF7AC0, 0x130 },  // UEnum          (CL-1177678)
+                { 0xAE13030, 0x000 },  // UPackage       (CL-1177678)
+                { 0xB583B90, 0x490 },  // BPGC           (CL-1177678)
+                { 0xB3AF490, 0x5D0 },  // WBPGC          (CL-1177678)
+                { 0xBECF7F0, 0x7F0 },  // AnimBPGC       (CL-1177678)
             };
             for (const auto& v : CompileTime) {
                 AddIf(v.Rva);
@@ -1303,19 +1311,27 @@ namespace gobjects
             // engine 0xB35B400) doesn't leave engine vtables unscanned.
             struct Vt { uint64_t Rva; uint32_t Stride; };
             static constexpr Vt CompileTime[] = {
-                { 0xAD9DC20, 0x130 },  // UScriptStruct
-                { 0xAD9E500, 0x300 },  // UClass (native)
-                { 0xAD9EA70, 0x200 },  // UFunction
-                { 0xADA1140, 0x130 },  // UEnum
-                { 0xADBC9A0, 0x000 },  // UPackage (no neighbor stride)
-                { 0xB5653C0, 0x490 },  // UBlueprintGeneratedClass
-                { 0xB35B400, 0x5D0 },  // UWidgetBlueprintGeneratedClass
-                { 0xB512510, 0x7F0 },  // UAnimBlueprintGeneratedClass
-                { 0xB7BBCF0, 0x490 },  // USkeletalMeshBlueprintGeneratedClass
-                { 0xB8ED140, 0x340 },  // UASClass (AngelScript)
-                { 0xB8F6920, 0x150 },  // UASStruct (AngelScript)
-                { 0xB8EDA70, 0x200 },  // ASFunction subclass A (Tick-shape)
-                { 0xB8EDEC0, 0x200 },  // ASFunction subclass B (Destruct-shape)
+                { 0xAD9DC20, 0x130 },  // UScriptStruct                          (CL-1177146)
+                { 0xAD9E500, 0x300 },  // UClass (native)                        (CL-1177146)
+                { 0xAD9EA70, 0x200 },  // UFunction                              (CL-1177146)
+                { 0xADA1140, 0x130 },  // UEnum                                  (CL-1177146)
+                { 0xADBC9A0, 0x000 },  // UPackage (no neighbor stride)          (CL-1177146)
+                { 0xB5653C0, 0x490 },  // UBlueprintGeneratedClass               (CL-1177146)
+                { 0xB35B400, 0x5D0 },  // UWidgetBlueprintGeneratedClass         (CL-1177146)
+                { 0xB512510, 0x7F0 },  // UAnimBlueprintGeneratedClass           (CL-1177146)
+                { 0xB7BBCF0, 0x490 },  // USkeletalMeshBlueprintGeneratedClass   (CL-1177146)
+                { 0xB8ED140, 0x340 },  // UASClass (AngelScript)                 (CL-1177146)
+                { 0xB8F6920, 0x150 },  // UASStruct (AngelScript)                (CL-1177146)
+                { 0xB8EDA70, 0x200 },  // ASFunction subclass A (Tick-shape)     (CL-1177146)
+                { 0xB8EDEC0, 0x200 },  // ASFunction subclass B (Destruct-shape) (CL-1177146)
+                { 0xADF4820, 0x130 },  // UScriptStruct                          (CL-1177678)
+                { 0xB63A840, 0x300 },  // UClass (native)                        (CL-1177678)
+                { 0xB940DC0, 0x200 },  // UFunction                              (CL-1177678)
+                { 0xADF7AC0, 0x130 },  // UEnum                                  (CL-1177678)
+                { 0xAE13030, 0x000 },  // UPackage                               (CL-1177678)
+                { 0xB583B90, 0x490 },  // UBlueprintGeneratedClass               (CL-1177678)
+                { 0xB3AF490, 0x5D0 },  // UWidgetBlueprintGeneratedClass         (CL-1177678)
+                { 0xBECF7F0, 0x7F0 },  // UAnimBlueprintGeneratedClass           (CL-1177678)
             };
             for (const auto& v : CompileTime) {
                 AddIf(m_knownTypeVtables, v.Rva);

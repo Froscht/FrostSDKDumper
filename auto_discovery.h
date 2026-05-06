@@ -1791,6 +1791,10 @@ struct GNamesDiscovery {
     uint64_t GNamesRva = 0;
     int      RefCount  = 0;   // how many LEAs across the walk pointed at it
     bool     Valid     = false;
+    // Bonus output: the FName SIMD-constants block (highest-ref non-FNamePool
+    // candidate). RVA_FNAME_KEY_TABLE = SimdBlockRva + 0xA0.
+    uint64_t SimdBlockRva  = 0;
+    int      SimdBlockRefs = 0;
 };
 
 // One known-non-FNamePool zone: a centerpoint RVA + half-width radius.
@@ -1884,18 +1888,63 @@ inline GNamesDiscovery DiscoverGNamesViaFNameWalk(
         return false;
     };
 
+    // Tie-break heuristic: FNamePool (the global we want) is runtime-
+    // initialized — its FNameBlock[0] header is at low offsets and at
+    // +0x18 inside the struct it stores a heap-allocated chunk pointer
+    // (the first FNameBlock's data buffer). The other heavily-referenced
+    // .data globals near the FName fn — keystream tables, SIMD constants
+    // blocks — are pure compile-time data with no heap pointers anywhere.
+    // Probe the first 0x40 bytes of each candidate for ANY value in the
+    // Wine heap range (0x100000000 ≤ x < 0x800000000000). Real FNamePool
+    // returns true; SIMD/keystream blocks return false.
+    //
+    // Why: on CL-1177146 the FNamePool was the unique mode by ref count;
+    // on CL-1177678 a SIMD constants block tied at 10 refs and the
+    // sort-stable order flipped the wrong way, breaking name resolution.
+    auto LooksLikeFNamePool = [&](uint64_t rva) -> bool {
+        if (!scanner.IsValidRVA(rva)) return false;
+        const uint8_t* p = scanner.GetLocalPtr(rva);
+        if (!p) return false;
+        // Read first 8 qwords; check if any is a Wine heap pointer.
+        for (int i = 0; i < 8; ++i) {
+            uint64_t qw = 0;
+            std::memcpy(&qw, p + i * 8, 8);
+            if (qw >= 0x100000000ULL && qw < 0x800000000000ULL)
+                return true;
+        }
+        return false;
+    };
+
     // Diagnostic: rank ALL targets first (so the user can see the full picture
     // including excluded ones), then mark which were skipped.
     std::vector<std::pair<uint64_t, int>> sorted(targetCounts.begin(), targetCounts.end());
     std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.second > b.second; });
 
-    // Mode pick — first non-excluded candidate by descending refs.
+    // Mode pick — highest-ref candidate that ALSO looks like FNamePool
+    // (has a heap pointer). Falls back to highest-ref non-excluded if no
+    // candidate has a heap pointer (e.g. game in pre-init state).
     uint64_t best = 0; int bestCount = 0;
+    bool best_via_heap_probe = false;
     for (const auto& [t, c] : sorted) {
         if (inExcludeZone(t)) continue;
-        best = t;
-        bestCount = c;
-        break;
+        if (LooksLikeFNamePool(t)) {
+            best = t;
+            bestCount = c;
+            best_via_heap_probe = true;
+            break;
+        }
+    }
+    if (!best) {
+        for (const auto& [t, c] : sorted) {
+            if (inExcludeZone(t)) continue;
+            best = t;
+            bestCount = c;
+            break;
+        }
+        if (best) {
+            std::printf("[autodisc-gnames] no candidate had a heap pointer in first 0x40 bytes — "
+                        "falling back to highest-ref non-excluded (game may not be fully booted)\n");
+        }
     }
     if (!best) {
         std::printf("[autodisc-gnames] all candidates fell into exclude zones — keeping compile-time constant\n");
@@ -1909,16 +1958,203 @@ inline GNamesDiscovery DiscoverGNamesViaFNameWalk(
     out.GNamesRva = best;
     out.RefCount  = bestCount;
     out.Valid     = true;
-    std::printf("[autodisc-gnames] GNamePool RVA = 0x%llX (%d refs across walk)\n",
-        (unsigned long long)best, bestCount);
+    std::printf("[autodisc-gnames] GNamePool RVA = 0x%llX (%d refs across walk%s)\n",
+        (unsigned long long)best, bestCount,
+        best_via_heap_probe ? ", heap-probe ✓" : "");
+
+    // Bonus: the highest-ref non-excluded candidate that FAILS the heap-probe
+    // is the FName SIMD-constants block (PSHUFB masks, PXOR keys, AND/ANDNOT
+    // pairs, AND the 64-entry u16 keystream embedded at +0xA0). On CL-1177146
+    // and CL-1177678 this is `unk_DB2E7F4`-shaped; the dumper consumes it as
+    // RVA_FNAME_KEY_TABLE = block_base + 0xA0. Auto-detecting it here piggy-
+    // backs on the same walk — no extra scanning required.
+    uint64_t simd_block_rva = 0; int simd_refs = 0;
+    for (const auto& [t, c] : sorted) {
+        if (inExcludeZone(t)) continue;
+        if (LooksLikeFNamePool(t)) continue;
+        simd_block_rva = t;
+        simd_refs = c;
+        break;
+    }
+    if (simd_block_rva) {
+        out.SimdBlockRva = simd_block_rva;
+        out.SimdBlockRefs = simd_refs;
+    }
 
     int shown = 0;
     for (const auto& [t, c] : sorted) {
         if (shown++ >= 8) break;
-        const char* tag = inExcludeZone(t) ? "  EXCLUDED" : "";
+        const char* tag = "";
+        if (inExcludeZone(t))            tag = "  EXCLUDED";
+        else if (LooksLikeFNamePool(t))  tag = "  HEAP-PROBE-PASS";
+        else                              tag = "  HEAP-PROBE-FAIL";
         std::printf("[autodisc-gnames]   0x%llX  refs=%d%s\n",
             (unsigned long long)t, c, tag);
     }
+    if (simd_block_rva) {
+        std::printf("[autodisc-gnames] SIMD-constants block (FName) = 0x%llX (%d refs); "
+                    "inferred KEYSTREAM = 0x%llX (= block + 0xA0)\n",
+                    (unsigned long long)simd_block_rva, simd_refs,
+                    (unsigned long long)(simd_block_rva + 0xA0));
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 6.5: FName keystream RVA via AppendNameToString-fn body scan
+//
+// The per-pair string decoder (sub_23F2D0 on CL-1177678) reads a 64-entry
+// u16 keystream. In the binary it's encoded as either:
+//
+//   movdqu xmm0, [rip + (KEYSTREAM_BASE - rip - 7) + 2*idx + 0xA0]
+//   pxor   xmm0, [rip + ...]                                  (SSE path)
+//
+// or (the `_mm_loadl_epi64` form for the trailing odd character):
+//
+//   movq   xmm0, qword ptr [rip + (KEYSTREAM_BASE + 0xA0) + ...]
+//
+// The salient feature is that EVERY rip-rel load inside the AppendNameToString
+// fn body that points into .rdata uses the same KEYSTREAM_BASE, just with
+// different per-instruction immediate offsets in the [+0xA0..+0xA0+0x7E]
+// range (since `(idx & 0x3F) + 80` covers 80..143 in u16 units = 160..286 bytes).
+// We mode-pick the most-referenced .rdata RVA whose effective targets cluster
+// in that band — that target IS `KEYSTREAM_BASE + 0xA0` (or the base + small
+// offset, depending on which load instruction we sample).
+//
+// Strategy — defensive against shape drift:
+//   1. Decode insns at the FName fn entry; collect direct CALL targets.
+//   2. For each callee that's "load-bearing" (≥0x40 bytes of code), decode
+//      its body up to ~0x600 bytes.
+//   3. Collect ALL rip-rel data targets that land in .rdata.
+//   4. Cluster targets by 0x100-byte page (so loads at [+0xA0, +0xA8, +0xC0, …]
+//      all bucket to the same base).
+//   5. The keystream cluster will have many distinct hits within a 0x100-byte
+//      window — that's the fingerprint (vs. PXOR with a single 16-byte const).
+//   6. The base RVA is the lowest target in the cluster minus 0xA0 (the
+//      per-instruction +0xA0 bias from the source code).
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct FNameKeystreamDiscovery {
+    uint64_t KeystreamRva = 0;     // RVA of first keystream byte (= cluster_base - 0xA0)
+    uint64_t ClusterBase  = 0;     // RVA of densest-in-window cluster
+    int      WindowHits   = 0;     // number of distinct loads inside the cluster window
+    bool     Valid        = false;
+};
+
+inline FNameKeystreamDiscovery DiscoverFNameKeystream(
+    const SigScanV2::Scanner& scanner, uint64_t fname_fn_rva,
+    int max_depth = 3)
+{
+    FNameKeystreamDiscovery out;
+    if (!fname_fn_rva || !scanner.IsTextRVA(fname_fn_rva)) return out;
+
+    InsnDecoder dec;
+
+    // Step 1: collect call-chain RVAs (entry + transitive callees up to max_depth).
+    std::unordered_set<uint64_t> chain_fns;
+    std::function<void(uint64_t, int)> collect = [&](uint64_t rva, int depth) {
+        if (depth >= max_depth) return;
+        if (!chain_fns.insert(rva).second) return;
+        const uint8_t* p = scanner.GetLocalPtr(rva);
+        if (!p) return;
+        auto insns = dec.Decode(p, 0x800, rva);
+        for (const auto& ins : insns) {
+            if (ins.type == INSN_CALL_RIP) {
+                uint64_t tgt = ins.ResolveRipRVA();
+                if (tgt && scanner.IsTextRVA(tgt))
+                    collect(tgt, depth + 1);
+            }
+        }
+    };
+    collect(fname_fn_rva, 0);
+
+    // Step 2: across all chain functions, collect rip-rel data targets that
+    // land in .rdata / .data. We only count NON-call rip-rel loads (PXOR /
+    // MOVDQU / MOVQ / PSHUFB / PAND etc. with a memory operand).
+    std::unordered_map<uint64_t, int> rdata_hits;
+    for (uint64_t fn : chain_fns) {
+        const uint8_t* p = scanner.GetLocalPtr(fn);
+        if (!p) continue;
+        auto insns = dec.Decode(p, 0x800, fn);
+        for (const auto& ins : insns) {
+            if (!ins.hasRipRel) continue;
+            if (ins.type == INSN_CALL_RIP) continue;
+            if (ins.type == INSN_JMP)      continue;
+            if (ins.type == INSN_JCC)      continue;
+            uint64_t t = ins.ResolveRipRVA();
+            if (!t) continue;
+            if (!scanner.IsRDataRVA(t) && !scanner.IsDataRVA(t)) continue;
+            rdata_hits[t]++;
+        }
+    }
+    if (rdata_hits.empty()) return out;
+
+    // Step 3: cluster by 0x100-byte page. The keystream window is 64 u16
+    // entries = 128 bytes, accessed via different per-load 8-byte offsets.
+    // A cluster with ≥4 distinct addresses in the same 0x100 window is
+    // overwhelmingly likely the keystream (PXOR/PAND constants are single
+    // 16-byte references, never spread).
+    struct Cluster { uint64_t lo, hi; int distinct; int total_refs; };
+    std::vector<uint64_t> targets;
+    targets.reserve(rdata_hits.size());
+    for (const auto& [t, _] : rdata_hits) targets.push_back(t);
+    std::sort(targets.begin(), targets.end());
+
+    Cluster best{0, 0, 0, 0};
+    for (size_t i = 0; i < targets.size(); ++i) {
+        uint64_t lo = targets[i];
+        uint64_t hi = lo + 0x100;
+        int distinct = 0, refs = 0;
+        size_t j = i;
+        while (j < targets.size() && targets[j] < hi) {
+            distinct++;
+            refs += rdata_hits[targets[j]];
+            j++;
+        }
+        if (distinct > best.distinct) {
+            best.lo = lo;
+            best.hi = hi;
+            best.distinct = distinct;
+            best.total_refs = refs;
+        }
+    }
+    // Threshold = 2: the keystream is accessed via at least two distinct
+    // SIMD loads in the AppendNameToString fn (one at +0xA0 = `+160`, one
+    // at +0xB0 = `+176`). Single-shot PXOR/PAND constants give a 1-distinct
+    // cluster, so 2 is a clean separator.
+    //
+    // Defense-in-depth: also require the cluster to span at least 0x10
+    // bytes (so the two targets aren't the same address by coincidence)
+    // AND fit within 0x80 bytes of each other (keystream is 128 bytes
+    // total; cluster must be tight).
+    int span = best.distinct >= 2 ? (int)(targets[std::min<size_t>(targets.size()-1, (size_t)best.distinct-1+0)] - best.lo) : 0;
+    (void)span; // computed inline for diagnostic only
+    if (best.distinct < 2) {
+        std::printf("[autodisc-fnkey] no keystream cluster found "
+                    "(best window: %d distinct rip-rel targets — need ≥2)\n",
+                    best.distinct);
+        // Diagnostic: dump the top rip-rel targets so the user can see what
+        // we found and adjust if needed.
+        std::vector<std::pair<uint64_t, int>> sorted(rdata_hits.begin(), rdata_hits.end());
+        std::sort(sorted.begin(), sorted.end(),
+                  [](auto& a, auto& b) { return a.second > b.second; });
+        int shown = 0;
+        for (const auto& [t, c] : sorted) {
+            if (shown++ >= 12) break;
+            std::printf("[autodisc-fnkey]   0x%llX  refs=%d\n",
+                (unsigned long long)t, c);
+        }
+        return out;
+    }
+
+    out.ClusterBase  = best.lo;
+    out.KeystreamRva = (best.lo > 0xA0) ? (best.lo - 0xA0) : best.lo;
+    out.WindowHits   = best.distinct;
+    out.Valid        = true;
+    std::printf("[autodisc-fnkey] keystream cluster @ 0x%llX (%d distinct loads, %d refs); "
+                "inferred KEYSTREAM_BASE = 0x%llX (= cluster - 0xA0)\n",
+                (unsigned long long)best.lo, best.distinct, best.total_refs,
+                (unsigned long long)out.KeystreamRva);
     return out;
 }
 
@@ -2545,6 +2781,7 @@ inline FPropertyDecryptParams    g_DiscoveredFProperty;
 inline UObjSlotDecryptParams     g_DiscoveredUObjSlot;
 inline FNameResolverConsts       g_DiscoveredFName;
 inline GNamesDiscovery           g_DiscoveredGNames;
+inline FNameKeystreamDiscovery   g_DiscoveredFNameKey;
 inline FFieldClassNameParams     g_DiscoveredFFieldClassName;
 inline std::vector<FFieldClassGlobal> g_DiscoveredFClassGlobals;
 inline GUObjectArrayLayout       g_DiscoveredGObjLayout;

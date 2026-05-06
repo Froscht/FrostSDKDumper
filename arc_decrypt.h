@@ -109,23 +109,27 @@ namespace Offsets {
         inline uint64_t FieldsSlots  = 0x20;
     }
     namespace FField {
+        // CL-1177678: all fields shifted down by 0x40 from CL-1177146.
+        // Verified via live FField walk at PostProcessSettings (Agent 1
+        // discovery). Auto-offset probe will sticky these on init.
         inline uint64_t VTable        = 0x00;
-        inline uint64_t ClassPrivate  = 0x90;
-        inline uint64_t Next          = 0x80;
-        inline uint64_t Owner         = 0xA0;
-        inline uint64_t NameEncrypted = 0x70;
-        inline uint64_t NamePrivate   = 0x70;
-        inline uint64_t SaltSentinel  = 0x78;
+        inline uint64_t ClassPrivate  = 0x50;     // was 0x90
+        inline uint64_t Next          = 0x48;     // was 0x80
+        inline uint64_t Owner         = 0x58;     // was 0xA0
+        inline uint64_t NameEncrypted = 0x30;     // was 0x70
+        inline uint64_t NamePrivate   = 0x30;     // was 0x70
+        inline uint64_t SaltSentinel  = 0x38;     // was 0x78
     }
     namespace FFieldClass {
         inline uint64_t ElementSize  = 0x70;
     }
     namespace FProperty {
-        inline uint64_t ArrayDim        = 0xF0;
-        inline uint64_t ElementSize     = 0xF8;
-        inline uint64_t Offset_Internal = 0xC4;
-        inline uint32_t Offset_XOR      = 0x40277448u;
-        inline uint64_t PropertyFlags   = 0x98;
+        // CL-1177678: also shifted by ~0x40 from CL-1177146.
+        inline uint64_t ArrayDim        = 0x78;   // was 0xF0
+        inline uint64_t ElementSize     = 0x7C;   // was 0xF8
+        inline uint64_t Offset_Internal = 0x88;   // was 0xC4 (bool); 0x8C for non-bool subclasses
+        inline uint32_t Offset_XOR      = 0xCCCCACBBu;  // CL-1177678 (was 0x40277448)
+        inline uint64_t PropertyFlags   = 0x40;   // was 0x98
     }
     namespace FBoolProperty {
         inline uint64_t FieldSize  = 0x130;
@@ -133,18 +137,20 @@ namespace Offsets {
         inline uint64_t ByteMask   = 0x132;
         inline uint64_t FieldMask  = 0x133;
     }
-    namespace FStructProperty  { inline uint64_t Struct        = 0x108; }
-    namespace FObjectProperty  { inline uint64_t PropertyClass = 0x108; }
+    // CL-1177678: FProperty sub-class fields shifted by 0x40 (= same shift
+    // as FField/FProperty base fields). 0x108 → 0xC8, 0x110 → 0xD0.
+    namespace FStructProperty  { inline uint64_t Struct        = 0xC8; }   // was 0x108
+    namespace FObjectProperty  { inline uint64_t PropertyClass = 0xC8; }   // was 0x108
     namespace FEnumProperty    {
-        inline uint64_t UnderlyingProp = 0x108;
-        inline uint64_t Enum           = 0x110;
+        inline uint64_t UnderlyingProp = 0xC8;                              // was 0x108
+        inline uint64_t Enum           = 0xD0;                              // was 0x110
     }
-    namespace FArrayProperty   { inline uint64_t Inner         = 0x110; }
-    namespace FSetProperty     { inline uint64_t ElementProp   = 0x108; }
-    namespace FSoftObjectProperty { inline uint64_t PropertyClass = 0x108; }
+    namespace FArrayProperty   { inline uint64_t Inner         = 0xD0; }   // was 0x110
+    namespace FSetProperty     { inline uint64_t ElementProp   = 0xC8; }   // was 0x108
+    namespace FSoftObjectProperty { inline uint64_t PropertyClass = 0xC8; } // was 0x108
     namespace FMapProperty {
-        inline uint64_t KeyProp   = 0x108;
-        inline uint64_t ValueProp = 0x110;
+        inline uint64_t KeyProp   = 0xC8;                                  // was 0x108
+        inline uint64_t ValueProp = 0xD0;                                  // was 0x110
     }
     namespace UField {
         inline uint64_t Next            = 0x90;
@@ -157,10 +163,14 @@ namespace Offsets {
         inline uint64_t PropertyFlags   = 0x70;
     }
     namespace UStruct {
-        inline uint64_t SuperStruct     = 0x0B0;
-        inline uint64_t Children        = 0x100;
-        inline uint64_t ChildProperties = 0x100;
-        inline uint64_t PropertiesSize  = 0x0D8;
+        // CL-1177678: shifted from CL-1177146. Verified live against
+        // Pawn(0x75B71600).Super=Actor(0x2A5A9700) and Actor.Super=UObject_UClass
+        // (0x2A5A1300). PropertiesSize verified: Actor=0x3A0, Pawn=0x430,
+        // ARFilter=0x150 — all read from +0x110.
+        inline uint64_t SuperStruct     = 0x0A8;   // was 0x0B0
+        inline uint64_t Children        = 0x0B8;   // was 0x100 (UField/UFunction list)
+        inline uint64_t ChildProperties = 0x0B0;   // was 0x100 (FField list head)
+        inline uint64_t PropertiesSize  = 0x110;   // was 0x0D8
         inline uint64_t MinAlignment    = 0x0F8;
     }
     namespace UEnum {

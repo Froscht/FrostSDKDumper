@@ -342,15 +342,26 @@ inline void ProbeFFieldNamePrivate(Context& ctx, const std::vector<uint64_t>& us
 
     // Structural pass: at each offset, count samples agreeing on hi64.
     // Map: offset → (hi64 → count).
+    // Scan starts at 0x20 to cover CL-1177678's +0x30 NamePrivate slot
+    // (was missing from the old 0x40+ range). Step 8 (not 16) so we don't
+    // skip the +0x30 if scan starts at 0x20.
+    // Real FField NamePrivate slots on CL-1177678 are REPLICATED — lo64
+    // equals hi64. Strongly bias toward replicated slots: count those
+    // with weight 4, others with weight 1. Earlier "lo!=hi → skip"
+    // filter killed ALL hits when CollectFFields returned UScriptStruct
+    // children that didn't share the replicated pattern (different
+    // FField subclass), regressing properties to 0.
     std::unordered_map<uint64_t, std::unordered_map<uint64_t, int>> hi_agree;
     for (uint64_t ff : ffields) {
-        for (uint64_t off = 0x40; off <= 0x180; off += 16) {
+        for (uint64_t off = 0x20; off <= 0x180; off += 8) {
             uint8_t slot[16] = {};
             if (!R(*ctx.reader, ff + off, slot)) continue;
-            uint64_t hi = 0;
+            uint64_t lo = 0, hi = 0;
+            std::memcpy(&lo, slot, 8);
             std::memcpy(&hi, slot + 8, 8);
             if (hi == 0 || hi == ~0ULL) continue;
-            hi_agree[off][hi]++;
+            int weight = (lo == hi) ? 4 : 1;
+            hi_agree[off][hi] += weight;
         }
     }
 
@@ -363,8 +374,17 @@ inline void ProbeFFieldNamePrivate(Context& ctx, const std::vector<uint64_t>& us
     auto [best, hits] = PickMode(off_score);
     const uint64_t slot_off = ArcDecrypt::Offsets::FField::NamePrivate;
     int slot_hits = off_score.count(slot_off) ? off_score[slot_off] : 0;
-    ApplyOffsetSticky("FField::NamePrivate", ArcDecrypt::Offsets::FField::NamePrivate,
-                      best, hits, slot_hits, (int)ffields.size(), 10);
+    // CL-1177678: NamePrivate is HARDCODED at +0x30 (verified live in
+    // sub_44E3DC FBoolProperty::GetCPPType which loads __m128i [a1+3]).
+    // Earlier auto-disc moved it to +0xE0 because CollectFFields walked
+    // UStruct::Children (UField list) instead of FField chain heads —
+    // those non-FField objects have their session-constant hi64 at +0xE0
+    // (probably a flag/version block), giving a misleading 70-hit signal.
+    // Until CollectFFields is patched to walk +0xB0 ChildProperties on
+    // CL-1177678, hard-pin NamePrivate to its compile-time value to
+    // prevent the regression.
+    std::printf("[autoff] FField::NamePrivate              pinned to 0x%llX (slot=%d, best=0x%llX@%d hits)\n",
+        (unsigned long long)slot_off, slot_hits, (unsigned long long)best, hits);
     ArcDecrypt::Offsets::FField::NameEncrypted = ArcDecrypt::Offsets::FField::NamePrivate;
 }
 

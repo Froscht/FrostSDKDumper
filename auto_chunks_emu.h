@@ -416,21 +416,32 @@ inline Result Discover(IMemoryReader& reader, uint64_t module_base,
     Result out;
     if (!bounds.Valid) return out;
 
-    // Read NumElements at GUObjectArray + 0x30 (CL-1177146 plain layout).
-    // If this fails or returns garbage, the layout is encrypted at +0x30 —
-    // a future patch may need a different approach. For now bail and let the
-    // structural scan handle it.
+    // Read NumElements. The field has migrated across patches:
+    //   CL-1177146: +0x30  (plain u32)
+    //   CL-1177678: +0xFC  (plain u32 — listener arrays / serial-counter
+    //                       ahead of it pushed the count further out)
+    // Probe both; first one in the plausible live-count range (1000..2M) wins.
+    // The encrypted chunks_manager pipeline at GUObjectArray+0xC0 is unchanged
+    // across both — only the count field moved.
     uint64_t guobj_abs = module_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE;
     uint32_t num_elements = 0;
-    if (!reader.Read(guobj_abs + 0x30, &num_elements, 4)) {
-        std::printf("[autoemu] read NumElements @ +0x30 failed\n");
+    static constexpr uint32_t kCountOffs[] = { 0xFC, 0x30 };
+    uint32_t count_off_used = 0;
+    for (uint32_t off : kCountOffs) {
+        uint32_t cand = 0;
+        if (!reader.Read(guobj_abs + off, &cand, 4)) continue;
+        if (cand >= 1000 && cand <= 2'000'000) {
+            num_elements = cand;
+            count_off_used = off;
+            break;
+        }
+    }
+    if (!num_elements) {
+        std::printf("[autoemu] no NumElements found at +0xFC or +0x30 in plausible range; "
+                    "skipping emu discovery\n");
         return out;
     }
-    if (num_elements < 1000 || num_elements > 2'000'000) {
-        std::printf("[autoemu] NumElements=%u not in plain-layout range; skipping emu discovery\n",
-            num_elements);
-        return out;
-    }
+    std::printf("[autoemu] NumElements=%u @ +0x%X (good)\n", num_elements, count_off_used);
     out.NumElements = num_elements;
     out.NumChunks   = (num_elements + 0xFFFF) / 0x10000;
     int probe_n = std::min(out.NumChunks, 4);

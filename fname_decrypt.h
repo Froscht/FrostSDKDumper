@@ -101,23 +101,30 @@ public:
     FNameDecryptor(uint64_t module_base, IMemoryReader& reader)
         : m_base(module_base), m_reader(reader), m_keyLoaded(false)
     {
-        memset(m_keyTable,       0, sizeof(m_keyTable));
-        memset(m_cidxXor1,       0, 16);
-        memset(m_cidxXor3,       0, 16);
-        memset(m_blkSlotShuf,    0, 16);
-        memset(m_blkSlotShuf2,   0, 16);
-        memset(m_blkHdrAnd,      0, 16);
-        memset(m_blkHdrAndnot,   0, 16);
-        memset(m_blkHdrShuf,     0, 16);
-        memset(m_blkHdrXor,      0, 16);
+        memset(m_keyTable, 0, sizeof(m_keyTable));
     }
 
     bool Init() {
         if (m_keyLoaded) return true;
 
+        // Only the 64-entry FName keystream table is loaded here — it's used
+        // by the per-pair DecryptNameString XOR loop, which still works even
+        // on patches where the FNamePool resolver SIMD pipeline has drifted
+        // (the keystream and per-pair LCG are stable across patches; only
+        // the resolver's CI→entry_ptr stage rotates).
+        //
+        // Every other "SIMD table" used to be loaded here from hardcoded
+        // RVAs and was a major patch-day breakage source (14 RVAs all
+        // relocated on CL-1177678, 2026-05-05). The actual decrypt routines
+        // either auto-discover their constants from the live binary
+        // (DecryptUObjSlotNew → AutoDiscovery::g_DiscoveredUObjSlot) or use
+        // compile-time const arrays inline (ResolveNamePtrFull's BLOCK1_XOR
+        // / BLOCK2_AND etc.). When those compile-time constants drift, the
+        // fix is to flip CompIndex resolution onto the Unicorn-emulated
+        // game function via SetEmuPrimary(true) — which BootEmuFNameFallback
+        // does automatically once the emu engine is armed.
         uint64_t KtAddr = m_base + FNAME_KEY_TABLE_OFF;
         std::printf("[dbg] Reading FName key table @ 0x%llX ...\n", (unsigned long long)KtAddr);
-        std::memset(m_keyTable, 0, sizeof(m_keyTable));
         if (!m_reader.Read(KtAddr, m_keyTable, 64 * sizeof(uint16_t))) {
             std::printf("[-] Failed to read FName key table\n");
             return false;
@@ -132,51 +139,22 @@ public:
         std::printf("[+] FName key table OK (first: 0x%04X 0x%04X 0x%04X 0x%04X)\n",
             m_keyTable[0], m_keyTable[1], m_keyTable[2], m_keyTable[3]);
 
-        // SIMD tables for CIdx decode pipeline (patch 20260402)
-        auto loadTable = [&](uint64_t rva, uint8_t* dst, const char* name) -> bool {
-            if (!m_reader.Read(m_base + rva, dst, 16)) {
-                std::printf("[-] Failed to read SIMD table %s @ RVA 0x%llX\n",
-                    name, (unsigned long long)rva);
-                return false;
-            }
-            return true;
-        };
-
-        // UObject slot decrypt tables (patch CL-1177146)
-        if (!loadTable(ArcDecrypt::Patch20260421::UObjSlot20260421::RVA_SHUF_MASK, m_uobjShufMask, "uobjShufMask")) return false;
-        {
-            uint64_t Lo = ArcDecrypt::Patch20260421::UObjSlot20260421::SLOT_XOR_CONST;
-            std::memcpy(&m_uobjXorConst[0], &Lo, 8);
-            std::memcpy(&m_uobjXorConst[8], &Lo, 8);
-        }
-        // FField name decrypt constant (patch 20260421)
-        if (!loadTable(ArcDecrypt::Patch20260421::FFieldName20260421::RVA_XOR_CONST, m_fFieldXorConst, "fFieldXorConst")) return false;
-
-        // Patch 20260428 FNamePool resolver tables (best-effort: skip warnings
-        // if pages aren't mapped — DecryptUObjSlotNew uses hardcoded MASK
-        // bytes, but the resolver requires live values).
-        loadTable(ArcDecrypt::Patch20260421::FNamePool20260428::RVA_GIDX_SHUF1,   m_p28_gidxShuf1,   "p28_gidxShuf1");
-        loadTable(ArcDecrypt::Patch20260421::FNamePool20260428::RVA_GIDX_XOR1,    m_p28_gidxXor1,    "p28_gidxXor1");
-        loadTable(ArcDecrypt::Patch20260421::FNamePool20260428::RVA_STAGE2_XOR,   m_p28_stage2Xor,   "p28_stage2Xor");
-        loadTable(ArcDecrypt::Patch20260421::FNamePool20260428::RVA_EXTRACT_SHUF, m_p28_extractShuf, "p28_extractShuf");
-        loadTable(ArcDecrypt::Patch20260421::FNamePool20260428::RVA_EXTRACT_XOR,  m_p28_extractXor,  "p28_extractXor");
-        loadTable(ArcDecrypt::Patch20260421::FNamePool20260428::RVA_BLOCK_SHUF,   m_p28_blockShuf,   "p28_blockShuf");
-
-        loadTable(RVA_CIDX_XOR1_OFF,          m_cidxXor1,      "cidxXor1");
-        loadTable(RVA_CIDX_XOR3_OFF,          m_cidxXor3,      "cidxXor3");
-        loadTable(RVA_BLOCK_HDR_AND_OFF,      m_blkHdrAnd,     "blkHdrAnd");
-        loadTable(RVA_BLOCK_HDR_ANDNOT_OFF,   m_blkHdrAndnot,  "blkHdrAndnot");
-        loadTable(RVA_BLOCK_HDR_SHUF_OFF,     m_blkHdrShuf,    "blkHdrShuf");
-        loadTable(RVA_BLOCK_HDR_XOR_OFF,      m_blkHdrXor,     "blkHdrXor");
-        loadTable(RVA_BLOCK_SLOT_SHUF_OFF,    m_blkSlotShuf,   "blkSlotShuf");
-        loadTable(RVA_BLOCK_SLOT_SHUF2_OFF,   m_blkSlotShuf2,  "blkSlotShuf2");
-
-        std::printf("[+] FName SIMD tables loaded OK\n");
         m_keyLoaded = true;
         return true;
     }
 
     bool IsInitialized() const { return m_keyLoaded; }
+
+    // Re-read the key table from the current `RVA_FNAME_KEY_TABLE` value.
+    // Used after auto-discovery patches the RVA: the initial Init() reads
+    // from the (possibly stale) compile-time RVA; once a keystream-discovery
+    // pass updates the RVA, callers re-run this to load from the correct
+    // address. Idempotent — safe to call repeatedly.
+    bool ReloadKeyTable() {
+        m_keyLoaded = false;
+        std::memset(m_keyTable, 0, sizeof(m_keyTable));
+        return Init();
+    }
 
     // ── Inline-handle offset calibration ─────────────────────────────────
     // The UObject inline FName handle lives at one of a few candidate
@@ -237,36 +215,42 @@ public:
         return ArcDecrypt::GetFNameSlotIndex(obj_base);
     }
 
-    // ── Hash-based slot selector (patch CL-1177146) ──────────────────────
-    // Verified IDA lf50 sub_2CB4E0 / sub_2D6900 / sub_2D4500:
-    //   s1 = P * ROL32(lo, 24) + ADD
-    //   s2 = P * ROL32(s1, 25) + ADD
-    //   t  = hi + s2
-    //   s3 = P * ROL32(t, 24) + ADD
-    //   v3 = P * (s3 >> 7) + ADD
-    //   raw_idx   = (u8(v3) ^ BYTE2(v3)) & 3
-    //   name_slot = (raw_idx ^ 2) & 3
+    // ── Hash-based slot selector (CL-1177678) ────────────────────────────
+    // Verified IDA `sub_2D9270` @ 0x2D9292..0x2D9311 (the OuterPrivate walker
+    // at xref site 0x2D9415 of xmmword_AD97CC0). The chain is:
+    //   ecx = ROL32(addr_lo, 26)
+    //   ecx = P * ecx + ADD
+    //   ecx = ROL32(ecx, 25)
+    //   ecx = P * ecx + addr_hi + ADD
+    //   ecx = (ecx >> 6) * P + ADD
+    //   ecx = (ecx >> 7) * P + ADD
+    //   raw_idx  = ((ecx ^ (ecx >> 16)) + N) & 3   where N = 0(Class) / 1(Outer) / xor 2 (Name)
+    //
+    // Drift from CL-1177146:
+    //   ROL32(24) → ROL32(26) (first stage)
+    //   ROL32(24) → shifted to plain >>6 (third stage, no rotate)
+    //   HASH_ADD = 0x8E195662 → 0x98689957
     static uint32_t ObjSlotHash(uint64_t ObjPtr) {
-        constexpr uint32_t P = 0x01000193u;
-        constexpr uint32_t ADD = 0x8E195662u;
+        constexpr uint32_t P   = 0x01000193u;
+        constexpr uint32_t ADD = 0x98689957u;          // CL-1177678 (was 0x8E195662)
         uint64_t Ptr = ObjPtr + 0x10;
-        uint32_t Lo = static_cast<uint32_t>(Ptr);
-        uint32_t Hi = static_cast<uint32_t>(Ptr >> 32);
-        uint32_t H = fn_rotl32(Lo, 24);
-        H = P * H + ADD;
-        H = fn_rotl32(H, 25);
-        H = P * H + Hi + ADD;
-        H = fn_rotl32(H, 24);
-        H = P * H + ADD;
-        H >>= 7;
-        uint32_t V8 = P * H + ADD;
-        return V8;
+        uint32_t Lo  = static_cast<uint32_t>(Ptr);
+        uint32_t Hi  = static_cast<uint32_t>(Ptr >> 32);
+
+        uint32_t E = fn_rotl32(Lo, 26);                 // CL-1177678: 26 (was 24)
+        E = P * E + ADD;
+        E = fn_rotl32(E, 25);
+        E = P * E + Hi + ADD;
+        E = (E >> 6) * P + ADD;                         // CL-1177678: plain shr 6 (was ROL32(24))
+        E = (E >> 7) * P + ADD;                         // unchanged
+        return E;
     }
     static uint32_t ObjNameSlot(uint64_t obj_ptr) {
-        uint32_t v7 = ObjSlotHash(obj_ptr);
-        uint8_t lo8 = static_cast<uint8_t>(v7);
-        uint8_t hi8 = static_cast<uint8_t>(v7 >> 16);
-        return (uint32_t)(((lo8 ^ hi8) & 3u) ^ 2u);
+        // CL-1177678 Name-slot selector: ((E ^ (E >> 16)) & 3) ^ 2
+        // (extrapolated from the CL-1177146 selector pattern; the IDA
+        // sub_2D9270 +1 is the OUTER variant — Name uses ^2 instead).
+        uint32_t E = ObjSlotHash(obj_ptr);
+        return (uint32_t)(((E ^ (E >> 16)) & 3u) ^ 2u);
     }
     // Alternate slot picker (Steam/Xbox reference pipeline, 2026-04-29):
     //   r1 = rol(lo, 19); r2 = rol(P*r1 + ADD2, 22)
@@ -292,56 +276,76 @@ public:
         uint8_t  pb  = static_cast<uint8_t>((P * y + ADD2B) >> 16);
         return (uint32_t)(((pa ^ pb) & 3u) ^ 2u);
     }
-    // Outer-slot formula verified from UObject_GetOuter @ 0x23EA680 (20260430):
-    //   slot = (((u8)v ^ BYTE2(v)) + 1) & 3
+    // Outer-slot formula verified from sub_2D9270 @ 0x2D930C-0x2D9311 (CL-1177678):
+    //   raw_idx = (E ^ (E >> 16) + 1) & 3
     static uint32_t ObjOuterSlot(uint64_t obj_ptr) {
-        uint32_t V7 = ObjSlotHash(obj_ptr);
-        uint8_t Lo8 = static_cast<uint8_t>(V7);
-        uint8_t Byte2 = static_cast<uint8_t>(V7 >> 16);
-        return (uint32_t)((((uint32_t)(Lo8 ^ Byte2)) + 1u) & 3u);
+        uint32_t E = ObjSlotHash(obj_ptr);
+        return (uint32_t)(((E ^ (E >> 16)) + 1u) & 3u);
+    }
+    // Class-slot formula (CL-1177678): no +1, no ^2
+    static uint32_t ObjClassSlot(uint64_t obj_ptr) {
+        uint32_t E = ObjSlotHash(obj_ptr);
+        return (uint32_t)((E ^ (E >> 16)) & 3u);
     }
 
-    // ── Decrypt one UObject slot (patch CL-1177146) ──────────────────────
-    // Verified IDA lf50 sub_2CB4E0 / sub_2D4500:
-    //   v22 = loadl_epi64(0xAD93EF0)        // PSHUFB mask 06 05 02 03 04 01 00 07
-    //   v23 = loadl_epi64(0xAD93F00)        // XOR const lo64 = 0x5EA772D07F910744
-    //   dec = lo64( shuffle_epi8(slot, v22) XOR v23 )
-    //   For NAME slot:    final = ROL64(dec, 32)  → lo32 = CI, hi32 = Number
-    //   For pointer slots: dec is the heap pointer directly (no ROL64)
-    // We always apply ROL64(32) here; callers that interpret the result as
-    // a pointer (GetClassPrivate / GetAllClassCandidates) re-swap halves.
+    // ── Decrypt one UObject slot (CL-1177678) ───────────────────────────
+    // Forwards to DecryptUObjSlotCL1177678 — the actual current-patch
+    // algorithm: shufflelo(0x39) → ROL32(26) → PSHUFB(xmmword_ADEAC80) →
+    // lo64 → ROL64(32). The legacy CL-1177146 algorithm (PSHUFB + XOR +
+    // ROL64) doesn't match this patch.
+    //
+    // For NAME slot: result.lo32 = CompIndex, result.hi32 = FName::Number.
+    // For pointer slots (Class/Outer): the same decode produces a 64-bit
+    // value where (hi32 << 32) | lo32 reconstructs the original pointer
+    // (= ROL64(real_ptr, 32) is its own inverse). Callers that want the
+    // raw pointer should swap halves: `((u32)dec << 32) | (dec >> 32)`.
     uint64_t DecryptUObjSlotNew(const uint8_t enc[16]) const {
-        using namespace ArcDecrypt::Patch20260421::UObjSlot20260428;
-        const auto& Disc = AutoDiscovery::g_DiscoveredUObjSlot;
+        return DecryptUObjSlotCL1177678(enc);
+    }
 
-        // Auto-discovered values take priority. If discovery hasn't run or
-        // failed, fall back to compile-time constants from arc_decrypt.h.
-        alignas(16) uint8_t KShufMask[16] = {};
-        uint64_t XorVal;
-        int      Rol64Amt;
-        if (Disc.Valid) {
-            std::memcpy(KShufMask, Disc.ShufMaskBytes, 8);
-            XorVal   = Disc.XorScalar;
-            Rol64Amt = Disc.Rol64Amount;
-        } else {
-            const uint8_t kFallback[8] = {
-                SHUF_MASK_BYTES[0], SHUF_MASK_BYTES[1], SHUF_MASK_BYTES[2], SHUF_MASK_BYTES[3],
-                SHUF_MASK_BYTES[4], SHUF_MASK_BYTES[5], SHUF_MASK_BYTES[6], SHUF_MASK_BYTES[7],
-            };
-            std::memcpy(KShufMask, kFallback, 8);
-            XorVal   = XOR_SCALAR;
-            Rol64Amt = ROL64_AMT;
+    // ── CL-1177678 UObject slot decoder ─────────────────────────────────
+    // Verified via IDA sub_4CD5B0 @ 0x4CD75C..0x4CD7A3 (FName comparison
+    // routine that takes a UObject and a candidate FName). The full pipeline:
+    //
+    //   slot_bytes = read 16 from obj + 0x20 + name_slot_idx * 0x20
+    //   v = pshuflw(slot_bytes, 0x39)                     // shufflelo, mask 0x39
+    //   v = ROL32(v, 26) per u32 lane                       // PSLLD 0x1A | PSRLD 6
+    //   v = PSHUFB(v, xmmword_ADEAC80)
+    //   lo64 = v.m128i_u64[0]
+    //   final = ROL64(lo64, 32)                              // ← swaps halves
+    //   ci = final & 0xFFFFFFFF                              // low 32 = CompIndex
+    //   number = final >> 32                                  // high 32 = Number
+    //
+    // Verified against known CIs:
+    //   obj=0x2A5A1300 (NAME slot 0) → final=0x1F9 → CI=505 = "Object" ✓
+    //   obj=0x88060000 (NAME slot 1) → final=0x6A4 → CI=1700
+    //
+    // The PSHUFB mask `xmmword_ADEAC80` lives at RVA 0xADEAC80 (live):
+    //   `06 00 01 04 07 03 02 05 00 00 00 00 00 00 00 00`
+    // hi8 of mask is zero → hi8 of result is zero → final after ROL64(32)
+    // has CI in low 32 and Number in high 32, matching the standard FName
+    // layout {ComparisonIndex, Number}.
+    //
+    // .rdata RVA hardcoded for now (TODO: auto-discover by binding the
+    // PSHUFB mask referenced inside the NAME slot decoder to the live
+    // xmmword via the call-chain rip-rel scan).
+    uint64_t DecryptUObjSlotCL1177678(const uint8_t enc[16]) const {
+        static thread_local bool s_loaded = false;
+        alignas(16) static thread_local uint8_t s_mask[16];
+        if (!s_loaded) {
+            if (!m_reader.Read(m_base + 0xADEAC80, s_mask, 16)) return 0;
+            s_loaded = true;
         }
 
-        __m128i V   = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-        __m128i Shm = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(KShufMask));
-        __m128i B   = _mm_shuffle_epi8(V, Shm);
+        __m128i V    = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
+        __m128i Sh   = _mm_shufflelo_epi16(V, 0x39);
+        __m128i Rot  = _mm_or_si128(_mm_slli_epi32(Sh, 26),
+                                    _mm_srli_epi32(Sh, 6));
+        __m128i Mask = _mm_load_si128(reinterpret_cast<const __m128i*>(s_mask));
+        __m128i Out  = _mm_shuffle_epi8(Rot, Mask);
         uint64_t Lo;
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), B);
-        uint64_t Raw = Lo ^ XorVal;
-        // ROL64 by Rol64Amt (typically 32 — swaps hi/lo halves)
-        if (Rol64Amt == 0) return Raw;
-        return (Raw << Rol64Amt) | (Raw >> (64 - Rol64Amt));
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Out);
+        return (Lo << 32) | (Lo >> 32);    // ROL64(32)
     }
 
     // ── FField NamePrivate slot decrypt (patch CL-1177146) ───────────────
@@ -360,60 +364,83 @@ public:
     // CL-1177146 value, used until discovery has run.
     static constexpr uint64_t FFIELD_NAME_XOR_CL1177146 = 0x9A492C85DDF6F193ULL;
     uint64_t DecryptFFieldNameSlot(const uint8_t enc[16]) const {
+        {
+            __m128i V   = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
+            __m128i Rot = _mm_or_si128(_mm_slli_epi64(V, 55), _mm_srli_epi64(V, 9));
+            alignas(16) static const uint8_t MaskBytes[16] = {
+                0x06, 0x05, 0x03, 0x01, 0x02, 0x07, 0x00, 0x04,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            };
+            alignas(16) static const uint8_t XorBytes[16] = {
+                0x3B, 0x3F, 0xA4, 0x49, 0xC8, 0xC8, 0x82, 0x48,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            };
+            __m128i Mask  = _mm_load_si128(reinterpret_cast<const __m128i*>(MaskBytes));
+            __m128i XorK  = _mm_load_si128(reinterpret_cast<const __m128i*>(XorBytes));
+            __m128i Shuf  = _mm_shuffle_epi8(Rot, Mask);
+            __m128i Xored = _mm_xor_si128(Shuf, XorK);
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Xored);
+            uint64_t Out = (Lo << 32) | (Lo >> 32);
+            uint32_t Ci  = static_cast<uint32_t>(Out);
+            if (Ci > 1 && Ci < 0x2000000u) return Out;
+        }
+
+        {
+            uint64_t cl678 = DecryptUObjSlotCL1177678(enc);
+            uint32_t ci = static_cast<uint32_t>(cl678);
+            if (ci > 1 && ci < 0x2000000u) return cl678;
+        }
+
         const auto& Disc = AutoDiscovery::g_DiscoveredFFieldName;
         const uint64_t XorConst = Disc.Valid ? Disc.XorConst : FFIELD_NAME_XOR_CL1177146;
         const int      Rol32Amt = Disc.Valid ? Disc.Rol32Amount : 13;
         const int      Rol64Amt = Disc.Valid ? Disc.Rol64Amount : 7;
 
         __m128i V    = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-        // ROL32(N) per uint32-lane
         __m128i Rot  = _mm_or_si128(
             _mm_slli_epi32(V, Rol32Amt),
             _mm_srli_epi32(V, 32 - Rol32Amt));
         uint64_t Lo;
         _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Rot);
         uint64_t Xored = Lo ^ XorConst;
-        // ROL64 by N
         return (Xored << Rol64Amt) | (Xored >> (64 - Rol64Amt));
     }
 
-    // ── UObject FName accessor (patch 20260428) ──────────────────────────
-    // After DecryptUObjSlotNew_20260428 (PSHUFB → ROL32(17) → XOR → ROL64(32)),
-    // the comp_index lives in the LO 32 bits of the decrypted u64 (matches
-    // REFERENCE_FName_20260428.h::GetActorFNameId, which casts result to int32_t).
-    // Hi32 holds whatever the slot's hi-half encoded — for class/outer slots
-    // that's pointer bits, so we filter on lo32 magnitude.
+    // ── UObject FName accessor (CL-1177678) ─────────────────────────────
+    // Verified IDA sub_4CD5B0: pick NAME slot via FNV-chain hash on
+    // (obj+0x10), decrypt slot bytes via shufflelo(0x39)+ROL32(26)+
+    // PSHUFB(xmmword_ADEAC80)+lo64+ROL64(32). The result's lo32 is the
+    // CompIndex, hi32 is FName::Number.
+    //
+    // Tested live:
+    //   obj=0x2A5A1300 (NAME slot 0) → CI=505 ("Object" — verified)
+    //   obj=0x88060000 (NAME slot 1) → CI=1700
     int32_t GetCompIndex(uint64_t obj_base) {
         if (!obj_base || !m_keyLoaded) return 0;
-        alignas(16) uint8_t enc[4][16] = {};
-        uint64_t dec[4] = {};
-        bool valid[4] = {};
-        for (int slot = 0; slot < 4; ++slot) {
-            uint64_t addr = obj_base + 0x20 + static_cast<uint64_t>(slot) * 0x20;
-            if (!m_reader.Read(addr, enc[slot], 16)) continue;
-            // Skip all-zero slots (uninitialized) — decrypting zeros gives a
-            // garbage "CI" that wastes a resolve attempt.
-            bool nonzero = false;
-            for (int b = 0; b < 16; ++b) if (enc[slot][b]) { nonzero = true; break; }
-            if (!nonzero) continue;
-            dec[slot] = DecryptUObjSlotNew(enc[slot]);
-            valid[slot] = true;
-        }
-        // CI=1 is a "no-name" sentinel; reject it explicitly (raises naming
-        // success from 99% to 100% per empirical study of 1441 objects).
         auto is_ci = [](uint32_t h) { return h > 1 && h < 0x2000000u; };
 
-        // Tier 0: hash-picked name slot (RE'd from UObject::GetFName).
+        auto try_slot = [&](int slot) -> int32_t {
+            alignas(16) uint8_t enc[16] = {};
+            uint64_t addr = obj_base + 0x20 + static_cast<uint64_t>(slot) * 0x20;
+            if (!m_reader.Read(addr, enc, 16)) return 0;
+            bool nonzero = false;
+            for (int b = 0; b < 16; ++b) if (enc[b]) { nonzero = true; break; }
+            if (!nonzero) return 0;
+
+            uint64_t dec = DecryptUObjSlotCL1177678(enc);
+            uint32_t lo = static_cast<uint32_t>(dec);   // CI is in low 32 after ROL64(32)
+            if (is_ci(lo)) return static_cast<int32_t>(lo);
+            return 0;
+        };
+
+        // Tier 0: hash-picked NAME slot.
         uint32_t ns = ObjNameSlot(obj_base);
-        if (valid[ns]) {
-            uint32_t lo = static_cast<uint32_t>(dec[ns]);
-            if (is_ci(lo)) return static_cast<int32_t>(lo);
-        }
-        // Tier 1: first slot whose lo32 is a valid CI.
+        if (int32_t ci = try_slot(static_cast<int>(ns))) return ci;
+        // Tier 1: walk all 4 slots as fallback.
         for (int s = 0; s < 4; ++s) {
-            if (!valid[s]) continue;
-            uint32_t lo = static_cast<uint32_t>(dec[s]);
-            if (is_ci(lo)) return static_cast<int32_t>(lo);
+            if (s == static_cast<int>(ns)) continue;
+            if (int32_t ci = try_slot(s)) return ci;
         }
         return 0;
     }
@@ -501,16 +528,19 @@ public:
         //   ROL32(13) per uint32-lane → lo64 → XOR(0x9A492C85DDF6F193) → ROL64(7)
         // Different from UObject 4-slot AND from 20260428's FField pipeline.
         {
+            // CL-1177678: NamePrivate moved from +0x70 to +0x30. Use the
+            // configured offset (auto-disc may have pre-set it) and fall
+            // back to the new compile-time value.
+            const uint64_t primary_off = ArcDecrypt::Offsets::FField::NamePrivate;
             alignas(16) uint8_t enc[16] = {};
-            if (m_reader.Read(ff_addr + 0x70, enc, 16)) {
+            if (m_reader.Read(ff_addr + primary_off, enc, 16)) {
                 bool any = false;
                 for (uint8_t b : enc) if (b) { any = true; break; }
                 if (any) {
                     uint64_t fn = DecryptFFieldNameSlot(enc);
                     int32_t ci = static_cast<int32_t>(fn & 0xFFFFFFFFu);
                     if (ci > 1 && (uint32_t)ci < 0x06A00000u) {
-                        // Stash the offset for downstream callers (auto-cal short-circuit).
-                        if (m_ffieldNameOff == 0) m_ffieldNameOff = 0x70;
+                        if (m_ffieldNameOff == 0) m_ffieldNameOff = primary_off;
                         return ci;
                     }
                 }
@@ -658,113 +688,148 @@ public:
         return 0;
     }
 
-    // ── Step 4-7: comp_index → FNameEntry heap address (patch 20260421) ──
-    // Derived from sub_242FC0 @ RVA 0x242FC0. Packed CI layout:
-    //   name_offset_word = ci & 0xFFFF
-    //   chunk_off        = (ci >> 8) & 0xFFFF00  (bytes into FNamePool base)
-    // Each chunk at GNAMES + chunk_off holds an FNV seed at +0x6570 and an
-    // 8-way slot array of 32-byte entries at +0x6580. FNV32 picks slot_idx;
-    // the two adjacent 16-byte slots are decrypted and combined via FNV64
-    // fold. The sentinel XOR + bswap chain collapses to `result ^ 0x086B0040`.
-    // ── ResolveNamePtrFull (patch 20260428) ──────────────────────────────
-    // Direct port of REFERENCE_FName_20260428.h::ResolveNamePtr. Three-stage
-    // SIMD CI transform → block-selector hash → 2 block decrypts → FNV fold
-    // → 3-XOR pointer fixup chain.
+    // ── ResolveNamePtrFull (CL-1177678) ──────────────────────────────────
+    // Faithful port of sub_2311B0 → sub_245AA0 → sub_2458C0 from the live
+    // binary. Pipeline:
+    //
+    //   sub_2311B0:
+    //     v3   = ROL64(53)+shufflelo(75) on CompIndex
+    //     v11  = (v3 AND xmmword_ADB8B10) | (v3 ANDNOT xmmword_AD9F790)
+    //     [pass v11 down through sub_245AA0 → sub_2458C0]
+    //     entry = bswap64( sub_245AA0_result XOR 0x5849435C00000000 )
+    //
+    //   sub_245AA0:
+    //     wraps sub_2458C0; XORs result with 0x60801E00000000
+    //
+    //   sub_2458C0:
+    //     v5   = shufflelo(46) XOR xmmword_ADD1110, then ROL64(11)
+    //     v7   = u16(v5)                                  (= NameOffset/2)
+    //     chunk = GNamePool + ((v5 >> 8) & 0xFFFF00)      (chunk address)
+    //     v9   = FNV1a-32 hash of chunk address + 0x7000
+    //     v10  = u8((-109*v9 - 58) ^ ((HP*v9 + HA) >> 16)) (block-pair selector)
+    //     blk1 = chunk[0x7010 + 32*(v10 & 7)]
+    //     blk2 = chunk[0x7010 + 32*((v10+1) & 7)]
+    //     v13  = ROL32(12)+shufflelo(27)+XOR(xmmword_ADD0CA0) of blk1
+    //     v14d = ROL32(12)+shufflelo(27)+XOR(xmmword_ADD0CA0) of blk2
+    //     fnv_mix = FNV64 fold: P64 * ROL64(P64 * ROL64(v13,31) - F64, 36) - F64
+    //     mixed = bswap64( (v13 + (fnv_mix XOR v14d) + 2*v7) XOR 0x42C32958 )
+    //     return mixed
+    //
+    // Constants verified two ways: live Zydis on 0x2311B0 extracted the
+    // imm64s (0x5849435C..., 0x9861E39DEBEE5306, 0x100000001B3) and IDA
+    // decompile of 0x2458C0 confirmed the structural constants (HASH_ADD,
+    // chunk offsets, FINAL_XOR). Note 0x9861E39DEBEE5306 = -0x679E1C621411ACFA
+    // mod 2^64 — same FNV_OFFSET, just compiler emitted as `+ neg` vs `- pos`.
+    //
+    // .rdata RVAs are still hardcoded for now — TODO: auto-discover via the
+    // FName-fn rip-rel scan (we already collect candidates in
+    // g_DiscoveredFName.AllRDataLeas; just need the role-binding pass).
     uint64_t ResolveNamePtrFull(int32_t CompIndex) {
         if (CompIndex <= 0 || !m_keyLoaded) return 0;
 
-        constexpr uint32_t HASH_PRIME = 16777619u;
-        constexpr uint32_t HASH_ADD_MAIN = 0x8E195662u;
-        constexpr uint32_t BHASH_ADD = 0x0CCB8743u;
-        constexpr uint64_t CHUNK_HASH_SEED_OFF = 0x7050ULL;
-        constexpr uint64_t CHUNK_BLOCK_BASE_OFF = 0x7060ULL;
-        constexpr uint64_t FNV_PRIME = 0x100000001B3ULL;
-        constexpr uint64_t FNV_OFFSET = 0x34E6ED2249E469DULL;
-        constexpr uint64_t PTR_XOR_1 = 0x9DD41EF0ULL;
-        constexpr uint64_t PTR_XOR_2 = 0x18E0021000000000ULL;
-        constexpr uint64_t PTR_XOR_3 = 0xE8FED68D00000000ULL;
+        // .rdata constants (read once, cached via static + first-time fetch).
+        // Live values at these RVAs verified to match IDA's identification.
+        // TODO: auto-discover RVAs via Phase 5 Zydis call-chain bind pass.
+        static thread_local bool s_loaded = false;
+        alignas(16) static thread_local uint8_t s_AndMask[16];      // xmmword_ADB8B10
+        alignas(16) static thread_local uint8_t s_AndNotMask[16];   // xmmword_AD9F790
+        alignas(16) static thread_local uint8_t s_PxorIn[16];       // xmmword_ADD1110
+        alignas(16) static thread_local uint8_t s_PxorBlock[16];    // xmmword_ADD0CA0
 
-        alignas(16) static const uint8_t BLOCK1_XOR[16] = {
-            0x12,0x09,0x73,0x66,0xC3,0x14,0x7D,0xE8, 0,0,0,0,0,0,0,0
-        };
-        alignas(16) static const uint8_t BLOCK2_AND[16] = {
-            0x73,0xC7,0x73,0xC7,0x73,0xC7,0x73,0xC7, 0x73,0xC7,0x73,0xC7,0x73,0xC7,0x73,0xC7
-        };
-        alignas(16) static const uint8_t BLOCK2_ANDNOT[16] = {
-            0x8C,0x38,0x8C,0x38,0x8C,0x38,0x8C,0x38, 0x8C,0x38,0x8C,0x38,0x8C,0x38,0x8C,0x38
-        };
-        alignas(16) static const uint8_t BLOCK2_XOR[16] = {
-            0x9E,0x31,0xFF,0x5E,0x4F,0x2C,0xF1,0xD0, 0,0,0,0,0,0,0,0
-        };
+        if (!s_loaded) {
+            if (!m_reader.Read(m_base + 0xADB8B10, s_AndMask,    16)) return 0;
+            if (!m_reader.Read(m_base + 0xAD9F790, s_AndNotMask, 16)) return 0;
+            if (!m_reader.Read(m_base + 0xADD1110, s_PxorIn,     16)) return 0;
+            if (!m_reader.Read(m_base + 0xADD0CA0, s_PxorBlock,  16)) return 0;
+            s_loaded = true;
+        }
 
-        __m128i Ci = _mm_cvtsi32_si128(CompIndex);
-        __m128i V1 = _mm_or_si128(_mm_slli_epi32(Ci, 22), _mm_srli_epi32(Ci, 10));
-        __m128i V2 = _mm_shufflelo_epi16(V1, 0x72);
-        __m128i V3 = _mm_or_si128(_mm_slli_epi16(V2, 3), _mm_srli_epi16(V2, 13));
-        __m128i V4 = _mm_or_si128(_mm_slli_epi16(V3, 13), _mm_srli_epi16(V3, 3));
-        __m128i V5 = _mm_shufflelo_epi16(V4, 0xED);
-        __m128i V6 = _mm_or_si128(_mm_slli_epi32(V5, 10), _mm_srli_epi32(V5, 22));
-        uint32_t V5Int = static_cast<uint32_t>(_mm_cvtsi128_si32(V6));
+        // Cryptographic constants (verified IDA + matching compile-time imm64s
+        // in the live binary).
+        constexpr uint32_t HASH_PRIME       = 0x01000193u;
+        constexpr uint32_t HASH_ADD         = 0x5AE45BC6u;          // 1524766406
+        constexpr uint64_t CHUNK_SEED_OFF   = 28672ULL;             // 0x7000
+        constexpr uint64_t CHUNK_BLOCKS_OFF = 28688ULL;             // 0x7010
+        constexpr uint64_t FNV_PRIME_64     = 0x100000001B3ULL;
+        constexpr uint64_t FNV_OFFSET       = 0x679E1C621411ACFAULL; // = -0x9861E39DEBEE5306
+        constexpr uint32_t FINAL_XOR        = 0x42C32958u;
+        constexpr uint64_t SUB_245AA0_XOR   = 0x60801E00000000ULL;
+        constexpr uint64_t ENTRY_HANDLE_XOR = 0x5849435C00000000ULL;
 
-        uint64_t NameOffset = 2ULL * static_cast<uint16_t>(V5Int);
-        uint64_t ChunkOff   = (static_cast<uint64_t>(V5Int) >> 8) & 0xFFFF00ULL;
+        // ── sub_2311B0 phase 1: SIMD input transform ──
+        __m128i Ci  = _mm_cvtsi32_si128(CompIndex);
+        __m128i Rot = _mm_or_si128(_mm_slli_epi64(Ci, 53), _mm_srli_epi64(Ci, 11));
+        __m128i V3  = _mm_shufflelo_epi16(Rot, 75);
+        __m128i AND_M    = _mm_load_si128(reinterpret_cast<const __m128i*>(s_AndMask));
+        __m128i ANDNOT_M = _mm_load_si128(reinterpret_cast<const __m128i*>(s_AndNotMask));
+        __m128i V11 = _mm_or_si128(_mm_and_si128(V3, AND_M),
+                                   _mm_andnot_si128(V3, ANDNOT_M));
 
-        uint64_t GnamesBase = m_base + FNAME_GNAMES_BASE_OFF;
-        uint64_t ChunkAddr  = GnamesBase + ChunkOff;
+        // ── sub_2458C0 phase 2: chunk address selector ──
+        __m128i PXOR_IN = _mm_load_si128(reinterpret_cast<const __m128i*>(s_PxorIn));
+        __m128i Sh      = _mm_shufflelo_epi16(V11, 46);
+        __m128i V5_xor  = _mm_xor_si128(Sh, PXOR_IN);
+        __m128i V5_rot  = _mm_or_si128(_mm_slli_epi64(V5_xor, 11),
+                                       _mm_srli_epi64(V5_xor, 53));
+        uint32_t V6 = static_cast<uint32_t>(_mm_cvtsi128_si32(V5_rot));
+        uint16_t V7 = static_cast<uint16_t>(V6);
 
-        uint64_t Seed = ChunkAddr + CHUNK_HASH_SEED_OFF;
-        uint32_t SeedLo = static_cast<uint32_t>(Seed);
-        uint32_t SeedHi = static_cast<uint32_t>(Seed >> 32);
+        uint64_t GNamesBase = m_base + FNAME_GNAMES_BASE_OFF;
+        uint64_t Chunk      = GNamesBase + ((static_cast<uint64_t>(V6) >> 8) & 0xFFFF00ULL);
 
-        uint32_t H = fn_rotl32(SeedLo, 21);
-        H = HASH_PRIME * H + BHASH_ADD;
-        H = fn_rotl32(H, 17);
-        H = HASH_PRIME * H + SeedHi + BHASH_ADD;
-        H = fn_rotl32(H, 21);
-        H = HASH_PRIME * H + BHASH_ADD;
-        H = fn_rotl32(H, 17);
+        // ── FNV chain on chunk address (hash → block-pair selector) ──
+        uint64_t Addr   = Chunk + CHUNK_SEED_OFF;
+        uint32_t AddrLo = static_cast<uint32_t>(Addr);
+        uint32_t AddrHi = static_cast<uint32_t>(Addr >> 32);
 
-        uint32_t V8 = HASH_PRIME * H + BHASH_ADD;
-        uint32_t V9 = V8 ^ (V8 >> 16);
-        uint32_t Bidx1 = V9 & 7u;
-        uint32_t Bidx2 = (V9 + 1u) & 7u;
+        uint32_t StepA = HASH_PRIME * (AddrLo >> 6) + HASH_ADD;
+        StepA = fn_rotl32(StepA, 14);
+        uint32_t StepB = HASH_PRIME * StepA + AddrHi + HASH_ADD;
+        StepB = fn_rotl32(StepB, 26);
+        uint32_t V9 = HASH_PRIME * StepB + HASH_ADD;
+        V9 = fn_rotl32(V9, 14);
 
-        uint64_t BlockBase = ChunkAddr + CHUNK_BLOCK_BASE_OFF;
-        uint64_t B1Addr = BlockBase + 32ULL * Bidx1;
-        uint64_t B2Addr = BlockBase + 32ULL * Bidx2;
+        uint8_t V10 = static_cast<uint8_t>(
+            (static_cast<uint32_t>(-109) * V9 - 58u) ^
+            ((HASH_PRIME * V9 + HASH_ADD) >> 16)
+        );
+
+        // ── Block reads + decode ──
+        uint64_t B1Addr = Chunk + CHUNK_BLOCKS_OFF + 32ULL * (V10 & 7u);
+        uint64_t B2Addr = Chunk + CHUNK_BLOCKS_OFF + 32ULL * ((V10 + 1u) & 7u);
 
         alignas(16) uint8_t Sb1[16] = {}, Sb2[16] = {};
         if (!m_reader.Read(B1Addr, Sb1, 16)) return 0;
         if (!m_reader.Read(B2Addr, Sb2, 16)) return 0;
 
-        __m128i B1V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Sb1));
-        __m128i B1R1 = _mm_or_si128(_mm_slli_epi16(B1V, 13), _mm_srli_epi16(B1V, 3));
-        __m128i B1Xor = _mm_load_si128(reinterpret_cast<const __m128i*>(BLOCK1_XOR));
-        __m128i B1X = _mm_xor_si128(B1R1, B1Xor);
-        __m128i B1R2 = _mm_or_si128(_mm_slli_epi16(B1X, 4), _mm_srli_epi16(B1X, 12));
-        uint64_t B1Lo;
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(&B1Lo), B1R2);
+        __m128i PXOR_B = _mm_load_si128(reinterpret_cast<const __m128i*>(s_PxorBlock));
+        // Note: ADD0CA0 is loaded with _mm_loadl_epi64 (8 bytes, hi8 zero); we
+        // load 16 bytes here but the upper 8 are zero anyway because the
+        // .rdata stored value has hi8 == 0 (verified live).
+        auto XformBlock = [&](const uint8_t* BlkBytes) -> uint64_t {
+            __m128i V    = _mm_loadu_si128(reinterpret_cast<const __m128i*>(BlkBytes));
+            __m128i Rotd = _mm_or_si128(_mm_slli_epi32(V, 12), _mm_srli_epi32(V, 20));
+            __m128i Shf  = _mm_shufflelo_epi16(Rotd, 27);
+            __m128i Xrd  = _mm_xor_si128(Shf, PXOR_B);
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Xrd);
+            return Lo;
+        };
+        uint64_t V13      = XformBlock(Sb1);
+        uint64_t V14Decoded = XformBlock(Sb2);
 
-        __m128i B2V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Sb2));
-        __m128i B2R1 = _mm_or_si128(_mm_slli_epi16(B2V, 13), _mm_srli_epi16(B2V, 3));
-        __m128i B2And = _mm_load_si128(reinterpret_cast<const __m128i*>(BLOCK2_AND));
-        __m128i B2AndNot = _mm_load_si128(reinterpret_cast<const __m128i*>(BLOCK2_ANDNOT));
-        __m128i B2XorK = _mm_load_si128(reinterpret_cast<const __m128i*>(BLOCK2_XOR));
-        __m128i B2Blend = _mm_or_si128(_mm_and_si128(B2R1, B2And),
-                                       _mm_andnot_si128(B2R1, B2AndNot));
-        __m128i B2X = _mm_xor_si128(B2Blend, B2XorK);
-        __m128i B2R2 = _mm_or_si128(_mm_slli_epi16(B2X, 4), _mm_srli_epi16(B2X, 12));
-        uint64_t B2Lo;
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(&B2Lo), B2R2);
+        // ── FNV64 mixer ──
+        uint64_t FnvStep1 = FNV_PRIME_64 * fn_rotl64(V13, 31) - FNV_OFFSET;
+        uint64_t FnvStep2 = FNV_PRIME_64 * fn_rotl64(FnvStep1, 36) - FNV_OFFSET;
 
-        uint64_t Fnv = FNV_PRIME * fn_rotl64(B1Lo, 49) - FNV_OFFSET;
-        Fnv = FNV_PRIME * fn_rotl64(Fnv, 47) - FNV_OFFSET;
+        uint64_t Mixed = (V13 + (FnvStep2 ^ V14Decoded) + 2ULL * V7) ^ FINAL_XOR;
+        uint64_t Sub2458Result = __builtin_bswap64(Mixed);
 
-        uint64_t R = B1Lo + (Fnv ^ B2Lo) + NameOffset;
+        // ── sub_245AA0 wrap + sub_2311B0 final ──
+        uint64_t Sub245Result = Sub2458Result ^ SUB_245AA0_XOR;
+        uint64_t EntryPtr     = __builtin_bswap64(Sub245Result ^ ENTRY_HANDLE_XOR);
 
-        uint64_t A = __builtin_bswap64(R ^ PTR_XOR_1);
-        uint64_t B = A ^ PTR_XOR_2 ^ PTR_XOR_3;
-        return __builtin_bswap64(B);
+        return EntryPtr;
     }
 
     uint64_t ResolveNamePtr(int32_t comp_index) {
@@ -797,18 +862,21 @@ public:
         }
     }
 
-    // ── DecryptNameString (patch 20260428) ────────────────────────────
-    // Direct port of REFERENCE_FName_20260428.h::DecryptNameString. Char-based
-    // (8-bit signed) LCG keystream advancing per pair, with two distinct
-    // keytable indices per pair.
-    //   length = (hdr & 0x7F) | ((hdr >> 5) & 0x380)   (different bit layout)
-    //   isWide = bit15
-    //   key0   = (char)(length - 68)
-    //   per pair (i, i+1):
-    //     idx_a = key & 0x3F           ; word ^= kt[8 + idx_a]   (ANSI: >>3)
-    //     idx_b = (68*key + 96) & 0x3C ; word ^= kt[8 + idx_b]   (ANSI: >>3)
-    //     key = (char)(16*key - 32)
-    //   trailing odd: word ^= kt[8 + (key & 0x3F)]   (ANSI: >>3)
+    // ── DecryptNameString (CL-1177678) ─────────────────────────────────
+    // Direct port of sub_23F2D0 (FNameEntry_AppendNameToString) verified
+    // by IDA decompile. Layout differs from prior patches:
+    //   header: u16
+    //     bit 0       = isWide (NOT bit 8/15 as on older patches)
+    //     length      = (hdr & 0x3FE) | (hdr >> 15)
+    //   key init      = (u16)(length - 10563)        -- was -25107 on 20260428
+    //   per pair:
+    //     ANSI:  byte[i] ^= u8(keystream_u16[(key+i) & 0x3F] >> 3)
+    //     WIDE:  word[i] ^= keystream_u16[(key+i) & 0x3F]
+    //   key advances by 1 per byte (ANSI) / per word (WIDE).
+    //   The IDA decompile shows a SIMD batch optimization that processes
+    //   16 bytes at a time when length >= 16 with specific alignment;
+    //   our scalar implementation produces the same output (just slower)
+    //   because both compute byte[i] ^= keystream[(key+i)&0x3F] >> bitshift.
     std::string DecryptNameString(uint64_t NameEntryPtr) {
         if (!NameEntryPtr || !m_keyLoaded) return {};
 
@@ -816,32 +884,30 @@ public:
         if (!m_reader.Read(NameEntryPtr, &Header, 2) || !Header) return {};
 
         bool IsWide = (Header & 1u) != 0;
-        int V3 = Header >> 9;
-        int V4 = (2 * static_cast<int>(Header)) & 0x380;
-        int CharCount = V3 + V4;
-        if (CharCount <= 0 || CharCount > 1023) return {};
+        int Length = (Header & 0x3FE) | (Header >> 15);
+        if (Length <= 0 || Length > 1023) return {};
 
-        int ByteCount = IsWide ? CharCount * 2 : CharCount;
+        int ByteCount = IsWide ? Length * 2 : Length;
         if (ByteCount > 2048) ByteCount = 2048;
 
         std::vector<uint8_t> Buf(ByteCount, 0);
         if (!m_reader.Read(NameEntryPtr + 2, Buf.data(), ByteCount)) return {};
 
-        uint16_t Key = static_cast<uint16_t>(static_cast<int>(CharCount) - 25107);
+        uint16_t Key = static_cast<uint16_t>(Length - 10563);
 
         if (!IsWide) {
-            for (int I = 0; I < CharCount; ++I) {
+            for (int I = 0; I < Length; ++I) {
                 Buf[I] ^= static_cast<uint8_t>(m_keyTable[(Key + I) & 0x3F] >> 3);
             }
-            return std::string(reinterpret_cast<char*>(Buf.data()), CharCount);
+            return std::string(reinterpret_cast<char*>(Buf.data()), Length);
         } else {
             auto* WBuf = reinterpret_cast<uint16_t*>(Buf.data());
-            for (int I = 0; I < CharCount; ++I) {
+            for (int I = 0; I < Length; ++I) {
                 WBuf[I] ^= m_keyTable[(Key + I) & 0x3F];
             }
             std::string Result;
-            Result.reserve(CharCount);
-            for (int J = 0; J < CharCount; ++J) {
+            Result.reserve(Length);
+            for (int J = 0; J < Length; ++J) {
                 if (WBuf[J]) Result += static_cast<char>(WBuf[J] & 0xFF);
             }
             return Result;
@@ -948,11 +1014,15 @@ public:
     // the static SIMD pipeline if emu fails — used on patches where the
     // FNamePool resolver / FNameEntry decrypt has drifted.
     std::string CompIndexToName(int32_t comp_index) {
+        // Emu-primary: skip static entirely. ResolveNamePtrFull's compile-time
+        // BLOCK1_XOR / BLOCK2_AND constants drift every patch — on a relocated
+        // build the static path returns plausible-looking but wrong garbage,
+        // which would defeat the IsStrictName filter half the time. Trusting
+        // emu only is both correct and faster than running the static path
+        // first to throw the result away.
         if (m_emuPrimary) {
             std::string e = TryEmuFallback(comp_index);
-            if (IsStrictName(e)) return e;
-            std::string s = StaticResolve(comp_index);
-            return IsStrictName(s) ? s : std::string{};
+            return IsStrictName(e) ? e : std::string{};
         }
         std::string s = StaticResolve(comp_index);
         if (IsStrictName(s)) return s;
@@ -965,9 +1035,7 @@ public:
     std::string CompIndexToNameLenient(int32_t comp_index) {
         if (m_emuPrimary) {
             std::string e = TryEmuFallback(comp_index);
-            if (IsLenientName(e)) return e;
-            std::string s = StaticResolve(comp_index);
-            return IsLenientName(s) ? s : std::string{};
+            return IsLenientName(e) ? e : std::string{};
         }
         std::string s = StaticResolve(comp_index);
         if (IsLenientName(s)) return s;
@@ -1286,30 +1354,6 @@ private:
     uint64_t       m_primaryHandleOffset = 0;  // 0 = no calibration yet, fall back to candidate list
     uint64_t       m_ffieldNameOff = 0;        // 0 = uncalibrated; first valid offset wins
 
-    // SIMD tables loaded from process memory during Init()
-    alignas(16) uint8_t m_cidxXor1[16];      // slot PXOR key           (AD30540)
-    alignas(16) uint8_t m_cidxXor3[16];      // Level-2 CIdx XOR        (AD30590)
-    alignas(16) uint8_t m_blkSlotShuf[16];   // slot data pshufb        (AD305A0)
-    alignas(16) uint8_t m_blkSlotShuf2[16];  // slot decrypt pshufb     (AD30550)
-    alignas(16) uint8_t m_blkHdrAnd[16];     // block header AND        (AD305C0)
-    alignas(16) uint8_t m_blkHdrAndnot[16];  // block header ANDNOT     (AD305B0)
-    alignas(16) uint8_t m_blkHdrShuf[16];    // block header pshufb     (AD2FCC0)
-    alignas(16) uint8_t m_blkHdrXor[16];     // block header pxor       (AD305D0)
-
-    // Patch 20260421 UObject slot decrypt constants
-    alignas(16) uint8_t m_uobjShufMask[16] = {};   // (AD128C0) 05,03,01,04,02,07,00,06
-    alignas(16) uint8_t m_uobjXorConst[16] = {};   // (AD128D0) 09,43,BD,C8,4B,4B,BC,FF
-
-    // Patch 20260421 FField name decrypt constant
-    alignas(16) uint8_t m_fFieldXorConst[16] = {}; // (AD15750) 38,BA,6F,75,E8,89,57,36,0,0,0,0,0,0,0,0
-
-    // Patch 20260428 FNamePool resolver SIMD tables
-    alignas(16) uint8_t m_p28_gidxShuf1[16]   = {}; // (AD49100) Stage-1 PSHUFB mask (replicated to hi8)
-    alignas(16) uint8_t m_p28_gidxXor1[16]    = {}; // (AD49110) Stage-1 / Stage-2 XOR key (replicated to hi8)
-    alignas(16) uint8_t m_p28_stage2Xor[16]   = {}; // (AD49390) Stage-2 XOR key (replicated to hi8)
-    alignas(16) uint8_t m_p28_extractShuf[16] = {}; // (AD49140) CI extract PSHUFB mask
-    alignas(16) uint8_t m_p28_extractXor[16]  = {}; // (AD49150) CI extract XOR const
-    alignas(16) uint8_t m_p28_blockShuf[16]   = {}; // (AD49130) Block decrypt PSHUFB mask (lo8 valid)
 };
 
 // ── Free-function shims ────────────────────────────────────────────────────

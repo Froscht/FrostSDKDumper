@@ -1235,6 +1235,39 @@ public:
                     ArcDecrypt::RVA_GNAMES_BASE = Live;
                 }
             }
+
+            // ── Phase 6.5: FName keystream RVA = SIMD-block + 0xA0 ────────
+            // The FName keystream lives at a fixed +0xA0 inside the SIMD-
+            // constants block — both globals are referenced ~equally many
+            // times by the FName fn body, so the GNames-walk picks them up
+            // as candidates side-by-side. The heap-probe tie-break
+            // distinguishes them: FNamePool has a heap pointer (PASS), the
+            // SIMD block has only inline constants (FAIL). Take the highest-
+            // ref FAIL candidate as the SIMD block; keystream = block + 0xA0.
+            //
+            // Why: hardcoded `RVA_FNAME_KEY_TABLE = 0xDAF88EC` was correct
+            // on CL-1177146 but moved on CL-1177678. Without auto-discovery
+            // the static `DecryptNameString` XORs against the wrong keystream
+            // and produces garbage even when the resolver itself is healthy.
+            if (AutoDiscovery::g_DiscoveredGNames.SimdBlockRva) {
+                uint64_t Hard = ArcDecrypt::RVA_FNAME_KEY_TABLE;
+                uint64_t Live = AutoDiscovery::g_DiscoveredGNames.SimdBlockRva + 0xA0;
+                if (Live == Hard) {
+                    std::printf("[autodisc] FName keystream RVA matches constant 0x%llX\n",
+                        (unsigned long long)Live);
+                } else {
+                    std::printf("[autodisc] FName keystream RVA drift: 0x%llX → 0x%llX "
+                                "(auto-fixed via SIMD-block + 0xA0)\n",
+                        (unsigned long long)Hard, (unsigned long long)Live);
+                    ArcDecrypt::RVA_FNAME_KEY_TABLE = Live;
+                    if (!m_fname.ReloadKeyTable()) {
+                        std::printf("[autodisc] WARNING: ReloadKeyTable failed at new RVA 0x%llX\n",
+                            (unsigned long long)Live);
+                    } else {
+                        std::printf("[autodisc] FName key table re-loaded from corrected RVA\n");
+                    }
+                }
+            }
         }
 
         // 2. Boot Unicorn with PE-on-disk fallback for VMProtect-cold pages.
@@ -1261,14 +1294,17 @@ public:
         m_emuFName->SetGamePeb(0x7FFD0000ULL);  // Wine-canonical PEB
         m_emuEngine->MapGamePage(0x7FFD0000ULL);
 
-        // 4. Plumb into FNameDecryptor — every CompIndexToName(Lenient) that
-        //    fails the static path will now hit the game's real function via
-        //    Unicorn, with results cached in FNameDecryptor's m_emuCache.
+        // 4. Plumb into FNameDecryptor as a FALLBACK. Phase 0.6's runtime
+        //    sanity check on actor names will flip to emu-primary mode if
+        //    the static path is broken; otherwise static stays primary
+        //    because it's ~10x faster than per-CI Unicorn emulation. The
+        //    fallback path uses Unicorn-emulated game function code, with
+        //    results cached in FNameDecryptor::m_emuCache.
         m_fname.SetEmuFallback([this](int32_t ci) -> std::string {
             if (ci <= 0 || !m_emuFName) return {};
             return m_emuFName->DecryptByIndex(static_cast<uint32_t>(ci));
         });
-        std::printf("[emu-auto] Unicorn FName fallback armed\n");
+        std::printf("[emu-auto] Unicorn FName fallback armed (Phase 0.6 will choose primary)\n");
     }
 
     // ── Canonical chunks-array recovery via vtable[7] emulation ──────────
