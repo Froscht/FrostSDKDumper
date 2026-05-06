@@ -373,7 +373,7 @@ public:
         // (qword pointer followed by a small count), then reading the
         // pointed-to data, then trying flat UTF-16.
 
-        uint8_t out_raw[64] = {};
+        uint8_t out_raw[2048] = {};
         m_engine->EmuRead(out_addr, out_raw, sizeof(out_raw));
 
         if (m_verbose) {
