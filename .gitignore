@@ -9,6 +9,7 @@ SDK_Output.h
 SDK_Output.txt
 dump_*.txt
 vtable_map.md
+decrypt_export.json
 
 # IDE / MCP config
 .mcp.json

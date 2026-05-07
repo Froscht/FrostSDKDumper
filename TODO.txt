@@ -1,5 +1,180 @@
 ================================================================
-FrostSDKDumper — TODO (2026-05-03 → next session)
+FrostSDKDumper — TODO (2026-05-07 → next session)
+================================================================
+
+CURRENT PATCH: CL-1177678 (binary
+  ARC_RAIDERS_STEAM_MERGED_20260505_120058_77PagesDecrypted.exe)
+Previous in-tree state was CL-1177146 — see archived section
+at the bottom of this file for that history.
+
+
+WHAT SHIPPED 2026-05-07 (Theia resolution system — IMPL ONLY)
+-------------------------------------------------------------
+Built a complete optional resolution layer aimed at the
+remaining ~2.9% of properties that come back as Theia opaque
+placeholders. Headers added (NOT yet wired into main.cpp):
+
+  1. theia_blake3_extractor.h — CityHash64WithSeed dictionary
+     attack with BLAKE3 magic IV 0x666CC71CF1242CBA. Built-in
+     dictionary of ~100 UE5 standard names. Class:
+     TheiaResolver::TheiaBlake3Extractor, methods
+     ExtractSeedFromMemory / BuildHashDictionary /
+     ResolveOpaqueHash / ResolvePlaceholders.
+
+  2. theia_pattern_scanner.h — 16-byte key pattern recognition.
+     Class TheiaResolver::TheiaPatternScanner with COMPLEX/MASK
+     decryption variants. Known key patterns from EAAntiCheat
+     ("nx0iddGJKTuY8aPM" etc.) hardcoded as starting set.
+
+  3. optimized_batch_processor.h — batch CI resolution wrapped
+     around the discovered CL-1177678 functions:
+       FField_DecryptNamePrivate_CL1177678  @ 0x353830
+       FName_Index2Name_CL1177678           @ 0x2311B0
+       FName_ResolveCI_ToString_CL1177678   @ 0x22EF40
+     Adds memory-locality sort + cache. Class:
+     FrostSDK::OptimizedBatchProcessor.
+
+  4. theia_master_resolver.h — coordinator running 4 phases
+     (BLAKE3 dict / pattern scan / batch CI / Epic FNAME_Find
+     fallback). Class FrostSDK::TheiaMasterResolver, struct
+     ResolutionStatistics for tracking, method
+     ExecuteFullResolution.
+
+  5. sdk_generator_theia_integration.h — drop-in subclass
+     SDKGen::TheiaIntegratedGenerator : public Generator that
+     overrides BuildSDK() to extract placeholders, run the
+     master resolver, and rewrite output.
+
+  6. test_theia_resolution.cpp — standalone test harness with
+     mock placeholders, per-component tests, and a 10K-entry
+     benchmark. UNTESTED — see "TEST ON WINDOWS" below.
+
+  7. IMPLEMENTATION_GUIDE.md — integration recipes (Option 1
+     1-line swap, Option 2 manual master resolver call,
+     Option 3 component-by-component).
+
+Reference docs added in same pass:
+  - status_06.05.26.md  (CL-1177678 RE state, 17 fn renames,
+    7 globals, decoder ecosystem)
+  - complete_function_analysis_06.05.26.md  (21-fn deep dive)
+  - theia_resolution_strategy.md  (3-phase strategy synthesis
+    from leaked source dumps)
+
+
+PENDING — INTEGRATION & VALIDATION (priority order)
+---------------------------------------------------
+P0  Wire TheiaIntegratedGenerator into main.cpp.
+    Single-line swap per IMPLEMENTATION_GUIDE.md Option 1:
+      SDKGen::Generator generator;
+      → SDKGen::TheiaIntegratedGenerator generator;
+    Verify build is still clean. Default behavior should be
+    no-op + statistics print when there are no placeholders.
+
+P0  Add the 7 new headers to FrostDumper.vcxproj
+    <ClInclude> group + test_theia_resolution.cpp to
+    <ClCompile> if we want it as a buildable test target.
+    (CLAUDE.md rule: missing files cause unresolved-extern
+    linker errors, easy to miss.)
+
+P0  TEST ON WINDOWS via the heredoc + cmd //C build pattern
+    documented in CLAUDE.md "Building C/C++ Projects".
+    The test harness writes printf-style output; capture
+    stdout on a real run and check:
+      - BLAKE3 dictionary builds without crash
+      - Mock CI 505 → "Object" / 506 → "World" etc. resolve
+      - Master resolver Phase 1-4 stats print
+      - 10K-entry benchmark completes <5s
+
+P1  Live in-game validation. With game running on
+    CL-1177678, run dumper with TheiaIntegratedGenerator
+    enabled. Check:
+      - Reports at SDK_Output.txt / Theia_Resolution_Report.txt
+        / Detailed_Analysis_Report.txt are emitted
+      - Resolution rate goes from baseline 97.1% → ≥99%
+      - No regression on already-resolved properties
+      - Total runtime stays under ~1.5× the pre-Theia run
+
+P1  CityHash64WithSeed implementation in
+    theia_blake3_extractor.h needs unit-validation against a
+    known reference (e.g. one of the leaked Epic samples in
+    /media/frost/Coding Stuf/Infos/theia*.txt). The constants
+    k0=0xc3a5c85c97cb3127 / k1=0xb492b66fbe98f273 /
+    k2=0x9ae16a3b2f90404f are correct, but the mixing /
+    final-mix steps need a sanity check before we trust the
+    ResolveOpaqueHash output.
+
+P2  Function-pointer addresses inside OptimizedBatchProcessor
+    (FunctionPointers struct) are hardcoded RVAs from
+    CL-1177678. They need:
+      - A live verification pass (read first byte at each
+        address, compare against the IDA prologue) before any
+        of the cross-process call attempts is allowed to fire
+      - Auto-rediscovery hook — string-anchor the same way
+        status_06.05.26.md found them, so the next patch
+        doesn't silently break this codepath
+
+P2  Test suite is g++/Linux. We're MSVC/Windows. Either:
+      - Build it as a console subproject under FrostDumper.sln
+        (preferred — exercises the same toolchain), or
+      - Strip it out of the production tree and keep it as a
+        ref-only sample.
+
+
+KNOWN ISSUES
+------------
+- Slot-decoder + FField offset shift to CL-1177678 already
+  shipped (see discovery_cl1177678_slot_decoder_solved.md and
+  discovery_cl1177678_ffield_offsets.md memories). Current
+  end-to-end stat baseline before Theia layer:
+    127,220 names @ 100% naming, 4004 structs + 2878 enums,
+    Properties 102K — i.e. ~37% of the reference SDK target.
+    Hybrid refSDK overlay (tools/sdk_postprocess.py) lifts
+    effective coverage to ~95%. Theia layer is meant to lift
+    the LIVE-only coverage closer to refSDK without the
+    overlay step.
+
+- No-op runs of the new resolver should be free (early-out
+  when Placeholders is empty) but this hasn't been verified.
+  Confirm before merging — we don't want it adding seconds
+  to every dump even when there's nothing to resolve.
+
+- Pattern scanner relies on at least one of the EAAntiCheat
+  16-byte key strings still being resident. Not validated on
+  the CL-1177678 pages — may need a pattern refresh.
+
+- Epic FNAME_Find fallback is a heuristic. On the lookup
+  list it MAY rename a real placeholder to a wrong but
+  plausible UE5 name. Need a confidence gate so fallback
+  results are tagged in the SDK output (e.g. /* heuristic */
+  comment) instead of silently overwriting OriginalName.
+
+
+NEXT-SESSION QUICK START
+------------------------
+1. Read CLAUDE.md project root section for CL-1177678 layout
+   constants — auto-loaded but worth re-reading the
+   "FField/FProperty offsets" + "engine type-pool vtable
+   RVAs" lines before touching any decode code.
+2. Open IMPLEMENTATION_GUIDE.md and pick Option 1 (1-line
+   swap) for first integration.
+3. Build via the heredoc .bat → cmd //C pattern from
+   CLAUDE.md. Do NOT try inline cmd //C "VsDevCmd.bat &&
+   msbuild" — it hangs. Rebuild as soon as any header is
+   added to vcxproj.
+4. Run dumper against live game; collect baseline stats from
+   one pre-Theia run + one post-Theia run for comparison.
+5. If resolution rate doesn't move ≥1.5pp, the BLAKE3 seed
+   is the most likely culprit. Validate
+   CityHash64WithSeed + dictionary build with a known input
+   first.
+6. NEVER spawn parallel memory-probe work — kernel
+   rate-limit overflow caused a 14-min hang last time.
+   Serialize all /dev/memreader access. IDA MCP work is fine
+   to parallelize.
+
+
+================================================================
+ARCHIVED (CL-1177146, 2026-05-02 → 2026-05-04 history)
 ================================================================
 
 WHAT SHIPPED 2026-05-03 (Option B — partial; only WIN bump kept)
@@ -22,238 +197,72 @@ REVERTED (load-bearing):
     slots without vtable filtering, so Pass A produced 21 noise
     runs that all failed density. Pass B kept 22 of 92K+ runs
     (largest=84733) but emitted only 46688 (vs ~70K NumElements).
-    Sample obj[0]=0x7B90CD00 with bytes "00 00 00 00 ... A0 51
-    91 4B 01 00 00 00 ..." — clearly not a UObject; structural
-    scan was harvesting heap noise.
 
 Final structural scan: still does per-slot vtable check (same
 as before). Just reads pages 4MB at a time instead of 64KB.
-This is a smaller speedup than the TODO predicted (the per-slot
-syscalls are the dominant cost, not the bulk reads).
 
 SECONDARY FIX (same day, 2026-05-03):
   Initial WIN=4MB version had a region-tail bug — `page + WIN
-  <= rg.hi` skipped any heap region smaller than 4MB. Heap
-  regions in the 1-4MB band (where smaller metaclass arrays
-  like UClass live) were entirely missed. Fixed by clamping
-  the per-iteration read to `min(WIN, rg.hi - page)` and the
-  inner offset cap to `this_win`. With the old 64KB window
-  the same bug existed but skipped only <64KB regions
-  (negligible).
-
-Build verified clean. Runtime VERIFIED 2026-05-03:
-  [p21] scan (MIN_RUN=32,MAX_GAP=64): 40124 runs (largest=153027);
-        total 70848 objs   ← matches NumElements=70592
-  [p21] scan pass A: 0 objs, pass B added 70848 (total 70848)
-  [p28] structural scan collected 70848 UObject pointers
-  [p28] vtable scan added 4668 UObject pointers (total 75516)
-  [autodisc-fnchk] sampled 32 actors: non_empty=21 looks_like_name=20  → PASS
-  Scan done: 54585 named, 20931 failed (72% naming rate)
-
-  Final SDK: 10807 classes / 3835 structs / 1223 enums /
-             24707 funcs / 370442 properties
-
-Pass A producing 0 objs is fine — its MAX_GAP=0+MIN_RUN=500
-requires no nulls in any chunk run; Pass B is more lenient
-(MAX_GAP=64) and catches the same objects. Likely held at
-baseline too.
-
-Counts vs baseline (14627 / 7946 / 2881 / 40826 / 180828):
-classes/structs/enums down ~24-58%, properties almost 2× up.
-Structural scan is correctness-equivalent — the deltas come
-from naming-rate variance (72% vs ~85%+) and BPGC PropertyLink
-walking inherited fields (TODO §6 documents this trade-off).
-
+  <= rg.hi` skipped any heap region smaller than 4MB. Fixed by
+  clamping the per-iteration read to `min(WIN, rg.hi - page)`
+  and the inner offset cap to `this_win`.
 
 WHAT SHIPPED 2026-05-02
-------------------
-1. arc_decrypt.h — Offsets:: namespace flipped from constexpr to inline
-   mutable globals so probe phases can overwrite at runtime. 108 consumer
-   sites unchanged. No constant-expression context broke.
+-----------------------
+1. arc_decrypt.h — Offsets:: namespace flipped from constexpr
+   to inline mutable globals so probe phases can overwrite at
+   runtime. 108 consumer sites unchanged.
+2. auto_offsets.h (NEW, ~600 lines) — Phase 9-15 live-probe
+   layout discovery (joint UStruct::ChildProperties +
+   FField::ClassPrivate, NamePrivate via hi64 dispersion,
+   UStruct::SuperStruct + PropertiesSize, UEnum::Names,
+   UClass::FuncMap_*, UFunction::NativeFunc/FunctionFlags,
+   FProperty subclass sub-pointers, ArrayDim/ElementSize).
+3. fname_decrypt.h — added SetEmuPrimary(bool) flag.
+4. main.cpp — Phase 0.6 sanity check + Phase 2 fallback.
+5. main.cpp — TryInitViaVtable7 short-circuits on plain
+   NumElements layout.
+6. auto_discovery.h — depth-2 BFS for chunks-array pointer
+   (doesn't find it on CL-1177146).
+7. auto_chunks_emu.h (NEW, ~350 lines) — Tier 1 function
+   emulation.
 
-2. auto_offsets.h (NEW, ~600 lines) — Phase 9-15 live-probe layout discovery:
-   - Joint UStruct::ChildProperties + FField::ClassPrivate (FFieldClass-pointer
-     oracle distinguishes FFields from UObjects)
-   - FField::Next chain validation via LooksLikeFField
-   - FField::NamePrivate via hi64 dispersion
-   - UStruct::SuperStruct + PropertiesSize (with dispersion gate to reject
-     flag-like constants)
-   - UEnum::Names with FName-decode validation (rejected the 0xD8 false positive)
-   - UClass::FuncMap_*, UFunction::NativeFunc/FunctionFlags
-   - FProperty subclass sub-pointers bucketed by FFieldClass type
-   - FProperty::ArrayDim / ElementSize with high consensus floor
-   - NumParms probe DROPPED (no reliable oracle — chain length includes return
-     + locals, not just input params)
-
-3. fname_decrypt.h — added SetEmuPrimary(bool) flag. When set, CompIndexToName
-   / CompIndexToNameLenient / GetName route through Unicorn FIRST and use
-   static decrypt only as fallback. main.cpp::Init auto-flips it on if Phase 0.6
-   sanity check fails AND emu fallback is armed.
-
-4. main.cpp — Phase 0.6 sanity check now falls back to seed sample when GWorld
-   doesn't validate (game in main menu). Phase 2 (FFieldName XOR) falls back
-   to UClass samples when ScriptStruct vtable wasn't detected.
-
-5. main.cpp — TryInitViaVtable7 short-circuits when GUObjectArray+0x30 looks
-   like plain NumElements (CL-1177146 layout). Misleading "Vt7 failed" warning
-   replaced with clean "going straight to structural scan" message.
-
-6. auto_discovery.h — DiscoverGUObjectArrayLayout depth-2 BFS for chunks-array
-   pointer. Doesn't find it on CL-1177146 (chunks-array isn't statically stored
-   — recomputed per access via SIMD+vt[3] call).
-
-7. auto_chunks_emu.h (NEW, ~350 lines) — Tier 1 function-emulation discovery.
-   Finds candidate functions via rip-rel SIMD loads to GUObjectArray, walks
-   back to function start, emulates with insn limit, scans regs for chunks_mgr
-   candidates, then emulates vt[3]/vt[7]/vt[5] to get chunks_array.
-   STATUS: builds clean, runs cleanly, but DOES NOT FIND CHUNKS_ARRAY YET.
-
-8. IDA findings saved to memory:
-   - project_chunks_pipeline_cl1177146.md
-   - feedback_chunks_simd_sig_unstable.md (cross-build sig test: 196 hits on
-     CL-1177146, 0 on Apr-02/14/21 — confirms sig-based auto-discovery is
-     single-patch only)
-
-
-WHAT SHIPPED 2026-05-04 (Option A — Tier 1 emulation now works)
----------------------------------------------------------------
+WHAT SHIPPED 2026-05-04 (Option A — Tier 1 emulation works)
+-----------------------------------------------------------
 auto_chunks_emu.h:
-  1. Cap lifted 12 → 256 distinct fn_starts. The original cap stopped
-     the search at RVA 0x32786A — far short of any chunks-pipeline fn.
-     With 256, hit-process counters now show: 256 distinct, 182 dup,
-     0 walkback_failed.
-  2. Walkback validation: WalkBackToFunctionStart now checks the
-     CC-walkback result against LooksLikePrologue (push reg / sub rsp /
-     mov [rsp+X], rXX / lea / mov rax,rcx / etc.). On reject, retries
-     up to 6× with the previous CC. Removes embedded-CC false starts
-     (e.g. 0x2C93EB landed inside a `cmp byte ptr [rip+disp32], imm`
-     instruction's disp32). Strict prologue check costs ~nothing — the
-     subsequent ~300-µs emulation per candidate dwarfs it.
-  3. SIMD pattern coverage extended: MOVDQU /r=25/2D/35/3D (xmm4-7),
-     MOVAPS /r=05..3D, MOVUPS /r=05..3D. Previous patterns missed any
-     load into xmm4-xmm7 that wasn't MOVDQA/MOVQ/PSHUFLW.
+  1. Cap lifted 12 → 256 distinct fn_starts.
+  2. Walkback validation via LooksLikePrologue, retries up to
+     6× with previous CC.
+  3. SIMD pattern coverage extended for xmm4-7 (MOVDQU /r=25/
+     2D/35/3D, MOVAPS /r=05..3D, MOVUPS /r=05..3D).
 
-  Result on 6093 (in-match):
-    [autoemu] 789 rip-rel loaders found targeting GUObjectArray's first 0x180 bytes
-    [autoemu] 256 distinct candidate functions (cap=256, walkback_failed=0, dup=182)
-    [autoemu] candidate fn @ rva=0x422856 — emulating
-    [autoemu]   1 chunks_manager candidate(s): 0x297F0F10
-    [autoemu] SUCCESS — chunks_manager=0x297F0F10 chunks_array=0x6AE53D60 vt[3] blob_off=+0x90
-    [canon] chunk[0] @ 0x7B470008: 65536 non-null, 65536 valid-vtable
-    [canon] chunk[1] @ 0x7B5C0008: 60335 non-null, 60335 valid-vtable
-    [canon] canonical enumeration: 125871 unique UObjects (expected ~70592)
+  Result on PID 6093 (in-match):
+    789 rip-rel loaders found targeting GUObjectArray+0x180
+    256 distinct candidate fns
+    SUCCESS via fn @ rva=0x422856 — chunks_manager=
+      0x297F0F10  chunks_array=0x6AE53D60  vt[3] blob_off=+0x90
+    canonical enumeration: 125871 unique UObjects (~70592 expected)
 
-  The fn that produced success was 0x422856 — NOT the documented
-  sub_4BD190 from project memory. Both functions read the same
-  GUObjectArray+0x10 blob via PSHUFLW(0x39)+XOR(AD40D20)+ROL32(15) and
-  emit chunks_manager via vt[3]. 0x422856 is a simpler caller (less
-  call-chain noise before the SIMD pipeline) so emulation reaches the
-  output without short-circuiting on intercepted-CALL zero returns.
+  Final SDK on CL-1177146:
+    18284 classes / 10915 structs / 2878 enums /
+    55354 functions / 198772 properties
+    126775 named, 251 failed (99.8%)
 
-  Game state: in-match (UWorld='PracticeRangeArray'). FName resolution
-  is at full quality here; main-menu state cuts it to ~80%.
-
-  Final SDK: 18284 classes / 10915 structs / 3045 enums / 55615 funcs
-             / 198847 properties.  126775 named, 251 failed (99.8%).
   After enum-gate tightening (sdk_generator.h Path A/C):
-             18284 / 10915 / 2878 / 55354 / 198772.
-  Removed ~167 pseudo-enums (UBoneWeightsAsset BWA_HM_*,
-  UAngelscriptClass AnimNotifyState_SetGameplayTags*, and similar
-  data-asset misclassifications). Real enums (ETeleportType,
-  EAttachmentRule, EBlendMode, EObjectTypeQuery, etc.) intact.
+    Removed ~167 pseudo-enums; real enums intact.
 
-  Comparison vs prior in-main-menu run (11233/4163/1130/24686/122090):
-    classes +63%, structs +163%, enums +169%, functions +125%, props +63%.
-    Naming rate jumped 80% → 99.8% — partly from in-match state, partly
-    from canonical chunks doubling object count from 70k → 127k.
+  Reference target (CLAUDE.md §6 "Reference"):
+    21453 / 9355 / 2340 / 41093 / 275843
+    Structs/enums/functions exceed reference;
+    classes 85% of target, properties 72%.
 
-  Reference target (CLAUDE.md §6 "Reference"): 21453/9355/2340/41093/275843.
-    Structs/enums/functions now exceed reference (PropertyLink-walk
-    inflation expected); classes at 85% of target, properties at 72%.
-
-
-OPEN DECISION (pick one for next session)
------------------------------------------
-For STRUCTURAL-SCAN speedup beyond the 4MB-window win:
-  X — drop per-slot vtable check (TRIED 2026-05-03, FAILED — see above)
-  - Batch-validate obj pointers per run after detection. Collect heap-
-    shaped slots first (no vtable check), then for each run sort obj_ptrs
-    by address proximity and bulk-read groups via process_vm_readv with
-    multiple iovecs (1024 per syscall). Less critical now that autoemu
-    canonical walk covers the path.
-
-Class vtable still NOT FOUND in autodisc-vt cluster (compile-time
-0xAD9E500 is correct — wide-string anchor finds it). The cluster gate
-drops it because the ClassNative oracle name list doesn't match enough
-of the live UClass instance set in PracticeRangeArray map. Loosen the
-oracle (more names) or lower the floor for kind=KCLASS_NATIVE.
-
-WBPGC autodisc found 0xC199910 not 0xB35B400 — but compile-time
-fallback list still has 0xB35B400 from CLAUDE.md, and the live
-0xC199910 isn't seeded into knownTypeVtables. Investigate whether
-0xC199910 is the new patch-shifted WBPGC or a sibling type
-(WidgetBlueprintGeneratedClass subclass).
-
-OPTION C — PE on-disk fallback for autoemu cold-page recovery.
-The current autoemu only succeeds when the candidate fn's pages are
-fault-resolvable from live memory. Some candidate fns end up on
-VMProtect cold pages where process_vm_readv returns zero. The
-EmuEngine PE-on-disk fallback isn't currently set up
-("[pe] no PE binary found ... — PE fallback disabled"). Pointing it
-at the actual binary in the Wine prefix would expand coverage.
-
-
-KNOWN MINOR ISSUES (lower priority)
------------------------------------
-- Phase 3 (FProperty Offset XOR): "no validated load+xor+bswap sites in
-  plausible range". Compile-time const is correct on CL-1177146 so it's not
-  blocking, but on a future patch this would silently keep the wrong value.
-  Either loosen the range gate or add a plausibility cross-check.
-
-- Phase 1 vtable cluster scoring is flaky — sometimes finds Class but misses
-  ScriptStruct (or vice versa) depending on which names happen to resolve in
-  the random sample. Phase 2 fallback handles it but means probe quality
-  depends on luck.
-
-- Legacy SIMD tables (cidxXor1, blkSlotShuf, etc.) read OUT OF BOUNDS on
-  CL-1177146. They're stale 20260421 RVAs. The static FName path is degraded
-  but the inline-handle path + auto-extracted ENTRY_HANDLE_XOR keep it
-  partially working. Auto-flip to emu-primary handles the hard cases.
-
-
-CURRENT STATE — VERIFIED ON CL-1177146 (2026-05-04)
----------------------------------------------------
-- Build: clean, FrostDumper @ ~1.4 MB
-- Run (in-match map=PracticeRangeArray, PID 6093):
-    Final SDK: 18284 classes / 10915 structs / 2878 enums /
-               55354 functions / 198772 properties
-    Naming: 126775 named, 251 failed (99.8%)
-- Sanity check: PASS (32/32 names look like names)
-- Auto-offsets: every probe matches its compile-time constant
-  (SuperStruct +0xB0, PropertiesSize +0xD8, UEnum::Names +0xB0,
-  FunctionFlags +0x130, ArrayDim +0xF0, ElementSize +0xF8,
-  Offset_Internal XOR 0x40277448, NamePrivate slot XOR
-  0x5EA772D07F910744, FFieldClass NamePrivate +0x40)
-- Autoemu Tier 1: SUCCESS via fn @ rva=0x422856, vt[3], blob_off=+0x90
-- Wide-string vtable anchor: finds all 4 engine roots
-  (ScriptStruct/Class/Function/Enum) via .rdata UTF-16 kind strings
-
-
-NEXT-SESSION QUICK START
-------------------------
-1. Run: sudo ./build_and_run.sh <PID>
-2. Check the [autoemu] section — should print SUCCESS line with
-   chunks_manager / chunks_array / vt[N] / blob_off. If it falls
-   through, look at which fn_starts were tried (cap=256 should cover
-   most cases on CL-1177146; future patches may need pattern updates
-   in FindGUObjectArrayLoaders).
-3. Check the [autoff] section near the end — every probe should report
-   "matches constant 0x...". If anything still drifts, the probe oracle
-   needs tightening.
-4. Run again in main-menu state to confirm autoemu still works there
-   (FName resolution will be degraded to ~80% but autoemu shouldn't
-   regress — it doesn't depend on map state).
-5. Memory pointers (auto-load):
-   - project_chunks_pipeline_cl1177146.md
-   - feedback_chunks_simd_sig_unstable.md
-   - Existing CLAUDE.md project doc covers everything else
+OPEN ITEMS (CL-1177146, may still be relevant)
+----------------------------------------------
+- Class vtable cluster oracle floor too high for KCLASS_NATIVE.
+- WBPGC autodisc found 0xC199910 (sibling type? unverified).
+- Phase 3 FProperty Offset XOR plausibility cross-check.
+- Phase 1 vtable cluster scoring depends on random sample luck.
+- Legacy SIMD tables (cidxXor1, blkSlotShuf, etc.) read OOB on
+  CL-1177146 — stale 20260421 RVAs.
+- Option C: PE on-disk fallback for autoemu cold-page recovery
+  — not currently set up.

@@ -59,6 +59,7 @@
 using FNameDecryptor = FName::FNameDecryptor;
 #include "auto_offsets.h"
 #include "auto_chunks_emu.h"
+#include "auto_export.h"
 #include "sdk_generator.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -516,6 +517,12 @@ public:
                 (unsigned long long)ArcDecrypt::RVA_GWORLD);
         }
 
+        // Earliest snapshot — fires before any failure-prone live-memory
+        // bootstrapping (FName key table read, Unicorn boot, GObjectArray
+        // init). Captures auto-discovery output even when later phases
+        // bail out on a busted memreader / unfortunate game state.
+        AutoExport::WriteAll("decrypt_export.json", MODULE_BASE);
+
         // Init FName key table + SIMD tables
         if (!m_fname.Init()) {
             std::cerr << "[-] Failed to read FName key table / SIMD tables\n";
@@ -568,6 +575,11 @@ public:
                 AutoDiscovery::g_DiscoveredBounds,
                 pe_path.empty() ? nullptr : pe_path.c_str(),
                 EmuMapSize);
+            AutoChunksEmu::g_LastResult = emu_result;
+            // Early snapshot — captures everything discovered so far. If a
+            // later phase hangs (sanity check / auto-offsets / FName boot),
+            // the JSON still has chunks_emu + Phase 3/4/7/8 results.
+            AutoExport::WriteAll("decrypt_export.json", MODULE_BASE);
             if (emu_result.Valid) {
                 if (m_gobj.InitFromChunksCanonical(emu_result.ChunksArray,
                                                    emu_result.NumChunks,
@@ -714,41 +726,44 @@ public:
             AutoDiscovery::g_DiscoveredWorld.GWorldAbs)
         {
             UWorldPtr = AutoDiscovery::g_DiscoveredWorld.GWorldAbs;
-        } else {
+        } else if (AutoDiscovery::g_DiscoveredBounds.Valid) {
             // Try compile-time GWorld RVAs as a fallback. NewESP's verified
             // CL-1177146 value is 0xE07CFD8; the FrostSDKDumper compile-time
-            // is 0xDFDB4D8 (older patch). Try both, with both single and
-            // double deref. UE5 typically uses double-deref (the .data slot
-            // holds a pointer-to-pointer to keep the UWorld pointer stable
-            // across hot-reload).
+            // is 0xDFDB4D8 (older patch). UE5 GWorld is double-deref on this
+            // build (the .data slot holds a pointer-to-pointer for stable
+            // hot-reload), so single-deref candidates are silently rejected
+            // here — they typically point at unrelated UObjects (e.g. the
+            // current Discovery-tab item) and would mislabel the map.
+            //
+            // VALIDATION: candidate must pass the same PL+Actors+Levels[0]
+            // check that auto_discovery's Phase 0.5 runs. A vtable-in-module
+            // check alone isn't enough — every UObject passes that, and an
+            // un-validated candidate produced wrong map names like
+            // 'ApiGatewayDiscoveryGameItem' from non-UWorld pointers.
             const uint64_t kCandidateRvas[] = {
                 ArcDecrypt::RVA_GWORLD,   // current dumper compile-time
                 0xE07CFD8ULL,             // NewESP-verified CL-1177146
             };
-            auto LooksLikeUWorld = [&](uint64_t Ptr) -> bool {
-                if (!Ptr || Ptr < 0x10000ULL || Ptr >= 0x800000000000ULL) return false;
-                uint64_t Vt = 0;
-                if (!m_reader.Read(Ptr, &Vt, 8)) return false;
-                return Vt >= MODULE_BASE && Vt < MODULE_BASE + 0x10000000ULL;
-            };
             for (uint64_t Rva : kCandidateRvas) {
                 uint64_t Slot = 0;
                 if (!m_reader.Read(MODULE_BASE + Rva, &Slot, 8) || !Slot) continue;
-                // Single-deref: slot itself IS the UWorld*.
-                if (LooksLikeUWorld(Slot)) {
-                    UWorldPtr = Slot;
-                    std::printf("[autodisc-mapstate] resolved UWorld via single-deref @ RVA 0x%llX -> 0x%llX\n",
-                        (unsigned long long)Rva, (unsigned long long)UWorldPtr);
-                    break;
-                }
-                // Double-deref: slot points to a heap location holding the
-                // real UWorld* (NewESP / older UE5 layout).
+                if (Slot < 0x10000ULL || Slot >= 0x800000000000ULL) continue;
                 uint64_t Inner = 0;
-                if (m_reader.Read(Slot, &Inner, 8) && LooksLikeUWorld(Inner)) {
+                if (!m_reader.Read(Slot, &Inner, 8) || !Inner) continue;
+                if (Inner < 0x10000ULL || Inner >= 0x800000000000ULL) continue;
+                uint32_t PlOff = 0, AlOff = 0, AcOff = 0;
+                int Actors = 0;
+                if (AutoDiscovery::ValidateUWorldCandidate(
+                        m_reader, MODULE_BASE, Inner,
+                        AutoDiscovery::g_DiscoveredBounds,
+                        PlOff, AlOff, AcOff, Actors))
+                {
                     UWorldPtr = Inner;
-                    std::printf("[autodisc-mapstate] resolved UWorld via double-deref @ RVA 0x%llX -> 0x%llX -> 0x%llX\n",
+                    std::printf("[autodisc-mapstate] resolved UWorld via double-deref @ RVA 0x%llX -> 0x%llX -> 0x%llX (PL+0x%X Actors+0x%X count=%d)\n",
                         (unsigned long long)Rva,
-                        (unsigned long long)Slot, (unsigned long long)UWorldPtr);
+                        (unsigned long long)Slot,
+                        (unsigned long long)UWorldPtr,
+                        PlOff, AlOff, Actors);
                     break;
                 }
             }
@@ -913,6 +928,12 @@ public:
         // (FProperty Offset_Internal XOR key auto-discovery already ran
         // inside the SigScanV2 init block above; the discovered value is in
         // ArcDecrypt::Patch20260421::g_PropertyOffsetXor.)
+
+        // Snapshot every runtime-resolved decryption constant / offset /
+        // anchor to a JSON file next to SDK_Output.txt. Forensic trail for
+        // patch days + consumable by external tooling.
+        AutoExport::WriteAll("decrypt_export.json", MODULE_BASE);
+
         return true;
     }
 

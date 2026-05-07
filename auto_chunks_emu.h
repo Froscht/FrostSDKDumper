@@ -523,4 +523,6 @@ inline Result Discover(IMemoryReader& reader, uint64_t module_base,
     return out;
 }
 
+inline Result g_LastResult;
+
 }  // namespace AutoChunksEmu
