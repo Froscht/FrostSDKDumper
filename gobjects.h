@@ -257,70 +257,110 @@ namespace gobjects
                 if (Va && Stride) vt_targets.push_back({Va, Stride});
             };
 
-            // Compile-time CL-1177146 baseline — always scan engine type-pool
-            // vtables so autodisc misses (e.g. WBPGC oracle scoring 0xC199910
-            // over engine 0xB35B400 because of small cluster) don't drop
-            // engine coverage.
-            struct Vt { uint64_t Rva; uint32_t Stride; };
-            static constexpr Vt CompileTime[] = {
-                { 0xAD9DC20, 0x130 },  // UScriptStruct  (CL-1177146)
-                { 0xAD9E500, 0x300 },  // UClass         (CL-1177146)
-                { 0xAD9EA70, 0x200 },  // UFunction      (CL-1177146)
-                { 0xADA1140, 0x130 },  // UEnum          (CL-1177146)
-                { 0xADBC9A0, 0x000 },  // UPackage       (CL-1177146)
-                { 0xB5653C0, 0x490 },  // BPGC           (CL-1177146)
-                { 0xB35B400, 0x5D0 },  // WBPGC          (CL-1177146)
-                { 0xB512510, 0x7F0 },  // AnimBPGC       (CL-1177146)
-                { 0xB7BBCF0, 0x490 },  // SMBPGC         (CL-1177146)
-                { 0xB8ED140, 0x340 },  // ASClass        (CL-1177146)
-                { 0xB8F6920, 0x150 },  // ASStruct       (CL-1177146)
-                { 0xB8EDA70, 0x200 },  // ASFunction-A   (CL-1177146)
-                { 0xB8EDEC0, 0x200 },  // ASFunction-B   (CL-1177146)
-                { 0xADF4820, 0x130 },  // UScriptStruct  (CL-1177678)
-                { 0xB63A840, 0x300 },  // UClass         (CL-1177678)
-                { 0xB940DC0, 0x200 },  // UFunction      (CL-1177678)
-                { 0xADF7AC0, 0x130 },  // UEnum          (CL-1177678)
-                { 0xAE13030, 0x000 },  // UPackage       (CL-1177678)
-                { 0xB583B90, 0x490 },  // BPGC           (CL-1177678)
-                { 0xB3AF490, 0x5D0 },  // WBPGC          (CL-1177678)
-                { 0xBECF7F0, 0x7F0 },  // AnimBPGC       (CL-1177678)
+            // Compile-time CL-1177146/CL-1177678 baseline — fallback ONLY for
+            // kinds that auto-discovery missed. When Phase 1 returns a live
+            // RVA for a kind, we skip the compile-time entries tagged with
+            // that kind: stale RVAs from older patches generate +0-hit noise
+            // and obscure which scans actually matter.
+            enum VtKind {
+                KIND_ScriptStruct, KIND_Class, KIND_Function, KIND_Enum,
+                KIND_Package, KIND_BPGC, KIND_WBPGC, KIND_AnimBPGC,
+                KIND_SMBPGC, KIND_ASClass, KIND_ASStruct, KIND_ASFunction
             };
-            for (const auto& v : CompileTime) {
-                AddIf(v.Rva);
-                AddTargetIf(m_base + v.Rva, v.Stride);
-            }
+            auto KindName = [](VtKind k) -> const char* {
+                switch (k) {
+                    case KIND_ScriptStruct: return "ScriptStruct";
+                    case KIND_Class:        return "Class";
+                    case KIND_Function:     return "Function";
+                    case KIND_Enum:         return "Enum";
+                    case KIND_Package:      return "Package";
+                    case KIND_BPGC:         return "BPGC";
+                    case KIND_WBPGC:        return "WBPGC";
+                    case KIND_AnimBPGC:     return "AnimBPGC";
+                    case KIND_SMBPGC:       return "SMBPGC";
+                    case KIND_ASClass:      return "ASClass";
+                    case KIND_ASStruct:     return "ASStruct";
+                    case KIND_ASFunction:   return "ASFunction";
+                }
+                return "?";
+            };
+            struct Vt { uint64_t Rva; uint32_t Stride; VtKind Kind; const char* Tag; };
+            static constexpr Vt CompileTime[] = {
+                { 0xAD9DC20, 0x130, KIND_ScriptStruct, "CL-1177146" },
+                { 0xAD9E500, 0x300, KIND_Class,        "CL-1177146" },
+                { 0xAD9EA70, 0x200, KIND_Function,     "CL-1177146" },
+                { 0xADA1140, 0x130, KIND_Enum,         "CL-1177146" },
+                { 0xADBC9A0, 0x000, KIND_Package,      "CL-1177146" },
+                { 0xB5653C0, 0x490, KIND_BPGC,         "CL-1177146" },
+                { 0xB35B400, 0x5D0, KIND_WBPGC,        "CL-1177146" },
+                { 0xB512510, 0x7F0, KIND_AnimBPGC,     "CL-1177146" },
+                { 0xB7BBCF0, 0x490, KIND_SMBPGC,       "CL-1177146" },
+                { 0xB8ED140, 0x340, KIND_ASClass,      "CL-1177146" },
+                { 0xB8F6920, 0x150, KIND_ASStruct,     "CL-1177146" },
+                { 0xB8EDA70, 0x200, KIND_ASFunction,   "CL-1177146" },
+                { 0xB8EDEC0, 0x200, KIND_ASFunction,   "CL-1177146" },
+                { 0xADF4820, 0x130, KIND_ScriptStruct, "CL-1177678" },
+                { 0xB63A840, 0x300, KIND_Class,        "CL-1177678" },
+                { 0xB940DC0, 0x200, KIND_Function,     "CL-1177678" },
+                { 0xADF7AC0, 0x130, KIND_Enum,         "CL-1177678" },
+                { 0xAE13030, 0x000, KIND_Package,      "CL-1177678" },
+                { 0xB583B90, 0x490, KIND_BPGC,         "CL-1177678" },
+                { 0xB3AF490, 0x5D0, KIND_WBPGC,        "CL-1177678" },
+                { 0xBECF7F0, 0x7F0, KIND_AnimBPGC,     "CL-1177678" },
+            };
+            auto KindCovered = [&](VtKind k) -> bool {
+                if (!UseDiscovered) return false;
+                switch (k) {
+                    case KIND_ScriptStruct: return Disc.ScriptStructRVA != 0;
+                    case KIND_Class:        return Disc.ClassNativeRVA  != 0;
+                    case KIND_Function:     return Disc.FunctionRVA     != 0;
+                    case KIND_Enum:         return Disc.EnumRVA         != 0;
+                    case KIND_Package:      return Disc.PackageRVA      != 0;
+                    case KIND_BPGC:         return Disc.BPGCRVA         != 0;
+                    case KIND_WBPGC:        return Disc.WBPGCRVA        != 0;
+                    case KIND_AnimBPGC:     return Disc.AnimBPGCRVA     != 0;
+                    case KIND_SMBPGC:       return Disc.SMBPGCRVA       != 0;
+                    case KIND_ASClass:      return Disc.ASClassRVA      != 0;
+                    case KIND_ASStruct:     return Disc.ASStructRVA     != 0;
+                    case KIND_ASFunction:   return !Disc.ASFunctionRVAs.empty();
+                }
+                return false;
+            };
 
+            // Phase 1 entries FIRST — these are live, per-session RVAs.
             if (UseDiscovered) {
-                std::printf("[vt-rescan] union: compile-time + auto-discovered vtable map\n");
-                AddIf(Disc.ScriptStructRVA); AddIf(Disc.ClassNativeRVA);
-                AddIf(Disc.FunctionRVA);     AddIf(Disc.EnumRVA);
-                AddIf(Disc.PackageRVA);      AddIf(Disc.BPGCRVA);
-                AddIf(Disc.WBPGCRVA);        AddIf(Disc.SMBPGCRVA);
-                AddIf(Disc.AnimBPGCRVA);     AddIf(Disc.ASClassRVA);
-                AddIf(Disc.ASStructRVA);
-                for (uint64_t Rva : Disc.ASFunctionRVAs) AddIf(Rva);
-
-                auto AddTargetIfNew = [&](uint64_t Rva, uint32_t Stride) {
-                    if (!Rva || !Stride) return;
-                    uint64_t Va = m_base + Rva;
-                    for (const auto& t : vt_targets)
-                        if (t.target_vt == Va) return;
-                    vt_targets.push_back({Va, Stride});
+                std::printf("[vt-rescan] auto-discovered vtable map takes priority\n");
+                auto AddDisc = [&](VtKind k, uint64_t Rva, uint32_t Stride) {
+                    if (!Rva) return;
+                    AddIf(Rva);
+                    AddTargetIf(m_base + Rva, Stride);
+                    std::printf("[vt-rescan]   [autodisc] %-12s RVA=0x%llX stride=0x%X\n",
+                        KindName(k), (unsigned long long)Rva, Stride);
                 };
-                AddTargetIfNew(Disc.ScriptStructRVA, Disc.ScriptStructStride);
-                AddTargetIfNew(Disc.ClassNativeRVA,  Disc.ClassNativeStride);
-                AddTargetIfNew(Disc.FunctionRVA,     Disc.FunctionStride);
-                AddTargetIfNew(Disc.EnumRVA,         Disc.EnumStride);
-                AddTargetIfNew(Disc.BPGCRVA,         Disc.BPGCStride);
-                AddTargetIfNew(Disc.WBPGCRVA,        Disc.WBPGCStride);
-                AddTargetIfNew(Disc.AnimBPGCRVA,     Disc.AnimBPGCStride);
-                AddTargetIfNew(Disc.SMBPGCRVA,       Disc.SMBPGCStride);
-                AddTargetIfNew(Disc.ASClassRVA,      Disc.ASClassStride);
-                AddTargetIfNew(Disc.ASStructRVA,     Disc.ASStructStride);
+                AddDisc(KIND_ScriptStruct, Disc.ScriptStructRVA, Disc.ScriptStructStride);
+                AddDisc(KIND_Class,        Disc.ClassNativeRVA,  Disc.ClassNativeStride);
+                AddDisc(KIND_Function,     Disc.FunctionRVA,     Disc.FunctionStride);
+                AddDisc(KIND_Enum,         Disc.EnumRVA,         Disc.EnumStride);
+                AddDisc(KIND_Package,      Disc.PackageRVA,      0);
+                AddDisc(KIND_BPGC,         Disc.BPGCRVA,         Disc.BPGCStride);
+                AddDisc(KIND_WBPGC,        Disc.WBPGCRVA,        Disc.WBPGCStride);
+                AddDisc(KIND_AnimBPGC,     Disc.AnimBPGCRVA,     Disc.AnimBPGCStride);
+                AddDisc(KIND_SMBPGC,       Disc.SMBPGCRVA,       Disc.SMBPGCStride);
+                AddDisc(KIND_ASClass,      Disc.ASClassRVA,      Disc.ASClassStride);
+                AddDisc(KIND_ASStruct,     Disc.ASStructRVA,     Disc.ASStructStride);
                 for (uint64_t Rva : Disc.ASFunctionRVAs)
-                    AddTargetIfNew(Rva, Disc.ASFunctionStride);
+                    AddDisc(KIND_ASFunction, Rva, Disc.ASFunctionStride);
             } else {
                 std::printf("[vt-rescan] auto-discovery unavailable; compile-time vtable list only\n");
+            }
+
+            // Compile-time fallback ONLY for kinds Phase 1 didn't cover.
+            for (const auto& v : CompileTime) {
+                if (KindCovered(v.Kind)) continue;
+                AddIf(v.Rva);
+                AddTargetIf(m_base + v.Rva, v.Stride);
+                std::printf("[vt-rescan]   [fallback %s] %-12s RVA=0x%llX stride=0x%X\n",
+                    v.Tag, KindName(v.Kind), (unsigned long long)v.Rva, v.Stride);
             }
 
             size_t pre = m_worldFallbackObjects.size();
@@ -1304,81 +1344,110 @@ namespace gobjects
             std::vector<VtableScanTarget> vt_targets;
             m_knownTypeVtables.clear();
 
-            // Compile-time CL-1177146 baseline — engine type-pool vtables
-            // verified live 2026-04-30. Always scan these so the autodisc
-            // map (which can miss classes whose name oracles don't fire on
-            // small clusters, e.g. WBPGC scored at 0xC199910 instead of
-            // engine 0xB35B400) doesn't leave engine vtables unscanned.
-            struct Vt { uint64_t Rva; uint32_t Stride; };
-            static constexpr Vt CompileTime[] = {
-                { 0xAD9DC20, 0x130 },  // UScriptStruct                          (CL-1177146)
-                { 0xAD9E500, 0x300 },  // UClass (native)                        (CL-1177146)
-                { 0xAD9EA70, 0x200 },  // UFunction                              (CL-1177146)
-                { 0xADA1140, 0x130 },  // UEnum                                  (CL-1177146)
-                { 0xADBC9A0, 0x000 },  // UPackage (no neighbor stride)          (CL-1177146)
-                { 0xB5653C0, 0x490 },  // UBlueprintGeneratedClass               (CL-1177146)
-                { 0xB35B400, 0x5D0 },  // UWidgetBlueprintGeneratedClass         (CL-1177146)
-                { 0xB512510, 0x7F0 },  // UAnimBlueprintGeneratedClass           (CL-1177146)
-                { 0xB7BBCF0, 0x490 },  // USkeletalMeshBlueprintGeneratedClass   (CL-1177146)
-                { 0xB8ED140, 0x340 },  // UASClass (AngelScript)                 (CL-1177146)
-                { 0xB8F6920, 0x150 },  // UASStruct (AngelScript)                (CL-1177146)
-                { 0xB8EDA70, 0x200 },  // ASFunction subclass A (Tick-shape)     (CL-1177146)
-                { 0xB8EDEC0, 0x200 },  // ASFunction subclass B (Destruct-shape) (CL-1177146)
-                { 0xADF4820, 0x130 },  // UScriptStruct                          (CL-1177678)
-                { 0xB63A840, 0x300 },  // UClass (native)                        (CL-1177678)
-                { 0xB940DC0, 0x200 },  // UFunction                              (CL-1177678)
-                { 0xADF7AC0, 0x130 },  // UEnum                                  (CL-1177678)
-                { 0xAE13030, 0x000 },  // UPackage                               (CL-1177678)
-                { 0xB583B90, 0x490 },  // UBlueprintGeneratedClass               (CL-1177678)
-                { 0xB3AF490, 0x5D0 },  // UWidgetBlueprintGeneratedClass         (CL-1177678)
-                { 0xBECF7F0, 0x7F0 },  // UAnimBlueprintGeneratedClass           (CL-1177678)
+            // Compile-time CL-1177146/CL-1177678 baseline — fallback ONLY for
+            // kinds Phase 1 missed. Stale RVAs from older patches generate
+            // +0-hit log noise and steal scan budget from live vtables, so
+            // when auto-discovery has a live RVA for a kind we skip every
+            // compile-time entry tagged with that kind.
+            enum VtKind {
+                KIND_ScriptStruct, KIND_Class, KIND_Function, KIND_Enum,
+                KIND_Package, KIND_BPGC, KIND_WBPGC, KIND_AnimBPGC,
+                KIND_SMBPGC, KIND_ASClass, KIND_ASStruct, KIND_ASFunction
             };
-            for (const auto& v : CompileTime) {
-                AddIf(m_knownTypeVtables, v.Rva);
-                AddTargetIf(vt_targets, m_base + v.Rva, v.Stride);
-            }
+            auto KindName = [](VtKind k) -> const char* {
+                switch (k) {
+                    case KIND_ScriptStruct: return "ScriptStruct";
+                    case KIND_Class:        return "Class";
+                    case KIND_Function:     return "Function";
+                    case KIND_Enum:         return "Enum";
+                    case KIND_Package:      return "Package";
+                    case KIND_BPGC:         return "BPGC";
+                    case KIND_WBPGC:        return "WBPGC";
+                    case KIND_AnimBPGC:     return "AnimBPGC";
+                    case KIND_SMBPGC:       return "SMBPGC";
+                    case KIND_ASClass:      return "ASClass";
+                    case KIND_ASStruct:     return "ASStruct";
+                    case KIND_ASFunction:   return "ASFunction";
+                }
+                return "?";
+            };
+            struct Vt { uint64_t Rva; uint32_t Stride; VtKind Kind; const char* Tag; };
+            static constexpr Vt CompileTime[] = {
+                { 0xAD9DC20, 0x130, KIND_ScriptStruct, "CL-1177146" },
+                { 0xAD9E500, 0x300, KIND_Class,        "CL-1177146" },
+                { 0xAD9EA70, 0x200, KIND_Function,     "CL-1177146" },
+                { 0xADA1140, 0x130, KIND_Enum,         "CL-1177146" },
+                { 0xADBC9A0, 0x000, KIND_Package,      "CL-1177146" },
+                { 0xB5653C0, 0x490, KIND_BPGC,         "CL-1177146" },
+                { 0xB35B400, 0x5D0, KIND_WBPGC,        "CL-1177146" },
+                { 0xB512510, 0x7F0, KIND_AnimBPGC,     "CL-1177146" },
+                { 0xB7BBCF0, 0x490, KIND_SMBPGC,       "CL-1177146" },
+                { 0xB8ED140, 0x340, KIND_ASClass,      "CL-1177146" },
+                { 0xB8F6920, 0x150, KIND_ASStruct,     "CL-1177146" },
+                { 0xB8EDA70, 0x200, KIND_ASFunction,   "CL-1177146" },
+                { 0xB8EDEC0, 0x200, KIND_ASFunction,   "CL-1177146" },
+                { 0xADF4820, 0x130, KIND_ScriptStruct, "CL-1177678" },
+                { 0xB63A840, 0x300, KIND_Class,        "CL-1177678" },
+                { 0xB940DC0, 0x200, KIND_Function,     "CL-1177678" },
+                { 0xADF7AC0, 0x130, KIND_Enum,         "CL-1177678" },
+                { 0xAE13030, 0x000, KIND_Package,      "CL-1177678" },
+                { 0xB583B90, 0x490, KIND_BPGC,         "CL-1177678" },
+                { 0xB3AF490, 0x5D0, KIND_WBPGC,        "CL-1177678" },
+                { 0xBECF7F0, 0x7F0, KIND_AnimBPGC,     "CL-1177678" },
+            };
+            auto KindCovered = [&](VtKind k) -> bool {
+                if (!UseDiscovered) return false;
+                switch (k) {
+                    case KIND_ScriptStruct: return Disc.ScriptStructRVA != 0;
+                    case KIND_Class:        return Disc.ClassNativeRVA  != 0;
+                    case KIND_Function:     return Disc.FunctionRVA     != 0;
+                    case KIND_Enum:         return Disc.EnumRVA         != 0;
+                    case KIND_Package:      return Disc.PackageRVA      != 0;
+                    case KIND_BPGC:         return Disc.BPGCRVA         != 0;
+                    case KIND_WBPGC:        return Disc.WBPGCRVA        != 0;
+                    case KIND_AnimBPGC:     return Disc.AnimBPGCRVA     != 0;
+                    case KIND_SMBPGC:       return Disc.SMBPGCRVA       != 0;
+                    case KIND_ASClass:      return Disc.ASClassRVA      != 0;
+                    case KIND_ASStruct:     return Disc.ASStructRVA     != 0;
+                    case KIND_ASFunction:   return !Disc.ASFunctionRVAs.empty();
+                }
+                return false;
+            };
 
+            // Phase 1 entries FIRST — these are live, per-session RVAs.
             if (UseDiscovered) {
-                std::printf("[p28] union: compile-time + auto-discovered vtable map\n");
-                // Add any auto-discovered vtables not in the compile-time list.
-                // Game-specific BPGC subtypes (e.g. UDataAssetClass clusters)
-                // and patch-shifted variants get scanned without losing engine
-                // baseline coverage.
-                AddIf(m_knownTypeVtables, Disc.ScriptStructRVA);
-                AddIf(m_knownTypeVtables, Disc.ClassNativeRVA);
-                AddIf(m_knownTypeVtables, Disc.FunctionRVA);
-                AddIf(m_knownTypeVtables, Disc.EnumRVA);
-                AddIf(m_knownTypeVtables, Disc.PackageRVA);
-                AddIf(m_knownTypeVtables, Disc.BPGCRVA);
-                AddIf(m_knownTypeVtables, Disc.WBPGCRVA);
-                AddIf(m_knownTypeVtables, Disc.SMBPGCRVA);
-                AddIf(m_knownTypeVtables, Disc.AnimBPGCRVA);
-                AddIf(m_knownTypeVtables, Disc.ASClassRVA);
-                AddIf(m_knownTypeVtables, Disc.ASStructRVA);
-                for (uint64_t Rva : Disc.ASFunctionRVAs)
+                std::printf("[p28] auto-discovered vtable map takes priority\n");
+                auto AddDisc = [&](VtKind k, uint64_t Rva, uint32_t Stride) {
+                    if (!Rva) return;
                     AddIf(m_knownTypeVtables, Rva);
-
-                auto AddTargetIfNew = [&](uint64_t Rva, uint32_t Stride) {
-                    if (!Rva || !Stride) return;
-                    uint64_t Va = m_base + Rva;
-                    for (const auto& t : vt_targets)
-                        if (t.target_vt == Va) return;
-                    vt_targets.push_back({Va, Stride});
+                    AddTargetIf(vt_targets, m_base + Rva, Stride);
+                    std::printf("[p28]   [autodisc] %-12s RVA=0x%llX stride=0x%X\n",
+                        KindName(k), (unsigned long long)Rva, Stride);
                 };
-                AddTargetIfNew(Disc.ScriptStructRVA, Disc.ScriptStructStride);
-                AddTargetIfNew(Disc.ClassNativeRVA,  Disc.ClassNativeStride);
-                AddTargetIfNew(Disc.FunctionRVA,     Disc.FunctionStride);
-                AddTargetIfNew(Disc.EnumRVA,         Disc.EnumStride);
-                AddTargetIfNew(Disc.BPGCRVA,         Disc.BPGCStride);
-                AddTargetIfNew(Disc.WBPGCRVA,        Disc.WBPGCStride);
-                AddTargetIfNew(Disc.AnimBPGCRVA,     Disc.AnimBPGCStride);
-                AddTargetIfNew(Disc.SMBPGCRVA,       Disc.SMBPGCStride);
-                AddTargetIfNew(Disc.ASClassRVA,      Disc.ASClassStride);
-                AddTargetIfNew(Disc.ASStructRVA,     Disc.ASStructStride);
+                AddDisc(KIND_ScriptStruct, Disc.ScriptStructRVA, Disc.ScriptStructStride);
+                AddDisc(KIND_Class,        Disc.ClassNativeRVA,  Disc.ClassNativeStride);
+                AddDisc(KIND_Function,     Disc.FunctionRVA,     Disc.FunctionStride);
+                AddDisc(KIND_Enum,         Disc.EnumRVA,         Disc.EnumStride);
+                AddDisc(KIND_Package,      Disc.PackageRVA,      0);
+                AddDisc(KIND_BPGC,         Disc.BPGCRVA,         Disc.BPGCStride);
+                AddDisc(KIND_WBPGC,        Disc.WBPGCRVA,        Disc.WBPGCStride);
+                AddDisc(KIND_AnimBPGC,     Disc.AnimBPGCRVA,     Disc.AnimBPGCStride);
+                AddDisc(KIND_SMBPGC,       Disc.SMBPGCRVA,       Disc.SMBPGCStride);
+                AddDisc(KIND_ASClass,      Disc.ASClassRVA,      Disc.ASClassStride);
+                AddDisc(KIND_ASStruct,     Disc.ASStructRVA,     Disc.ASStructStride);
                 for (uint64_t Rva : Disc.ASFunctionRVAs)
-                    AddTargetIfNew(Rva, Disc.ASFunctionStride);
+                    AddDisc(KIND_ASFunction, Rva, Disc.ASFunctionStride);
             } else {
                 std::printf("[p28] auto-discovery unavailable; compile-time vtable list only\n");
+            }
+
+            // Compile-time fallback ONLY for kinds Phase 1 didn't cover.
+            for (const auto& v : CompileTime) {
+                if (KindCovered(v.Kind)) continue;
+                AddIf(m_knownTypeVtables, v.Rva);
+                AddTargetIf(vt_targets, m_base + v.Rva, v.Stride);
+                std::printf("[p28]   [fallback %s] %-12s RVA=0x%llX stride=0x%X\n",
+                    v.Tag, KindName(v.Kind), (unsigned long long)v.Rva, v.Stride);
             }
 
             size_t pre = objects.size();

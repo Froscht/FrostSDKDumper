@@ -15,14 +15,17 @@
 // =============================================================================
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "memreader_iface.h"
+#include "insn_decoder.h"
 
 namespace FNameFuncFinder {
 
@@ -691,6 +694,325 @@ inline uint64_t ExtractEntryHandleXor(IMemoryReader& reader,
         }
     }
     std::printf("[xor-extract] MOV r64,imm64 + XOR + BSWAP triple not found\n");
+    return 0;
+}
+
+// =============================================================================
+// Keystream-offset rediscovery — extends the auto-disc heap-probe pipeline so
+// it survives one more patch generation.
+//
+// Background: the existing path in auto_discovery.h::DiscoverFNameKeystream
+// picks the densest SIMD-constants cluster, then assumes the keystream sits at
+// a fixed +0xA0 inside that block. On CL-1177678 that's still true, but on
+// later builds (current = ScriptStruct vtable moved from 0xAD9DC20 → 0xADF4820)
+// the +0xA0 bias is the first thing that drifts when ARC reshuffles the SIMD
+// constants table. The fix is to validate multiple offsets and pick by entropy
+// — encrypted u16 keystream tables have ~7.7 bits/byte Shannon entropy, while
+// the adjacent SIMD masks / XOR constants are full of repeating patterns
+// (entropy ≤ 5.0) or runs of 0x00 / 0xFF padding (entropy → 0).
+// =============================================================================
+
+// Shannon entropy of `len` bytes, returned as bits-per-byte (max = 8.0).
+inline double KeystreamEntropy(const uint8_t* buf, size_t len) {
+    if (len == 0) return 0.0;
+    int hist[256] = {};
+    for (size_t i = 0; i < len; ++i) hist[buf[i]]++;
+    double h = 0.0;
+    const double inv = 1.0 / (double)len;
+    for (int i = 0; i < 256; ++i) {
+        if (!hist[i]) continue;
+        double p = (double)hist[i] * inv;
+        h -= p * std::log2(p);
+    }
+    return h;
+}
+
+// Reject anchors whose +0..256 window is all-zero, all-FF, or has < 32 distinct
+// byte values. Real keystreams hit at least ~120 distinct bytes in 256.
+inline bool KeystreamShapeOK(const uint8_t* buf, size_t len) {
+    if (len < 64) return false;
+    bool all_same = true;
+    for (size_t i = 1; i < len; ++i) {
+        if (buf[i] != buf[0]) { all_same = false; break; }
+    }
+    if (all_same) return false;
+    int distinct = 0;
+    int hist[256] = {};
+    for (size_t i = 0; i < len; ++i) {
+        if (!hist[buf[i]]) { hist[buf[i]] = 1; ++distinct; }
+    }
+    return distinct >= 32;
+}
+
+struct KeystreamCandidate {
+    uint64_t offset_from_anchor = 0;
+    uint64_t absolute_rva       = 0;
+    double   entropy            = 0.0;
+    bool     shape_ok           = false;
+    bool     readable           = false;
+};
+
+struct KeystreamProbeResult {
+    bool                            found        = false;
+    uint64_t                        best_rva     = 0;
+    uint64_t                        best_offset  = 0;
+    double                          best_entropy = 0.0;
+    std::vector<KeystreamCandidate> candidates;
+};
+
+// Try +0x80, +0xA0, +0xC0, +0xE0, +0x100 from `anchor_rva` (the SIMD-constants
+// cluster base). For each, read 256 bytes via the live reader, gate on shape,
+// score by Shannon entropy, and pick the highest-entropy survivor. Threshold:
+// entropy ≥ 6.0 bits/byte (encrypted keystreams sit at ~7.5–7.9; structured
+// SIMD masks rarely break 5.5).
+inline KeystreamProbeResult ProbeKeystreamOffsets(IMemoryReader& reader,
+                                                  uint64_t module_base,
+                                                  uint64_t anchor_rva,
+                                                  double   entropy_min = 6.0)
+{
+    KeystreamProbeResult out;
+    if (!anchor_rva) {
+        std::printf("[autodisc-fname] ProbeKeystreamOffsets: anchor=0 — skipped\n");
+        return out;
+    }
+
+    static const uint64_t kOffsets[] = { 0x80, 0xA0, 0xC0, 0xE0, 0x100 };
+    constexpr size_t SAMPLE = 256;
+    uint8_t buf[SAMPLE] = {};
+
+    std::printf("[autodisc-fname] probing keystream offsets from anchor 0x%llX:\n",
+                (unsigned long long)anchor_rva);
+
+    for (uint64_t off : kOffsets) {
+        KeystreamCandidate c;
+        c.offset_from_anchor = off;
+        c.absolute_rva       = anchor_rva + off;
+
+        std::memset(buf, 0, SAMPLE);
+        c.readable = reader.Read(module_base + c.absolute_rva, buf, SAMPLE);
+        if (!c.readable) {
+            std::printf("[autodisc-fname]   +0x%03llX rva=0x%llX  unreadable\n",
+                        (unsigned long long)off,
+                        (unsigned long long)c.absolute_rva);
+            out.candidates.push_back(c);
+            continue;
+        }
+        c.shape_ok = KeystreamShapeOK(buf, SAMPLE);
+        c.entropy  = KeystreamEntropy(buf, SAMPLE);
+
+        std::printf("[autodisc-fname]   +0x%03llX rva=0x%llX  H=%.3f  shape=%s\n",
+                    (unsigned long long)off,
+                    (unsigned long long)c.absolute_rva,
+                    c.entropy, c.shape_ok ? "ok" : "BAD");
+
+        out.candidates.push_back(c);
+
+        if (c.shape_ok && c.entropy >= entropy_min && c.entropy > out.best_entropy) {
+            out.best_entropy = c.entropy;
+            out.best_offset  = off;
+            out.best_rva     = c.absolute_rva;
+            out.found        = true;
+        }
+    }
+
+    if (out.found) {
+        std::printf("[autodisc-fname] pick: +0x%llX → rva=0x%llX  H=%.3f\n",
+                    (unsigned long long)out.best_offset,
+                    (unsigned long long)out.best_rva,
+                    out.best_entropy);
+    } else {
+        std::printf("[autodisc-fname] no candidate passed entropy floor %.2f — probe failed\n",
+                    entropy_min);
+    }
+    return out;
+}
+
+// =============================================================================
+// Structural fallback — when the SIMD-anchor + offset probe fails entirely,
+// walk the FName resolver function (plus its first-level direct callees) with
+// Zydis and collect every rip-rel load whose target lands in .data/.rdata.
+// The keystream cluster shows up as a dense window of distinct addresses
+// (≥2 separate loads in a 0x100-byte band) — same fingerprint as the primary
+// auto-disc, just centred on the resolver call-graph instead of the
+// AppendNameToString chain.
+//
+// Returns the highest-entropy 256-byte window inside any such cluster, or 0
+// if nothing qualifies. Cheap — decodes ≤ 0x800 bytes per function and only
+// recurses one level deep (the keystream load is always within 2 frames of
+// the resolver entry per the CL-1177678 reference: 0x2311B0 → 0x245AA0
+// → 0x2458C0 has the MOVQ xmm, cs:keystream).
+// =============================================================================
+struct ResolverKeystreamScan {
+    uint64_t keystream_rva = 0;     // best candidate RVA (cluster base)
+    double   entropy       = 0.0;
+    int      cluster_size  = 0;     // distinct rip-rel loads inside the cluster window
+    bool     found         = false;
+    std::vector<uint64_t> hot_targets; // top rip-rel targets, sorted by ref count
+};
+
+inline ResolverKeystreamScan ScanResolverForKeystream(IMemoryReader& reader,
+                                                     uint64_t module_base,
+                                                     uint64_t fname_fn_rva,
+                                                     int max_depth = 2)
+{
+    ResolverKeystreamScan out;
+    if (!fname_fn_rva) {
+        std::printf("[autodisc-fname] ScanResolver: fname_rva=0 — skipped\n");
+        return out;
+    }
+
+    InsnDecoder dec;
+
+    // BFS over the call chain — bounded to `max_depth` frames so we don't
+    // chase the entire transitive graph. CL-1177678's keystream load lives at
+    // depth 2 (entry → sub_245AA0 → sub_2458C0), so 2 is the floor.
+    std::unordered_set<uint64_t> visited;
+    std::vector<uint64_t> frontier{ fname_fn_rva };
+
+    std::unordered_map<uint64_t, int> data_hits;  // target_rva → ref count
+
+    for (int depth = 0; depth <= max_depth && !frontier.empty(); ++depth) {
+        std::vector<uint64_t> next;
+        for (uint64_t fn_rva : frontier) {
+            if (!visited.insert(fn_rva).second) continue;
+
+            uint8_t code[0x800] = {};
+            if (!reader.Read(module_base + fn_rva, code, sizeof(code))) continue;
+
+            auto insns = dec.Decode(code, sizeof(code), fn_rva);
+            for (const auto& ins : insns) {
+                // Collect direct callees for next frontier layer.
+                if (ins.type == INSN_CALL_RIP && ins.hasRipRel) {
+                    uint64_t tgt = ins.ResolveRipRVA();
+                    if (tgt && tgt != fn_rva) next.push_back(tgt);
+                    continue;
+                }
+                // Skip control flow / non-data rip-rel.
+                if (ins.type == INSN_JMP)  continue;
+                if (ins.type == INSN_JCC)  continue;
+                if (!ins.hasRipRel) continue;
+
+                uint64_t t = ins.ResolveRipRVA();
+                if (!t) continue;
+                // Heuristic: .data/.rdata live well after .text. Reject
+                // anything that looks like a back-ref into .text (resolver
+                // itself, jump tables) by requiring t > fname_fn_rva + 0x100000.
+                if (t < fname_fn_rva + 0x100000ULL) continue;
+                data_hits[t]++;
+            }
+        }
+        frontier.swap(next);
+    }
+
+    if (data_hits.empty()) {
+        std::printf("[autodisc-fname] ScanResolver: no rip-rel data targets in call chain\n");
+        return out;
+    }
+
+    // Cluster the targets exactly like DiscoverFNameKeystream does: a 0x100-
+    // byte window with ≥2 distinct hits is the keystream signature (single-
+    // shot PXOR/PAND constants give 1-distinct clusters).
+    std::vector<uint64_t> targets;
+    targets.reserve(data_hits.size());
+    for (const auto& kv : data_hits) targets.push_back(kv.first);
+    std::sort(targets.begin(), targets.end());
+
+    uint64_t best_lo = 0;
+    int      best_distinct = 0;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        uint64_t lo = targets[i];
+        uint64_t hi = lo + 0x100;
+        int distinct = 0;
+        for (size_t j = i; j < targets.size() && targets[j] < hi; ++j) ++distinct;
+        if (distinct > best_distinct) {
+            best_distinct = distinct;
+            best_lo       = lo;
+        }
+    }
+
+    // Surface the top-N rip-rel targets for the verbose log so a human can
+    // sanity-check on patch-day.
+    std::vector<std::pair<uint64_t, int>> sorted(data_hits.begin(), data_hits.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](auto& a, auto& b) { return a.second > b.second; });
+    std::printf("[autodisc-fname] ScanResolver: %zu distinct rip-rel targets across "
+                "call chain (depth≤%d); top loads:\n",
+                data_hits.size(), max_depth);
+    int shown = 0;
+    for (const auto& [t, c] : sorted) {
+        if (shown++ >= 8) break;
+        std::printf("[autodisc-fname]   rva=0x%llX  refs=%d\n",
+                    (unsigned long long)t, c);
+        out.hot_targets.push_back(t);
+    }
+
+    if (best_distinct < 2) {
+        std::printf("[autodisc-fname] ScanResolver: best cluster has %d distinct loads "
+                    "(need ≥2) — fallback failed\n", best_distinct);
+        return out;
+    }
+
+    // Score the cluster's 256-byte window by entropy; only accept if it
+    // actually looks like a keystream (same gate as ProbeKeystreamOffsets).
+    uint8_t buf[256] = {};
+    if (!reader.Read(module_base + best_lo, buf, sizeof(buf))) {
+        std::printf("[autodisc-fname] ScanResolver: cluster @ 0x%llX unreadable\n",
+                    (unsigned long long)best_lo);
+        return out;
+    }
+    double h = KeystreamEntropy(buf, sizeof(buf));
+    bool   shape = KeystreamShapeOK(buf, sizeof(buf));
+    std::printf("[autodisc-fname] ScanResolver: cluster @ 0x%llX  distinct=%d  H=%.3f  shape=%s\n",
+                (unsigned long long)best_lo, best_distinct, h, shape ? "ok" : "BAD");
+
+    if (!shape || h < 6.0) {
+        std::printf("[autodisc-fname] ScanResolver: cluster failed entropy/shape gate — reject\n");
+        return out;
+    }
+
+    out.keystream_rva = best_lo;
+    out.entropy       = h;
+    out.cluster_size  = best_distinct;
+    out.found         = true;
+    std::printf("[autodisc-fname] ScanResolver: keystream candidate = 0x%llX  H=%.3f\n",
+                (unsigned long long)out.keystream_rva, out.entropy);
+    return out;
+}
+
+// =============================================================================
+// One-shot wrapper — pick the keystream RVA using the offset probe first, and
+// fall back to the structural scan if every offset fails. Returns 0 on total
+// failure. Logs everything under the [autodisc-fname] tag so patch-day triage
+// can read the decision trail end-to-end.
+// =============================================================================
+inline uint64_t AutoDiscoverFNameKeystream(IMemoryReader& reader,
+                                          uint64_t module_base,
+                                          uint64_t simd_anchor_rva,
+                                          uint64_t fname_fn_rva)
+{
+    std::printf("[autodisc-fname] === keystream rediscovery ===\n");
+    std::printf("[autodisc-fname]   anchor (SIMD cluster) = 0x%llX\n",
+                (unsigned long long)simd_anchor_rva);
+    std::printf("[autodisc-fname]   resolver fn           = 0x%llX\n",
+                (unsigned long long)fname_fn_rva);
+
+    KeystreamProbeResult probe = ProbeKeystreamOffsets(reader, module_base, simd_anchor_rva);
+    if (probe.found) {
+        std::printf("[autodisc-fname] WIN via offset probe: rva=0x%llX (+0x%llX from anchor)\n",
+                    (unsigned long long)probe.best_rva,
+                    (unsigned long long)probe.best_offset);
+        return probe.best_rva;
+    }
+
+    std::printf("[autodisc-fname] offset probe failed — engaging resolver structural scan\n");
+    ResolverKeystreamScan scan = ScanResolverForKeystream(reader, module_base, fname_fn_rva);
+    if (scan.found) {
+        std::printf("[autodisc-fname] WIN via structural fallback: rva=0x%llX\n",
+                    (unsigned long long)scan.keystream_rva);
+        return scan.keystream_rva;
+    }
+
+    std::printf("[autodisc-fname] LOSS: both probe + structural fallback returned nothing\n");
     return 0;
 }
 

@@ -235,6 +235,134 @@ public:
         return 0;
     }
 
+    // ── CL-1177678 anchors (added 2026-05-16) ──────────────────────────────
+    // These migrate the remaining hardcoded module-base constants from
+    // arc_decrypt.h / fname_decrypt.h / gobjects.h into the sig framework.
+    // Per memory feedback_disasm_emu_over_hardcode.md: every hardcoded RVA
+    // drifts at patch boundaries. Each anchor below picks an opcode pattern
+    // whose disp32 resolves to the desired global.
+
+    // FField NamePrivate decoder PSHUFB+PXOR constants (returned together).
+    // Anchor: any FField-subclass GetFName() accessor — the prologue
+    //   movdqa xmm0,[rcx+0x30]; ROL64(55); PSHUFB,[rip+M]; PXOR,[rip+K]
+    // is duplicated 11× across FProperty subclasses on CL-1177678. Every
+    // duplicate loads the same shared mask/xor pair, so the first match's
+    // disps resolve to RVA_FFIELD_PSHUFB_MASK and RVA_FFIELD_XOR_CONST.
+    struct FFieldDecryptConsts { uint64_t pshufb_mask, xor_const; };
+    FFieldDecryptConsts FindFFieldDecryptConsts() {
+        FFieldDecryptConsts t = {};
+        static const char* kSig =
+            "66 0F 6F 41 30 66 0F 6F C8 66 0F 73 D1 09 "
+            "66 0F 73 F0 37 66 0F EB C1 "
+            "66 0F 38 00 05 ? ? ? ? "
+            "66 0F EF 05 ? ? ? ?";
+        auto pat = Pattern::Parse(kSig);
+        uint64_t hit = Find(pat);
+        if (!hit) return t;
+        // PSHUFB is 9 bytes at +23; disp at +28; insn_end = hit+32.
+        uint64_t m = ResolveRipDisp(hit + 23, 9, 5);
+        // PXOR is 8 bytes at +32; disp at +36; insn_end = hit+40.
+        uint64_t x = ResolveRipDisp(hit + 32, 8, 4);
+        if (!InRange(m) || !InRange(x)) return t;
+        uint64_t m_rva = m - m_base, x_rva = x - m_base;
+        // Both constants are read-only data; reject .text/.data drift.
+        if (!InRDataRVA(m_rva) || !InRDataRVA(x_rva)) return t;
+        // PSHUFB mask and XOR const are 16 bytes apart in .rdata.
+        if (x_rva != m_rva + 0x10) return t;
+        t.pshufb_mask = m_rva;
+        t.xor_const   = x_rva;
+        return t;
+    }
+
+    // FName_ToString / FName_Index2Name function entry.
+    // Anchor: function prologue + the unique CI-decode kernel
+    //   movd xmm0,[rcx]; PSRLQ 0x0B; PSLLQ 0x35; POR; PSHUFLW 0x4B
+    // (this is the CL-1177678 CI-stage-1 transform; was a different pipeline
+    // on CL-1177146). Sig hit == function start.
+    uint64_t FindFNameToStringRVA() {
+        static const char* kSig =
+            "41 56 56 57 53 48 83 EC 78 "
+            "48 8B 05 ? ? ? ? 48 31 E0 48 89 44 24 70 "
+            "66 0F 6E 01 66 0F 6F C8 66 0F 73 D1 0B "
+            "66 0F 73 F0 35 66 0F EB C1 F2 0F 70 C0 4B";
+        auto pat = Pattern::Parse(kSig);
+        uint64_t hit = Find(pat);
+        if (!hit) return 0;
+        uint64_t rva = hit - m_base;
+        return InTextRVA(rva) ? rva : 0;
+    }
+
+    // UObject slot-decoder stage-1 PSHUFB mask (xmmword_ADEAC80 on CL-1177678).
+    // Anchor: sub_4CD5B0 / UObject_FName_Equals — unique outer-loop preamble
+    //   movq xmm1,[rip+mask]; nop; test rdx,rdx; jz; lea r11,[rdx+0x10]
+    uint64_t FindUObjSlotStage1MaskRVA() {
+        static const char* kSig =
+            "F3 0F 7E 0D ? ? ? ? "
+            "66 90 48 85 D2 0F 84 CF 01 00 00 4C 8D 5A 10";
+        auto pat = Pattern::Parse(kSig);
+        uint64_t hit = Find(pat);
+        if (!hit) return 0;
+        // MOVQ is 8 bytes; disp at +4; insn_end = hit+8.
+        uint64_t t = ResolveRipDisp(hit, 8, 4);
+        if (!InRange(t)) return 0;
+        uint64_t rva = t - m_base;
+        return InRDataRVA(rva) ? rva : 0;
+    }
+
+    // FNamePool resolver stage XOR const (xmmword_ADD1110 on CL-1177678).
+    // Anchor: sub_2458C0 inner pipeline
+    //   pshuflw xmm0,xmm6,0x2E; PXOR [rip+const]; ROL64(11)-as-two-shifts
+    uint64_t FindFNamePoolStageXorRVA() {
+        static const char* kSig =
+            "F2 0F 70 C6 2E "
+            "66 0F EF 05 ? ? ? ? "
+            "66 0F 6F C8 66 0F 73 D1 35 66 0F 73 F0 0B";
+        auto pat = Pattern::Parse(kSig);
+        uint64_t hit = Find(pat);
+        if (!hit) return 0;
+        // PXOR is 8 bytes at +5; disp at +9; insn_end = hit+13.
+        uint64_t t = ResolveRipDisp(hit + 5, 8, 4);
+        if (!InRange(t)) return 0;
+        uint64_t rva = t - m_base;
+        return InRDataRVA(rva) ? rva : 0;
+    }
+
+    // FNamePool resolver post-XOR const (xmmword_ADD0CA0 on CL-1177678).
+    // Anchor: the second movq-xor-movq pair inside the block-decrypt loop:
+    //   movq xmm1,[rip+const]; pxor xmm0,xmm1; movq rdx,xmm0; shl r8d,5
+    uint64_t FindFNamePoolPostXorRVA() {
+        static const char* kSig =
+            "F3 0F 7E 0D ? ? ? ? "
+            "66 0F EF C1 66 48 0F 7E C2 41 C1 E0 05";
+        auto pat = Pattern::Parse(kSig);
+        uint64_t hit = Find(pat);
+        if (!hit) return 0;
+        uint64_t t = ResolveRipDisp(hit, 8, 4);
+        if (!InRange(t)) return 0;
+        uint64_t rva = t - m_base;
+        return InRDataRVA(rva) ? rva : 0;
+    }
+
+    // FNamePool base (unk_DBE9E80 / GNames on CL-1177678).
+    // Anchor: the once-init sled at the top of sub_2458C0
+    //   cmp [rip+guard],0; jnz +0x13; lea rcx,[rip+pool]; call ctor; mov [guard],1
+    // followed by the pipeline opener `pshuflw xmm0,xmm6,0x2E`. Unique.
+    uint64_t FindFNamePoolBaseRVA() {
+        static const char* kSig =
+            "80 3D ? ? ? ? 00 75 13 "
+            "48 8D 0D ? ? ? ? E8 ? ? ? ? "
+            "C6 05 ? ? ? ? 01 F2 0F 70 C6 2E";
+        auto pat = Pattern::Parse(kSig);
+        uint64_t hit = Find(pat);
+        if (!hit) return 0;
+        // LEA is 7 bytes at +9; disp at +12; insn_end = hit+16.
+        uint64_t t = ResolveRipDisp(hit + 9, 7, 3);
+        if (!InRange(t)) return 0;
+        uint64_t rva = t - m_base;
+        // GNamePool is a .data global; non-.data hit indicates drift.
+        return InDataRVA(rva) ? rva : 0;
+    }
+
 private:
     // Section RVA ranges (stable across 2026 builds; update if PE layout shifts).
     // Used to sanity-check LEA displacements — a .data global resolving into

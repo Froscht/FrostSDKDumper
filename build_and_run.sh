@@ -85,19 +85,22 @@ ensure_kmod() {
 # ---------------------------------------------------------------------------
 build_dumper() {
     info "Building FrostDumper ..."
-    # Build Zydis (amalgamated C source) — used by auto_discovery.h /
-    # insn_decoder.h for instruction-stream parsing. Cached in build/.
-    if [[ ! -f "$SCRIPT_DIR/build/Zydis.o" ]] || \
-       [[ "$SCRIPT_DIR/zydis/Zydis.c" -nt "$SCRIPT_DIR/build/Zydis.o" ]]; then
-        info "Compiling Zydis ..."
-        mkdir -p "$SCRIPT_DIR/build"
-        gcc -O2 -c "$SCRIPT_DIR/zydis/Zydis.c" -I"$SCRIPT_DIR/zydis" \
-            -o "$SCRIPT_DIR/build/Zydis.o" || error "Zydis build failed"
+    # Build vendored Zydis 4.0 (single-file amalgamation at zydis/Zydis.c).
+    # Cached in build/. Re-migrated from bddisasm on 2026-05-16 — Zydis matches
+    # the leaked ARC_Decryptor reference and ships system-wide as libZydis,
+    # so vendoring is a portability nicety, not a hard requirement.
+    mkdir -p "$SCRIPT_DIR/build"
+    ZYDIS_OBJ="$SCRIPT_DIR/build/Zydis.o"
+    if [[ ! -f "$ZYDIS_OBJ" ]] || [[ "$SCRIPT_DIR/zydis/Zydis.c" -nt "$ZYDIS_OBJ" ]]; then
+        info "Compiling Zydis: zydis/Zydis.c"
+        gcc -O2 -fPIC -I"$SCRIPT_DIR/zydis" \
+            -c "$SCRIPT_DIR/zydis/Zydis.c" -o "$ZYDIS_OBJ" \
+            || error "Zydis build failed"
     fi
     g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 \
-        -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/zydis" -I"$SCRIPT_DIR/../KernelDriver/include" \
+        -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
         -o "$BINARY" \
-        "$SCRIPT_DIR/main.cpp" "$SCRIPT_DIR/build/Zydis.o" \
+        "$SCRIPT_DIR/main.cpp" "$ZYDIS_OBJ" \
         -lcapstone -lunicorn -lm
     info "Binary built: $BINARY"
 
@@ -129,6 +132,13 @@ build_dumper() {
             -o "$SCRIPT_DIR/probe_uobject_fullname" \
             "$SCRIPT_DIR/probe_uobject_fullname.cpp" -lcapstone -lunicorn -lm 2>/dev/null \
             && info "Probe tool built: probe_uobject_fullname" || warn "probe_uobject_fullname build skipped"
+    fi
+    if [[ -f "$SCRIPT_DIR/tools/extract_vtables_offline.cpp" ]]; then
+        g++ -std=c++17 -O2 \
+            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+            -o "$SCRIPT_DIR/tools/extract_vtables_offline" \
+            "$SCRIPT_DIR/tools/extract_vtables_offline.cpp" 2>/dev/null \
+            && info "Offline tool built: tools/extract_vtables_offline" || warn "extract_vtables_offline build skipped"
     fi
 }
 

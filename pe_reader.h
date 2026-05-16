@@ -12,6 +12,13 @@
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+#include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include "memreader_iface.h"
 
 namespace SigScan {
 
@@ -226,6 +233,233 @@ private:
                 }
             }
         }
+    }
+};
+
+// =============================================================================
+// PEReaderFile — offline IMemoryReader backed by an mmap'd .exe on disk.
+//
+// Maps virtual addresses (using a synthetic UE5 image base of 0x140000000) back
+// to file offsets through the section table. Sections are page-aligned in VM
+// but unaligned on disk, so a single Read() that straddles a section boundary
+// is serviced section-by-section. Bytes that land in zero-fill tail (VirtSize
+// > RawSize) are returned as 0x00 — the live reader returns the page contents,
+// but PE loaders zero-extend that tail so this matches the in-memory image for
+// the only addresses callers will actually probe.
+//
+// Use for: CI sigscan validation, offline vtable extraction, patch-day triage
+// without launching the game. Cannot satisfy reads that target heap/stack or
+// otherwise-RVA-less addresses — those return false.
+// =============================================================================
+class PEReaderFile : public IMemoryReader {
+public:
+    static constexpr uint64_t kSyntheticBase = 0x140000000ULL;
+
+    struct SectionView {
+        uint32_t VirtualAddress;
+        uint32_t VirtualSize;
+        uint32_t RawDataOffset;
+        uint32_t RawDataSize;
+        char     Name[9];
+    };
+
+    PEReaderFile() = default;
+
+    explicit PEReaderFile(const char* Path) { Open(Path); }
+    explicit PEReaderFile(const std::string& Path) { Open(Path.c_str()); }
+
+    ~PEReaderFile() override { Close(); }
+
+    PEReaderFile(const PEReaderFile&)            = delete;
+    PEReaderFile& operator=(const PEReaderFile&) = delete;
+
+    bool Open(const char* Path) {
+        Close();
+        int Fd = ::open(Path, O_RDONLY | O_CLOEXEC);
+        if (Fd < 0) {
+            std::printf("[PEFile] open failed: %s\n", Path);
+            return false;
+        }
+        struct stat St = {};
+        if (::fstat(Fd, &St) != 0 || St.st_size < 0x200) {
+            ::close(Fd);
+            std::printf("[PEFile] fstat failed or file too small: %s\n", Path);
+            return false;
+        }
+        size_t MapSize = static_cast<size_t>(St.st_size);
+        void* Mapping = ::mmap(nullptr, MapSize, PROT_READ, MAP_PRIVATE, Fd, 0);
+        ::close(Fd);
+        if (Mapping == MAP_FAILED) {
+            std::printf("[PEFile] mmap failed: %s\n", Path);
+            return false;
+        }
+
+        m_Map     = static_cast<const uint8_t*>(Mapping);
+        m_MapSize = MapSize;
+
+        if (!ParseHeaders()) {
+            std::printf("[PEFile] PE header parse failed: %s\n", Path);
+            Close();
+            return false;
+        }
+
+        std::printf("[PEFile] Opened %s (sections=%u, ImageBase=0x%llX→synth=0x%llX, "
+                    ".text=0x%X+0x%X, .rdata=0x%X+0x%X, .data=0x%X+0x%X)\n",
+                    Path, (unsigned)m_Sections.size(),
+                    (unsigned long long)m_PreferredBase,
+                    (unsigned long long)kSyntheticBase,
+                    (unsigned)TextRva, (unsigned)TextSize,
+                    (unsigned)RDataRva, (unsigned)RDataSize,
+                    (unsigned)DataRva, (unsigned)DataSize);
+        return true;
+    }
+
+    void Close() {
+        if (m_Map) {
+            ::munmap(const_cast<uint8_t*>(m_Map), m_MapSize);
+            m_Map     = nullptr;
+            m_MapSize = 0;
+        }
+        m_Sections.clear();
+        m_PreferredBase = 0;
+        m_SizeOfImage   = 0;
+        TextRva = TextSize = 0;
+        RDataRva = RDataSize = 0;
+        DataRva = DataSize = 0;
+    }
+
+    bool IsOpen() const { return m_Map != nullptr && !m_Sections.empty(); }
+
+    // ── ModuleBounds-style accessors (kept as raw fields to avoid a circular
+    // include with auto_discovery.h, which itself pulls pe_reader.h).
+    uint32_t TextRva   = 0;
+    uint32_t TextSize  = 0;
+    uint32_t RDataRva  = 0;
+    uint32_t RDataSize = 0;
+    uint32_t DataRva   = 0;
+    uint32_t DataSize  = 0;
+
+    uint64_t ModuleBase()    const { return kSyntheticBase; }
+    uint64_t PreferredBase() const { return m_PreferredBase; }
+    uint32_t SizeOfImage()   const { return m_SizeOfImage; }
+    const std::vector<SectionView>& Sections() const { return m_Sections; }
+
+    // IMemoryReader: addr is a runtime VA against kSyntheticBase. Splits the
+    // request at section boundaries and zero-fills any tail that falls in
+    // VirtSize-beyond-RawSize space or outside every section.
+    bool Read(uint64_t Address, void* OutBuffer, size_t Size) override {
+        if (!OutBuffer || !Size || !m_Map) return false;
+        if (Address < kSyntheticBase) return false;
+        uint64_t Rva = Address - kSyntheticBase;
+        if (Rva >= m_SizeOfImage) return false;
+
+        uint8_t* Dst       = static_cast<uint8_t*>(OutBuffer);
+        size_t   Remaining = Size;
+        uint64_t CurRva    = Rva;
+        bool     AnyHit    = false;
+        std::memset(Dst, 0, Size);
+
+        while (Remaining > 0) {
+            const SectionView* Sec = FindSection(static_cast<uint32_t>(CurRva));
+            if (!Sec) {
+                // Skip one byte at a time across an inter-section gap; in
+                // practice PE loaders never leave true gaps so this just
+                // bails on out-of-image addresses.
+                CurRva++; Dst++; Remaining--;
+                continue;
+            }
+            uint32_t OffInSection = static_cast<uint32_t>(CurRva) - Sec->VirtualAddress;
+            uint32_t SectionEnd   = Sec->VirtualAddress + Sec->VirtualSize;
+            size_t   Avail        = SectionEnd - static_cast<uint32_t>(CurRva);
+            size_t   Chunk        = (Remaining < Avail) ? Remaining : Avail;
+
+            if (OffInSection < Sec->RawDataSize) {
+                size_t   RawAvail    = Sec->RawDataSize - OffInSection;
+                size_t   RawChunk    = (Chunk < RawAvail) ? Chunk : RawAvail;
+                uint64_t FileOff     = static_cast<uint64_t>(Sec->RawDataOffset) + OffInSection;
+                if (FileOff + RawChunk <= m_MapSize) {
+                    std::memcpy(Dst, m_Map + FileOff, RawChunk);
+                    AnyHit = true;
+                }
+            }
+            // Whatever falls beyond RawDataSize (BSS tail) stays zero from
+            // the initial memset — matches PE loader zero-extension.
+
+            Dst       += Chunk;
+            CurRva    += Chunk;
+            Remaining -= Chunk;
+        }
+        return AnyHit;
+    }
+
+private:
+    const uint8_t*           m_Map           = nullptr;
+    size_t                   m_MapSize       = 0;
+    uint64_t                 m_PreferredBase = 0;
+    uint32_t                 m_SizeOfImage   = 0;
+    std::vector<SectionView> m_Sections;
+
+    bool ParseHeaders() {
+        if (m_MapSize < 0x40) return false;
+        if (m_Map[0] != 'M' || m_Map[1] != 'Z') return false;
+        uint32_t PeOff = *reinterpret_cast<const uint32_t*>(m_Map + 0x3C);
+        if (PeOff + 0x18 > m_MapSize) return false;
+        if (*reinterpret_cast<const uint32_t*>(m_Map + PeOff) != 0x00004550) return false;
+
+        uint16_t NumSections   = *reinterpret_cast<const uint16_t*>(m_Map + PeOff + 6);
+        uint16_t OptHeaderSize = *reinterpret_cast<const uint16_t*>(m_Map + PeOff + 0x14);
+        uint32_t OptHdrOff     = PeOff + 0x18;
+        if (OptHdrOff + OptHeaderSize > m_MapSize) return false;
+
+        uint16_t OptMagic = *reinterpret_cast<const uint16_t*>(m_Map + OptHdrOff);
+        if (OptMagic != 0x20B) return false; // PE32+ only
+
+        m_PreferredBase = *reinterpret_cast<const uint64_t*>(m_Map + OptHdrOff + 24);
+        m_SizeOfImage   = *reinterpret_cast<const uint32_t*>(m_Map + OptHdrOff + 56);
+
+        uint32_t SectStart = OptHdrOff + OptHeaderSize;
+        if (SectStart + uint32_t(NumSections) * 0x28 > m_MapSize) return false;
+
+        m_Sections.clear();
+        m_Sections.reserve(NumSections);
+        for (uint16_t i = 0; i < NumSections; ++i) {
+            const uint8_t* S = m_Map + SectStart + i * 0x28;
+            SectionView Sec = {};
+            std::memcpy(Sec.Name, S, 8);
+            Sec.Name[8]        = 0;
+            Sec.VirtualSize    = *reinterpret_cast<const uint32_t*>(S + 8);
+            Sec.VirtualAddress = *reinterpret_cast<const uint32_t*>(S + 12);
+            Sec.RawDataSize    = *reinterpret_cast<const uint32_t*>(S + 16);
+            Sec.RawDataOffset  = *reinterpret_cast<const uint32_t*>(S + 20);
+            m_Sections.push_back(Sec);
+
+            if (std::strncmp(Sec.Name, ".text", 5) == 0) {
+                TextRva  = Sec.VirtualAddress;
+                TextSize = Sec.VirtualSize;
+            } else if (std::strncmp(Sec.Name, ".rdata", 6) == 0) {
+                RDataRva  = Sec.VirtualAddress;
+                RDataSize = Sec.VirtualSize;
+            } else if (std::strncmp(Sec.Name, ".data", 5) == 0 && DataRva == 0) {
+                DataRva  = Sec.VirtualAddress;
+                DataSize = Sec.VirtualSize;
+            }
+        }
+        if (!TextRva || !RDataRva || !DataRva || !m_SizeOfImage) return false;
+        return true;
+    }
+
+    // Section-virtual-to-file mapper. Sections are 0x1000-aligned in memory
+    // but FileAlignment-aligned on disk (commonly 0x200), so a hit on Rva
+    // must be located via VirtualAddress/VirtualSize, then translated to
+    // RawDataOffset + (Rva - VirtualAddress).
+    const SectionView* FindSection(uint32_t Rva) const {
+        for (const auto& Sec : m_Sections) {
+            if (Rva >= Sec.VirtualAddress &&
+                Rva <  Sec.VirtualAddress + Sec.VirtualSize) {
+                return &Sec;
+            }
+        }
+        return nullptr;
     }
 };
 

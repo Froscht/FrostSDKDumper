@@ -169,7 +169,7 @@ namespace Offsets {
         // ARFilter=0x150 — all read from +0x110.
         inline uint64_t SuperStruct     = 0x0A8;   // was 0x0B0
         inline uint64_t Children        = 0x0B8;   // was 0x100 (UField/UFunction list)
-        inline uint64_t ChildProperties = 0x0B0;   // was 0x100 (FField list head)
+        inline uint64_t ChildProperties = 0x0B0;   // was 0x100 (FField list head); kChainOffs in sdk_generator.h also walks +0xC0 to catch the full FField chain on newer patches where +0xB0 is only a subset
         inline uint64_t PropertiesSize  = 0x110;   // was 0x0D8
         inline uint64_t MinAlignment    = 0x0F8;
     }

@@ -840,7 +840,9 @@ public:
                 auto& VT = AutoDiscovery::g_DiscoveredVTables;
                 bool needAnchor = !VT.ScriptStructRVA || !VT.ClassNativeRVA ||
                                   !VT.FunctionRVA    || !VT.EnumRVA ||
-                                  !VT.PackageRVA;
+                                  !VT.PackageRVA    ||
+                                  !VT.BPGCRVA       || !VT.AnimBPGCRVA ||
+                                  !VT.WBPGCRVA;
                 if (needAnchor) {
                     std::printf("[autodisc] Phase 1.5 (wide-string anchor) — Phase 1 left engine roots NOT FOUND\n");
                     auto anchor = AutoDiscovery::DiscoverEngineVTablesByWideStringAnchor(
@@ -856,6 +858,12 @@ public:
                         VT.EnumRVA         = anchor.EnumRVA;
                     if (!VT.PackageRVA      && anchor.PackageRVA)
                         VT.PackageRVA      = anchor.PackageRVA;
+                    if (!VT.BPGCRVA         && anchor.BPGCRVA)
+                        VT.BPGCRVA         = anchor.BPGCRVA;
+                    if (!VT.AnimBPGCRVA     && anchor.AnimBPGCRVA)
+                        VT.AnimBPGCRVA     = anchor.AnimBPGCRVA;
+                    if (!VT.WBPGCRVA        && anchor.WBPGCRVA)
+                        VT.WBPGCRVA        = anchor.WBPGCRVA;
                 }
             }
 
@@ -1286,6 +1294,29 @@ public:
                             (unsigned long long)Live);
                     } else {
                         std::printf("[autodisc] FName key table re-loaded from corrected RVA\n");
+                    }
+                }
+            } else {
+                uint64_t LiveKs = FNameFuncFinder::AutoDiscoverFNameKeystream(
+                    m_reader, MODULE_BASE,
+                    AutoDiscovery::g_DiscoveredGNames.SimdBlockRva,
+                    fname_rva);
+                if (LiveKs) {
+                    uint64_t Hard = ArcDecrypt::RVA_FNAME_KEY_TABLE;
+                    if (LiveKs == Hard) {
+                        std::printf("[autodisc] FName keystream RVA (Phase 6.6 entropy probe) matches constant 0x%llX\n",
+                            (unsigned long long)LiveKs);
+                    } else {
+                        std::printf("[autodisc] FName keystream RVA drift: 0x%llX → 0x%llX "
+                                    "(auto-fixed via Phase 6.6 entropy probe)\n",
+                            (unsigned long long)Hard, (unsigned long long)LiveKs);
+                        ArcDecrypt::RVA_FNAME_KEY_TABLE = LiveKs;
+                        if (!m_fname.ReloadKeyTable()) {
+                            std::printf("[autodisc] WARNING: ReloadKeyTable failed at new RVA 0x%llX\n",
+                                (unsigned long long)LiveKs);
+                        } else {
+                            std::printf("[autodisc] FName key table re-loaded from corrected RVA\n");
+                        }
                     }
                 }
             }
@@ -2262,6 +2293,11 @@ public:
                   << "[+]   Enums:      " << sdk.enums.size() << "\n"
                   << "[+]   Functions:  " << n_functions  << "\n"
                   << "[+]   Properties: " << n_properties << "  (named: " << n_named << ")\n";
+
+        // Dumper-7 style per-package tree (opt-in via Generator::kEmitDumper7).
+        if (SDKGen::Generator::kEmitDumper7) {
+            gen.EmitDumper7(sdk, ".");
+        }
     }
 
     void Run() {

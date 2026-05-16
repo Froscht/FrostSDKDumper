@@ -56,6 +56,11 @@
 #include <cstring>
 #include <vector>
 #include <unordered_set>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <algorithm>
+#include <immintrin.h>
 #include <unicorn/unicorn.h>
 
 #include "memreader_iface.h"
@@ -66,6 +71,26 @@
 #include "emu_engine.h"
 
 namespace AutoChunksEmu {
+
+// Toggle to disable thread fan-out (single-threaded fallback for debugging).
+inline constexpr bool kParallelEmu = true;
+
+// Wraps an IMemoryReader and serializes every Read() through a shared mutex.
+// Lazy page-faults inside Unicorn callbacks and direct reads in TryVtCall both
+// go through this — the underlying /dev/memreader path is NOT documented as
+// thread-safe so we conservatively serialize all access.
+class SerializedReader : public IMemoryReader {
+public:
+    SerializedReader(IMemoryReader* inner, std::mutex* mu)
+        : m_inner(inner), m_mu(mu) {}
+    bool Read(uint64_t addr, void* out, size_t size) override {
+        std::lock_guard<std::mutex> g(*m_mu);
+        return m_inner->Read(addr, out, size);
+    }
+private:
+    IMemoryReader* m_inner;
+    std::mutex*    m_mu;
+};
 
 struct Result {
     uint64_t ChunksManager   = 0;
@@ -364,6 +389,16 @@ inline uint64_t TryVtCallForChunksArray(EmuEngine& emu, IMemoryReader& reader,
     if (!reader.Read(vtable_ptr + (uint64_t)vt_index * 8, &vt_fn, 8)) return 0;
     if (!InModule(vt_fn, module_base, bounds.ImageSize)) return 0;
 
+    static thread_local int VerboseBudget = 0;
+    bool Verbose = (vt_index == 4) && (VerboseBudget > 0);
+    if (Verbose) {
+        --VerboseBudget;
+        std::printf("[autoemu-trace] cm=0x%llX vt_holder=0x%llX vt_ptr=0x%llX vt[%d]=rva 0x%llX blob_off=+0x%X\n",
+            (unsigned long long)chunks_manager, (unsigned long long)vt_holder_addr,
+            (unsigned long long)vtable_ptr, vt_index,
+            (unsigned long long)(vt_fn - module_base), blob_off);
+    }
+
     uint8_t blob[16] = {};
     if (!reader.Read(chunks_manager + blob_off, blob, 16)) return 0;
 
@@ -376,6 +411,19 @@ inline uint64_t TryVtCallForChunksArray(EmuEngine& emu, IMemoryReader& reader,
     uc_mem_map(emu.UC(), SCRATCH & ~0xFFFULL, 0x1000, UC_PROT_ALL);
     uc_mem_write(emu.UC(), SCRATCH, blob, 16);
 
+    // Re-establish FAKE_TEB + PEB pointer at +0x60. emu.Reset() unmaps this
+    // between retries; without it gs:[0x60] returns 0 and any vt[N] that does
+    // `add rax, gs:[0x60]` (e.g. CL-1177678 vt[4]) computes the wrong PEB-XOR
+    // key and returns garbage. uc_mem_map fails harmlessly if already mapped.
+    constexpr uint64_t FAKE_PEB = 0x7FFD0000ULL;
+    uc_mem_map(emu.UC(), FAKE_TEB, 0x1000, UC_PROT_ALL);
+    uint8_t TebZero[0x1000] = {};
+    uc_mem_write(emu.UC(), FAKE_TEB, TebZero, sizeof(TebZero));
+    uint64_t TebSelf = FAKE_TEB;
+    uc_mem_write(emu.UC(), FAKE_TEB + 0x30, &TebSelf, 8);
+    uc_mem_write(emu.UC(), FAKE_TEB + 0x60, &FAKE_PEB, 8);
+    emu.MapGamePage(FAKE_PEB);
+
     emu.ResetCPU();
     uint64_t rsp = emu.ReadReg(UC_X86_REG_RSP);
     rsp -= 8;
@@ -386,20 +434,28 @@ inline uint64_t TryVtCallForChunksArray(EmuEngine& emu, IMemoryReader& reader,
     emu.SetGSBase(FAKE_TEB);
 
     uc_err er = emu.Run(vt_fn, SENTINEL, /*timeout*/300'000, /*max*/300);
-    (void)er;
 
-    // chunks_array might be in xmm0.lo64 or rax — try both
     uint8_t xmm0_bytes[16] = {};
     uc_reg_read(emu.UC(), UC_X86_REG_XMM0, xmm0_bytes);
     uint64_t xmm0_lo = 0;
     std::memcpy(&xmm0_lo, xmm0_bytes, 8);
     uint64_t rax = emu.ReadReg(UC_X86_REG_RAX);
 
+    if (Verbose) {
+        std::printf("[autoemu-trace]   emu_err=%d  rax=0x%llX xmm0_lo=0x%llX heap?(rax)=%d heap?(xmm)=%d\n",
+            (int)er, (unsigned long long)rax, (unsigned long long)xmm0_lo,
+            IsHeapNonModule(rax, module_base, bounds.ImageSize),
+            IsHeapNonModule(xmm0_lo, module_base, bounds.ImageSize));
+    }
+
     for (uint64_t cand : {xmm0_lo, rax}) {
         if (!IsHeapNonModule(cand, module_base, bounds.ImageSize)) continue;
-        if (ValidateChunksArray(reader, cand, module_base, bounds, probe_n) >= 2) {
-            return cand;
+        int validated = ValidateChunksArray(reader, cand, module_base, bounds, probe_n);
+        if (Verbose) {
+            std::printf("[autoemu-trace]   candidate 0x%llX validated=%d/%d\n",
+                (unsigned long long)cand, validated, probe_n);
         }
+        if (validated >= 2) return cand;
     }
     return 0;
 }
@@ -447,6 +503,67 @@ inline Result Discover(IMemoryReader& reader, uint64_t module_base,
     int probe_n = std::min(out.NumChunks, 4);
     if (probe_n < 2) probe_n = 2;
 
+    // ── Direct path: CPU-side SIMD decrypt of chunks_manager. The vt[4] call
+    // in the original pipeline uses gs:[0x60] (PEB) and is unstable to
+    // emulate with a fake PEB. But the chunks_manager pointer ITSELF is
+    // derived from GUObjectArray+0xC0 via pure SIMD (no PEB):
+    //   inner = PSHUFB( ROL16( SHUFFLELO(blob, 0x1B), 3 ), xmmword_AD97CC0 ).lo64
+    // Then probe chunks_manager+0x00..0x200 (stride 8) for a TArray<chunk*>
+    // base whose first ≥2 chunk[0]'s look like real UObjects.
+    {
+        constexpr uint64_t kPshufbMaskRva = 0xAD97CC0;
+        uint8_t Enc[16] = {};
+        uint8_t MaskBytes[16] = {};
+        if (reader.Read(guobj_abs + 0xC0, Enc, 16) &&
+            reader.Read(module_base + kPshufbMaskRva, MaskBytes, 16))
+        {
+            __m128i X    = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Enc));
+            __m128i Mask = _mm_loadu_si128(reinterpret_cast<const __m128i*>(MaskBytes));
+            __m128i X1 = _mm_shufflelo_epi16(X, 0x1B);
+            __m128i X2 = _mm_or_si128(_mm_slli_epi16(X1, 3), _mm_srli_epi16(X1, 13));
+            __m128i X3 = _mm_shuffle_epi8(X2, Mask);
+            uint64_t Cm = 0;
+            std::memcpy(&Cm, &X3, 8);
+            if (IsHeapNonModule(Cm, module_base, bounds.ImageSize)) {
+                std::printf("[autoemu-direct] chunks_manager (SIMD decrypt of GUObjectArray+0xC0) = 0x%llX\n",
+                    (unsigned long long)Cm);
+                uint64_t BestArr = 0;
+                uint32_t BestOff = 0;
+                for (uint32_t Off = 0; Off <= 0x400; Off += 8) {
+                    uint64_t Cand = 0;
+                    if (!reader.Read(Cm + Off, &Cand, 8)) continue;
+                    if (!IsHeapNonModule(Cand, module_base, bounds.ImageSize)) continue;
+                    int Validated = ValidateChunksArray(reader, Cand, module_base, bounds, probe_n);
+                    if (Validated >= probe_n) {
+                        BestArr = Cand;
+                        BestOff = Off;
+                        break;
+                    }
+                }
+                if (BestArr) {
+                    std::printf("[autoemu-direct] SUCCESS — chunks_array=0x%llX @ chunks_manager+0x%X "
+                                "(no emu, no PEB needed)\n",
+                        (unsigned long long)BestArr, BestOff);
+                    out.ChunksManager = Cm;
+                    out.ChunksArray   = BestArr;
+                    out.DecryptFnRva  = 0;
+                    out.VtIndex       = -1;
+                    out.InnerBlobOff  = BestOff;
+                    out.Valid         = true;
+                    return out;
+                }
+
+                std::printf("[autoemu-direct] in-cm field scan empty — falling back to emu "
+                            "(heap-scan disabled: too many false positives on validate(2))\n");
+            } else {
+                std::printf("[autoemu-direct] SIMD decrypt produced non-heap value 0x%llX — "
+                            "GUObjectArray+0xC0 blob may be zero or PSHUFB-mask RVA stale; "
+                            "falling back to emu\n",
+                    (unsigned long long)Cm);
+            }
+        }
+    }
+
     auto hits = FindGUObjectArrayLoaders(scanner, ArcDecrypt::RVA_GOBJECT_ARRAY_BASE);
     std::printf("[autoemu] %zu rip-rel loaders found targeting GUObjectArray's first 0x180 bytes\n",
         hits.size());
@@ -455,11 +572,6 @@ inline Result Discover(IMemoryReader& reader, uint64_t module_base,
     // Build distinct function-start list from hits (many hits may map to
     // the same function via multiple SIMD loads in its body).
     //
-    // Cap at 256 distinct fn_starts. The previous 12-cap stopped before
-    // reaching the documented chunks-manager fn at RVA 0x4BD190 — hits
-    // are processed in ascending order and 12 unique walkbacks were filled
-    // by lower-RVA candidates (most of them embedded-CC false positives).
-    // 256 covers the full search range; each emulation is fast (~60 insns).
     std::vector<uint64_t> fn_starts;
     std::unordered_set<uint64_t> seen;
     size_t walkback_failed = 0, walkback_dup = 0;
@@ -468,56 +580,136 @@ inline Result Discover(IMemoryReader& reader, uint64_t module_base,
         if (!fn) { ++walkback_failed; continue; }
         if (!seen.insert(fn).second) { ++walkback_dup; continue; }
         fn_starts.push_back(fn);
-        if (fn_starts.size() >= 256) break;
+        if (fn_starts.size() >= 2048) break;
     }
-    std::printf("[autoemu] %zu distinct candidate functions (cap=256, walkback_failed=%zu, dup=%zu)\n",
+    std::printf("[autoemu] %zu distinct candidate functions (cap=2048, walkback_failed=%zu, dup=%zu)\n",
         fn_starts.size(), walkback_failed, walkback_dup);
-
-    EmuEngine emu;
-    if (!emu.Initialize(&reader, module_base, emu_map_size, pe_path)) {
-        std::printf("[autoemu] EmuEngine init failed\n");
-        return out;
-    }
 
     // Inner-blob offset candidates within chunks_manager. CL-1177146 uses
     // +0x90; older patches may differ. Try the most common ones.
     static constexpr uint32_t kBlobOffs[] = { 0x90, 0xB0, 0x70, 0x80, 0xA0 };
     static constexpr int      kVtIndices[] = { 3, 7, 5, 1, 4, 6 };
 
-    for (uint64_t fn : fn_starts) {
-        std::printf("[autoemu] candidate fn @ rva=0x%llX — emulating\n",
-            (unsigned long long)fn);
-        auto cands = EmulateAndScanForChunksManager(emu, fn, module_base, bounds, reader);
-        if (cands.empty()) {
-            std::printf("[autoemu]   no chunks_manager candidate registers\n");
-            continue;
-        }
-        std::printf("[autoemu]   %zu chunks_manager candidate(s):", cands.size());
-        for (uint64_t c : cands) std::printf(" 0x%llX", (unsigned long long)c);
-        std::printf("\n");
+    // Shared cross-thread state. Reader mutex serializes /dev/memreader access;
+    // print mutex avoids interleaved log lines; success flag stops other
+    // workers early; result mutex guards the published Result.
+    std::mutex          reader_mu;
+    std::mutex          print_mu;
+    std::mutex          result_mu;
+    std::atomic<bool>   found{false};
+    std::atomic<size_t> next_idx{0};
 
-        for (uint64_t cand : cands) {
-            for (int vt_idx : kVtIndices) {
-                for (uint32_t blob_off : kBlobOffs) {
-                    uint64_t arr = TryVtCallForChunksArray(emu, reader, module_base,
+    auto worker = [&](int tid) {
+        SerializedReader sreader(&reader, &reader_mu);
+        EmuEngine emu;
+        if (!emu.Initialize(&sreader, module_base, emu_map_size, pe_path)) {
+            std::lock_guard<std::mutex> g(print_mu);
+            std::printf("[autoemu][t%d] EmuEngine init failed\n", tid);
+            return;
+        }
+        while (!found.load(std::memory_order_relaxed)) {
+            size_t i = next_idx.fetch_add(1, std::memory_order_relaxed);
+            if (i >= fn_starts.size()) break;
+            uint64_t fn = fn_starts[i];
+            {
+                std::lock_guard<std::mutex> g(print_mu);
+                std::printf("[autoemu][t%d] candidate fn @ rva=0x%llX — emulating\n",
+                    tid, (unsigned long long)fn);
+            }
+
+            // Stage-A — retry once on uc_emu_start corruption by rebuilding
+            // the engine from scratch.
+            std::vector<uint64_t> cands =
+                EmulateAndScanForChunksManager(emu, fn, module_base, bounds, sreader);
+            if (cands.empty()) {
+                if (!emu.IsReady() || !emu.Reset()) {
+                    std::lock_guard<std::mutex> g(print_mu);
+                    std::printf("[autoemu][t%d]   engine wedged — abandoning thread\n", tid);
+                    return;
+                }
+                cands = EmulateAndScanForChunksManager(emu, fn, module_base, bounds, sreader);
+            }
+            if (cands.empty()) {
+                std::lock_guard<std::mutex> g(print_mu);
+                std::printf("[autoemu][t%d]   no chunks_manager candidate registers\n", tid);
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> g(print_mu);
+                std::printf("[autoemu][t%d]   %zu chunks_manager candidate(s):", tid, cands.size());
+                for (uint64_t c : cands) std::printf(" 0x%llX", (unsigned long long)c);
+                std::printf("\n");
+            }
+
+            for (uint64_t cand : cands) {
+                if (found.load(std::memory_order_relaxed)) return;
+                for (int vt_idx : kVtIndices) {
+                    if (found.load(std::memory_order_relaxed)) return;
+                    for (uint32_t blob_off : kBlobOffs) {
+                        if (found.load(std::memory_order_relaxed)) return;
+                        uint64_t arr = TryVtCallForChunksArray(emu, sreader, module_base,
+                                                               bounds, cand, vt_idx,
+                                                               blob_off, probe_n);
+                        if (!arr) {
+                            // Stage-B uc_emu_start fault → rebuild engine + retry once.
+                            if (!emu.IsReady() || !emu.Reset()) {
+                                std::lock_guard<std::mutex> g(print_mu);
+                                std::printf("[autoemu][t%d]   engine wedged mid-stageB — abandoning thread\n",
+                                    tid);
+                                return;
+                            }
+                            arr = TryVtCallForChunksArray(emu, sreader, module_base,
                                                           bounds, cand, vt_idx,
                                                           blob_off, probe_n);
-                    if (!arr) continue;
-                    out.ChunksManager = cand;
-                    out.ChunksArray   = arr;
-                    out.DecryptFnRva  = fn;
-                    out.VtIndex       = vt_idx;
-                    out.InnerBlobOff  = blob_off;
-                    out.Valid         = true;
-                    std::printf("[autoemu] SUCCESS — chunks_manager=0x%llX chunks_array=0x%llX "
-                                "vt[%d] blob_off=+0x%X\n",
-                        (unsigned long long)cand, (unsigned long long)arr,
-                        vt_idx, blob_off);
-                    return out;
+                            if (!arr) continue;
+                        }
+                        bool first_winner = false;
+                        {
+                            std::lock_guard<std::mutex> g(result_mu);
+                            if (!out.Valid) {
+                                out.ChunksManager = cand;
+                                out.ChunksArray   = arr;
+                                out.DecryptFnRva  = fn;
+                                out.VtIndex       = vt_idx;
+                                out.InnerBlobOff  = blob_off;
+                                out.Valid         = true;
+                                first_winner = true;
+                            }
+                        }
+                        if (first_winner) {
+                            found.store(true, std::memory_order_relaxed);
+                            std::lock_guard<std::mutex> g(print_mu);
+                            std::printf("[autoemu][t%d] SUCCESS — chunks_manager=0x%llX chunks_array=0x%llX "
+                                        "vt[%d] blob_off=+0x%X\n",
+                                tid, (unsigned long long)cand, (unsigned long long)arr,
+                                vt_idx, blob_off);
+                        }
+                        return;
+                    }
                 }
             }
         }
+    };
+
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 2;
+    if (hw > 8) hw = 8;
+    if (!kParallelEmu) hw = 1;
+    if (fn_starts.size() < hw) hw = (unsigned)std::max<size_t>(1, fn_starts.size());
+
+    std::printf("[autoemu] launching %u worker thread(s) over %zu candidates\n",
+        hw, fn_starts.size());
+
+    if (hw <= 1) {
+        worker(0);
+    } else {
+        std::vector<std::thread> pool;
+        pool.reserve(hw);
+        for (unsigned t = 0; t < hw; ++t) pool.emplace_back(worker, (int)t);
+        for (auto& th : pool) th.join();
     }
+
+    if (out.Valid) return out;
 
     std::printf("[autoemu] no working (chunks_manager, vt[N], blob_off) combination found\n");
     return out;

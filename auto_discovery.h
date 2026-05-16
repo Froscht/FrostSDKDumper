@@ -740,7 +740,27 @@ namespace VTableOracles {
         return s.compare(s.size() - 2, 2, "_C") == 0;
     }
     inline bool LooksLikeWBPGC(const std::string& s) {
-        return LooksLikeBPGC(s) && s.find("WBP_") != std::string::npos;
+        if (!LooksLikeBPGC(s)) return false;
+        if (s.find("WBP_")    != std::string::npos) return true;
+        if (s.find("WBP")     == 0)                 return true;
+        if (s.find("_WBP_")   != std::string::npos) return true;
+        if (s.find("Widget")  != std::string::npos) return true;
+        if (s.find("_W_")     != std::string::npos) return true;
+        if (s.size() >= 4 && s.compare(0, 2, "W_") == 0)                  return true;
+        if (s.size() >= 5 && s.compare(s.size() - 4, 4, "_W_C") == 0)     return true;
+        if (s.find("UMG_")    != std::string::npos) return true;
+        if (s.find("_UMG_")   != std::string::npos) return true;
+        if (s.find("HUD_")    != std::string::npos) return true;
+        if (s.find("_HUD_")   != std::string::npos) return true;
+        if (s.find("Menu_")   != std::string::npos) return true;
+        if (s.find("_Menu_")  != std::string::npos) return true;
+        if (s.find("Popup")   != std::string::npos) return true;
+        if (s.find("Overlay") != std::string::npos) return true;
+        if (s.find("Screen")  != std::string::npos) return true;
+        if (s.find("Modal")   != std::string::npos) return true;
+        if (s.find("Panel_")  != std::string::npos) return true;
+        if (s.find("UserWidget")  != std::string::npos) return true;
+        return false;
     }
     inline bool LooksLikeSMBPGC(const std::string& s) {
         return LooksLikeBPGC(s) && s.find("SK_") != std::string::npos;
@@ -794,7 +814,7 @@ inline VTableMap DiscoverEngineVTables(const std::vector<uint64_t>& objects,
 
         Cluster& c = clusters[vt];
         c.total_count++;
-        if (c.names.size() < 50) {
+        if (c.names.size() < 200) {
             std::string n = name_of(obj);
             if (!n.empty()) {
                 c.names.push_back(std::move(n));
@@ -891,9 +911,61 @@ inline VTableMap DiscoverEngineVTables(const std::vector<uint64_t>& objects,
     out.PackageRVA      = rva_of(pick_gated(KPACKAGE,       10));
     // Game/blueprint types: count varies wildly by content. Looser floors.
     out.BPGCRVA         = rva_of(pick_gated(KBPGC,          10));
-    out.WBPGCRVA        = rva_of(pick_gated(KWBPGC,         5));
+    out.WBPGCRVA        = rva_of(pick_gated(KWBPGC,         2));
     out.SMBPGCRVA       = rva_of(pick_gated(KSMBPGC,        2));
     out.AnimBPGCRVA     = rva_of(pick_gated(KANIM_BPGC,     2));
+
+    // Structural fallback for WBPGC: if the name oracle didn't fire (e.g. menu
+    // state with few widgets loaded, or non-standard naming), pick the largest
+    // unclassified _C cluster — widget blueprints almost always form the
+    // second-largest _C-suffix cluster after the generic BPGC bucket.
+    auto cluster_is_bp_style = [&](const ClusterScore& cs) -> bool {
+        const auto it = clusters.find(cs.vtable);
+        if (it == clusters.end() || it->second.names.empty()) return false;
+        size_t bp_hits = 0;
+        for (const auto& n : it->second.names)
+            if (VTableOracles::LooksLikeBPGC(n)) ++bp_hits;
+        return bp_hits * 2 >= it->second.names.size();
+    };
+    auto already_assigned = [&](uint64_t rva) -> bool {
+        return rva == out.ScriptStructRVA || rva == out.ClassNativeRVA ||
+               rva == out.FunctionRVA     || rva == out.EnumRVA        ||
+               rva == out.PackageRVA      || rva == out.BPGCRVA        ||
+               rva == out.WBPGCRVA        || rva == out.SMBPGCRVA      ||
+               rva == out.AnimBPGCRVA;
+    };
+    if (!out.WBPGCRVA) {
+        uint64_t best_vt = 0; size_t best_count = 0;
+        for (const auto& cs : scored) {
+            uint64_t r = rva_of(cs.vtable);
+            if (!r || already_assigned(r)) continue;
+            if (cs.count < 2) continue;
+            if (!cluster_is_bp_style(cs)) continue;
+            if (cs.count > best_count) { best_count = cs.count; best_vt = cs.vtable; }
+        }
+        if (best_vt) {
+            out.WBPGCRVA = rva_of(best_vt);
+            std::printf("[autodisc-vt]   WBPGC structural fallback: picked rva=0x%llX cluster_count=%zu (no name-oracle hit)\n",
+                (unsigned long long)out.WBPGCRVA, best_count);
+        } else {
+            // Surface every _C-style cluster so the user can see what's available.
+            std::printf("[autodisc-vt]   WBPGC unresolved — unclassified _C-style clusters:\n");
+            size_t shown = 0;
+            for (const auto& cs : scored) {
+                uint64_t r = rva_of(cs.vtable);
+                if (!r || already_assigned(r)) continue;
+                if (!cluster_is_bp_style(cs)) continue;
+                const auto it = clusters.find(cs.vtable);
+                const char* sample0 = (it != clusters.end() && !it->second.names.empty())
+                                      ? it->second.names[0].c_str() : "?";
+                const char* sample1 = (it != clusters.end() && it->second.names.size() > 1)
+                                      ? it->second.names[1].c_str() : "?";
+                std::printf("[autodisc-vt]     rva=0x%llX  count=%zu  e.g. \"%s\", \"%s\"\n",
+                    (unsigned long long)r, cs.count, sample0, sample1);
+                if (++shown >= 8) break;
+            }
+        }
+    }
 
     uint64_t as_lo = bounds.RDataRva + (bounds.RDataSize * 3 / 4);
     uint64_t as_hi = bounds.RDataEnd();
@@ -915,6 +987,73 @@ inline VTableMap DiscoverEngineVTables(const std::vector<uint64_t>& objects,
         }
     }
     std::sort(out.ASFunctionRVAs.begin(), out.ASFunctionRVAs.end());
+
+    // ── Structural-density fallback for SMBPGC / ASClass / ASStruct ─────────
+    // When the wide-string anchors are stripped (CL-1177678) and the name
+    // oracles can't tie a cluster to a kind, fall back to pure structure:
+    // a cluster's vtable lives in .rdata and looks like an engine type-pool
+    // vtable (≥10 text-pointer entries in its first 0x200 bytes), with a
+    // kind-specific cluster-size band. Picks the largest unassigned cluster
+    // that satisfies each gate. Logged distinctly so the user can see when
+    // structural fallback fires.
+    auto density_score_local = [&](uint64_t vt_addr) -> int {
+        if (!vt_addr || vt_addr < module_base) return 0;
+        uint64_t rva = vt_addr - module_base;
+        if (!bounds.InRData(rva)) return 0;
+        uint64_t qbuf[64] = {};
+        if (!reader.Read(vt_addr, qbuf, sizeof(qbuf))) return 0;
+        int textCount = 0;
+        for (int i = 0; i < 64; ++i) {
+            if (!qbuf[i]) continue;
+            if (qbuf[i] < module_base) continue;
+            uint64_t r = qbuf[i] - module_base;
+            if (bounds.InText(r)) ++textCount;
+        }
+        return textCount;
+    };
+    auto already_assigned_full = [&](uint64_t rva) -> bool {
+        if (!rva) return true;
+        if (rva == out.ScriptStructRVA || rva == out.ClassNativeRVA ||
+            rva == out.FunctionRVA     || rva == out.EnumRVA        ||
+            rva == out.PackageRVA      || rva == out.BPGCRVA        ||
+            rva == out.WBPGCRVA        || rva == out.SMBPGCRVA      ||
+            rva == out.AnimBPGCRVA     || rva == out.ASClassRVA     ||
+            rva == out.ASStructRVA) return true;
+        for (uint64_t f : out.ASFunctionRVAs) if (f == rva) return true;
+        return false;
+    };
+    auto pick_structural = [&](const char* label, size_t min_count, size_t max_count) -> uint64_t {
+        uint64_t bestVt = 0; size_t bestCount = 0; int bestDensity = 0;
+        for (const auto& cs : scored) {
+            uint64_t rva = rva_of(cs.vtable);
+            if (already_assigned_full(rva)) continue;
+            if (cs.count < min_count || cs.count > max_count) continue;
+            int d = density_score_local(cs.vtable);
+            if (d < 10) continue;
+            // Prefer larger clusters first; tiebreak by higher density.
+            if (cs.count > bestCount ||
+                (cs.count == bestCount && d > bestDensity)) {
+                bestVt = cs.vtable; bestCount = cs.count; bestDensity = d;
+            }
+        }
+        if (bestVt) {
+            std::printf("[autodisc-vt]   %s structural fallback: picked rva=0x%llX cluster_count=%zu density=%d\n",
+                label, (unsigned long long)(bestVt - module_base), bestCount, bestDensity);
+        }
+        return bestVt;
+    };
+    if (!out.ASClassRVA) {
+        uint64_t vt = pick_structural("ASClass", 100, 100000);
+        if (vt) out.ASClassRVA = rva_of(vt);
+    }
+    if (!out.ASStructRVA) {
+        uint64_t vt = pick_structural("ASStruct", 50, 100000);
+        if (vt) out.ASStructRVA = rva_of(vt);
+    }
+    if (!out.SMBPGCRVA) {
+        uint64_t vt = pick_structural("SMBPGC", 2, 10);
+        if (vt) out.SMBPGCRVA = rva_of(vt);
+    }
 
     auto count_for = [&](uint64_t rva) -> size_t {
         for (const auto& cs : scored) if (rva_of(cs.vtable) == rva) return cs.count;
@@ -992,8 +1131,11 @@ struct EngineVTableAnchorResult {
     uint64_t FunctionRVA     = 0;
     uint64_t EnumRVA         = 0;
     uint64_t PackageRVA      = 0;
+    uint64_t BPGCRVA         = 0;
+    uint64_t AnimBPGCRVA     = 0;
+    uint64_t WBPGCRVA        = 0;
 
-    int      Found           = 0;  // count of resolved kinds (max 5)
+    int      Found           = 0;  // count of resolved kinds (max 8)
 };
 
 inline EngineVTableAnchorResult DiscoverEngineVTablesByWideStringAnchor(
@@ -1284,10 +1426,20 @@ inline EngineVTableAnchorResult DiscoverEngineVTablesByWideStringAnchor(
     out.FunctionRVA     = resolve_kind("Function");
     out.EnumRVA         = resolve_kind("Enum");
     out.PackageRVA      = resolve_kind("Package");
+    // Blueprint-generated class kinds. Only the BPGC wide string is reliably
+    // present across patches (CL-1177678 strips L"WidgetBlueprintGeneratedClass"
+    // / L"AnimBlueprintGeneratedClass" / L"SkeletalMeshBlueprintGeneratedClass"
+    // from .rdata). The calls below still try the long names so future patches
+    // that restore the strings light up automatically; resolve_kind gracefully
+    // returns 0 with a "wide string not found" log when absent.
+    out.BPGCRVA      = resolve_kind("BlueprintGeneratedClass");
+    out.AnimBPGCRVA  = resolve_kind("AnimBlueprintGeneratedClass");
+    out.WBPGCRVA     = resolve_kind("WidgetBlueprintGeneratedClass");
     out.Found = (out.ScriptStructRVA ? 1 : 0) + (out.ClassNativeRVA ? 1 : 0) +
                 (out.FunctionRVA ? 1 : 0) + (out.EnumRVA ? 1 : 0) +
-                (out.PackageRVA ? 1 : 0);
-    std::printf("[autodisc-vt-anchor] resolved %d/5 engine vtables\n", out.Found);
+                (out.PackageRVA ? 1 : 0) + (out.BPGCRVA ? 1 : 0) +
+                (out.AnimBPGCRVA ? 1 : 0) + (out.WBPGCRVA ? 1 : 0);
+    std::printf("[autodisc-vt-anchor] resolved %d/8 engine vtables\n", out.Found);
     return out;
 }
 
@@ -1318,26 +1470,18 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
         return (v << n) | (v >> ((32 - n) & 31));
     };
 
-    int probed = 0;
-    for (uint64_t uss : sample_uscriptstructs) {
-        if (probed >= 8) break;
-        ++probed;
-
-        uint64_t ff_head = 0;
-        if (!reader.Read(uss + ustruct_childprops_offset, &ff_head, 8)) continue;
-        if (ff_head < module_base + 0x100000ULL || ff_head >= 0x800000000000ULL) continue;
-        if (ff_head >= module_base && ff_head < module_base + 0x10000000ULL) continue;
-
-        uint8_t slot[16] = {};
-        if (!reader.Read(ff_head + ffield_nameprivate_offset, slot, 16)) continue;
-
+    // Decrypt a candidate 16-byte FField NamePrivate slot using the CL-1177146
+    // pipeline (ROL32(13) per half → XOR const → ROL64(7)). Returns true and
+    // fills (xor_const, ci, num) if both ROL32-halves form a plausible CI/Num.
+    auto try_decrypt_slot = [&](const uint8_t* slot,
+                                uint64_t& xor_const, uint32_t& ci, uint32_t& num) -> bool {
         uint32_t hi_lo32 = 0, hi_hi32 = 0;
         std::memcpy(&hi_lo32, slot + 8,  4);
         std::memcpy(&hi_hi32, slot + 12, 4);
         uint32_t xor_lo32 = rol32(hi_lo32, 13);
         uint32_t xor_hi32 = rol32(hi_hi32, 13);
-        uint64_t xor_const = (static_cast<uint64_t>(xor_hi32) << 32) | xor_lo32;
-        if (xor_const == 0 || xor_const == ~0ULL) continue;
+        xor_const = (static_cast<uint64_t>(xor_hi32) << 32) | xor_lo32;
+        if (xor_const == 0 || xor_const == ~0ULL) return false;
 
         uint32_t lo_lo32 = 0, lo_hi32 = 0;
         std::memcpy(&lo_lo32, slot + 0, 4);
@@ -1345,21 +1489,132 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
         uint64_t pipe_lo64 = (static_cast<uint64_t>(rol32(lo_hi32, 13)) << 32) | rol32(lo_lo32, 13);
         uint64_t pipe_xored = pipe_lo64 ^ xor_const;
         uint64_t result = (pipe_xored << 7) | (pipe_xored >> (64 - 7));
-        uint32_t ci = static_cast<uint32_t>(result);
-        uint32_t num = static_cast<uint32_t>(result >> 32);
-        if (ci < 2 || ci > 0x2000000u) continue;
-        if (num > 0x10000u) continue;
+        ci  = static_cast<uint32_t>(result);
+        num = static_cast<uint32_t>(result >> 32);
+        if (ci < 2 || ci > 0x2000000u) return false;
+        if (num > 0x10000u) return false;
+        return true;
+    };
+    auto looks_like_heap_ptr = [&](uint64_t p) -> bool {
+        if (p < module_base + 0x100000ULL || p >= 0x800000000000ULL) return false;
+        if (p >= module_base && p < module_base + 0x10000000ULL) return false;
+        return true;
+    };
+    // Walk up to `hops` FField-chain steps from `head` using `next_off` as the
+    // "Next" pointer offset. Each link must stay in heap. Returns the count of
+    // valid hops (0 if the head itself is bogus). Used as a structural gate to
+    // distinguish a real FField chain from a TArray data pointer (e.g. UEnum::
+    // Names) that also reads "heap-shaped" but doesn't form a singly-linked
+    // list when chased.
+    auto chain_length = [&](uint64_t head, uint64_t next_off, int hops) -> int {
+        int n = 0;
+        uint64_t cur = head;
+        for (int i = 0; i < hops; ++i) {
+            uint64_t nx = 0;
+            if (!reader.Read(cur + next_off, &nx, 8)) break;
+            if (nx == 0) { ++n; break; }
+            if (!looks_like_heap_ptr(nx)) break;
+            if (nx == cur) break;
+            cur = nx; ++n;
+        }
+        return n;
+    };
 
-        out.XorConst    = xor_const;
-        out.Rol32Amount = 13;
-        out.Rol64Amount = 7;
-        out.Valid       = true;
-        std::printf("[autodisc-ffield] NamePrivate XOR const = 0x%016llX (CI=%u Num=%u from FField 0x%llX)\n",
-            (unsigned long long)xor_const, ci, num, (unsigned long long)ff_head);
-        return out;
+    // Broad-scan: sweep candidate ChildProps offsets and candidate NamePrivate
+    // offsets, validate by (a) the decrypt math producing a plausible CI/Num
+    // AND (b) the candidate having a Next-chain of ≥1 heap hop at one of the
+    // common FField::Next offsets seen across patches (0x48, 0x68, 0x70, 0x80).
+    // Requires the SAME (childprops_off, nameprivate_off, xor_const) tuple to
+    // succeed across ≥2 different sample objects — single-object agreement is
+    // not enough (enum bodies + spurious heap-looking globals can pass once).
+    struct Candidate {
+        uint64_t childprops_off = 0;
+        uint64_t nameprivate_off = 0;
+        uint64_t xor_const = 0;
+        int votes = 0;
+        uint64_t example_head = 0;
+        uint32_t example_ci = 0;
+        uint32_t example_num = 0;
+    };
+    std::vector<Candidate> cands;
+    std::vector<uint64_t> cpOffs;
+    cpOffs.push_back(ustruct_childprops_offset);
+    for (uint64_t v = 0x20; v <= 0x140; v += 8)
+        if (v != ustruct_childprops_offset) cpOffs.push_back(v);
+    std::vector<uint64_t> npOffs;
+    npOffs.push_back(ffield_nameprivate_offset);
+    for (uint64_t v : {0x30ULL, 0x40ULL, 0x48ULL, 0x50ULL, 0x58ULL, 0x60ULL,
+                       0x68ULL, 0x70ULL, 0x78ULL, 0x80ULL, 0x88ULL, 0x90ULL})
+        if (v != ffield_nameprivate_offset) npOffs.push_back(v);
+    static const uint64_t kNextOffs[] = { 0x48, 0x80, 0x70, 0x68, 0x58, 0x50, 0x60 };
+    int probed = 0;
+    for (uint64_t uss : sample_uscriptstructs) {
+        if (probed >= 16) break;
+        ++probed;
+        for (uint64_t cp : cpOffs) {
+            uint64_t ff_head = 0;
+            if (!reader.Read(uss + cp, &ff_head, 8)) continue;
+            if (!looks_like_heap_ptr(ff_head)) continue;
+            for (uint64_t np : npOffs) {
+                uint8_t slot[16] = {};
+                if (!reader.Read(ff_head + np, slot, 16)) continue;
+                uint64_t xor_const = 0; uint32_t ci = 0, num = 0;
+                if (!try_decrypt_slot(slot, xor_const, ci, num)) continue;
+                // Structural gate: require at least one Next hop landing in
+                // heap at some plausible Next offset. Discriminates real FField
+                // heads from TArray data pointers and stray heap globals.
+                int best_hops = 0;
+                for (uint64_t nxo : kNextOffs) {
+                    int h = chain_length(ff_head, nxo, 3);
+                    if (h > best_hops) best_hops = h;
+                }
+                if (best_hops < 1) continue;
+
+                // Merge into cands by (cp, np, xor_const).
+                bool merged = false;
+                for (auto& c : cands) {
+                    if (c.childprops_off == cp && c.nameprivate_off == np &&
+                        c.xor_const == xor_const) {
+                        ++c.votes; merged = true; break;
+                    }
+                }
+                if (!merged) {
+                    cands.push_back({cp, np, xor_const, 1, ff_head, ci, num});
+                }
+            }
+        }
+    }
+    if (!cands.empty()) {
+        std::sort(cands.begin(), cands.end(),
+            [](const Candidate& a, const Candidate& b) { return a.votes > b.votes; });
+        const Candidate& best = cands.front();
+        if (best.votes >= 2) {
+            out.XorConst    = best.xor_const;
+            out.Rol32Amount = 13;
+            out.Rol64Amount = 7;
+            out.Valid       = true;
+            std::printf("[autodisc-ffield] broad-scan picked childprops_off=0x%llX nameprivate_off=0x%llX votes=%d XOR=0x%016llX (CI=%u Num=%u from FField 0x%llX)\n",
+                (unsigned long long)best.childprops_off,
+                (unsigned long long)best.nameprivate_off,
+                best.votes, (unsigned long long)best.xor_const,
+                best.example_ci, best.example_num,
+                (unsigned long long)best.example_head);
+            return out;
+        }
+        // Surface the top-3 candidates so the user can eyeball drift.
+        std::printf("[autodisc-ffield] broad-scan top candidates (need votes>=2):\n");
+        size_t shown = 0;
+        for (const auto& c : cands) {
+            std::printf("[autodisc-ffield]   cp=0x%llX np=0x%llX votes=%d XOR=0x%016llX (CI=%u Num=%u)\n",
+                (unsigned long long)c.childprops_off,
+                (unsigned long long)c.nameprivate_off,
+                c.votes, (unsigned long long)c.xor_const,
+                c.example_ci, c.example_num);
+            if (++shown >= 3) break;
+        }
     }
 
-    std::printf("[autodisc-ffield] no usable FField chain found in %d UScriptStructs\n", probed);
+    std::printf("[autodisc-ffield] no usable FField chain found in %d UScriptStructs (broad-scan exhausted)\n", probed);
     return out;
 }
 

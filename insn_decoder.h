@@ -3,21 +3,23 @@
 #include <cstring>
 #include <vector>
 #include <cstdio>
+
 #include "zydis/Zydis.h"
 
 // =============================================================================
 // INSN DECODER — Zydis-backed x86-64 instruction decoder for auto-discovery
 //
-// Layer 3 of the auto-discovery pipeline.
-// Uses Zydis v4.1 amalgamated build for full x86-64 coverage including
-// all VEX/EVEX/legacy SSE encodings. Maps Zydis decoded instructions to
-// our simplified InsnType enum for pattern matching in auto_config.h.
+// Layer 3 of the auto-discovery pipeline. Wraps Zydis 4.0 so the rest of the
+// codebase only sees DecodedInsn / InsnType. Replaces the bddisasm backend on
+// 2026-05-16: Zydis ships in the leaked ARC_Decryptor (any code we port from
+// there is closer to copy-paste), has a more mature operand model, and is
+// already vendored in this repo at zydis/Zydis.[ch] (single-file amalgamation).
 //
-// Previous hand-rolled decoder had issues with:
-//   - Missing VEX/AVX prefix support (C4/C5)
-//   - Instruction length desync on uncached pages
-//   - Incomplete ModR/M parsing for rare encodings
-// Zydis eliminates all of these classes of bugs.
+// Coverage parity:
+//   - All SSE/AVX shuffles, packed integer ops, packed shifts (legacy + VEX)
+//   - LEA / MOV with RIP-relative addressing
+//   - Control flow: CALL / JMP (rel + indirect) / Jcc / RET
+//   - REX.W detection via raw.rex.W (legacy) + raw.vex.W / raw.evex.W (AVX)
 // =============================================================================
 
 enum InsnType : uint8_t {
@@ -91,8 +93,8 @@ struct DecodedInsn {
     bool      hasREX_W = false;  // REX.W prefix present
 
     // Operands
-    uint8_t   reg1     = 0;      // first register (ModR/M reg field)
-    uint8_t   reg2     = 0;      // second register (ModR/M r/m field)
+    uint8_t   reg1     = 0;      // first register (ModR/M reg field) — Intel encoding 0..15
+    uint8_t   reg2     = 0;      // second register (ModR/M r/m field) — Intel encoding 0..15
     uint8_t   imm8     = 0;      // 8-bit immediate (shuffle immediates, shift amounts)
     uint32_t  imm32    = 0;      // 32-bit immediate (XOR keys, FNV constants)
     uint64_t  imm64    = 0;      // 64-bit immediate (mov r64, imm64)
@@ -184,13 +186,13 @@ struct DecodedInsn {
 
 
 // =============================================================================
-// INSTRUCTION DECODER — Zydis-powered backend
+// INSTRUCTION DECODER — Zydis 4.0-powered backend
 // =============================================================================
 
 class InsnDecoder {
 public:
     InsnDecoder() {
-        ZydisDecoderInit(&m_decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+        ZydisDecoderInit(&m_zdec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
     }
 
     // Decode a buffer of instructions, returns list of decoded instructions
@@ -199,68 +201,149 @@ public:
         insns.reserve(len / 4);
 
         size_t offset = 0;
+        ZydisDecodedInstruction inst;
+        ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT];
+
         while (offset < len) {
-            ZydisDecodedInstruction zinst;
-            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+            DecodedInsn d;
+            d.rva = startRVA + offset;
 
-            ZyanStatus status = ZydisDecoderDecodeFull(
-                &m_decoder, buf + offset, len - offset,
-                &zinst, operands);
+            ZyanStatus s = ZydisDecoderDecodeFull(
+                &m_zdec, buf + offset, len - offset, &inst, ops);
 
-            DecodedInsn insn;
-            insn.rva = startRVA + offset;
-
-            if (!ZYAN_SUCCESS(status)) {
-                // Failed to decode — skip one byte
-                insn.type   = INSN_UNKNOWN;
-                insn.length = 1;
-                insns.push_back(insn);
+            if (!ZYAN_SUCCESS(s) || inst.length == 0) {
+                d.type   = INSN_UNKNOWN;
+                d.length = 1;
+                insns.push_back(d);
                 offset++;
                 continue;
             }
 
-            insn.length = (uint8_t)zinst.length;
-            MapInstruction(zinst, operands, insn);
-            insns.push_back(insn); // DecodedInsn is a POD-like struct, push_back is fine
-            offset += zinst.length;
+            d.length = (uint8_t)inst.length;
+            MapInstruction(inst, ops, d);
+            insns.push_back(d);
+            offset += inst.length;
         }
 
         return insns;
     }
 
 private:
-    ZydisDecoder m_decoder;
+    // Map a register enum to Intel 0..15 encoding (RAX=0..R15=15).
+    // Zydis assigns ZYDIS_REGISTER_RAX through ZYDIS_REGISTER_R15 as
+    // consecutive enum values in Intel order — subtract the base and mask.
+    static uint8_t RegIdx(ZydisRegister r) {
+        if (r >= ZYDIS_REGISTER_RAX && r <= ZYDIS_REGISTER_R15)
+            return (uint8_t)((r - ZYDIS_REGISTER_RAX) & 0xF);
+        if (r >= ZYDIS_REGISTER_EAX && r <= ZYDIS_REGISTER_R15D)
+            return (uint8_t)((r - ZYDIS_REGISTER_EAX) & 0xF);
+        if (r >= ZYDIS_REGISTER_AX && r <= ZYDIS_REGISTER_R15W)
+            return (uint8_t)((r - ZYDIS_REGISTER_AX) & 0xF);
+        if (r >= ZYDIS_REGISTER_AL && r <= ZYDIS_REGISTER_R15B)
+            return (uint8_t)((r - ZYDIS_REGISTER_AL) & 0xF);
+        if (r >= ZYDIS_REGISTER_XMM0 && r <= ZYDIS_REGISTER_XMM31)
+            return (uint8_t)((r - ZYDIS_REGISTER_XMM0) & 0xF);
+        if (r >= ZYDIS_REGISTER_YMM0 && r <= ZYDIS_REGISTER_YMM31)
+            return (uint8_t)((r - ZYDIS_REGISTER_YMM0) & 0xF);
+        if (r >= ZYDIS_REGISTER_ZMM0 && r <= ZYDIS_REGISTER_ZMM31)
+            return (uint8_t)((r - ZYDIS_REGISTER_ZMM0) & 0xF);
+        return 0;
+    }
 
-    // =========================================================================
-    // Map a Zydis decoded instruction to our InsnType + extract operands
-    // =========================================================================
-    static void MapInstruction(const ZydisDecodedInstruction& zinst,
+    // Return true if the first operand is a 32+ bit-wide GPR/SSE — used to
+    // disambiguate MOV r/m, imm vs MOV-with-encoded-reg forms.
+    static bool HasGprDest32Plus(const ZydisDecodedInstruction& inst,
+                                 const ZydisDecodedOperand* ops)
+    {
+        if (inst.operand_count_visible == 0) return false;
+        return ops[0].size >= 32;  // Zydis reports bits, not bytes
+    }
+
+    // Pull RIP-rel disp, register IDs, immediates from operand list into out.
+    static void ExtractOperands(const ZydisDecodedInstruction& inst,
+                                const ZydisDecodedOperand* ops,
+                                DecodedInsn& out)
+    {
+        const uint8_t kVisible = inst.operand_count_visible;
+        for (uint8_t i = 0; i < kVisible && i < ZYDIS_MAX_OPERAND_COUNT; ++i) {
+            const ZydisDecodedOperand& op = ops[i];
+
+            switch (op.type) {
+            case ZYDIS_OPERAND_TYPE_MEMORY: {
+                // RIP-relative addressing in 64-bit mode: base == RIP.
+                if (op.mem.base == ZYDIS_REGISTER_RIP && op.mem.disp.has_displacement) {
+                    out.hasRipRel = true;
+                    out.disp32 = (int32_t)op.mem.disp.value;
+                }
+                break;
+            }
+
+            case ZYDIS_OPERAND_TYPE_REGISTER:
+                if (i == 0)      out.reg1 = RegIdx(op.reg.value);
+                else if (i == 1) out.reg2 = RegIdx(op.reg.value);
+                break;
+
+            case ZYDIS_OPERAND_TYPE_IMMEDIATE: {
+                const uint64_t v = op.imm.value.u;
+                const uint16_t sz_bits = op.size;
+                if (sz_bits <= 8) {
+                    out.imm8     = (uint8_t)v;
+                    out.hasImm8  = true;
+                    out.imm32    = (uint32_t)(int32_t)(int8_t)v;
+                    out.hasImm32 = true;
+                } else if (sz_bits <= 32) {
+                    out.imm32    = (uint32_t)v;
+                    out.hasImm32 = true;
+                    out.imm8     = (uint8_t)v;
+                    out.hasImm8  = true;
+                } else {
+                    out.imm64    = v;
+                    out.imm32    = (uint32_t)v;
+                    out.hasImm32 = true;
+                }
+                break;
+            }
+
+            default:
+                break;
+            }
+        }
+
+        // REX.W: legacy REX or merged into VEX/EVEX/XOP W bit.
+        out.hasREX_W = (inst.raw.rex.W != 0) ||
+                       (inst.raw.vex.W != 0) ||
+                       (inst.raw.evex.W != 0) ||
+                       (inst.raw.xop.W != 0);
+        out.prefix = 0;
+    }
+
+    // Map a Zydis decoded instruction to our InsnType.
+    static void MapInstruction(const ZydisDecodedInstruction& inst,
                                const ZydisDecodedOperand* ops,
                                DecodedInsn& out)
     {
-        // Extract common operand info first
-        ExtractOperands(zinst, ops, out);
+        ExtractOperands(inst, ops, out);
 
-        switch (zinst.mnemonic) {
+        switch (inst.mnemonic) {
         // --- Shuffles ---
         case ZYDIS_MNEMONIC_PSHUFLW:
-        case ZYDIS_MNEMONIC_VPSHUFLW:   out.type = INSN_PSHUFLW; break;
+        case ZYDIS_MNEMONIC_VPSHUFLW:    out.type = INSN_PSHUFLW; break;
         case ZYDIS_MNEMONIC_PSHUFHW:
-        case ZYDIS_MNEMONIC_VPSHUFHW:   out.type = INSN_PSHUFHW; break;
+        case ZYDIS_MNEMONIC_VPSHUFHW:    out.type = INSN_PSHUFHW; break;
         case ZYDIS_MNEMONIC_PSHUFD:
-        case ZYDIS_MNEMONIC_VPSHUFD:    out.type = INSN_PSHUFD;  break;
+        case ZYDIS_MNEMONIC_VPSHUFD:     out.type = INSN_PSHUFD;  break;
         case ZYDIS_MNEMONIC_PSHUFB:
-        case ZYDIS_MNEMONIC_VPSHUFB:    out.type = INSN_PSHUFB;  break;
+        case ZYDIS_MNEMONIC_VPSHUFB:     out.type = INSN_PSHUFB;  break;
 
         // --- Logical XOR ---
         case ZYDIS_MNEMONIC_PXOR:
         case ZYDIS_MNEMONIC_VPXOR:
         case ZYDIS_MNEMONIC_VPXORD:
-        case ZYDIS_MNEMONIC_VPXORQ:     out.type = INSN_PXOR;    break;
+        case ZYDIS_MNEMONIC_VPXORQ:      out.type = INSN_PXOR;    break;
         case ZYDIS_MNEMONIC_XORPS:
         case ZYDIS_MNEMONIC_VXORPS:
         case ZYDIS_MNEMONIC_XORPD:
-        case ZYDIS_MNEMONIC_VXORPD:     out.type = INSN_XORPS;   break;
+        case ZYDIS_MNEMONIC_VXORPD:      out.type = INSN_XORPS;   break;
 
         // --- Logical AND ---
         case ZYDIS_MNEMONIC_PAND:
@@ -268,39 +351,39 @@ private:
         case ZYDIS_MNEMONIC_VPANDD:
         case ZYDIS_MNEMONIC_VPANDQ:
         case ZYDIS_MNEMONIC_ANDPS:
-        case ZYDIS_MNEMONIC_VANDPS:     out.type = INSN_PAND;    break;
+        case ZYDIS_MNEMONIC_VANDPS:      out.type = INSN_PAND;    break;
         case ZYDIS_MNEMONIC_PANDN:
         case ZYDIS_MNEMONIC_VPANDN:
         case ZYDIS_MNEMONIC_VPANDND:
         case ZYDIS_MNEMONIC_VPANDNQ:
         case ZYDIS_MNEMONIC_ANDNPS:
-        case ZYDIS_MNEMONIC_VANDNPS:    out.type = INSN_PANDN;   break;
+        case ZYDIS_MNEMONIC_VANDNPS:     out.type = INSN_PANDN;   break;
 
         // --- Logical OR ---
         case ZYDIS_MNEMONIC_POR:
         case ZYDIS_MNEMONIC_VPOR:
         case ZYDIS_MNEMONIC_VPORD:
-        case ZYDIS_MNEMONIC_VPORQ:      out.type = INSN_POR;     break;
+        case ZYDIS_MNEMONIC_VPORQ:       out.type = INSN_POR;     break;
 
         // --- Packed integer add ---
         case ZYDIS_MNEMONIC_PADDB:
-        case ZYDIS_MNEMONIC_VPADDB:     out.type = INSN_PADDB;   break;
+        case ZYDIS_MNEMONIC_VPADDB:      out.type = INSN_PADDB;   break;
         case ZYDIS_MNEMONIC_PADDW:
-        case ZYDIS_MNEMONIC_VPADDW:     out.type = INSN_PADDW;   break;
+        case ZYDIS_MNEMONIC_VPADDW:      out.type = INSN_PADDW;   break;
         case ZYDIS_MNEMONIC_PADDD:
-        case ZYDIS_MNEMONIC_VPADDD:     out.type = INSN_PADDD;   break;
+        case ZYDIS_MNEMONIC_VPADDD:      out.type = INSN_PADDD;   break;
         case ZYDIS_MNEMONIC_PADDQ:
-        case ZYDIS_MNEMONIC_VPADDQ:     out.type = INSN_PADDQ;   break;
+        case ZYDIS_MNEMONIC_VPADDQ:      out.type = INSN_PADDQ;   break;
 
         // --- Packed integer subtract ---
         case ZYDIS_MNEMONIC_PSUBB:
-        case ZYDIS_MNEMONIC_VPSUBB:     out.type = INSN_PSUBB;   break;
+        case ZYDIS_MNEMONIC_VPSUBB:      out.type = INSN_PSUBB;   break;
         case ZYDIS_MNEMONIC_PSUBW:
-        case ZYDIS_MNEMONIC_VPSUBW:     out.type = INSN_PSUBW;   break;
+        case ZYDIS_MNEMONIC_VPSUBW:      out.type = INSN_PSUBW;   break;
         case ZYDIS_MNEMONIC_PSUBD:
-        case ZYDIS_MNEMONIC_VPSUBD:     out.type = INSN_PSUBD;   break;
+        case ZYDIS_MNEMONIC_VPSUBD:      out.type = INSN_PSUBD;   break;
         case ZYDIS_MNEMONIC_PSUBQ:
-        case ZYDIS_MNEMONIC_VPSUBQ:     out.type = INSN_PSUBQ;   break;
+        case ZYDIS_MNEMONIC_VPSUBQ:      out.type = INSN_PSUBQ;   break;
 
         // --- Moves (packed) ---
         case ZYDIS_MNEMONIC_MOVDQA:
@@ -312,7 +395,7 @@ private:
         case ZYDIS_MNEMONIC_VMOVDQU8:
         case ZYDIS_MNEMONIC_VMOVDQU16:
         case ZYDIS_MNEMONIC_VMOVDQU32:
-        case ZYDIS_MNEMONIC_VMOVDQU64:  out.type = INSN_MOVDQA;  break;
+        case ZYDIS_MNEMONIC_VMOVDQU64:   out.type = INSN_MOVDQA;  break;
         case ZYDIS_MNEMONIC_MOVAPS:
         case ZYDIS_MNEMONIC_VMOVAPS:
         case ZYDIS_MNEMONIC_MOVUPS:
@@ -320,19 +403,18 @@ private:
         case ZYDIS_MNEMONIC_MOVAPD:
         case ZYDIS_MNEMONIC_VMOVAPD:
         case ZYDIS_MNEMONIC_MOVUPD:
-        case ZYDIS_MNEMONIC_VMOVUPD:    out.type = INSN_MOVAPS;  break;
+        case ZYDIS_MNEMONIC_VMOVUPD:     out.type = INSN_MOVAPS;  break;
         case ZYDIS_MNEMONIC_MOVD:
-        case ZYDIS_MNEMONIC_VMOVD:      out.type = INSN_MOVD;    break;
+        case ZYDIS_MNEMONIC_VMOVD:       out.type = INSN_MOVD;    break;
         case ZYDIS_MNEMONIC_MOVQ:
-        case ZYDIS_MNEMONIC_VMOVQ:      out.type = INSN_MOVQ;    break;
+        case ZYDIS_MNEMONIC_VMOVQ:       out.type = INSN_MOVQ;    break;
 
         // --- LEA ---
-        case ZYDIS_MNEMONIC_LEA:        out.type = INSN_LEA;     break;
+        case ZYDIS_MNEMONIC_LEA:         out.type = INSN_LEA;     break;
 
         // --- MOV (general purpose) ---
         case ZYDIS_MNEMONIC_MOV:
-            // Classify MOV reg, imm32 (opcode B8+rd) and MOV r64, r/m64
-            if (out.hasImm32 || zinst.operand_width >= 32)
+            if (out.hasImm32 || HasGprDest32Plus(inst, ops))
                 out.type = INSN_MOV_REG;
             else
                 out.type = INSN_UNKNOWN;
@@ -340,26 +422,25 @@ private:
 
         // --- Packed shifts ---
         case ZYDIS_MNEMONIC_PSLLD:
-        case ZYDIS_MNEMONIC_VPSLLD:     out.type = INSN_PSLLD;   break;
+        case ZYDIS_MNEMONIC_VPSLLD:      out.type = INSN_PSLLD;   break;
         case ZYDIS_MNEMONIC_PSRLD:
-        case ZYDIS_MNEMONIC_VPSRLD:     out.type = INSN_PSRLD;   break;
+        case ZYDIS_MNEMONIC_VPSRLD:      out.type = INSN_PSRLD;   break;
         case ZYDIS_MNEMONIC_PSLLW:
-        case ZYDIS_MNEMONIC_VPSLLW:     out.type = INSN_PSLLW;   break;
+        case ZYDIS_MNEMONIC_VPSLLW:      out.type = INSN_PSLLW;   break;
         case ZYDIS_MNEMONIC_PSRLW:
-        case ZYDIS_MNEMONIC_VPSRLW:     out.type = INSN_PSRLW;   break;
+        case ZYDIS_MNEMONIC_VPSRLW:      out.type = INSN_PSRLW;   break;
         case ZYDIS_MNEMONIC_PSLLQ:
-        case ZYDIS_MNEMONIC_VPSLLQ:     out.type = INSN_PSLLQ;   break;
+        case ZYDIS_MNEMONIC_VPSLLQ:      out.type = INSN_PSLLQ;   break;
         case ZYDIS_MNEMONIC_PSRLQ:
-        case ZYDIS_MNEMONIC_VPSRLQ:     out.type = INSN_PSRLQ;   break;
+        case ZYDIS_MNEMONIC_VPSRLQ:      out.type = INSN_PSRLQ;   break;
 
-        // PSLLDQ / PSRLDQ — byte-granular shifts (distinct from bit-granular PSLLQ/PSRLQ)
         case ZYDIS_MNEMONIC_PSLLDQ:
-        case ZYDIS_MNEMONIC_VPSLLDQ:    out.type = INSN_PSLLDQ;  break;
+        case ZYDIS_MNEMONIC_VPSLLDQ:     out.type = INSN_PSLLDQ;  break;
         case ZYDIS_MNEMONIC_PSRLDQ:
-        case ZYDIS_MNEMONIC_VPSRLDQ:    out.type = INSN_PSRLDQ;  break;
+        case ZYDIS_MNEMONIC_VPSRLDQ:     out.type = INSN_PSRLDQ;  break;
 
         // --- IMUL with immediate ---
-        case ZYDIS_MNEMONIC_IMUL:       out.type = INSN_IMUL;    break;
+        case ZYDIS_MNEMONIC_IMUL:        out.type = INSN_IMUL;    break;
 
         // --- Scalar XOR ---
         case ZYDIS_MNEMONIC_XOR:
@@ -370,10 +451,10 @@ private:
             break;
 
         // --- Rotate/Shift ---
-        case ZYDIS_MNEMONIC_ROR:        out.type = INSN_ROR;     break;
-        case ZYDIS_MNEMONIC_ROL:        out.type = INSN_ROL;     break;
-        case ZYDIS_MNEMONIC_SHR:        out.type = INSN_SHR;     break;
-        case ZYDIS_MNEMONIC_SHL:        out.type = INSN_SHL;     break;
+        case ZYDIS_MNEMONIC_ROR:         out.type = INSN_ROR;     break;
+        case ZYDIS_MNEMONIC_ROL:         out.type = INSN_ROL;     break;
+        case ZYDIS_MNEMONIC_SHR:         out.type = INSN_SHR;     break;
+        case ZYDIS_MNEMONIC_SHL:         out.type = INSN_SHL;     break;
 
         // --- Arithmetic ---
         case ZYDIS_MNEMONIC_ADD:
@@ -390,100 +471,39 @@ private:
             break;
 
         // --- Control flow ---
-        case ZYDIS_MNEMONIC_CALL:       out.type = INSN_CALL_RIP; break;
-        case ZYDIS_MNEMONIC_JMP:        out.type = INSN_JMP;      break;
-        case ZYDIS_MNEMONIC_RET:        out.type = INSN_RET;      break;
-        case ZYDIS_MNEMONIC_INT3:       out.type = INSN_INT3;     break;
-        case ZYDIS_MNEMONIC_NOP:        out.type = INSN_NOP;      break;
-
-        // Conditional jumps
-        case ZYDIS_MNEMONIC_JB:   case ZYDIS_MNEMONIC_JBE:
-        case ZYDIS_MNEMONIC_JL:   case ZYDIS_MNEMONIC_JLE:
-        case ZYDIS_MNEMONIC_JNB:  case ZYDIS_MNEMONIC_JNBE:
-        case ZYDIS_MNEMONIC_JNL:  case ZYDIS_MNEMONIC_JNLE:
-        case ZYDIS_MNEMONIC_JNO:  case ZYDIS_MNEMONIC_JNP:
-        case ZYDIS_MNEMONIC_JNS:  case ZYDIS_MNEMONIC_JNZ:
-        case ZYDIS_MNEMONIC_JO:   case ZYDIS_MNEMONIC_JP:
-        case ZYDIS_MNEMONIC_JS:   case ZYDIS_MNEMONIC_JZ:
-        case ZYDIS_MNEMONIC_JCXZ: case ZYDIS_MNEMONIC_JECXZ:
-        case ZYDIS_MNEMONIC_JRCXZ:
-            out.type = INSN_JCC;
-            break;
+        // Zydis has ONE CALL/JMP mnemonic; near-rel32 vs near-indirect is
+        // distinguished by the first operand type. Both map to INSN_CALL_RIP
+        // (xref recovery treats them uniformly).
+        case ZYDIS_MNEMONIC_CALL:        out.type = INSN_CALL_RIP; break;
+        case ZYDIS_MNEMONIC_JMP:         out.type = INSN_JMP;      break;
+        case ZYDIS_MNEMONIC_RET:         out.type = INSN_RET;      break;
+        case ZYDIS_MNEMONIC_INT3:        out.type = INSN_INT3;     break;
+        case ZYDIS_MNEMONIC_NOP:         out.type = INSN_NOP;      break;
 
         // --- MOVSD load (used for _mm_loadl_epi64) ---
-        case ZYDIS_MNEMONIC_MOVSD:      out.type = INSN_LOADL_EPI64; break;
+        case ZYDIS_MNEMONIC_MOVSD:       out.type = INSN_LOADL_EPI64; break;
 
         // --- BSWAP ---
-        case ZYDIS_MNEMONIC_BSWAP:      out.type = INSN_BSWAP; break;
+        case ZYDIS_MNEMONIC_BSWAP:       out.type = INSN_BSWAP; break;
 
         // --- Double-precision shift / BMI2 rotate ---
-        case ZYDIS_MNEMONIC_SHLD:       out.type = INSN_SHLD; break;
-        case ZYDIS_MNEMONIC_SHRD:       out.type = INSN_SHRD; break;
-        case ZYDIS_MNEMONIC_RORX:       out.type = INSN_RORX; break;
+        case ZYDIS_MNEMONIC_SHLD:        out.type = INSN_SHLD; break;
+        case ZYDIS_MNEMONIC_SHRD:        out.type = INSN_SHRD; break;
+        case ZYDIS_MNEMONIC_RORX:        out.type = INSN_RORX; break;
 
         default:
-            out.type = INSN_UNKNOWN;
+            // Catch all Jcc variants (JZ/JNZ/JG/JLE/etc.) via the meta
+            // category — Zydis splits each condition into its own mnemonic
+            // (~22 of them) so a category check is cleaner than enumerating.
+            if (inst.meta.category == ZYDIS_CATEGORY_COND_BR)
+                out.type = INSN_JCC;
+            else
+                out.type = INSN_UNKNOWN;
             break;
         }
     }
 
-    // =========================================================================
-    // Extract operand info from Zydis decoded operands into DecodedInsn fields
-    // =========================================================================
-    static void ExtractOperands(const ZydisDecodedInstruction& zinst,
-                                const ZydisDecodedOperand* ops,
-                                DecodedInsn& out)
-    {
-        for (ZyanU8 i = 0; i < zinst.operand_count_visible; i++) {
-            const auto& op = ops[i];
-
-            switch (op.type) {
-            case ZYDIS_OPERAND_TYPE_MEMORY:
-                // Check for RIP-relative addressing (mod=00, rm=101 in x86-64)
-                if (op.mem.base == ZYDIS_REGISTER_RIP && op.mem.index == ZYDIS_REGISTER_NONE) {
-                    out.hasRipRel = true;
-                    out.disp32 = (int32_t)op.mem.disp.value;
-                }
-                break;
-
-            case ZYDIS_OPERAND_TYPE_REGISTER:
-                if (i == 0)      out.reg1 = (uint8_t)(op.reg.value & 0xF);
-                else if (i == 1) out.reg2 = (uint8_t)(op.reg.value & 0xF);
-                break;
-
-            case ZYDIS_OPERAND_TYPE_IMMEDIATE:
-                if (op.size <= 8) {
-                    out.imm8 = (uint8_t)op.imm.value.u;
-                    out.hasImm8 = true;
-                    // Also set imm32 with sign-extension for sign-extended imm8 ops
-                    out.imm32 = (uint32_t)(int32_t)(int8_t)op.imm.value.s;
-                    out.hasImm32 = true;
-                } else if (op.size <= 32) {
-                    out.imm32 = (uint32_t)op.imm.value.u;
-                    out.hasImm32 = true;
-                    out.imm8 = (uint8_t)op.imm.value.u;
-                    out.hasImm8 = true;
-                } else {
-                    out.imm64 = op.imm.value.u;
-                    out.imm32 = (uint32_t)op.imm.value.u;
-                    out.hasImm32 = true;
-                }
-                break;
-
-            default:
-                break;
-            }
-        }
-
-        // Extract prefix info
-        if (zinst.attributes & ZYDIS_ATTRIB_HAS_OPERANDSIZE)  out.prefix = 0x66;
-        else if (zinst.attributes & ZYDIS_ATTRIB_HAS_REPNE)   out.prefix = 0xF2;
-        else if (zinst.attributes & ZYDIS_ATTRIB_HAS_REP)     out.prefix = 0xF3;
-
-        // REX.W
-        if ((zinst.attributes & ZYDIS_ATTRIB_HAS_REX) && zinst.raw.rex.W)
-            out.hasREX_W = true;
-    }
+    ZydisDecoder m_zdec{};
 };
 
 
@@ -514,69 +534,6 @@ public:
         for (int i = 0; i < (int)insns.size(); i++)
             if (insns[i].type == type) result.push_back(i);
         return result;
-    }
-
-    // Find PSHUFLW with specific immediate
-    static int FindPSHUFLW(const std::vector<DecodedInsn>& insns, uint8_t imm, int startIdx = 0) {
-        for (int i = startIdx; i < (int)insns.size(); i++)
-            if (insns[i].type == INSN_PSHUFLW && insns[i].imm8 == imm) return i;
-        return -1;
-    }
-
-    // Find PSHUFB with RIP-relative operand
-    static int FindPSHUFB(const std::vector<DecodedInsn>& insns, int startIdx = 0) {
-        for (int i = startIdx; i < (int)insns.size(); i++)
-            if (insns[i].type == INSN_PSHUFB && insns[i].hasRipRel) return i;
-        return -1;
-    }
-
-    // Find PXOR/XORPS with RIP-relative operand
-    static int FindXorRip(const std::vector<DecodedInsn>& insns, int startIdx = 0) {
-        for (int i = startIdx; i < (int)insns.size(); i++)
-            if ((insns[i].type == INSN_PXOR || insns[i].type == INSN_XORPS) && insns[i].hasRipRel)
-                return i;
-        return -1;
-    }
-
-    // Find IMUL with specific constant
-    static int FindIMUL(const std::vector<DecodedInsn>& insns, uint32_t constant, int startIdx = 0) {
-        for (int i = startIdx; i < (int)insns.size(); i++)
-            if (insns[i].type == INSN_IMUL && insns[i].imm32 == constant) return i;
-        return -1;
-    }
-
-    // Find LEA with RIP-relative
-    static int FindLEA(const std::vector<DecodedInsn>& insns, int startIdx = 0) {
-        for (int i = startIdx; i < (int)insns.size(); i++)
-            if (insns[i].type == INSN_LEA && insns[i].hasRipRel) return i;
-        return -1;
-    }
-
-    // Find nearest shift instruction within range of an index
-    static int FindShiftNear(const std::vector<DecodedInsn>& insns, int fromIdx, int range = 5) {
-        int start = (std::max)(0, fromIdx - range);
-        int end = (std::min)((int)insns.size(), fromIdx + range);
-        for (int i = start; i < end; i++)
-            if (insns[i].IsShiftImm()) return i;
-        return -1;
-    }
-
-    // Find ROL or ROR instruction
-    static int FindRolRor(const std::vector<DecodedInsn>& insns, int startIdx = 0) {
-        for (int i = startIdx; i < (int)insns.size(); i++)
-            if (insns[i].type == INSN_ROL || insns[i].type == INSN_ROR) return i;
-        return -1;
-    }
-
-    // Match a sequence of instruction types starting at index
-    static bool MatchSequence(const std::vector<DecodedInsn>& insns, int idx,
-                              const std::vector<InsnType>& pattern) {
-        if (idx < 0 || idx + (int)pattern.size() > (int)insns.size()) return false;
-        for (size_t i = 0; i < pattern.size(); i++) {
-            if (pattern[i] != INSN_UNKNOWN && insns[idx + i].type != pattern[i])
-                return false;
-        }
-        return true;
     }
 
 private:

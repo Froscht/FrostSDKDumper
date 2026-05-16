@@ -3,6 +3,7 @@ FrostDumper
 FrostDumper_test
 probe_next
 probe_subprop
+build/
 
 # Generated output
 SDK_Output.h
@@ -29,3 +30,5 @@ probe_live_rvas
 probe_live_rvas
 /writeup
 *.bin
+/SDK
+/.claude

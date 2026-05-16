@@ -14,11 +14,15 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
 #include <sstream>
+#include <fstream>
 #include <cstdio>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 // arc_decrypt.h, fname_decrypt.h, and gobjects.h must already be included by the TU.
 
@@ -2727,6 +2731,11 @@ public:
             static constexpr uint64_t kChainOffs[] = {
                 0xB0, 0x100, 0xB8, 0xC8, 0xD8, 0x108, 0x118, 0x138, 0x190
             };
+            // +0xC0 is a UScriptStruct-only FField chain head on newer patches
+            // (full chain, vs +0xB0's subset). On UClass it overlaps with
+            // UField/UFunction list pointers and pollutes UFunction detection
+            // downstream (pass-3 vt-dtor rejections explode). Gate it.
+            static constexpr uint64_t kScriptStructOnlyChainOffs[] = { 0xC0 };
             auto walk_chain = [&](uint64_t chain_head) {
                 if (chain_head <= 0x10000 || chain_head >= 0x7FFFFFFFFFFFULL) return;
                 uint64_t cpvt = Read<uint64_t>(chain_head);
@@ -2761,6 +2770,12 @@ public:
             for (uint64_t off : kChainOffs) {
                 uint64_t head = Read<uint64_t>(obj_ptr + off);
                 walk_chain(head);
+            }
+            if (is_scriptstruct && !is_class) {
+                for (uint64_t off : kScriptStructOnlyChainOffs) {
+                    uint64_t head = Read<uint64_t>(obj_ptr + off);
+                    walk_chain(head);
+                }
             }
             for (auto& [ff, p] : best_at_ff)
                 rec.properties.push_back(std::move(p));
@@ -2963,6 +2978,423 @@ public:
         std::sort(result.enums.begin(),   result.enums.end(),   sort_by_pkg_name);
 
         return result;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Dumper-7 style per-package SDK emit
+    // ─────────────────────────────────────────────────────────────────────────
+    // Opt-in. When true, EmitDumper7() writes a directory tree similar to the
+    // Dumper-7 layout that downstream menus / internal cheats / ESP expect:
+    //     <base>/SDK.hpp
+    //     <base>/SDK/Basic.hpp
+    //     <base>/SDK/<Package>_classes.hpp
+    //     <base>/SDK/<Package>_structs.hpp
+    //     <base>/SDK/<Package>_enums.hpp
+    //     <base>/SDK/<Package>_functions.hpp     (stubs only — no native call wiring)
+    // SDK_Output.txt flat dump is still emitted regardless.
+    static constexpr bool kEmitDumper7 = true;
+
+    // ── Extract last segment of a UE5 path like "/Script/Engine" → "Engine"
+    static std::string D7_ShortPackage(const std::string& pkg) {
+        if (pkg.empty()) return "Unknown";
+        size_t slash = pkg.find_last_of('/');
+        std::string s = (slash == std::string::npos) ? pkg : pkg.substr(slash + 1);
+        if (s.empty()) s = "Unknown";
+        // Sanitize: replace any non-identifier char with '_'
+        for (char& c : s) {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_'))
+                c = '_';
+        }
+        if (s[0] >= '0' && s[0] <= '9') s = "_" + s;
+        return s;
+    }
+
+    // ── Sanitize an arbitrary identifier (field / class / enum) for C++ output
+    static std::string D7_SanIdent(const std::string& name) {
+        if (name.empty()) return "_unnamed";
+        std::string s = name;
+        for (char& c : s) {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_'))
+                c = '_';
+        }
+        if (s[0] >= '0' && s[0] <= '9') s = "_" + s;
+        return s;
+    }
+
+    // ── Map an FProperty type-name string to a Dumper-7 style C++ type token.
+    // PropertyRecord only carries the FProperty subclass name (e.g.
+    // "FArrayProperty") and not the resolved inner type, so containers fall
+    // back to opaque inner ("uint8_t" / "void*"). Downstream consumers that
+    // need full inner types can post-process via refSDK overlay.
+    static std::string D7_PropertyType(const PropertyRecord& pr) {
+        const std::string& t = pr.type_name;
+        if (t == "FBoolProperty")               return pr.bool_field_size == 4 ? "bool" : "uint8_t";
+        if (t == "FByteProperty")               return "uint8_t";
+        if (t == "FInt8Property")               return "int8_t";
+        if (t == "FInt16Property")              return "int16_t";
+        if (t == "FIntProperty")                return "int32_t";
+        if (t == "FInt64Property")              return "int64_t";
+        if (t == "FUInt16Property")             return "uint16_t";
+        if (t == "FUInt32Property")             return "uint32_t";
+        if (t == "FUInt64Property")             return "uint64_t";
+        if (t == "FFloatProperty")              return "float";
+        if (t == "FDoubleProperty")             return "double";
+        if (t == "FNameProperty")               return "FName";
+        if (t == "FStrProperty")                return "FString";
+        if (t == "FTextProperty")               return "FText";
+        if (t == "FEnumProperty")               return "uint8_t";
+        if (t == "FStructProperty")             return "FStructOpaque";
+        if (t == "FObjectProperty")             return "class UObject*";
+        if (t == "FObjectPropertyBase")         return "class UObject*";
+        if (t == "FClassProperty")              return "class UClass*";
+        if (t == "FClassPtrProperty")           return "class UClass*";
+        if (t == "FWeakObjectProperty")         return "TWeakObjectPtr<class UObject>";
+        if (t == "FLazyObjectProperty")         return "TLazyObjectPtr<class UObject>";
+        if (t == "FSoftObjectProperty")         return "TSoftObjectPtr<class UObject>";
+        if (t == "FSoftClassProperty")          return "TSoftClassPtr<class UObject>";
+        if (t == "FInterfaceProperty")          return "TScriptInterface<class IInterface>";
+        if (t == "FArrayProperty")              return "TArray<uint8_t>";
+        if (t == "FSetProperty")                return "TSet<uint8_t>";
+        if (t == "FMapProperty")                return "TMap<uint8_t, uint8_t>";
+        if (t == "FOptionalProperty")           return "TOptional<uint8_t>";
+        if (t == "FFieldPathProperty")          return "TFieldPath<void>";
+        if (t == "FDelegateProperty")           return "FScriptDelegate";
+        if (t == "FMulticastDelegateProperty")  return "FMulticastScriptDelegate";
+        if (t == "FMulticastInlineDelegateProperty") return "FMulticastScriptDelegate";
+        if (t == "FMulticastSparseDelegateProperty") return "FSparseDelegate";
+        return "uint8_t";
+    }
+
+    // ── Type byte size, used to fill the holes between offsets.
+    static uint32_t D7_PropertyTypeSize(const PropertyRecord& pr) {
+        if (pr.elem_size > 0) return pr.elem_size;
+        const std::string& t = pr.type_name;
+        if (t == "FBoolProperty" || t == "FByteProperty" || t == "FInt8Property") return 1;
+        if (t == "FInt16Property" || t == "FUInt16Property") return 2;
+        if (t == "FIntProperty"  || t == "FUInt32Property" || t == "FFloatProperty" ||
+            t == "FEnumProperty") return 4;
+        if (t == "FInt64Property" || t == "FUInt64Property" || t == "FDoubleProperty" ||
+            t == "FObjectProperty" || t == "FObjectPropertyBase" || t == "FClassProperty" ||
+            t == "FClassPtrProperty")
+            return 8;
+        if (t == "FNameProperty") return 8;
+        if (t == "FStrProperty" || t == "FTextProperty") return 16;
+        if (t == "FArrayProperty" || t == "FSetProperty") return 16;
+        if (t == "FMapProperty") return 80;
+        if (t == "FStructProperty") return 0;
+        return 0;
+    }
+
+    // ── Convert a parameter property type to a Dumper-7 style parameter token.
+    static std::string D7_ParamType(const PropertyRecord& pr) {
+        return D7_PropertyType(pr);
+    }
+
+    static void D7_Mkdir(const std::string& path) {
+        ::mkdir(path.c_str(), 0755);
+    }
+
+    // ── Emit a Dumper-7 style SDK tree under <base_dir>/.
+    // Creates <base_dir>/SDK/ and a master <base_dir>/SDK.hpp.
+    void EmitDumper7(const SDKResult& sdk, const std::string& base_dir) {
+        if (!kEmitDumper7) return;
+
+        D7_Mkdir(base_dir);
+        std::string sdk_dir = base_dir + "/SDK";
+        D7_Mkdir(sdk_dir);
+        // Per-package subdirectory layout requested by downstream consumers:
+        //   SDK/<Package>/<Package>_classes.hpp etc.
+        // The per-package directory is created lazily before each file write.
+
+        // Bucket records by short package name. Use std::map for stable
+        // alphabetical order of generated includes.
+        std::map<std::string, std::vector<const StructRecord*>> pkg_classes;
+        std::map<std::string, std::vector<const StructRecord*>> pkg_structs;
+        std::map<std::string, std::vector<const EnumRecord*>>   pkg_enums;
+        for (const auto& s : sdk.structs) {
+            std::string p = D7_ShortPackage(s.package);
+            if (s.is_class) pkg_classes[p].push_back(&s);
+            else            pkg_structs[p].push_back(&s);
+        }
+        for (const auto& e : sdk.enums)
+            pkg_enums[D7_ShortPackage(e.package)].push_back(&e);
+
+        // Build name → short-package map so DumpStruct's #include chain can
+        // forward-declare super classes living in another package.
+        std::unordered_map<std::string, std::string> name_to_pkg;
+        for (const auto& s : sdk.structs)
+            name_to_pkg[s.name] = D7_ShortPackage(s.package);
+
+        // ── 1. Basic.hpp — alias the UE primitives Dumper-7 expects ───────
+        {
+            std::ofstream f(sdk_dir + "/Basic.hpp");
+            f << "#pragma once\n\n";
+            f << "// FrostDumper — Basic.hpp (Dumper-7 style aliases)\n";
+            f << "// Generated alongside SDK_Output.txt — opaque shells only,\n";
+            f << "// downstream consumers must define real layouts as needed.\n\n";
+            f << "#include <cstdint>\n#include <cstddef>\n\n";
+            f << "#ifdef _MSC_VER\n#pragma pack(push, 0x8)\n#endif\n\n";
+            f << "namespace SDK\n{\n\n";
+            f << "struct FName        { uint8_t Pad[0x8]; };\n";
+            f << "struct FString      { uint8_t Pad[0x10]; };\n";
+            f << "struct FText        { uint8_t Pad[0x18]; };\n";
+            f << "struct FScriptDelegate          { uint8_t Pad[0x14]; };\n";
+            f << "struct FMulticastScriptDelegate { uint8_t Pad[0x10]; };\n";
+            f << "struct FSparseDelegate          { uint8_t Pad[0x1]; };\n";
+            f << "struct FStructOpaque            { uint8_t Pad[0x1]; };\n";
+            f << "\ntemplate<typename T> struct TArray              { T* Data; int32_t Count; int32_t Max; };\n";
+            f << "template<typename T> struct TSet                { uint8_t Pad[0x50]; };\n";
+            f << "template<typename K, typename V> struct TMap    { uint8_t Pad[0x50]; };\n";
+            f << "template<typename T> struct TOptional           { uint8_t Pad[0x10]; };\n";
+            f << "template<typename T> struct TWeakObjectPtr      { int32_t Index; int32_t Serial; };\n";
+            f << "template<typename T> struct TLazyObjectPtr      { uint8_t Pad[0x1C]; };\n";
+            f << "template<typename T> struct TSoftObjectPtr      { uint8_t Pad[0x28]; };\n";
+            f << "template<typename T> struct TSoftClassPtr       { uint8_t Pad[0x28]; };\n";
+            f << "template<typename T> struct TSubclassOf         { class UClass* Class; };\n";
+            f << "template<typename T> struct TScriptInterface    { class UObject* Object; void* Interface; };\n";
+            f << "template<typename T> struct TFieldPath          { uint8_t Pad[0x20]; };\n";
+            f << "\n";
+            f << "class UObject;\n";
+            f << "class UClass;\n";
+            f << "class IInterface { };\n";
+            f << "\n} // namespace SDK\n\n";
+            f << "#ifdef _MSC_VER\n#pragma pack(pop)\n#endif\n";
+        }
+
+        // ── 2. Per-package files ──────────────────────────────────────────
+        auto write_header = [](std::ofstream& f, const std::string& pkg, const std::string& kind) {
+            f << "#pragma once\n\n";
+            f << "// FrostDumper — " << pkg << "_" << kind << ".hpp\n";
+            f << "// Auto-generated. Do not edit.\n\n";
+            f << "#ifdef _MSC_VER\n#pragma pack(push, 0x8)\n#endif\n\n";
+            f << "namespace SDK\n{\n\n";
+        };
+        auto write_footer = [](std::ofstream& f) {
+            f << "\n} // namespace SDK\n\n";
+            f << "#ifdef _MSC_VER\n#pragma pack(pop)\n#endif\n";
+        };
+
+        // Emit one StructRecord (class or struct) in Dumper-7 form.
+        auto emit_record = [&](std::ofstream& f, const StructRecord& rec) {
+            std::string clean_name = D7_SanIdent(rec.name);
+            // Prefix with U/A/F? The dumper already strips prefixes (see
+            // reference_sdk_naming memory), so we emit the bare name and let
+            // downstream consumers re-prefix if needed. Inheritance uses the
+            // bare super name too.
+            f << "// 0x" << std::hex << rec.props_size
+              << " (0x" << rec.props_size << " - 0x0)\n";
+            f << "// " << (rec.is_class ? "Class " : "ScriptStruct ")
+              << (rec.package.empty() ? "" : (rec.package[0] == '/' ? rec.package : "/Script/" + rec.package))
+              << "." << rec.name << "\n";
+            if (rec.is_class)
+                f << "class " << clean_name;
+            else
+                f << "struct " << clean_name;
+            if (!rec.super_name.empty())
+                f << " : public " << D7_SanIdent(rec.super_name);
+            f << "\n{\npublic:\n";
+
+            // Sort properties by offset so the layout reads top-down. Bool
+            // bitfields collapse into a single uint8_t per byte mask group;
+            // we emit each entry verbatim with a comment indicating the mask.
+            std::vector<const PropertyRecord*> sorted_props;
+            sorted_props.reserve(rec.properties.size());
+            for (const auto& p : rec.properties) sorted_props.push_back(&p);
+            std::sort(sorted_props.begin(), sorted_props.end(),
+                [](const PropertyRecord* a, const PropertyRecord* b) {
+                    if (a->offset != b->offset) return a->offset < b->offset;
+                    return a->name < b->name;
+                });
+
+            // Dedupe by (offset, name) — chain walks can pull the same field
+            // through multiple PropertyLink heads.
+            std::unordered_set<uint64_t> seen_key;
+            for (const auto* p : sorted_props) {
+                uint64_t key = (uint64_t)p->offset << 32;
+                for (char c : p->name) key = key * 131 + (uint8_t)c;
+                if (!seen_key.insert(key).second) continue;
+                std::string ty = D7_PropertyType(*p);
+                std::string nm = D7_SanIdent(p->name);
+                uint32_t sz = D7_PropertyTypeSize(*p);
+                if (p->array_dim > 1) {
+                    f << "    " << ty << " " << nm << "[0x" << std::hex << p->array_dim << "];";
+                } else {
+                    f << "    " << ty << " " << nm << ";";
+                }
+                f << " // 0x" << std::hex << p->offset
+                  << "(0x" << sz << ")";
+                if (p->is_bool && p->bool_byte_mask)
+                    f << " mask=0x" << std::hex << (unsigned)p->bool_byte_mask;
+                f << " (" << p->type_name << ")\n";
+            }
+
+            // Functions — emit as stubs (no native-call wiring; downstream
+            // consumers must hook ProcessEvent themselves).
+            if (!rec.functions.empty()) {
+                f << "\npublic:\n";
+                std::unordered_set<std::string> seen_fn;
+                for (const auto& fn : rec.functions) {
+                    std::string ret = "void";
+                    std::vector<const PropertyRecord*> ins;
+                    for (const auto& par : fn.params) {
+                        if (par.name == "ReturnValue") ret = D7_ParamType(par);
+                        else ins.push_back(&par);
+                    }
+                    std::string fname = D7_SanIdent(fn.name);
+                    // Disambiguate overloads — Dumper-7 normally uses
+                    // suffixed names; we postfix with a counter when needed.
+                    std::string base = fname;
+                    int dup = 0;
+                    while (!seen_fn.insert(fname).second)
+                        fname = base + "_" + std::to_string(++dup);
+                    f << "    " << ret << " " << fname << "(";
+                    bool first = true;
+                    for (const auto* par : ins) {
+                        if (!first) f << ", ";
+                        first = false;
+                        f << D7_ParamType(*par) << " " << D7_SanIdent(par->name);
+                        if (par->array_dim > 1) f << "[0x" << std::hex << par->array_dim << "]";
+                    }
+                    f << ");"
+                      << " // 0x" << std::hex << fn.fn_addr
+                      << " flags=0x" << fn.flags << "\n";
+                }
+            }
+            f << "};\n\n";
+        };
+
+        // Emit one EnumRecord in Dumper-7 form.
+        auto emit_enum = [&](std::ofstream& f, const EnumRecord& rec) {
+            std::string clean = D7_SanIdent(rec.name);
+            f << "// " << (rec.package.empty() ? "" : (rec.package[0] == '/' ? rec.package : "/Script/" + rec.package))
+              << "." << rec.name << "\n";
+            f << "enum class " << clean << " : uint8_t\n{\n";
+            std::unordered_set<std::string> seen_e;
+            for (const auto& ent : rec.entries) {
+                std::string nm = D7_SanIdent(ent.name);
+                // Strip Enum:: scope if present (UE often serializes as Foo::Bar)
+                size_t cc = nm.find("__");
+                if (cc != std::string::npos) nm = nm.substr(cc + 2);
+                std::string base = nm;
+                int dup = 0;
+                while (!seen_e.insert(nm).second)
+                    nm = base + "_" + std::to_string(++dup);
+                f << "    " << nm << " = " << std::dec << ent.value << ",\n";
+            }
+            f << "};\n\n";
+        };
+
+        // Build a topologically sorted package list per kind. For simplicity
+        // we use alphabetical order — Dumper-7's strict dep-graph requires
+        // the parser to resolve inherits-from cross-package, which we
+        // approximate by emitting all classes after all structs after all
+        // enums in master SDK.hpp.
+        std::vector<std::string> all_pkgs;
+        {
+            std::unordered_set<std::string> seen_pkg;
+            auto add = [&](const std::string& p) {
+                if (seen_pkg.insert(p).second) all_pkgs.push_back(p);
+            };
+            for (auto& kv : pkg_enums)   add(kv.first);
+            for (auto& kv : pkg_structs) add(kv.first);
+            for (auto& kv : pkg_classes) add(kv.first);
+            std::sort(all_pkgs.begin(), all_pkgs.end());
+        }
+
+        size_t f_enums = 0, f_structs = 0, f_classes = 0, f_funcs = 0;
+        for (const auto& pkg : all_pkgs) {
+            std::string pkg_dir = sdk_dir + "/" + pkg;
+            D7_Mkdir(pkg_dir);
+            // Enums
+            auto eit = pkg_enums.find(pkg);
+            if (eit != pkg_enums.end() && !eit->second.empty()) {
+                std::ofstream f(pkg_dir + "/" + pkg + "_enums.hpp");
+                write_header(f, pkg, "enums");
+                for (const auto* e : eit->second) emit_enum(f, *e);
+                write_footer(f);
+                ++f_enums;
+            }
+            // Structs
+            auto sit = pkg_structs.find(pkg);
+            if (sit != pkg_structs.end() && !sit->second.empty()) {
+                std::ofstream f(pkg_dir + "/" + pkg + "_structs.hpp");
+                write_header(f, pkg, "structs");
+                for (const auto* s : sit->second) emit_record(f, *s);
+                write_footer(f);
+                ++f_structs;
+            }
+            // Classes
+            auto cit = pkg_classes.find(pkg);
+            if (cit != pkg_classes.end() && !cit->second.empty()) {
+                std::ofstream f(pkg_dir + "/" + pkg + "_classes.hpp");
+                write_header(f, pkg, "classes");
+                for (const auto* c : cit->second) emit_record(f, *c);
+                write_footer(f);
+                ++f_classes;
+            }
+            // Functions — emit a small per-package stub file listing every
+            // UFunction discovered for this package, so consumers can grep
+            // RVAs out without parsing the class bodies.
+            bool has_funcs = false;
+            if (cit != pkg_classes.end())
+                for (const auto* c : cit->second) if (!c->functions.empty()) { has_funcs = true; break; }
+            if (!has_funcs && sit != pkg_structs.end())
+                for (const auto* s : sit->second) if (!s->functions.empty()) { has_funcs = true; break; }
+            if (has_funcs) {
+                std::ofstream f(pkg_dir + "/" + pkg + "_functions.hpp");
+                write_header(f, pkg, "functions");
+                auto emit_fn_table = [&](const StructRecord& rec) {
+                    if (rec.functions.empty()) return;
+                    f << "// " << rec.name << " — " << rec.functions.size() << " functions\n";
+                    for (const auto& fn : rec.functions) {
+                        f << "//   0x" << std::hex << fn.fn_addr
+                          << "  flags=0x" << fn.flags
+                          << "  " << rec.name << "::" << fn.name
+                          << "  params=" << std::dec << fn.params.size() << "\n";
+                    }
+                };
+                if (cit != pkg_classes.end())
+                    for (const auto* c : cit->second) emit_fn_table(*c);
+                if (sit != pkg_structs.end())
+                    for (const auto* s : sit->second) emit_fn_table(*s);
+                write_footer(f);
+                ++f_funcs;
+            }
+        }
+
+        // ── 3. Master SDK.hpp ─────────────────────────────────────────────
+        {
+            std::ofstream m(base_dir + "/SDK.hpp");
+            m << "#pragma once\n\n";
+            m << "// FrostDumper — master SDK.hpp\n";
+            m << "// Packages: " << std::dec << all_pkgs.size() << "\n\n";
+            m << "#include \"SDK/Basic.hpp\"\n\n";
+            m << "// Enums (no cross-package deps)\n";
+            for (const auto& pkg : all_pkgs)
+                if (pkg_enums.count(pkg))   m << "#include \"SDK/" << pkg << "/" << pkg << "_enums.hpp\"\n";
+            m << "\n// Structs (may depend on enums)\n";
+            for (const auto& pkg : all_pkgs)
+                if (pkg_structs.count(pkg)) m << "#include \"SDK/" << pkg << "/" << pkg << "_structs.hpp\"\n";
+            m << "\n// Classes (may depend on structs + enums)\n";
+            for (const auto& pkg : all_pkgs)
+                if (pkg_classes.count(pkg)) m << "#include \"SDK/" << pkg << "/" << pkg << "_classes.hpp\"\n";
+            m << "\n// Function stub tables (optional)\n";
+            for (const auto& pkg : all_pkgs) {
+                bool has = false;
+                auto cit = pkg_classes.find(pkg);
+                auto sit = pkg_structs.find(pkg);
+                if (cit != pkg_classes.end())
+                    for (const auto* c : cit->second) if (!c->functions.empty()) { has = true; break; }
+                if (!has && sit != pkg_structs.end())
+                    for (const auto* s : sit->second) if (!s->functions.empty()) { has = true; break; }
+                if (has) m << "// #include \"SDK/" << pkg << "/" << pkg << "_functions.hpp\"\n";
+            }
+        }
+
+        std::printf("[dumper7] Wrote SDK tree to %s/SDK/  (packages=%zu enums=%zu structs=%zu classes=%zu fnstubs=%zu)\n",
+            base_dir.c_str(), all_pkgs.size(), f_enums, f_structs, f_classes, f_funcs);
     }
 };
 
