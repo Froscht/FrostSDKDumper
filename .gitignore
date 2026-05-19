@@ -32,3 +32,6 @@ probe_live_rvas
 *.bin
 /SDK
 /.claude
+SDK_Output_OLD.txt
+*.id2
+*.nam
