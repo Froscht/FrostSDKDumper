@@ -178,14 +178,33 @@ public:
     //
     // .data range (CL-1177146): MODULE_BASE + [0xDAF3000 .. 0xE25C000)
     uint64_t ReadFFieldClassPtr(uint64_t ff) {
-        constexpr uint64_t kDataLo = 0xDAF3000ULL;
-        constexpr uint64_t kDataHi = 0xE25C000ULL;
-        uint64_t lo = MODULE_BASE + kDataLo;
-        uint64_t hi = MODULE_BASE + kDataHi;
-        uint64_t fc = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
-        if (fc >= lo && fc < hi) return fc;
-        uint64_t fc2 = Read<uint64_t>(ff + 0x88);
-        if (fc2 >= lo && fc2 < hi) return fc2;
+        // FFieldClass globals live in .rdata (vtables and class descriptors).
+        // Use the live-discovered PE bounds rather than a hardcoded .data range.
+        uint64_t lo, hi;
+        if (AutoDiscovery::g_DiscoveredBounds.Valid) {
+            lo = MODULE_BASE + AutoDiscovery::g_DiscoveredBounds.RDataRva;
+            hi = MODULE_BASE + AutoDiscovery::g_DiscoveredBounds.DataRva
+                             + AutoDiscovery::g_DiscoveredBounds.DataSize;   // accept .rdata + .data
+        } else {
+            // Fallback to whole module range when bounds aren't ready yet.
+            lo = MODULE_BASE + 0x1000ULL;
+            hi = MODULE_BASE + 0xF0F5000ULL;
+        }
+        // Try the live ArcDecrypt::Offsets::FField::ClassPrivate first, then
+        // a wider sweep. FField layout has drifted per patch, so we accept
+        // the first offset whose pointee lands inside .rdata / .data.
+        uint64_t primary = ff + ArcDecrypt::Offsets::FField::ClassPrivate;
+        uint64_t fc0 = Read<uint64_t>(primary);
+        if (fc0 >= lo && fc0 < hi) return fc0;
+        static constexpr uint64_t kSweepOffs[] = {
+            0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40,
+            0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80,
+            0x88, 0x90,
+        };
+        for (uint64_t off : kSweepOffs) {
+            uint64_t fc = Read<uint64_t>(ff + off);
+            if (fc >= lo && fc < hi) return fc;
+        }
         return 0;
     }
 
@@ -352,9 +371,10 @@ public:
                     continue;
                 }
 
-                // Skip only if this specific FFieldClass* is already resolved
-                // (NOT by vtable RVA — all FProperties share one vtable in patch 20260402)
-                uint64_t fc_early = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
+                // Skip only if this specific FFieldClass* is already resolved.
+                // Use ReadFFieldClassPtr (live .rdata/.data sweep) since our
+                // hardcoded ClassPrivate offset is wrong on CL-1195482.
+                uint64_t fc_early = ReadFFieldClassPtr(ff);
                 if (fc_early && m_fclass_to_type.count(fc_early)) {
                     ff = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
                     continue;
@@ -367,7 +387,7 @@ public:
                     auto kit = known.find(pname);
                     if (kit != known.end() && IsCanonicalPropertyTypeName(kit->second)) {
                         std::string type_str = "F" + kit->second;
-                        uint64_t fc = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
+                        uint64_t fc = ReadFFieldClassPtr(ff);
                         if (fc && !m_fclass_to_type.count(fc))
                             m_fclass_to_type[fc] = type_str;
                         // Also seed vtable map for Tier 2/3 sample probing
@@ -380,11 +400,8 @@ public:
 
                 // Record for Tier 2/3 — track fclass_ptr and ElementSize
                 uint32_t elem = 0;
-                uint64_t fc_ptr = 0;
-                {
-                    fc_ptr = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
-                    if (fc_ptr) elem = Read<uint32_t>(fc_ptr + ArcDecrypt::Offsets::FFieldClass::ElementSize);
-                }
+                uint64_t fc_ptr = ReadFFieldClassPtr(ff);
+                if (fc_ptr) elem = Read<uint32_t>(fc_ptr + ArcDecrypt::Offsets::FFieldClass::ElementSize);
                 if (!unresolved_vtbls.count(vtbl_rva))
                     unresolved_vtbls[vtbl_rva] = {fc_ptr, elem};
 

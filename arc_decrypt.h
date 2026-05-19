@@ -119,10 +119,13 @@ namespace Offsets {
         // Verified via live FField walk at PostProcessSettings (Agent 1
         // discovery). Auto-offset probe will sticky these on init.
         inline uint64_t VTable        = 0x00;
-        // CL-1195482: FField layout shifted +0x20 again. All offsets bumped.
-        inline uint64_t ClassPrivate  = 0x70;     // CL-1195482 (CL-1177678: 0x50, original: 0x90)
-        inline uint64_t Next          = 0x68;     // CL-1195482 (CL-1177678: 0x48, original: 0x80)
-        inline uint64_t Owner         = 0x78;     // CL-1195482 (CL-1177678: 0x58, original: 0xA0)
+        // CL-1195482: FField layout — NamePrivate at +0x50 confirmed via IDA
+        // sub_43BF16. ClassPrivate placed at the standard UE5 offset (+0x08
+        // right after vtable). Next/Owner inferred — broad-scan in auto_offsets
+        // will tune them if invalid.
+        inline uint64_t ClassPrivate  = 0x08;     // CL-1195482 (standard UE5 layout)
+        inline uint64_t Next          = 0x20;     // CL-1195482 estimate
+        inline uint64_t Owner         = 0x10;     // CL-1195482 estimate
         inline uint64_t NameEncrypted = 0x50;     // CL-1195482 (CL-1177678: 0x30, original: 0x70)
         inline uint64_t NamePrivate   = 0x50;     // CL-1195482 (CL-1177678: 0x30, original: 0x70)
         inline uint64_t SaltSentinel  = 0x58;     // CL-1195482 (CL-1177678: 0x38, original: 0x78)
