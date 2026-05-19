@@ -149,10 +149,14 @@ namespace Offsets {
         inline uint64_t PropertyFlags   = 0x60;   // CL-1195482 estimate — likely 4-byte tail of FField
     }
     namespace FBoolProperty {
-        inline uint64_t FieldSize  = 0x130;
-        inline uint64_t ByteOffset = 0x131;
-        inline uint64_t ByteMask   = 0x132;
-        inline uint64_t FieldMask  = 0x133;
+        // CL-1195482: IDA sub_43BF16 reads `a1[13].i8[3]` = +0xD3 as FieldMask
+        // (compared against -1 / 0xFF). FieldSize lives at +0x68 (overloaded
+        // FProperty.ElementSize). ByteOffset/ByteMask cluster at +0xD0..+0xD3.
+        // Was 0x130..0x133 on CL-1177146/678.
+        inline uint64_t FieldSize  = 0x68;   // alias for FProperty::ElementSize
+        inline uint64_t ByteOffset = 0xD0;
+        inline uint64_t ByteMask   = 0xD2;
+        inline uint64_t FieldMask  = 0xD3;
     }
     // CL-1177678: FProperty sub-class fields shifted by 0x40 (= same shift
     // as FField/FProperty base fields). 0x108 → 0xC8, 0x110 → 0xD0.
