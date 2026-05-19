@@ -590,10 +590,27 @@ public:
                           ? Build20260519_ObjNameSlot(obj_base)
                           : ObjNameSlot(obj_base);
         if (int32_t ci = try_slot(static_cast<int>(ns))) return ci;
-        // Tier 1: walk all 4 slots as fallback.
+        // Tier 1: walk all 4 slots as fallback. Validate each via emu — only
+        // accept the slot whose CI resolves to a non-empty, mostly-printable
+        // string. Without validation, non-name slots (Class/Outer/Inner)
+        // produce in-range-but-bogus CIs that emu-resolves to garbage.
+        auto looks_name = [](const std::string& s) {
+            if (s.empty() || s.size() > 256) return false;
+            int printable = 0;
+            for (unsigned char c : s)
+                if (c >= 32 && c <= 126) ++printable;
+            return printable * 4 >= static_cast<int>(s.size()) * 3;
+        };
         for (int s = 0; s < 4; ++s) {
             if (s == static_cast<int>(ns)) continue;
-            if (int32_t ci = try_slot(s)) return ci;
+            int32_t ci = try_slot(s);
+            if (!ci) continue;
+            if (m_emuFallback) {
+                std::string nm = TryEmuFallback(ci);
+                if (looks_name(nm)) return ci;
+            } else {
+                return ci;  // no validator available — best-effort
+            }
         }
         return 0;
     }

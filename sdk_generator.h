@@ -1484,34 +1484,38 @@ public:
             // for UE5 property offsets) and validate via the decoded value.
             {
                 pr.offset = 0;
-                // CL-1177678: Offset_Internal moved to +0x88 (bool) / +0x8C
-                // (other) — broad-scan in +0x70..+0xA8 to catch both.
-                // XOR key auto-discovered at runtime (was 0x40277448 on
-                // CL-1177146, drifted to 0xCCCCACBB on CL-1177678).
-                alignas(8) uint8_t probe[64] = {};
-                m_reader.Read(ff + 0x70, probe, 64);  // scan +0x70..+0xAF
-                const uint32_t live_xor = ArcDecrypt::Patch20260421::g_PropertyOffsetXor;
-                // Sentinel for offset=0 = bswap32(live_xor) == raw bytes of live_xor.
-                // Match the low 2 bytes of live_xor (stable for offsets < 0x10000).
-                const uint8_t k0 = static_cast<uint8_t>(live_xor & 0xFF);
-                const uint8_t k1 = static_cast<uint8_t>((live_xor >> 8) & 0xFF);
-                bool found = false;
-                for (int dx = 0; dx + 4 <= 64 && !found; ++dx) {
-                    if (probe[dx]     != k0) continue;
-                    if (probe[dx + 1] != k1) continue;
-                    uint32_t stored;
-                    std::memcpy(&stored, probe + dx, 4);
-                    uint32_t real = __builtin_bswap32(stored ^ live_xor);
-                    if (real <= 0x100000u) {
-                        pr.offset = real;
-                        found = true;
-                    }
-                }
-                if (!found) {
-                    // Try fixed offset +0x88 (CL-1177678 primary).
+                // CL-1195482: Offset_Internal is at FField+0x64. Use the
+                // patch-aware DecryptPropertyOffsetNew helper (bswap(stored) ^
+                // XOR) instead of the legacy inline (bswap(stored ^ XOR))
+                // which only works when XOR is its own bswap.
+                {
                     uint32_t stored_off = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::Offset_Internal);
-                    uint32_t real = __builtin_bswap32(stored_off ^ live_xor);
+                    uint32_t real = ArcDecrypt::Patch20260421::DecryptPropertyOffsetNew(stored_off);
                     if (real <= 0x100000u) pr.offset = real;
+                }
+                // Optional fallback: broad-scan +0x60..+0xA0 for the sentinel
+                // byte signature of the live XOR key, in case Offset_Internal
+                // drifts in a future patch. Sentinel value = bswap32(XOR_KEY)
+                // so its LE memory bytes equal the LE bytes of bswap32(XOR_KEY).
+                if (pr.offset == 0) {
+                    const uint32_t live_xor = ArcDecrypt::Patch20260421::g_PropertyOffsetXor;
+                    const uint32_t sentinel = __builtin_bswap32(live_xor);
+                    const uint8_t k0 = static_cast<uint8_t>(sentinel & 0xFF);
+                    const uint8_t k1 = static_cast<uint8_t>((sentinel >> 8) & 0xFF);
+                    alignas(8) uint8_t probe[64] = {};
+                    if (m_reader.Read(ff + 0x60, probe, 64)) {
+                        for (int dx = 0; dx + 4 <= 64; ++dx) {
+                            if (probe[dx]     != k0) continue;
+                            if (probe[dx + 1] != k1) continue;
+                            uint32_t stored;
+                            std::memcpy(&stored, probe + dx, 4);
+                            uint32_t real = ArcDecrypt::Patch20260421::DecryptPropertyOffsetNew(stored);
+                            if (real > 0 && real <= 0x100000u) {
+                                pr.offset = real;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1658,8 +1662,38 @@ public:
             }
 
             result.push_back(pr);
-            ff = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
-            // Validate next pointer
+            // CL-1195482: FField::Next offset isn't fully verified. Try the
+            // configured offset first, then sweep a fixed set of candidates —
+            // accept the first one whose value lands in heap AND whose +0x0
+            // qword (vtable) lies in module range (FField shape).
+            uint64_t next = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next);
+            auto IsValidFFieldNext = [&](uint64_t cand) -> bool {
+                if (cand == 0) return true;   // legitimate chain end
+                if (cand < 0x10000ULL || cand >= 0x7FFFFFFFFFFFULL) return false;
+                if (cand == ff) return false;
+                uint64_t vt = 0;
+                if (!m_reader.Read(cand, &vt, 8)) return false;
+                if (vt < MODULE_BASE + 0x1000ULL ||
+                    vt >= MODULE_BASE + 0xE9D0000ULL) return false;
+                // Additional gate: candidate must have a non-zero NamePrivate slot
+                uint8_t enc[16] = {};
+                if (!m_reader.Read(cand + ArcDecrypt::Offsets::FField::NameEncrypted, enc, 16)) return false;
+                for (uint8_t b : enc) if (b) return true;
+                return false;
+            };
+            if (!IsValidFFieldNext(next)) {
+                static constexpr uint64_t kSweepOffs[] = {
+                    0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40,
+                    0x48, 0x60, 0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8,
+                    0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8,
+                };
+                for (uint64_t off : kSweepOffs) {
+                    if (off == ArcDecrypt::Offsets::FField::Next) continue;
+                    uint64_t cand = Read<uint64_t>(ff + off);
+                    if (IsValidFFieldNext(cand)) { next = cand; break; }
+                }
+            }
+            ff = next;
             if (ff && (ff < 0x10000 || ff >= 0x7FFFFFFFFFFFULL)) break;
             ++count;
         }
@@ -2417,6 +2451,84 @@ public:
 
         // ── Auto-discover vtable-to-type mappings (replaces bootstrap + sweep) ──
         AutoDiscoverVTables(object_ptrs, addr_to_name, allTypeAddrs, ssAddr);
+
+        // ── Brute-force FField::Next offset calibration ──────────────────
+        // Sample a handful of UClass objects, try every 8-aligned offset in
+        // FField in 0x00..0xE8, walk the chain, count valid FField hops.
+        // Whichever offset yields the longest aggregate chain across samples
+        // is the real Next pointer offset on this patch.
+        {
+            std::vector<uint64_t> classSamples;
+            // Sample objects that LOOK like UStructs: heap address, vtable in
+            // module range, ChildProperties at our configured offset pointing
+            // to a heap ptr. Doesn't depend on the m_vtable_to_type map being
+            // populated (it may be empty or sparse at this point).
+            for (const auto& [idx, ptr] : object_ptrs) {
+                if (classSamples.size() >= 48) break;
+                uint64_t vt = 0;
+                if (!m_reader.Read(ptr, &vt, 8)) continue;
+                if (vt < MODULE_BASE + 0x1000ULL ||
+                    vt >= MODULE_BASE + 0xE9D0000ULL) continue;
+                uint64_t head = Read<uint64_t>(ptr + ArcDecrypt::Offsets::UStruct::ChildProperties);
+                if (head < 0x10000ULL || head >= 0x7FFFFFFFFFFFULL) continue;
+                uint64_t headVt = 0;
+                if (!m_reader.Read(head, &headVt, 8)) continue;
+                if (headVt < MODULE_BASE + 0x1000ULL ||
+                    headVt >= MODULE_BASE + 0xE9D0000ULL) continue;
+                classSamples.push_back(ptr);
+            }
+            std::printf("[autocal-next] picked %zu UClass-shaped samples for FField::Next sweep\n",
+                        classSamples.size());
+            if (!classSamples.empty()) {
+                // Get the head's vtable so we can require Next-pointed FFields
+                // to share the SAME vtable family (a chain of FProperties shares
+                // one vtable per concrete subclass — same vtable across the link
+                // is a robust signal that the link is a real chain pointer).
+                auto IsRealFField = [&](uint64_t ff) -> bool {
+                    if (ff < 0x10000ULL || ff >= 0x7FFFFFFFFFFFULL) return false;
+                    uint64_t vt = 0;
+                    if (!m_reader.Read(ff, &vt, 8)) return false;
+                    if (vt < MODULE_BASE + 0x1000ULL ||
+                        vt >= MODULE_BASE + 0xE9D0000ULL) return false;
+                    return true;
+                };
+                std::unordered_map<uint64_t, int> nextScore;
+                for (uint64_t cls : classSamples) {
+                    uint64_t head = Read<uint64_t>(cls + ArcDecrypt::Offsets::UStruct::ChildProperties);
+                    if (!IsRealFField(head)) continue;
+                    for (uint64_t nxo = 0x00; nxo <= 0xE8; nxo += 0x08) {
+                        uint64_t cur = head;
+                        std::unordered_set<uint64_t> seen;
+                        int hops = 0;
+                        while (cur && hops < 256) {
+                            if (!seen.insert(cur).second) break;
+                            uint64_t nx = Read<uint64_t>(cur + nxo);
+                            if (nx == 0) { ++hops; break; }
+                            if (!IsRealFField(nx)) break;
+                            ++hops; cur = nx;
+                        }
+                        if (hops > 1) nextScore[nxo] += hops;
+                    }
+                }
+                if (!nextScore.empty()) {
+                    std::vector<std::pair<uint64_t, int>> ranked(nextScore.begin(), nextScore.end());
+                    std::sort(ranked.begin(), ranked.end(),
+                              [](const auto& a, const auto& b){ return a.second > b.second; });
+                    std::printf("[autocal-next] FField::Next brute-force across %zu UClass samples (top 6):\n",
+                                classSamples.size());
+                    for (size_t I = 0; I < std::min<size_t>(ranked.size(), 6); ++I) {
+                        std::printf("[autocal-next]   next_off=+0x%llX total_hops=%d\n",
+                                    (unsigned long long)ranked[I].first, ranked[I].second);
+                    }
+                    if (ranked[0].second >= 10) {
+                        std::printf("[autocal-next] FField::Next drift: 0x%llX -> 0x%llX (auto-fixed)\n",
+                                    (unsigned long long)ArcDecrypt::Offsets::FField::Next,
+                                    (unsigned long long)ranked[0].first);
+                        ArcDecrypt::Offsets::FField::Next = ranked[0].first;
+                    }
+                }
+            }
+        }
 
         // ── Helper: resolve package name for any obj ptr ──────────────────────
         // When the pkg_ptr isn't in our 70K objects (e.g., /Script/Engine

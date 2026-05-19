@@ -134,12 +134,19 @@ namespace Offsets {
         inline uint64_t ElementSize  = 0x70;
     }
     namespace FProperty {
-        // CL-1177678: also shifted by ~0x40 from CL-1177146.
-        inline uint64_t ArrayDim        = 0x78;   // was 0xF0
-        inline uint64_t ElementSize     = 0x7C;   // was 0xF8
-        inline uint64_t Offset_Internal = 0x88;   // was 0xC4 (bool); 0x8C for non-bool subclasses
-        inline uint32_t Offset_XOR      = 0xCCCCACBBu;  // CL-1177678 (was 0x40277448)
-        inline uint64_t PropertyFlags   = 0x40;   // was 0x98
+        // CL-1195482: FProperty layout. Verified via IDA encode-site analysis
+        // (5 sites with `xor eax,imm32; bswap eax; mov [rbx+0x64]; ... mov ecx,
+        // [rbx+0x68]; imul ecx, [rbx+0x6C]`):
+        //   +0x64 = Offset_Internal (encoded)
+        //   +0x68 = ElementSize (int32, also serves as FBoolProperty::FieldSize)
+        //   +0x6C = ArrayDim (int32, multiplied with ElementSize)
+        // FField body ends ~+0x60; +0x60..+0x63 is some FField tail field
+        // (could be PropertyFlags low 32, or FlagsPrivate).
+        inline uint64_t ArrayDim        = 0x6C;   // CL-1195482 (was 0x78)
+        inline uint64_t ElementSize     = 0x68;   // CL-1195482 (was 0x7C)
+        inline uint64_t Offset_Internal = 0x64;   // CL-1195482 (was 0x88)
+        inline uint32_t Offset_XOR      = 0xCCCCACBBu;  // legacy fallback; g_PropertyOffsetXor=0xD632B3E9 wins
+        inline uint64_t PropertyFlags   = 0x60;   // CL-1195482 estimate — likely 4-byte tail of FField
     }
     namespace FBoolProperty {
         inline uint64_t FieldSize  = 0x130;
@@ -493,19 +500,20 @@ namespace Patch20260421 {
     // Runtime-overridable XOR key for FProperty::Offset_Internal decrypt.
     // Set by AutoDiscovery::DiscoverFPropertyOffsetXor at init time. Falls
     // back to the CL-1177146 verified value when discovery hasn't run.
-    inline uint32_t g_PropertyOffsetXor = 0x48742740u;   // CL-1195482 (bswap of 0x40277448).
-                                                          // Verified via SDK output sentinel:
-                                                          // stored bytes `40 27 74 48` decode to
-                                                          // 0 only when XOR key == 0x48742740.
+    inline uint32_t g_PropertyOffsetXor = 0xD632B3E9u;   // CL-1195482 (IDA-verified).
+                                                          // Found via signature `35 ?? ?? ?? ?? 0F C8`
+                                                          // (xor eax, imm32; bswap eax) — 5 sites use
+                                                          // 0xD632B3E9, 4 use its bswap 0xE9B332D6.
+                                                          // Was 0x40277448 on CL-1177146.
 
     inline uint32_t DecryptPropertyOffsetNew(uint32_t stored) {
-        // CL-1177146: matches IDA decompile of FProperty_OffsetReader
-        // (sub_353900): `bswap32(*(DWORD*)(i+0xC4) ^ 0x40277448)`.
-        // Sentinel for offset=0: stored = 0x40277448 (bytes `48 74 27 40` LE).
-        // Older form `bswap32(stored) ^ 0x40277448` was wrong: that XOR-then-bswap
-        // is only equivalent to bswap-then-XOR when the key is its own bswap, which
-        // 0x40277448 (= bswap 0x48742740) is NOT.
-        return __builtin_bswap32(stored ^ g_PropertyOffsetXor);
+        // CL-1195482: the IDA *encode* sites do `xor eax, 0xD632B3E9; bswap eax;
+        // mov [rbx+0x64], eax`. That stores `bswap(real ^ XOR)`. The inverse is
+        // `bswap(stored) ^ XOR` — bswap first, then xor. Our previous form
+        // (`bswap(stored ^ XOR)`) collapses to `real ^ (XOR ^ bswap(XOR))` which
+        // produces garbage for every offset except where the constant happens
+        // to be its own bswap.
+        return __builtin_bswap32(stored) ^ g_PropertyOffsetXor;
     }
 
     // =========================================================================
