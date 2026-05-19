@@ -493,7 +493,10 @@ namespace Patch20260421 {
     // Runtime-overridable XOR key for FProperty::Offset_Internal decrypt.
     // Set by AutoDiscovery::DiscoverFPropertyOffsetXor at init time. Falls
     // back to the CL-1177146 verified value when discovery hasn't run.
-    inline uint32_t g_PropertyOffsetXor = 0x40277448u;
+    inline uint32_t g_PropertyOffsetXor = 0x48742740u;   // CL-1195482 (bswap of 0x40277448).
+                                                          // Verified via SDK output sentinel:
+                                                          // stored bytes `40 27 74 48` decode to
+                                                          // 0 only when XOR key == 0x48742740.
 
     inline uint32_t DecryptPropertyOffsetNew(uint32_t stored) {
         // CL-1177146: matches IDA decompile of FProperty_OffsetReader

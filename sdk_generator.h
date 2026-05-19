@@ -528,11 +528,34 @@ public:
     // Length verified from the pool ctor (sub_2334A0):
     //   merge_out_clusters(a1 + 9536, 0, 2812)  → buffer size = 2812 bytes = 703 DWORDs
     // (9536 = 0x2540 — same struct offset as the reader)
+    // Seed the canonical set with hardcoded UE5 property type names so the
+    // FFieldClass NamePrivate calibration has something to match even when
+    // the dynamic table read fails (CL-1195482 has the table at a different
+    // RVA than 0xDBB64C0). Idempotent — safe to call multiple times.
+    void SeedCanonicalPropertyTypeNamesFromBuiltin() {
+        static const char* kBuiltin[] = {
+            "BoolProperty", "Int8Property", "ByteProperty", "Int16Property",
+            "UInt16Property", "IntProperty", "UInt32Property", "Int64Property",
+            "UInt64Property", "FloatProperty", "DoubleProperty",
+            "NameProperty", "StrProperty", "TextProperty",
+            "EnumProperty", "StructProperty", "ArrayProperty",
+            "MapProperty", "SetProperty", "ClassProperty",
+            "ObjectProperty", "WeakObjectProperty", "LazyObjectProperty",
+            "SoftObjectProperty", "SoftClassProperty", "InterfaceProperty",
+            "DelegateProperty", "MulticastDelegateProperty",
+            "MulticastInlineDelegateProperty", "MulticastSparseDelegateProperty",
+            "FieldPathProperty", "OptionalProperty", "VerseStringProperty",
+            "Property",
+        };
+        for (const char* n : kBuiltin) m_canonical_property_type_names.insert(n);
+    }
+
     bool LoadDynamicPropertyTypeTable() {
         constexpr uint64_t TABLE_RVA = 0xDBB64C0;
         constexpr size_t   TABLE_LEN = 703;
         m_type_idx_to_name.clear();
         m_canonical_property_type_names.clear();
+        SeedCanonicalPropertyTypeNamesFromBuiltin();
         std::vector<uint32_t> handles(TABLE_LEN, 0);
         if (!m_reader.Read(MODULE_BASE + TABLE_RVA, handles.data(), TABLE_LEN * sizeof(uint32_t))) {
             std::printf("[ptable] failed to read property-type table @ 0x%llX\n",
@@ -765,6 +788,22 @@ public:
             std::printf("[fcname-cal] no observed FFieldClass pointers — pre-pass must run first\n");
             return -1;
         }
+        // Diagnostic: dump the first FEW observed FFieldClass instances'
+        // bytes so we can see the actual struct layout on this build.
+        {
+            int dumped = 0;
+            for (uint64_t Fc : m_observed_fclass_ptrs) {
+                if (dumped++ >= 3) break;
+                std::printf("[fcname-cal] sample FFieldClass @ 0x%llX:\n", (unsigned long long)Fc);
+                for (int off = 0; off < 0xC0; off += 0x10) {
+                    uint64_t a = 0, b = 0;
+                    if (!m_reader.Read(Fc + off, &a, 8)) break;
+                    m_reader.Read(Fc + off + 8, &b, 8);
+                    std::printf("[fcname-cal]   +0x%02X: %016llX %016llX\n",
+                                off, (unsigned long long)a, (unsigned long long)b);
+                }
+            }
+        }
         if (m_canonical_property_type_names.empty()) {
             std::printf("[fcname-cal] no canonical property-type names — ptable must be loaded\n");
             return -1;
@@ -783,21 +822,25 @@ public:
             for (uint64_t Fc : Sample) {
                 alignas(16) uint8_t Enc[16] = {};
                 if (!m_reader.Read(Fc + static_cast<uint64_t>(Off), Enc, 16)) continue;
-                // All-zero slot is uninitialized — skip.
                 bool NonZero = false;
                 for (int B = 0; B < 16; ++B) if (Enc[B]) { NonZero = true; break; }
                 if (!NonZero) continue;
-                // FFieldClass uses a different decode pipeline than FField
-                // (XOR(all-FF) → ROL32(7) → PSHUFLW(0x1B) → ROL64(32) — see
-                // fname_decrypt.h::DecryptFFieldClassNameSlotFromBytes vs
-                // DecryptFFieldNameSlot). The previous call to
-                // DecryptFFieldNameSlot here applied the FField pipeline to
-                // FFieldClass slots, producing garbage CIs; calibration would
-                // report "no offset produced any canonical type-name match".
-                uint64_t Dec = m_fname.DecryptFFieldClassNameSlotFromBytes(Enc);
-                uint32_t Lo = static_cast<uint32_t>(Dec);
-                if (Lo < 2 || Lo > 0x2000000u) continue;
-                std::string Name = m_fname.CompIndexToName(static_cast<int32_t>(Lo));
+                // Try BOTH decoders: the (CL-1177146) FFieldClass-specific
+                // pipeline + the FField NamePrivate decoder. On CL-1195482 the
+                // FFieldClass-specific auto-disc sig is stale, so the FField
+                // pipeline (PSHUFLW(0x4B) → ROL32(1) → PSHUFB → XOR → ROL64(32))
+                // is used as the working fallback.
+                uint64_t Dec1 = m_fname.DecryptFFieldClassNameSlotFromBytes(Enc);
+                uint64_t Dec2 = m_fname.DecryptFFieldNameSlot(Enc);
+                uint32_t Lo1 = static_cast<uint32_t>(Dec1);
+                uint32_t Lo2 = static_cast<uint32_t>(Dec2);
+                std::string Name;
+                if (Lo1 >= 2 && Lo1 <= 0x2000000u) {
+                    Name = m_fname.CompIndexToName(static_cast<int32_t>(Lo1));
+                }
+                if (Name.empty() && Lo2 >= 2 && Lo2 <= 0x2000000u) {
+                    Name = m_fname.CompIndexToName(static_cast<int32_t>(Lo2));
+                }
                 if (Name.empty()) continue;
                 // Match against canonical type names — try with and without
                 // the leading 'F' prefix that some builds use ("BoolProperty"
@@ -869,11 +912,19 @@ public:
             bool NonZero = false;
             for (int B = 0; B < 16; ++B) if (Enc[B]) { NonZero = true; break; }
             if (!NonZero) { ++BadCi; continue; }
-            // FFieldClass pipeline (see calibration note above), NOT FField.
-            uint64_t Dec = m_fname.DecryptFFieldClassNameSlotFromBytes(Enc);
-            uint32_t Lo = static_cast<uint32_t>(Dec);
-            if (Lo < 2 || Lo > 0x2000000u) { ++BadCi; continue; }
-            std::string Name = m_fname.CompIndexToName(static_cast<int32_t>(Lo));
+            // Dual decoder: FFieldClass-specific pipeline (CL-1177146) + FField
+            // NamePrivate pipeline (CL-1195482 working fallback).
+            uint64_t Dec1 = m_fname.DecryptFFieldClassNameSlotFromBytes(Enc);
+            uint64_t Dec2 = m_fname.DecryptFFieldNameSlot(Enc);
+            uint32_t Lo1 = static_cast<uint32_t>(Dec1);
+            uint32_t Lo2 = static_cast<uint32_t>(Dec2);
+            std::string Name;
+            if (Lo1 >= 2 && Lo1 <= 0x2000000u) {
+                Name = m_fname.CompIndexToName(static_cast<int32_t>(Lo1));
+            }
+            if (Name.empty() && Lo2 >= 2 && Lo2 <= 0x2000000u) {
+                Name = m_fname.CompIndexToName(static_cast<int32_t>(Lo2));
+            }
             if (Name.empty()) { ++NoName; continue; }
             // Prefer the canonical "F"-prefixed form.
             std::string Canonical;
@@ -2431,11 +2482,17 @@ public:
         std::printf("[fcmap-dyn] observed %zu unique FFieldClass pointers during pre-pass\n",
             m_observed_fclass_ptrs.size());
 
-        if (m_dynamic_type_table_loaded) {
-            CalibrateFClassTypeIdxOffset();
-            size_t DynAdded = SeedDynamicFClassMap();
-            std::printf("[fcmap-dyn] dynamic seeding produced %zu new FFieldClass mappings (total=%zu)\n",
-                DynAdded, m_fclass_to_type.size());
+        // CL-1195482: m_dynamic_type_table_loaded is false on this build (ptable
+        // failed to decode), but we still want to RUN the FFieldClass.Name slot
+        // calibration + seeding paths — they don't depend on the dynamic table,
+        // only on m_observed_fclass_ptrs which IS populated.
+        {
+            if (m_dynamic_type_table_loaded) {
+                CalibrateFClassTypeIdxOffset();
+                size_t DynAdded = SeedDynamicFClassMap();
+                std::printf("[fcmap-dyn] dynamic seeding produced %zu new FFieldClass mappings (total=%zu)\n",
+                    DynAdded, m_fclass_to_type.size());
+            }
 
             // Parallel path: probe FFieldClass NamePrivate slot directly. On
             // builds where FFieldClass has an FName at a discoverable offset
