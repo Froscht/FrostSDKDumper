@@ -45,6 +45,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
+#include <immintrin.h>
 
 #include "memreader_iface.h"
 #include "arc_decrypt.h"
@@ -1475,6 +1476,34 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
     // fills (xor_const, ci, num) if both ROL32-halves form a plausible CI/Num.
     auto try_decrypt_slot = [&](const uint8_t* slot,
                                 uint64_t& xor_const, uint32_t& ci, uint32_t& num) -> bool {
+        // Attempt 1 — CL-1195482 pipeline (PSHUFLW(0x4B) → ROL32(1) per lane →
+        // PSHUFB(B34DF20-mask) → XOR(0x5C61A9C2230CDE97) → ROL64(32)). Fixed
+        // mask + XOR; validate via CI/Num sanity gate.
+        {
+            __m128i V    = _mm_loadu_si128(reinterpret_cast<const __m128i*>(slot));
+            __m128i Sh   = _mm_shufflelo_epi16(V, 0x4B);
+            __m128i Rot  = _mm_or_si128(_mm_add_epi32(Sh, Sh), _mm_srli_epi32(Sh, 31));
+            alignas(16) static const uint8_t MaskBytes[16] = {
+                0x04, 0x06, 0x07, 0x05, 0x02, 0x01, 0x00, 0x03,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            };
+            __m128i Mask = _mm_load_si128(reinterpret_cast<const __m128i*>(MaskBytes));
+            __m128i Sft  = _mm_shuffle_epi8(Rot, Mask);
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Sft);
+            uint64_t Xored = Lo ^ 0x5C61A9C2230CDE97ULL;
+            uint64_t Out   = (Xored << 32) | (Xored >> 32);
+            uint32_t Ci2   = static_cast<uint32_t>(Out);
+            uint32_t Num2  = static_cast<uint32_t>(Out >> 32);
+            if (Ci2 >= 2 && Ci2 <= 0x2000000u && Num2 <= 0x10000u) {
+                xor_const = 0x5C61A9C2230CDE97ULL;   // surface the pipeline marker
+                ci = Ci2; num = Num2;
+                return true;
+            }
+        }
+
+        // Attempt 2 — legacy CL-1177146 pipeline (ROL32(13) per lane → lo64 →
+        // XOR(const auto-derived from slot+8..+15) → ROL64(7)).
         uint32_t hi_lo32 = 0, hi_hi32 = 0;
         std::memcpy(&hi_lo32, slot + 8,  4);
         std::memcpy(&hi_hi32, slot + 12, 4);
@@ -1539,22 +1568,32 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
     std::vector<Candidate> cands;
     std::vector<uint64_t> cpOffs;
     cpOffs.push_back(ustruct_childprops_offset);
-    for (uint64_t v = 0x20; v <= 0x140; v += 8)
+    for (uint64_t v = 0x20; v <= 0x180; v += 8)   // widened for CL-1195482 (0x138)
         if (v != ustruct_childprops_offset) cpOffs.push_back(v);
     std::vector<uint64_t> npOffs;
     npOffs.push_back(ffield_nameprivate_offset);
     for (uint64_t v : {0x30ULL, 0x40ULL, 0x48ULL, 0x50ULL, 0x58ULL, 0x60ULL,
-                       0x68ULL, 0x70ULL, 0x78ULL, 0x80ULL, 0x88ULL, 0x90ULL})
+                       0x68ULL, 0x70ULL, 0x78ULL, 0x80ULL, 0x88ULL, 0x90ULL,
+                       0xA0ULL, 0xA8ULL, 0xB0ULL, 0xB8ULL, 0xC0ULL, 0xC8ULL,
+                       0xD0ULL, 0xD8ULL, 0xE0ULL, 0xE8ULL, 0xF0ULL, 0xF8ULL})
         if (v != ffield_nameprivate_offset) npOffs.push_back(v);
-    static const uint64_t kNextOffs[] = { 0x48, 0x80, 0x70, 0x68, 0x58, 0x50, 0x60 };
+    static const uint64_t kNextOffs[] = {
+        0x48, 0x80, 0x70, 0x68, 0x58, 0x50, 0x60,
+        // CL-1195482 candidates (FField layout shifted +0x80..+0xA0)
+        0xE0, 0xE8, 0xF0, 0xF8, 0x100, 0x108, 0x110, 0x118,
+    };
     int probed = 0;
+    // Per-offset "saw a heap pointer here" histogram. The most-popular offset
+    // is almost certainly ChildProperties even if its FFields don't validate.
+    std::unordered_map<uint64_t, int> heap_hits_per_cpoff;
     for (uint64_t uss : sample_uscriptstructs) {
-        if (probed >= 16) break;
+        if (probed >= 32) break;   // raised from 16 to surface more candidates
         ++probed;
         for (uint64_t cp : cpOffs) {
             uint64_t ff_head = 0;
             if (!reader.Read(uss + cp, &ff_head, 8)) continue;
             if (!looks_like_heap_ptr(ff_head)) continue;
+            heap_hits_per_cpoff[cp]++;
             for (uint64_t np : npOffs) {
                 uint8_t slot[16] = {};
                 if (!reader.Read(ff_head + np, slot, 16)) continue;
@@ -1615,6 +1654,19 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
     }
 
     std::printf("[autodisc-ffield] no usable FField chain found in %d UScriptStructs (broad-scan exhausted)\n", probed);
+    // Sort offsets by hit count and surface the top 6 — even if decode fails,
+    // the most-popular heap-pointer offset across samples is the candidate
+    // for ChildProperties. Use this output to update kNextOffs / kFieldOffs.
+    {
+        std::vector<std::pair<uint64_t,int>> ranked(heap_hits_per_cpoff.begin(), heap_hits_per_cpoff.end());
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto& a, const auto& b){ return a.second > b.second; });
+        std::printf("[autodisc-ffield] heap-ptr histogram (top offsets w/ heap-ptr across %d samples):\n", probed);
+        for (size_t I = 0; I < std::min<size_t>(ranked.size(), 8); ++I) {
+            std::printf("[autodisc-ffield]   off=+0x%llX hits=%d/%d\n",
+                (unsigned long long)ranked[I].first, ranked[I].second, probed);
+        }
+    }
     return out;
 }
 

@@ -891,7 +891,24 @@ public:
                         if (vt == want_struct_vt) uss_samples.push_back(obj);
                     }
                 }
-                // Fall back to UClass samples if no UScriptStruct samples found.
+                // CL-1195482: ScriptStruct vtable autodisc often collides with
+                // Class on this build (anchor picks 0xB355650 for both), so the
+                // ScriptStruct samples are usually wrong-class. Always *append*
+                // UClass samples so the broad-scan has real FField-bearing types
+                // to probe.
+                if (want_class_vt) {
+                    size_t before = uss_samples.size();
+                    for (uint64_t obj : m_gobj.GetSeedObjects()) {
+                        if (uss_samples.size() >= 64) break;
+                        uint64_t vt = 0;
+                        if (!m_reader.Read(obj, &vt, 8)) continue;
+                        if (vt == want_class_vt) uss_samples.push_back(obj);
+                    }
+                    if (uss_samples.size() > before) {
+                        std::printf("[autodisc] Phase 2 appended %zu UClass samples (total=%zu)\n",
+                            uss_samples.size() - before, uss_samples.size());
+                    }
+                }
                 if (uss_samples.empty() && want_class_vt) {
                     for (uint64_t obj : m_gobj.GetSeedObjects()) {
                         if (uss_samples.size() >= 32) break;
@@ -2422,6 +2439,7 @@ public:
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
+    setvbuf(stdout, nullptr, _IOLBF, 0);   // line-buffered: see real progress in piped logs
     std::cout << "======================================\n";
     std::cout << "  ARC Raiders SDK Dumper\n";
     std::cout << "  Newest patch (FChunkedFixedUObjectArray)\n";

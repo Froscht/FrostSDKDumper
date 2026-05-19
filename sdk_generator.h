@@ -21,8 +21,12 @@
 #include <sstream>
 #include <fstream>
 #include <cstdio>
+#ifdef _WIN32
+#include <direct.h>
+#else
 #include <sys/stat.h>
 #include <sys/types.h>
+#endif
 
 // arc_decrypt.h, fname_decrypt.h, and gobjects.h must already be included by the TU.
 
@@ -3093,7 +3097,11 @@ public:
     }
 
     static void D7_Mkdir(const std::string& path) {
+#ifdef _WIN32
+        ::_mkdir(path.c_str());
+#else
         ::mkdir(path.c_str(), 0755);
+#endif
     }
 
     // ── Emit a Dumper-7 style SDK tree under <base_dir>/.

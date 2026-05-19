@@ -4,6 +4,12 @@
 #include <cstring>
 #include <immintrin.h>
 
+#ifdef _MSC_VER
+#include <stdlib.h>
+#define __builtin_bswap64(x) _byteswap_uint64((unsigned __int64)(x))
+#define __builtin_bswap32(x) _byteswap_ulong((unsigned long)(x))
+#endif
+
 // =============================================================================
 // ARC Raiders – central decrypt constants & inline helpers (patch 20260414)
 // Discovered by IDA analysis on Arc_Raiders_Binary_Steam_2026_04_14.exe
@@ -113,12 +119,13 @@ namespace Offsets {
         // Verified via live FField walk at PostProcessSettings (Agent 1
         // discovery). Auto-offset probe will sticky these on init.
         inline uint64_t VTable        = 0x00;
-        inline uint64_t ClassPrivate  = 0x50;     // was 0x90
-        inline uint64_t Next          = 0x48;     // was 0x80
-        inline uint64_t Owner         = 0x58;     // was 0xA0
-        inline uint64_t NameEncrypted = 0x30;     // was 0x70
-        inline uint64_t NamePrivate   = 0x30;     // was 0x70
-        inline uint64_t SaltSentinel  = 0x38;     // was 0x78
+        // CL-1195482: FField layout shifted +0x20 again. All offsets bumped.
+        inline uint64_t ClassPrivate  = 0x70;     // CL-1195482 (CL-1177678: 0x50, original: 0x90)
+        inline uint64_t Next          = 0x68;     // CL-1195482 (CL-1177678: 0x48, original: 0x80)
+        inline uint64_t Owner         = 0x78;     // CL-1195482 (CL-1177678: 0x58, original: 0xA0)
+        inline uint64_t NameEncrypted = 0x50;     // CL-1195482 (CL-1177678: 0x30, original: 0x70)
+        inline uint64_t NamePrivate   = 0x50;     // CL-1195482 (CL-1177678: 0x30, original: 0x70)
+        inline uint64_t SaltSentinel  = 0x58;     // CL-1195482 (CL-1177678: 0x38, original: 0x78)
     }
     namespace FFieldClass {
         inline uint64_t ElementSize  = 0x70;
@@ -167,11 +174,15 @@ namespace Offsets {
         // Pawn(0x75B71600).Super=Actor(0x2A5A9700) and Actor.Super=UObject_UClass
         // (0x2A5A1300). PropertiesSize verified: Actor=0x3A0, Pawn=0x430,
         // ARFilter=0x150 — all read from +0x110.
-        inline uint64_t SuperStruct     = 0x0A8;   // was 0x0B0
-        inline uint64_t Children        = 0x0B8;   // was 0x100 (UField/UFunction list)
-        inline uint64_t ChildProperties = 0x0B0;   // was 0x100 (FField list head); kChainOffs in sdk_generator.h also walks +0xC0 to catch the full FField chain on newer patches where +0xB0 is only a subset
-        inline uint64_t PropertiesSize  = 0x110;   // was 0x0D8
-        inline uint64_t MinAlignment    = 0x0F8;
+        // CL-1195482: UStruct layout shifted again. Histogram-based discovery
+        // (broad-scan in DiscoverFFieldNameDecrypt) shows heap-pointer hits at
+        // +0x138 (100% of samples) and +0x120 (97%) — these are the new
+        // Children / ChildProperties offsets respectively.
+        inline uint64_t SuperStruct     = 0x130;   // CL-1195482 (CL-1177678: 0xA8)
+        inline uint64_t Children        = 0x138;   // CL-1195482 (CL-1177678: 0xB8)  UField list
+        inline uint64_t ChildProperties = 0x120;   // CL-1195482 (CL-1177678: 0xB0)  FField list head
+        inline uint64_t PropertiesSize  = 0x190;   // CL-1195482 estimate; verify via probe
+        inline uint64_t MinAlignment    = 0x178;
     }
     namespace UEnum {
         inline uint64_t Names = 0xB0;
@@ -209,10 +220,10 @@ constexpr uint64_t MODULE_BASE = 0x140000000;
 // values are the fallback and the "known good for current patch" default).
 // Values are the latest verified patch's defaults; older patches kept as
 // comments so a stale sig-scan or a partial revert can fall back gracefully.
-inline uint64_t RVA_GWORLD              = 0xDFDB4D8;   // CL-1177146 (20260428: 0xE024F68, 20260421: 0xE011D18)
-inline uint64_t RVA_GNAMES_BASE         = 0xDBB3F80;   // CL-1177146 (20260428: 0xDB5BE80, 20260421: 0xDB0FE00, 20260414: 0xDB48E80)
-inline uint64_t RVA_FNAME_KEY_TABLE     = 0xDAF88EC;   // CL-1177146 verified working reference (64 u16 entries; old 0xDA4F130 was sig-scan false positive)
-inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xDE6F6E0;   // CL-1177146 (verified via init-once sled @ 0x38D4BA, NumElements plain @ +0x30; 20260428: 0xDE173A0, 20260421: 0xDDCB420)
+inline uint64_t RVA_GWORLD              = 0xE706C58;   // 20260519 (CL-1177146: 0xDFDB4D8, 20260428: 0xE024F68)
+inline uint64_t RVA_GNAMES_BASE         = 0xE23DA00;   // 20260519 (CL-1177146: 0xDBB3F80, 20260428: 0xDB5BE80)
+inline uint64_t RVA_FNAME_KEY_TABLE     = 0xE17C7FC;   // 20260519 (= SIMD consts block 0xE17C7F4 + 8); CL-1177146: 0xDAF88EC
+inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xE4F8F60;   // CL-1195482 (Steam 19.05 evening; was 0xE4F8ED0 in pre-CL-1195482 morning build)
 constexpr uint64_t GOBJ_ENCRYPTED_OFF   = 0x30;        // legacy pipeline offset (unused on 20260428: NumElements is plain at +0x38)
 
 // SIMD runtime tables (GUObjectArray decrypt — patch 20260414)
@@ -791,5 +802,101 @@ namespace Patch20260421 {
         return _mm_cvtsi128_si32(c);
     }
 }
+
+
+// =============================================================================
+// Build 2026-05-19 (Steam 19.05) — FName pipeline constants
+//
+// All-new resolver shape vs CL-1177146:
+//   - Stage A1+A2+A3 chained SIMD transform on CI to produce (chunk_off, name_off)
+//   - Block-pair hash uses ROL32(13) × 4 with HASH_ADD 0x22243756
+//   - Chunk hash seed at +0x70D0, block base at +0x70E0 (was +0x7000 / +0x7010)
+//   - FNV fold: P * ROL64(v, 57) + 0x61E912C25C5F0996 ; then again with ROL64(56)
+//     (ADDITIVE — CL-1177146 used SUBTRACTIVE - 0x679E1C621411ACFA which is the
+//      same offset, but the sign matters for chain correctness)
+//   - Single XOR + bswap final (0xA05F743A) — vs three-XOR chain on CL-1177146
+//
+// UObject slot decrypt:
+//   shufflelo(57) → XOR(@0xB34B180) → ROL32(9) → XOR(0x890EF320D7E2DC4C) → ROL64(32)
+//
+// String decrypt:
+//   header: length = (h & 0x7F) | ((h >> 5) & 0x380), isWide = h & 0x8000
+//   narrow: u8 LCG seed = length - 107, update: seed = -71*seed - 124
+//   wide:   u32 LCG seed = length + 45717, update: seed = 2090044089*seed - 382688636
+//   per-pair key1 = (107 * (u8)seed - 77) & 0x3F
+//   narrow XORs (key >> 3); wide XORs full u16
+//   keytable indexed as (key_idx & 0x3F) -- our local 64-entry table starts at the
+//   +0x08 offset in the SIMD constants block, so the "+4 word" bias is baked in.
+// =============================================================================
+namespace v20260519 {
+    // ── RVAs (build 2026-05-19) ───────────────────────────────────────────
+    constexpr uint64_t RVA_GNAMEPOOL              = 0xE23DA00ULL;
+    constexpr uint64_t RVA_GNAMEPOOL_INIT_GUARD   = 0xE23D9F8ULL;
+    constexpr uint64_t RVA_FNAME_SIMD_CONSTS      = 0xE17C7F4ULL;
+    constexpr uint64_t RVA_FNAME_KEYTABLE         = RVA_FNAME_SIMD_CONSTS + 0x08ULL;  // 0xE17C7FC
+
+    constexpr uint64_t RVA_STAGE_A1_PSHUFB        = 0xB331000ULL;
+    constexpr uint64_t RVA_STAGE_A1_XOR           = 0xB331010ULL;
+    constexpr uint64_t RVA_STAGE_A2_XOR           = 0xB3311B0ULL;
+    constexpr uint64_t RVA_STAGE_A3_ANDNOT        = 0xB331230ULL;
+    constexpr uint64_t RVA_STAGE_A3_AND           = 0xB331240ULL;
+    constexpr uint64_t RVA_STAGE_A3_XOR           = 0xB331250ULL;
+    constexpr uint64_t RVA_STAGE_A3_PSHUFB_OUT    = 0xB331260ULL;
+    constexpr uint64_t RVA_BLOCK_DECRYPT_XOR      = 0xB331020ULL;
+    constexpr uint64_t RVA_UOBJ_SLOT_XOR          = 0xB34B0E0ULL;   // CL-1195482 (was 0xB34B180)
+
+    constexpr uint64_t RVA_GUOBJECTARRAY          = 0xE4F8F60ULL;   // CL-1195482
+    constexpr uint64_t RVA_GWORLD                 = 0xE706C58ULL;
+
+    // ── Scalar constants (FName pipeline) ─────────────────────────────────
+    constexpr int      SLOT_BASE_OFF        = 0x20;
+    constexpr int      SLOT_STRIDE          = 0x20;
+
+    constexpr uint32_t HASH_PRIME           = 0x01000193u;      // FNV32 prime (shared)
+    constexpr uint32_t SLOT_HASH_ADD        = 0x11315850u;      // 295559120
+    constexpr uint32_t SLOT_INNER_BIAS      = 0x0001DFE0u;      // 122832
+    constexpr uint32_t BHASH_ADD            = 0x22243756u;      // 572647254
+    constexpr int32_t  BHASH_INNER_BIAS     = 86;               // +86 in slot byte
+
+    constexpr uint64_t CHUNK_HASH_SEED_OFF  = 0x70D0;           // was 0x7000
+    constexpr uint64_t CHUNK_BLOCK_BASE_OFF = 0x70E0;           // was 0x7010
+
+    constexpr uint64_t FNV_PRIME            = 0x100000001B3ULL;
+    constexpr uint64_t FNV_ADD              = 0x61E912C25C5F0996ULL; // ADDED (was SUBTRACTED -0x679E1C621411ACFA)
+    constexpr int      FNV_ROL1             = 57;
+    constexpr int      FNV_ROL2             = 56;
+
+    constexpr uint64_t PTR_XOR_FINAL        = 0x3C000000ULL;    // CL-1195482: simple XOR, no bswap.
+                                                                // (Pre-CL-1195482 had bswap+0xA05F743A; CL-1195482 added
+                                                                //  post-A3 XOR(0xC03C00000000) + post-bswap XOR(0x3A749F9C00000000)
+                                                                //  which mathematically cancel down to internal ^ 0x3C000000.)
+
+    constexpr uint64_t UOBJ_SLOT_XOR_64     = 0x890EF320D7E2DC4CULL;  // applied before final ROL64(32)
+    constexpr int      UOBJ_SLOT_ROL32      = 9;                // was 26 on CL-1177678
+    constexpr int      UOBJ_SLOT_FINAL_ROL  = 32;
+
+    constexpr int      KEY_TABLE_SIZE       = 64;
+    constexpr int      KEY_TABLE_BIAS       = 4;
+    constexpr uint8_t  KEY_INDEX_MASK       = 0x3F;
+
+    // Narrow LCG: seed8 = -71 * seed8 - 124
+    constexpr int8_t   KEY_LCG_MUL_NARROW   = -71;
+    constexpr int8_t   KEY_LCG_ADD_NARROW   = -124;
+    constexpr int8_t   KEY_INIT_BIAS_NARROW = -107;
+
+    // Wide LCG: seed32 = 2090044089 * seed32 - 382688636
+    constexpr uint32_t KEY_LCG_MUL_WIDE     = 2090044089u;
+    constexpr uint32_t KEY_LCG_ADD_WIDE     = (uint32_t)-382688636;
+    constexpr uint32_t KEY_INIT_BIAS_WIDE   = 45717u;
+
+    // Per-pair "second key": idx2 = (107 * (u8)seed - 77) & 0x3F
+    constexpr int      KEY_PAIR_MUL         = 107;
+    constexpr int      KEY_PAIR_SUB         = 77;
+
+    // Header bit-layout
+    constexpr uint16_t HDR_LENGTH_LO_MASK   = 0x007F;       // bits 0..6 of hdr → bits 0..6 of length
+    constexpr uint16_t HDR_LENGTH_HI_MASK   = 0x0380;       // ((hdr >> 5) & 0x380) → bits 7..9 of length
+    constexpr uint16_t HDR_IS_WIDE_BIT      = 0x8000;
+} // namespace v20260519
 
 } // namespace ArcDecrypt

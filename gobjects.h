@@ -36,9 +36,13 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <immintrin.h>
+#ifdef _WIN32
+#include <Windows.h>
+#endif
 #include "memreader_iface.h"
 #include "arc_decrypt.h"
 #include "auto_discovery.h"
+#include "zydis/Zydis.h"
 
 namespace gobjects
 {
@@ -93,12 +97,30 @@ namespace gobjects
         }
 
         void SetPid(int pid) { m_pid = pid; }
+        void SetPeb(uint64_t peb) { m_pebAddr = peb; }
+
+        // Late module-base update — used when the live module base differs
+        // from the constructor value (e.g. HyperVReader reports the real
+        // base via NtQueryInformationProcess after construction).
+        void SetBase(uint64_t b) { m_base = b; }
 
         // Load SIMD tables, decrypt array base, count, and decrypt chunk ptr.
         bool Init() {
             if (m_initialized) return true;
 
-            // ── Patch 20260428 path (preferred) ──────────────────────────
+            // ── Patch 20260519 path (preferred) ──────────────────────────
+            // GUObjectArray @ 0xE4F8ED0; NumElements PLAIN u32 @ +0x1C;
+            // encrypted chunks-table m128 @ +0x1A0 (= 0xE4F9070).
+            // Cipher: ROL64(45) → shufflelo(30) → XOR(0x0B982F16865A5F21).
+            // Decrypted ptr P points to a chunks-manager struct; chunks-array
+            // ptr embedded inside (vtable[2] call in IDA; for external read
+            // we scan common offsets P+0x40..0x80 for a heap ptr).
+            if (InitPatch20260519()) {
+                return true;
+            }
+            std::printf("[!] Patch 20260519 path failed, trying 20260428...\n");
+
+            // ── Patch 20260428 path ──────────────────────────────────────
             // 20260428 layout exposes NumElements as a PLAIN u64 at
             // GUObjectArray + 0x38 (verified via live probe on PID 92919).
             // The chunks-manager-pointer pipeline shape changed too, but
@@ -1214,6 +1236,692 @@ namespace gobjects
             }
 
             out_num_elements = static_cast<int32_t>(total);
+            return true;
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // Vt2Interpret — dynamic mini-interpreter for chunks_manager vtable[2].
+        //
+        // Each game session picks one of ~37 vtable variants (hash on heap ptr
+        // in sub_49EFF0). All variants share the same template:
+        //   1. movq xmm0, [rdx]         ; load 8B encrypted from second arg
+        //   2. mov  eax, IMM32          ; PEB_ADD constant
+        //   3. add  rax, gs:[0x60]      ; rax = IMM32 + PEB
+        //   4. some sequence of SIMD ops on xmm0 (pshuflw, pshufhw, pshufd,
+        //      psllw/psrlw, pslld/psrld, psllq/psrlq, por, pxor with [rip+disp]
+        //      or another xmm, pcmpgtw/pcmpgtb/pcmpgtd, pmovzxwd, movdqa)
+        //   5. mov  rcx, IMM64 (optional) + xor rcx, rax (rcx becomes broadcast key)
+        //   6. movq xmm, rax_or_rcx + pshufd 0x44 (broadcast lo64 to all 128b)
+        //   7. pxor xmmA, xmmB (final XOR)
+        //   8. ret
+        // The lo64 of xmm0 (or whichever was final pxor target) is the
+        // chunks_array pointer.
+        //
+        // We decode each instruction via Zydis and execute it against a small
+        // VM state (4 xmm regs, rax, rcx). Returns the decrypted lo64, or 0
+        // on failure (unsupported instruction, read failure, fell off the end).
+        // ─────────────────────────────────────────────────────────────────
+        uint64_t Vt2Interpret(uint64_t fn_addr, uint64_t enc_addr) {
+            // Read function bytes
+            uint8_t code[256] = {};
+            if (!m_reader.Read(fn_addr, code, sizeof(code))) {
+                std::printf("[vt2] read fn @ 0x%llX failed\n", (unsigned long long)fn_addr);
+                return 0;
+            }
+            // Read full 16B encrypted input (some variants use movdqa [rdx])
+            alignas(16) uint8_t enc_buf[16] = {};
+            if (!m_reader.Read(enc_addr, enc_buf, 16)) {
+                std::printf("[vt2] read enc @ 0x%llX failed\n", (unsigned long long)enc_addr);
+                return 0;
+            }
+
+            // VM state
+            alignas(16) uint8_t xmm[8][16] = {}; // xmm0..xmm7
+            uint64_t gpr[16] = {};               // [0]=rax [1]=rcx [2]=rdx [3]=rbx ... (Intel encoding)
+            gpr[2] = enc_addr;                   // rdx = ptr to encrypted blob (caller convention)
+
+            ZydisDecoder dec;
+            ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+
+            ZyanUSize ip = 0;
+            for (int step = 0; step < 64 && ip < sizeof(code); ++step) {
+                ZydisDecodedInstruction inst;
+                ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+                if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code + ip, sizeof(code) - ip, &inst, ops))) {
+                    std::printf("[vt2] decode failed at +0x%llX\n", (unsigned long long)ip);
+                    return 0;
+                }
+                uint64_t insn_rip_after = fn_addr + ip + inst.length;
+
+                auto getXmmIdx = [](const ZydisDecodedOperand& op) -> int {
+                    if (op.type != ZYDIS_OPERAND_TYPE_REGISTER) return -1;
+                    int r = op.reg.value;
+                    if (r >= ZYDIS_REGISTER_XMM0 && r <= ZYDIS_REGISTER_XMM7)
+                        return r - ZYDIS_REGISTER_XMM0;
+                    return -1;
+                };
+                auto getGprIdx = [](const ZydisDecodedOperand& op) -> int {
+                    if (op.type != ZYDIS_OPERAND_TYPE_REGISTER) return -1;
+                    int r = op.reg.value;
+                    if (r >= ZYDIS_REGISTER_RAX && r <= ZYDIS_REGISTER_R15)
+                        return r - ZYDIS_REGISTER_RAX;
+                    if (r >= ZYDIS_REGISTER_EAX && r <= ZYDIS_REGISTER_R15D)
+                        return r - ZYDIS_REGISTER_EAX;
+                    return -1;
+                };
+
+                switch (inst.mnemonic) {
+                    case ZYDIS_MNEMONIC_MOVQ:
+                    case ZYDIS_MNEMONIC_MOVD: {
+                        // movq xmm, [mem] or movq xmm, gpr or movq gpr, xmm
+                        int xd = getXmmIdx(ops[0]);
+                        if (xd >= 0 && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                            // movq xmm, [rdx]  (load 8B from enc input)
+                            std::memset(xmm[xd], 0, 16);
+                            std::memcpy(xmm[xd], enc_buf, 8);
+                        } else if (xd >= 0) {
+                            int gs = getGprIdx(ops[1]);
+                            if (gs < 0) goto unsupported;
+                            std::memset(xmm[xd], 0, 16);
+                            std::memcpy(xmm[xd], &gpr[gs], 8);
+                        } else {
+                            int gd = getGprIdx(ops[0]);
+                            int xs = getXmmIdx(ops[1]);
+                            if (gd < 0 || xs < 0) goto unsupported;
+                            std::memcpy(&gpr[gd], xmm[xs], 8);
+                        }
+                        break;
+                    }
+                    case ZYDIS_MNEMONIC_MOV: {
+                        // mov eax/rax, imm or mov gpr, mem (gs:[0x60] = PEB)
+                        int gd = getGprIdx(ops[0]);
+                        if (gd < 0) goto unsupported;
+                        if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                            uint64_t val = (uint64_t)ops[1].imm.value.u;
+                            // mov eax → zero-extends to rax
+                            if (ops[0].size == 32) val &= 0xFFFFFFFFULL;
+                            gpr[gd] = val;
+                        } else {
+                            goto unsupported;
+                        }
+                        break;
+                    }
+                    case ZYDIS_MNEMONIC_ADD: {
+                        // add rax, qword ptr gs:[0x60]  → rax += PEB
+                        int gd = getGprIdx(ops[0]);
+                        if (gd < 0) goto unsupported;
+                        if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                            ops[1].mem.segment == ZYDIS_REGISTER_GS &&
+                            ops[1].mem.disp.value == 0x60) {
+                            gpr[gd] += m_pebAddr;
+                        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                            gpr[gd] += (uint64_t)ops[1].imm.value.u;
+                        } else {
+                            goto unsupported;
+                        }
+                        break;
+                    }
+                    case ZYDIS_MNEMONIC_XOR: {
+                        // xor rax, rcx or xor rcx, rax
+                        int gd = getGprIdx(ops[0]);
+                        int gs = getGprIdx(ops[1]);
+                        if (gd < 0 || gs < 0) goto unsupported;
+                        gpr[gd] ^= gpr[gs];
+                        break;
+                    }
+                    case ZYDIS_MNEMONIC_MOVDQA:
+                    case ZYDIS_MNEMONIC_MOVDQU: {
+                        int xd = getXmmIdx(ops[0]);
+                        if (xd < 0) goto unsupported;
+                        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                            int xs = getXmmIdx(ops[1]);
+                            if (xs < 0) goto unsupported;
+                            std::memcpy(xmm[xd], xmm[xs], 16);
+                        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                                   ops[1].mem.base == ZYDIS_REGISTER_RDX &&
+                                   ops[1].mem.disp.value == 0) {
+                            // movdqa xmm, [rdx]  — full 16B encrypted blob
+                            std::memcpy(xmm[xd], enc_buf, 16);
+                        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                                   ops[1].mem.base == ZYDIS_REGISTER_RIP) {
+                            uint64_t target = insn_rip_after + (int64_t)ops[1].mem.disp.value;
+                            alignas(16) uint8_t mask[16] = {};
+                            if (!m_reader.Read(target, mask, 16)) {
+                                std::printf("[vt2] read rip-rel @ 0x%llX failed\n",
+                                            (unsigned long long)target);
+                                return 0;
+                            }
+                            std::memcpy(xmm[xd], mask, 16);
+                        } else {
+                            goto unsupported;
+                        }
+                        break;
+                    }
+                    case ZYDIS_MNEMONIC_PSHUFB: {
+                        int xd = getXmmIdx(ops[0]);
+                        if (xd < 0) goto unsupported;
+                        alignas(16) uint8_t mask_bytes[16] = {};
+                        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                            int xs = getXmmIdx(ops[1]);
+                            if (xs < 0) goto unsupported;
+                            std::memcpy(mask_bytes, xmm[xs], 16);
+                        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                                   ops[1].mem.base == ZYDIS_REGISTER_RIP) {
+                            uint64_t target = insn_rip_after + (int64_t)ops[1].mem.disp.value;
+                            if (!m_reader.Read(target, mask_bytes, 16)) {
+                                std::printf("[vt2] pshufb mask read @ 0x%llX failed\n",
+                                            (unsigned long long)target);
+                                return 0;
+                            }
+                        } else {
+                            goto unsupported;
+                        }
+                        // PSHUFB: for each byte, if mask byte high bit set → 0, else use src[mask[i] & 0xF]
+                        uint8_t src[16];
+                        std::memcpy(src, xmm[xd], 16);
+                        uint8_t out[16];
+                        for (int i = 0; i < 16; ++i) {
+                            uint8_t m = mask_bytes[i];
+                            out[i] = (m & 0x80) ? 0 : src[m & 0x0F];
+                        }
+                        std::memcpy(xmm[xd], out, 16);
+                        break;
+                    }
+                    case ZYDIS_MNEMONIC_PSLLW:
+                    case ZYDIS_MNEMONIC_PSRLW:
+                    case ZYDIS_MNEMONIC_PSLLD:
+                    case ZYDIS_MNEMONIC_PSRLD:
+                    case ZYDIS_MNEMONIC_PSLLQ:
+                    case ZYDIS_MNEMONIC_PSRLQ: {
+                        int xd = getXmmIdx(ops[0]);
+                        if (xd < 0 || ops[1].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) goto unsupported;
+                        int shift = (int)ops[1].imm.value.u;
+                        __m128i v = _mm_loadu_si128((const __m128i*)xmm[xd]);
+                        __m128i r;
+                        switch (inst.mnemonic) {
+                            case ZYDIS_MNEMONIC_PSLLW: r = _mm_slli_epi16(v, shift); break;
+                            case ZYDIS_MNEMONIC_PSRLW: r = _mm_srli_epi16(v, shift); break;
+                            case ZYDIS_MNEMONIC_PSLLD: r = _mm_slli_epi32(v, shift); break;
+                            case ZYDIS_MNEMONIC_PSRLD: r = _mm_srli_epi32(v, shift); break;
+                            case ZYDIS_MNEMONIC_PSLLQ: r = _mm_slli_epi64(v, shift); break;
+                            case ZYDIS_MNEMONIC_PSRLQ: r = _mm_srli_epi64(v, shift); break;
+                            default: goto unsupported;
+                        }
+                        _mm_storeu_si128((__m128i*)xmm[xd], r);
+                        break;
+                    }
+                    case ZYDIS_MNEMONIC_POR: {
+                        int xd = getXmmIdx(ops[0]);
+                        int xs = getXmmIdx(ops[1]);
+                        if (xd < 0 || xs < 0) goto unsupported;
+                        __m128i a = _mm_loadu_si128((const __m128i*)xmm[xd]);
+                        __m128i b = _mm_loadu_si128((const __m128i*)xmm[xs]);
+                        _mm_storeu_si128((__m128i*)xmm[xd], _mm_or_si128(a, b));
+                        break;
+                    }
+                    case ZYDIS_MNEMONIC_PXOR: {
+                        int xd = getXmmIdx(ops[0]);
+                        if (xd < 0) goto unsupported;
+                        __m128i a = _mm_loadu_si128((const __m128i*)xmm[xd]);
+                        __m128i b;
+                        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                            int xs = getXmmIdx(ops[1]);
+                            if (xs < 0) goto unsupported;
+                            b = _mm_loadu_si128((const __m128i*)xmm[xs]);
+                        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                                   ops[1].mem.base == ZYDIS_REGISTER_RIP) {
+                            // pxor xmm, [rip+disp32] — read 16B mask from process
+                            uint64_t target = insn_rip_after + (int64_t)ops[1].mem.disp.value;
+                            alignas(16) uint8_t mask[16] = {};
+                            if (!m_reader.Read(target, mask, 16)) {
+                                std::printf("[vt2] read rdata mask @ 0x%llX failed\n",
+                                            (unsigned long long)target);
+                                return 0;
+                            }
+                            b = _mm_loadu_si128((const __m128i*)mask);
+                        } else {
+                            goto unsupported;
+                        }
+                        _mm_storeu_si128((__m128i*)xmm[xd], _mm_xor_si128(a, b));
+                        break;
+                    }
+                    case ZYDIS_MNEMONIC_PSHUFLW:
+                    case ZYDIS_MNEMONIC_PSHUFHW: {
+                        int xd = getXmmIdx(ops[0]);
+                        if (xd < 0 || ops[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) goto unsupported;
+                        int imm = (int)ops[2].imm.value.u;
+                        // Source: register OR memory ([rdx] for the cipher's first
+                        // insn, or [rip+disp32] for inline-data variants).
+                        alignas(16) uint8_t src_buf[16] = {};
+                        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                            int xs = getXmmIdx(ops[1]);
+                            if (xs < 0) goto unsupported;
+                            std::memcpy(src_buf, xmm[xs], 16);
+                        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                                   ops[1].mem.base == ZYDIS_REGISTER_RDX &&
+                                   ops[1].mem.disp.value == 0) {
+                            // pshuflw xmm, qword ptr [rdx], imm — only lo64 matters
+                            std::memcpy(src_buf, enc_buf, 8);
+                        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                                   ops[1].mem.base == ZYDIS_REGISTER_RIP) {
+                            uint64_t target = insn_rip_after + (int64_t)ops[1].mem.disp.value;
+                            if (!m_reader.Read(target, src_buf, 16)) {
+                                std::printf("[vt2] pshuf %s rip-rel read @ 0x%llX failed\n",
+                                            (inst.mnemonic == ZYDIS_MNEMONIC_PSHUFLW) ? "lw" : "hw",
+                                            (unsigned long long)target);
+                                return 0;
+                            }
+                        } else {
+                            goto unsupported;
+                        }
+                        __m128i v = _mm_loadu_si128((const __m128i*)src_buf);
+                        __m128i r;
+                        if (inst.mnemonic == ZYDIS_MNEMONIC_PSHUFLW) {
+                            // Note: _mm_shufflelo_epi16 requires compile-time constant.
+                            // Inline switch table over the 256 possible imm values:
+                            #define SHUFLO(I) case I: r = _mm_shufflelo_epi16(v, I); break;
+                            switch (imm) {
+                                SHUFLO(0x00) SHUFLO(0x01) SHUFLO(0x02) SHUFLO(0x03) SHUFLO(0x04) SHUFLO(0x05) SHUFLO(0x06) SHUFLO(0x07)
+                                SHUFLO(0x08) SHUFLO(0x09) SHUFLO(0x0A) SHUFLO(0x0B) SHUFLO(0x0C) SHUFLO(0x0D) SHUFLO(0x0E) SHUFLO(0x0F)
+                                SHUFLO(0x10) SHUFLO(0x11) SHUFLO(0x12) SHUFLO(0x13) SHUFLO(0x14) SHUFLO(0x15) SHUFLO(0x16) SHUFLO(0x17)
+                                SHUFLO(0x18) SHUFLO(0x19) SHUFLO(0x1A) SHUFLO(0x1B) SHUFLO(0x1C) SHUFLO(0x1D) SHUFLO(0x1E) SHUFLO(0x1F)
+                                SHUFLO(0x20) SHUFLO(0x21) SHUFLO(0x22) SHUFLO(0x23) SHUFLO(0x24) SHUFLO(0x25) SHUFLO(0x26) SHUFLO(0x27)
+                                SHUFLO(0x28) SHUFLO(0x29) SHUFLO(0x2A) SHUFLO(0x2B) SHUFLO(0x2C) SHUFLO(0x2D) SHUFLO(0x2E) SHUFLO(0x2F)
+                                SHUFLO(0x30) SHUFLO(0x31) SHUFLO(0x32) SHUFLO(0x33) SHUFLO(0x34) SHUFLO(0x35) SHUFLO(0x36) SHUFLO(0x37)
+                                SHUFLO(0x38) SHUFLO(0x39) SHUFLO(0x3A) SHUFLO(0x3B) SHUFLO(0x3C) SHUFLO(0x3D) SHUFLO(0x3E) SHUFLO(0x3F)
+                                SHUFLO(0x40) SHUFLO(0x41) SHUFLO(0x42) SHUFLO(0x43) SHUFLO(0x44) SHUFLO(0x45) SHUFLO(0x46) SHUFLO(0x47)
+                                SHUFLO(0x48) SHUFLO(0x49) SHUFLO(0x4A) SHUFLO(0x4B) SHUFLO(0x4C) SHUFLO(0x4D) SHUFLO(0x4E) SHUFLO(0x4F)
+                                SHUFLO(0x50) SHUFLO(0x51) SHUFLO(0x52) SHUFLO(0x53) SHUFLO(0x54) SHUFLO(0x55) SHUFLO(0x56) SHUFLO(0x57)
+                                SHUFLO(0x58) SHUFLO(0x59) SHUFLO(0x5A) SHUFLO(0x5B) SHUFLO(0x5C) SHUFLO(0x5D) SHUFLO(0x5E) SHUFLO(0x5F)
+                                SHUFLO(0x60) SHUFLO(0x61) SHUFLO(0x62) SHUFLO(0x63) SHUFLO(0x64) SHUFLO(0x65) SHUFLO(0x66) SHUFLO(0x67)
+                                SHUFLO(0x68) SHUFLO(0x69) SHUFLO(0x6A) SHUFLO(0x6B) SHUFLO(0x6C) SHUFLO(0x6D) SHUFLO(0x6E) SHUFLO(0x6F)
+                                SHUFLO(0x70) SHUFLO(0x71) SHUFLO(0x72) SHUFLO(0x73) SHUFLO(0x74) SHUFLO(0x75) SHUFLO(0x76) SHUFLO(0x77)
+                                SHUFLO(0x78) SHUFLO(0x79) SHUFLO(0x7A) SHUFLO(0x7B) SHUFLO(0x7C) SHUFLO(0x7D) SHUFLO(0x7E) SHUFLO(0x7F)
+                                SHUFLO(0x80) SHUFLO(0x81) SHUFLO(0x82) SHUFLO(0x83) SHUFLO(0x84) SHUFLO(0x85) SHUFLO(0x86) SHUFLO(0x87)
+                                SHUFLO(0x88) SHUFLO(0x89) SHUFLO(0x8A) SHUFLO(0x8B) SHUFLO(0x8C) SHUFLO(0x8D) SHUFLO(0x8E) SHUFLO(0x8F)
+                                SHUFLO(0x90) SHUFLO(0x91) SHUFLO(0x92) SHUFLO(0x93) SHUFLO(0x94) SHUFLO(0x95) SHUFLO(0x96) SHUFLO(0x97)
+                                SHUFLO(0x98) SHUFLO(0x99) SHUFLO(0x9A) SHUFLO(0x9B) SHUFLO(0x9C) SHUFLO(0x9D) SHUFLO(0x9E) SHUFLO(0x9F)
+                                SHUFLO(0xA0) SHUFLO(0xA1) SHUFLO(0xA2) SHUFLO(0xA3) SHUFLO(0xA4) SHUFLO(0xA5) SHUFLO(0xA6) SHUFLO(0xA7)
+                                SHUFLO(0xA8) SHUFLO(0xA9) SHUFLO(0xAA) SHUFLO(0xAB) SHUFLO(0xAC) SHUFLO(0xAD) SHUFLO(0xAE) SHUFLO(0xAF)
+                                SHUFLO(0xB0) SHUFLO(0xB1) SHUFLO(0xB2) SHUFLO(0xB3) SHUFLO(0xB4) SHUFLO(0xB5) SHUFLO(0xB6) SHUFLO(0xB7)
+                                SHUFLO(0xB8) SHUFLO(0xB9) SHUFLO(0xBA) SHUFLO(0xBB) SHUFLO(0xBC) SHUFLO(0xBD) SHUFLO(0xBE) SHUFLO(0xBF)
+                                SHUFLO(0xC0) SHUFLO(0xC1) SHUFLO(0xC2) SHUFLO(0xC3) SHUFLO(0xC4) SHUFLO(0xC5) SHUFLO(0xC6) SHUFLO(0xC7)
+                                SHUFLO(0xC8) SHUFLO(0xC9) SHUFLO(0xCA) SHUFLO(0xCB) SHUFLO(0xCC) SHUFLO(0xCD) SHUFLO(0xCE) SHUFLO(0xCF)
+                                SHUFLO(0xD0) SHUFLO(0xD1) SHUFLO(0xD2) SHUFLO(0xD3) SHUFLO(0xD4) SHUFLO(0xD5) SHUFLO(0xD6) SHUFLO(0xD7)
+                                SHUFLO(0xD8) SHUFLO(0xD9) SHUFLO(0xDA) SHUFLO(0xDB) SHUFLO(0xDC) SHUFLO(0xDD) SHUFLO(0xDE) SHUFLO(0xDF)
+                                SHUFLO(0xE0) SHUFLO(0xE1) SHUFLO(0xE2) SHUFLO(0xE3) SHUFLO(0xE4) SHUFLO(0xE5) SHUFLO(0xE6) SHUFLO(0xE7)
+                                SHUFLO(0xE8) SHUFLO(0xE9) SHUFLO(0xEA) SHUFLO(0xEB) SHUFLO(0xEC) SHUFLO(0xED) SHUFLO(0xEE) SHUFLO(0xEF)
+                                SHUFLO(0xF0) SHUFLO(0xF1) SHUFLO(0xF2) SHUFLO(0xF3) SHUFLO(0xF4) SHUFLO(0xF5) SHUFLO(0xF6) SHUFLO(0xF7)
+                                SHUFLO(0xF8) SHUFLO(0xF9) SHUFLO(0xFA) SHUFLO(0xFB) SHUFLO(0xFC) SHUFLO(0xFD) SHUFLO(0xFE) SHUFLO(0xFF)
+                                default: r = v;
+                            }
+                            #undef SHUFLO
+                        } else {
+                            // PSHUFHW — implement manually since less common.
+                            // Source already loaded into src_buf above.
+                            uint16_t in_words[8];
+                            std::memcpy(in_words, src_buf, 16);
+                            uint16_t out_words[8];
+                            for (int i = 0; i < 4; ++i) out_words[i] = in_words[i];
+                            for (int i = 0; i < 4; ++i) {
+                                int sel = (imm >> (2*i)) & 3;
+                                out_words[4+i] = in_words[4+sel];
+                            }
+                            r = _mm_loadu_si128((const __m128i*)out_words);
+                        }
+                        _mm_storeu_si128((__m128i*)xmm[xd], r);
+                        break;
+                    }
+                    case ZYDIS_MNEMONIC_PSHUFD: {
+                        int xd = getXmmIdx(ops[0]);
+                        int xs = getXmmIdx(ops[1]);
+                        if (xd < 0 || xs < 0 || ops[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) goto unsupported;
+                        int imm = (int)ops[2].imm.value.u;
+                        uint32_t in_dwords[4];
+                        std::memcpy(in_dwords, xmm[xs], 16);
+                        uint32_t out_dwords[4];
+                        for (int i = 0; i < 4; ++i) {
+                            int sel = (imm >> (2*i)) & 3;
+                            out_dwords[i] = in_dwords[sel];
+                        }
+                        std::memcpy(xmm[xd], out_dwords, 16);
+                        break;
+                    }
+                    case ZYDIS_MNEMONIC_RET: {
+                        // Result is in xmm0 (calling convention for __m128i return)
+                        uint64_t out;
+                        std::memcpy(&out, xmm[0], 8);
+                        return out;
+                    }
+                    default:
+                    unsupported:
+                        std::printf("[vt2] unsupported insn at +0x%llX: %s\n",
+                                    (unsigned long long)ip,
+                                    ZydisMnemonicGetString(inst.mnemonic));
+                        return 0;
+                }
+
+                ip += inst.length;
+            }
+            std::printf("[vt2] fell off without ret\n");
+            return 0;
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // InitPatch20260519 — chunks-table encrypted @ GUObjectArray + 0x1A0
+        // Cipher: ROL64(45) → shufflelo(30) → XOR(0x0B982F16865A5F21).
+        // Decrypted ptr P → chunks_manager struct; chunks_array somewhere
+        // in P+0x40..0x80 (vtable[2] returns it in IDA; we scan for heap ptr).
+        // NumElements: plain u32 @ base+0x1C.
+        // Each chunk: 65536 FUObjectItems × 20 bytes; HIWORD(idx) = chunk_idx,
+        // LOWORD(idx) = slot.
+        // ─────────────────────────────────────────────────────────────────
+        bool InitPatch20260519() {
+            // ── CL-1195482 layout (verified via IDA on 2026-05-19 evening dump) ──
+            // GUObjectArray @ 0xE4F8F60. Encrypted chunks-mgr blob @ +0x110
+            // (= 0xE4F9070). NumElements is NOT plain — it lives inside the
+            // decrypted chunks-mgr struct at +0x90, encrypted with a separate
+            // PSHUFLW(0xE3)+XOR+ROL16(12) pipeline. xmmword_B34B0D0 is the mask.
+            constexpr uint64_t kChunksEncOff = 0x110;
+            constexpr uint64_t kCipherXor = 0x0B982F16865A5F21ULL;
+            constexpr uint64_t kNumElEncOff = 0x90;       // inside decrypted chunks_mgr
+            constexpr uint64_t kRvaNumElXor = 0xB34B0D0;  // 16B mask, low 8 used
+
+            uint64_t base = m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE;
+
+            // Step 1: read encrypted chunks-mgr ptr blob at base+0x110.
+            alignas(16) uint8_t enc_buf[16] = {};
+            if (!m_reader.Read(base + kChunksEncOff, enc_buf, 16)) {
+                std::printf("[p519] read encrypted chunks-mgr blob @ base+0x%llX failed\n",
+                            (unsigned long long)kChunksEncOff);
+                return false;
+            }
+            __m128i enc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc_buf));
+
+            // Step 2: decrypt — ROL64(45) → shufflelo(30) → XOR(cipher) → lo64
+            __m128i rolled = _mm_or_si128(_mm_slli_epi64(enc, 45),
+                                          _mm_srli_epi64(enc, 64 - 45));
+            __m128i shuffled = _mm_shufflelo_epi16(rolled, 30);
+            uint64_t lo64 = static_cast<uint64_t>(_mm_cvtsi128_si64(shuffled));
+            uint64_t P = lo64 ^ kCipherXor;
+
+            std::printf("[p519] decrypted chunks-mgr ptr = 0x%llX\n", (unsigned long long)P);
+
+            // Sanity: must be a heap pointer
+            if (P < 0x10000ULL || P > 0x7FFFFFFFFFFFULL) {
+                std::printf("[p519] decrypted ptr out of heap range\n");
+                return false;
+            }
+
+            // Step 3: decrypt NumElements at chunks_mgr+0x90.
+            // Pipeline: PSHUFLW(0xE3) → XOR(xmmword_B34B0D0 low 8 bytes) → ROL16(12) → low32.
+            alignas(16) uint8_t numel_enc[16] = {};
+            if (!m_reader.Read(P + kNumElEncOff, numel_enc, 16)) {
+                std::printf("[p519] read encrypted NumElements @ P+0x%llX failed\n",
+                            (unsigned long long)kNumElEncOff);
+                return false;
+            }
+            alignas(16) uint8_t numel_mask[16] = {};
+            if (!m_reader.Read(m_base + kRvaNumElXor, numel_mask, 16)) {
+                std::printf("[p519] read NumElements XOR mask @ 0x%llX failed\n",
+                            (unsigned long long)(m_base + kRvaNumElXor));
+                return false;
+            }
+            __m128i ne_v   = _mm_loadu_si128(reinterpret_cast<const __m128i*>(numel_enc));
+            __m128i ne_mask = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(numel_mask));
+            __m128i ne_shuf = _mm_shufflelo_epi16(ne_v, 0xE3);
+            __m128i ne_xor  = _mm_xor_si128(ne_shuf, ne_mask);
+            __m128i ne_rol  = _mm_or_si128(_mm_slli_epi16(ne_xor, 12), _mm_srli_epi16(ne_xor, 4));
+            uint32_t num_elements = static_cast<uint32_t>(_mm_cvtsi128_si32(ne_rol));
+
+            if (num_elements < 1000 || num_elements > 4000000) {
+                std::printf("[p519] decrypted NumElements=%u implausible\n", num_elements);
+                return false;
+            }
+            std::printf("[p519] NumElements=%u (decrypted @ chunks_mgr+0x%llX)\n",
+                        num_elements, (unsigned long long)kNumElEncOff);
+
+            // Step 4: locate chunks_array. Try direct dereference paths first
+            // (chunks_manager has a vtable @ P+0x40; vtable[2] returns the
+            // chunks_array in IDA — but the chunks_array ptr might just sit
+            // at a fixed offset in the chunks_manager struct, accessible
+            // without calling the function). Probe both P+ offsets AND
+            // Q+ offsets where Q = *(P+0x40).
+            constexpr uint32_t kSlotsPerChunk = 65536;
+            constexpr uint32_t kItemStride    = 20;
+            uint32_t num_chunks_needed = (num_elements + kSlotsPerChunk - 1) / kSlotsPerChunk;
+
+            auto isHeap = [](uint64_t p) {
+                return p >= 0x10000ULL && p < 0x7FFFFFFFFFFFULL;
+            };
+            auto isModule = [&](uint64_t p) {
+                return p >= m_base && p < m_base + 0x10000000ULL;
+            };
+            auto validateAsChunksArray = [&](uint64_t arr, bool verbose=false) -> bool {
+                if (!isHeap(arr)) return false;
+                uint64_t cp[2] = {};
+                if (!m_reader.Read(arr, cp, 16)) return false;
+                if (!isHeap(cp[0]) || !isHeap(cp[1])) {
+                    if (verbose) std::printf("[p519]     arr=0x%llX cp0=0x%llX cp1=0x%llX (cp not heap)\n",
+                        (unsigned long long)arr, (unsigned long long)cp[0], (unsigned long long)cp[1]);
+                    return false;
+                }
+                uint64_t obj0 = 0, obj1 = 0;
+                if (!m_reader.Read(cp[0], &obj0, 8) || !m_reader.Read(cp[1], &obj1, 8)) return false;
+                if (!isHeap(obj0) || !isHeap(obj1)) {
+                    if (verbose) std::printf("[p519]     arr=0x%llX cp0=0x%llX obj0=0x%llX obj1=0x%llX (obj not heap)\n",
+                        (unsigned long long)arr, (unsigned long long)cp[0],
+                        (unsigned long long)obj0, (unsigned long long)obj1);
+                    return false;
+                }
+                // Stronger check: obj0 has a vtable in module range
+                uint64_t vt0 = 0;
+                if (!m_reader.Read(obj0, &vt0, 8)) return false;
+                if (!isModule(vt0)) {
+                    if (verbose) std::printf("[p519]     arr=0x%llX obj0=0x%llX vt0=0x%llX (vt not module)\n",
+                        (unsigned long long)arr, (unsigned long long)obj0, (unsigned long long)vt0);
+                    return false;
+                }
+                return true;
+            };
+
+            uint64_t chunks_array = 0;
+            uint64_t Q = 0;
+            m_reader.Read(P + 0x40, &Q, 8);
+            std::printf("[p519] P=0x%llX  *(P+0x40)=Q=0x%llX (vtable inline at P+0x40)\n",
+                        (unsigned long long)P, (unsigned long long)Q);
+            std::fflush(stdout);
+
+            // CL-1195482 layout: chunks_array is NOT at a fixed offset inside
+            // the chunks_mgr struct. The game retrieves it via vtable[2] call
+            // (`*(Q+0x10)`), passing an encrypted m128 input from P+0x70.
+            // We use Vt2Interpret to emulate the cipher live. Direct probe is
+            // a no-op fallback that almost never succeeds, so we skip it to
+            // avoid the long stall we've seen on this patch.
+            for (uint64_t off = 0x08; off <= 0x80 && !chunks_array; off += 8) {
+                uint64_t cand = 0;
+                if (!m_reader.Read(P + off, &cand, 8)) continue;
+                if (!isHeap(cand) || isModule(cand)) continue;
+                std::printf("[p519] probe P+0x%03llX cand=0x%llX\n",
+                            (unsigned long long)off, (unsigned long long)cand);
+                if (validateAsChunksArray(cand, true)) {
+                    std::printf("[p519] chunks_array via P+0x%llX = 0x%llX\n",
+                                (unsigned long long)off, (unsigned long long)cand);
+                    chunks_array = cand;
+                }
+                // Also try with low-byte stripped (in case low bits are tag bits).
+                if (!chunks_array && (cand & 0xF)) {
+                    uint64_t stripped = cand & ~0xFULL;
+                    std::printf("[p519]   also try stripped=0x%llX\n",
+                                (unsigned long long)stripped);
+                    if (validateAsChunksArray(stripped, true)) {
+                        std::printf("[p519] chunks_array via P+0x%llX (stripped) = 0x%llX\n",
+                                    (unsigned long long)off, (unsigned long long)stripped);
+                        chunks_array = stripped;
+                    }
+                }
+            }
+
+            // (Diagnostic vtable[2] body dump removed — it was the buffered-
+            // stdout culprit during patch-1.29.x debugging. The Vt2Interpret
+            // path below logs its own progress.)
+
+            // Ensure PEB is known before Vt2Interpret needs it. FindPEB() is a
+            // /proc/<pid>/maps scan + heap-probe; cheap, ~50ms.
+            if (m_pebAddr == 0) {
+                m_pebAddr = FindPEB();
+                std::printf("[p519] FindPEB() => 0x%llX\n", (unsigned long long)m_pebAddr);
+                std::fflush(stdout);
+            }
+
+            // Dynamic decrypt: interpret vtable[2] live with Zydis.
+            // The cipher VARIES per process launch (37 vtable variants picked by
+            // heap-pointer hash in sub_49EFF0). All variants follow the same
+            // template: load encrypted 8B from [rdx], SIMD massage (shufflelo/
+            // ROL16/ROL32/PXOR-with-rdata-mask), then XOR with broadcast(PEB+const)
+            // ± a 64-bit const, then RET. We decode the function bytes at runtime
+            // and execute each operation in software.
+            if (!chunks_array && Q && m_pebAddr) {
+                uint64_t vt2_fn = 0;
+                if (m_reader.Read(Q + 16, &vt2_fn, 8) && isModule(vt2_fn)) {
+                    std::printf("[p519] Vt2Interpret on vt2_fn=0x%llX, input=P+0x70=0x%llX\n",
+                                (unsigned long long)vt2_fn, (unsigned long long)(P + 0x70));
+                    std::fflush(stdout);
+                    uint64_t cand = Vt2Interpret(vt2_fn, P + 0x70);
+                    std::printf("[p519] Vt2Interpret => 0x%llX\n",
+                                (unsigned long long)cand);
+                    std::fflush(stdout);
+                    if (validateAsChunksArray(cand, true)) {
+                        chunks_array = cand;
+                        std::printf("[p519] chunks_array via Vt2Interpret = 0x%llX\n",
+                                    (unsigned long long)cand);
+                    }
+                }
+            }
+
+            // (Removed: hardcoded vt2-cipher direct decrypt — its constants
+            //  (0x49199A55, 0x725BFAF9AE494AF3) only matched pre-CL-1195482
+            //  vtable variants. Vt2Interpret above handles all 37 variants
+            //  dynamically, so the static fallback was always wrong-or-no-op.)
+#if 0
+            // Decrypt chunks_array from P+0x70 using IDA-confirmed vtable[2] cipher:
+            //   xmm0 = load_si64([P+0x70])                         ; 8 bytes encrypted
+            //   xmm0 = ROL16(xmm0, 13) per 16-bit lane
+            //   xmm1 = shufflelo(xmm0, 0x8D)
+            //   key  = (0x49199A55 + PEB) XOR 0x725BFAF9AE494AF3
+            //   xmm0 = broadcast(key) as (lo32, hi32, lo32, hi32)
+            //   result = xmm1 XOR xmm0
+            //   chunks_array = result.lo64
+            if (!chunks_array) {
+                if (m_pebAddr == 0) {
+                    m_pebAddr = FindPEB();
+                    std::printf("[p519] FindPEB() => 0x%llX\n",
+                                (unsigned long long)m_pebAddr);
+                }
+                if (m_pebAddr) {
+                    constexpr uint32_t kPebAdd  = 0x49199A55u;
+                    constexpr uint64_t kXorConst = 0x725BFAF9AE494AF3ULL;
+
+                    alignas(16) uint8_t enc70[16] = {};
+                    if (m_reader.Read(P + 0x70, enc70, 8)) {
+                        __m128i xmm0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc70));
+                        __m128i xmm1 = _mm_srli_epi16(xmm0, 3);
+                        xmm0 = _mm_slli_epi16(xmm0, 13);
+                        xmm0 = _mm_or_si128(xmm0, xmm1);              // ROL16(13)
+                        xmm1 = _mm_shufflelo_epi16(xmm0, 0x8D);
+
+                        uint64_t peb_plus = static_cast<uint64_t>(kPebAdd) + m_pebAddr;
+                        uint64_t key64    = peb_plus ^ kXorConst;
+                        __m128i  keyV     = _mm_set1_epi64x(static_cast<int64_t>(key64));
+                        // pshufd 0x44 broadcasts low 64 bits — set1_epi64 already does that
+
+                        __m128i result = _mm_xor_si128(xmm1, keyV);
+                        uint64_t cand = static_cast<uint64_t>(_mm_cvtsi128_si64(result));
+
+                        std::printf("[p519] decrypted chunks_array (vt2 cipher) = 0x%llX "
+                                    "(peb=0x%llX add=0x%X key=0x%llX)\n",
+                                    (unsigned long long)cand,
+                                    (unsigned long long)m_pebAddr,
+                                    kPebAdd, (unsigned long long)key64);
+                        if (validateAsChunksArray(cand, true)) {
+                            chunks_array = cand;
+                            std::printf("[p519] chunks_array validated = 0x%llX\n",
+                                        (unsigned long long)cand);
+                        }
+                    }
+                } else {
+                    std::printf("[p519] PEB unavailable, cannot apply vtable[2] cipher\n");
+                }
+            }
+#endif
+
+            // Last resort: heap-scan via ProbeChunkTableNoPEB.
+            // We don't have the module vt range here exactly; use [m_base, m_base+0xF0F5000)
+            // as a permissive vtable range.
+            if (!chunks_array) {
+                std::printf("[p519] direct/indirect probe failed, trying heap scan (num_chunks=%u)...\n",
+                            num_chunks_needed);
+                uint64_t vt_lo = m_base + 0x1000ULL;
+                uint64_t vt_hi = m_base + 0x10000000ULL;
+                chunks_array = ProbeChunkTableNoPEB(num_chunks_needed, vt_lo, vt_hi);
+                if (chunks_array) {
+                    std::printf("[p519] chunks_array via heap-scan = 0x%llX\n",
+                                (unsigned long long)chunks_array);
+                }
+            }
+
+            if (!chunks_array) {
+                std::printf("[p519] no chunks_array found via any probe\n");
+                return false;
+            }
+
+            // Step 5: walk chunks_array → flatten to m_worldFallbackObjects.
+            // Each chunk: 65536 × FUObjectItem (20 bytes). HIWORD(idx) = chunk_idx.
+            uint32_t num_chunks = num_chunks_needed;
+            m_worldFallbackObjects.clear();
+            m_worldFallbackObjects.reserve(num_elements);
+
+            uint64_t chunk_ptrs[1024] = {};
+            if (num_chunks > 1024) num_chunks = 1024;
+            if (!m_reader.Read(chunks_array, chunk_ptrs, num_chunks * 8)) {
+                std::printf("[p519] read chunks_array batch failed\n");
+                return false;
+            }
+
+            uint32_t valid_chunks = 0;
+            for (uint32_t ci = 0; ci < num_chunks; ++ci) {
+                uint64_t chunk = chunk_ptrs[ci];
+                if (!chunk || chunk < 0x10000ULL || chunk > 0x7FFFFFFFFFFFULL) continue;
+                uint32_t slots_in_this_chunk = kSlotsPerChunk;
+                if (ci == num_chunks - 1) {
+                    slots_in_this_chunk = num_elements - (ci * kSlotsPerChunk);
+                }
+                // Read chunk in bulk (slots * 20 bytes)
+                std::vector<uint8_t> chunk_buf(slots_in_this_chunk * kItemStride);
+                if (!m_reader.Read(chunk, chunk_buf.data(), chunk_buf.size())) continue;
+                for (uint32_t si = 0; si < slots_in_this_chunk; ++si) {
+                    uint64_t obj = 0;
+                    std::memcpy(&obj, chunk_buf.data() + si * kItemStride, 8);
+                    if (obj >= 0x10000ULL && obj <= 0x7FFFFFFFFFFFULL) {
+                        m_worldFallbackObjects.push_back(obj);
+                    }
+                }
+                ++valid_chunks;
+            }
+
+            std::printf("[p519] walked %u chunks, collected %zu objects\n",
+                        valid_chunks, m_worldFallbackObjects.size());
+
+            if (m_worldFallbackObjects.size() < 1000) {
+                std::printf("[p519] too few objects, giving up\n");
+                m_worldFallbackObjects.clear();
+                return false;
+            }
+
+            m_arrayBase = base;
+            m_numElements = static_cast<int32_t>(num_elements);
+            m_useWorldFallback = true;
+            m_initialized = true;
             return true;
         }
 
