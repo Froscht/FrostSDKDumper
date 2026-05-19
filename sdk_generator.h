@@ -1798,8 +1798,39 @@ public:
         return oss.str();
     }
 
+    // ── True when a record is an actor/component INSTANCE misclassified as
+    //    a class (CL-1195482 vtable detection picks up many UClass vtables
+    //    shared by BPGC instances; their UAID/instance-suffix name + empty
+    //    body + size=0 give them away). Skipping them de-noises the SDK
+    //    output without losing any real classes.
+    static bool IsJunkClassRecord(const StructRecord& rec) {
+        if (!rec.is_class) return false;
+        const bool no_body = rec.properties.empty() && rec.functions.empty();
+        if (!no_body) return false;
+        if (rec.props_size != 0) return false;
+        // Name markers: UE5 emits `_UAID_XXXX_NN` for actor instances spawned
+        // from level placements; `_C_NN` for blueprint-generated instances;
+        // bare hex-tail names also occur. Drop the obvious ones.
+        const std::string& n = rec.name;
+        if (n.find("_UAID_") != std::string::npos) return true;
+        // Any of the per-instance hash-suffixed BPGC names: 32+ hex chars
+        // following an underscore (e.g. _D288F928443963046556AF8A9441662D)
+        size_t und = n.rfind('_');
+        if (und != std::string::npos && n.size() - und - 1 >= 16) {
+            bool all_hex = true;
+            for (size_t i = und + 1; i < n.size() && all_hex; ++i) {
+                char c = n[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')))
+                    all_hex = false;
+            }
+            if (all_hex) return true;
+        }
+        return false;
+    }
+
     // ── Dump a single UStruct/UClass to string ──────────────────────────────────
     std::string DumpStruct(const StructRecord& rec) {
+        if (IsJunkClassRecord(rec)) return "";   // skip actor-instance junk
         std::ostringstream oss;
         // rec.package now holds the FULL UE5 path ("/Script/Engine",
         // "/Game/Pioneer/Items/BP_X"). Legacy non-path names (basename or
