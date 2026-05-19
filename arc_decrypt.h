@@ -174,15 +174,18 @@ namespace Offsets {
         // Pawn(0x75B71600).Super=Actor(0x2A5A9700) and Actor.Super=UObject_UClass
         // (0x2A5A1300). PropertiesSize verified: Actor=0x3A0, Pawn=0x430,
         // ARFilter=0x150 — all read from +0x110.
-        // CL-1195482: UStruct layout shifted again. Histogram-based discovery
-        // (broad-scan in DiscoverFFieldNameDecrypt) shows heap-pointer hits at
-        // +0x138 (100% of samples) and +0x120 (97%) — these are the new
-        // Children / ChildProperties offsets respectively.
-        inline uint64_t SuperStruct     = 0x130;   // CL-1195482 (CL-1177678: 0xA8)
-        inline uint64_t Children        = 0x138;   // CL-1195482 (CL-1177678: 0xB8)  UField list
-        inline uint64_t ChildProperties = 0x120;   // CL-1195482 (CL-1177678: 0xB0)  FField list head
-        inline uint64_t PropertiesSize  = 0x190;   // CL-1195482 estimate; verify via probe
-        inline uint64_t MinAlignment    = 0x178;
+        // CL-1195482: UStruct layout shifted significantly. Live histogram
+        // probe across 32 UClass samples shows heap-pointer hits at:
+        //   off=+0x168 hits=32/32  ← ChildProperties (FField chain head)
+        //   off=+0x148 hits= 2/32
+        //   off=+0x178 hits= 1/32
+        // auto-offsets probe identifies PropertiesSize at +0x100 (auto-fixed
+        // from 0x190 by live oracle, 100/200 hits).
+        inline uint64_t SuperStruct     = 0x130;   // CL-1195482 estimate
+        inline uint64_t Children        = 0x178;   // CL-1195482 estimate (UField list)
+        inline uint64_t ChildProperties = 0x168;   // CL-1195482 (100%-hit histogram)
+        inline uint64_t PropertiesSize  = 0x100;   // CL-1195482 (auto-disc verified)
+        inline uint64_t MinAlignment    = 0x108;
     }
     namespace UEnum {
         inline uint64_t Names = 0xB0;
