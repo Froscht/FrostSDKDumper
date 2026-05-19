@@ -2733,7 +2733,10 @@ public:
             // rejects UField/UFunction lists that get caught at +0xB8 on
             // native UClass.
             static constexpr uint64_t kChainOffs[] = {
-                0xB0, 0x100, 0xB8, 0xC8, 0xD8, 0x108, 0x118, 0x138, 0x190
+                // CL-1177678 / earlier:
+                0xB0, 0x100, 0xB8, 0xC8, 0xD8, 0x108, 0x118, 0x138, 0x190,
+                // CL-1195482 candidates (UStruct layout shifted ~+0x80):
+                0x120, 0x130, 0x140, 0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x178, 0x180
             };
             // +0xC0 is a UScriptStruct-only FField chain head on newer patches
             // (full chain, vs +0xB0's subset). On UClass it overlaps with

@@ -1276,9 +1276,20 @@ public:
                     std::printf("[autodisc] GNamePool RVA matches constant 0x%llX\n",
                         (unsigned long long)Live);
                 } else {
-                    std::printf("[autodisc] GNamePool RVA drift: 0x%llX → 0x%llX (auto-fixed via FName-walk)\n",
-                        (unsigned long long)Hard, (unsigned long long)Live);
-                    ArcDecrypt::RVA_GNAMES_BASE = Live;
+                    // CL-1195482: the FName-walk heap-probe heuristic mis-tags
+                    // a sibling SIMD-constants block (0xE8E2D28) as GNamePool,
+                    // whereas IDA confirms the real GNamePool is at 0xE23DA00.
+                    // Trust the compile-time value when keytable probe passes
+                    // at the compile-time-implied RVA — flipping GNAMES would
+                    // make ResolveNamePtr produce garbage pointers.
+                    if (m_fname.IsInitialized()) {
+                        std::printf("[autodisc] GNamePool drift suggested (0x%llX → 0x%llX) but FName keytable already validated at compile-time RVA — IGNORING drift.\n",
+                            (unsigned long long)Hard, (unsigned long long)Live);
+                    } else {
+                        std::printf("[autodisc] GNamePool RVA drift: 0x%llX → 0x%llX (auto-fixed via FName-walk)\n",
+                            (unsigned long long)Hard, (unsigned long long)Live);
+                        ArcDecrypt::RVA_GNAMES_BASE = Live;
+                    }
                 }
             }
 

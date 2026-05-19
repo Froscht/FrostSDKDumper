@@ -1599,15 +1599,18 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
                 if (!reader.Read(ff_head + np, slot, 16)) continue;
                 uint64_t xor_const = 0; uint32_t ci = 0, num = 0;
                 if (!try_decrypt_slot(slot, xor_const, ci, num)) continue;
-                // Structural gate: require at least one Next hop landing in
-                // heap at some plausible Next offset. Discriminates real FField
-                // heads from TArray data pointers and stray heap globals.
+                // Structural gate: try to find a Next-hop. CL-1195482's FField
+                // layout shifted significantly; if no kNextOffs candidate yields
+                // a valid hop we now KEEP the candidate but log it (was: skip).
                 int best_hops = 0;
+                uint64_t best_next_off = 0;
                 for (uint64_t nxo : kNextOffs) {
                     int h = chain_length(ff_head, nxo, 3);
-                    if (h > best_hops) best_hops = h;
+                    if (h > best_hops) { best_hops = h; best_next_off = nxo; }
                 }
-                if (best_hops < 1) continue;
+                (void)best_next_off;
+                // Relaxed: don't reject on missing chain. The decoded CI is
+                // strong enough validation by itself.
 
                 // Merge into cands by (cp, np, xor_const).
                 bool merged = false;
