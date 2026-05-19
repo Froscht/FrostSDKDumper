@@ -1312,9 +1312,13 @@ public:
                 uint64_t vtbl = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::VTable);
                 if (vtbl < (MODULE_BASE + 0x1000) ||
                     vtbl >= (MODULE_BASE + 0xE9D0000ULL)) break;
-                uint64_t cls_ptr = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
-                if (cls_ptr != 0 &&
-                    (cls_ptr < 0x100000ULL || cls_ptr >= 0x800000000000ULL)) break;
+                // CL-1195482: FField.ClassPrivate offset hasn't been verified —
+                // the hardcoded 0x70 reads garbage for many FFields and used to
+                // break the chain early. Relaxed: skip the cls_ptr range check.
+                // Real chain-end detection still works via vtable + slot checks.
+                // uint64_t cls_ptr = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
+                // if (cls_ptr != 0 &&
+                //     (cls_ptr < 0x100000ULL || cls_ptr >= 0x800000000000ULL)) break;
                 // Ghost-FField guard. CL-1177678 native UClass stores its
                 // UField chain (UFunction list) at offsets like +0xC8/+0xD8,
                 // and BPGC SuperStruct lands at +0xB8 — both can pass the
@@ -2732,11 +2736,18 @@ public:
             // ghost-FField guard (NamePrivate at +0x30 must be non-zero)
             // rejects UField/UFunction lists that get caught at +0xB8 on
             // native UClass.
+            // CL-1195482: exhaustive sweep — try every 8-byte-aligned offset
+            // from 0x60 to 0x200. walk_chain validates each candidate via the
+            // Ghost-FField guard (module-range vtable + non-zero NamePrivate
+            // slot at +0x50/+0x30), so bogus offsets fail fast and only real
+            // FField chain heads contribute properties.
             static constexpr uint64_t kChainOffs[] = {
-                // CL-1177678 / earlier:
-                0xB0, 0x100, 0xB8, 0xC8, 0xD8, 0x108, 0x118, 0x138, 0x190,
-                // CL-1195482 candidates (UStruct layout shifted ~+0x80):
-                0x120, 0x130, 0x140, 0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x178, 0x180
+                0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8,
+                0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8,
+                0x100, 0x108, 0x110, 0x118, 0x120, 0x128, 0x130, 0x138, 0x140,
+                0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x178, 0x180, 0x188,
+                0x190, 0x198, 0x1A0, 0x1A8, 0x1B0, 0x1B8, 0x1C0, 0x1C8, 0x1D0,
+                0x1D8, 0x1E0, 0x1E8, 0x1F0, 0x1F8, 0x200,
             };
             // +0xC0 is a UScriptStruct-only FField chain head on newer patches
             // (full chain, vs +0xB0's subset). On UClass it overlaps with
