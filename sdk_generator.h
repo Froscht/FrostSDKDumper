@@ -2483,6 +2483,72 @@ public:
         // ── Auto-discover vtable-to-type mappings (replaces bootstrap + sweep) ──
         AutoDiscoverVTables(object_ptrs, addr_to_name, allTypeAddrs, ssAddr);
 
+        // ── Brute-force FField::ClassPrivate offset calibration ─────────
+        // For each plausible FField head, scan offsets 0x00..0xC0 for a ptr
+        // into .rdata/.data WHOSE pointed-to struct has CastFlags-shape at
+        // +0x10 (single-or-few-bit u64 < 0xFFFFFFFF). The offset that hits
+        // most often across samples is FField::ClassPrivate.
+        {
+            uint64_t lo, hi;
+            if (AutoDiscovery::g_DiscoveredBounds.Valid) {
+                lo = MODULE_BASE + AutoDiscovery::g_DiscoveredBounds.RDataRva;
+                hi = MODULE_BASE + AutoDiscovery::g_DiscoveredBounds.DataRva
+                                 + AutoDiscovery::g_DiscoveredBounds.DataSize;
+            } else { lo = MODULE_BASE + 0x1000ULL; hi = MODULE_BASE + 0xF0F5000ULL; }
+            auto IsCastFlagsLike = [](uint64_t v) {
+                if (v == 0 || v >= 0x100000000ULL) return false;
+                // CastFlags has at most a few bits set among the low 32.
+                int bits = __builtin_popcountll(v);
+                return bits >= 1 && bits <= 6;
+            };
+            std::vector<uint64_t> ffSamples;
+            for (const auto& [idx, ptr] : object_ptrs) {
+                if (ffSamples.size() >= 200) break;
+                uint64_t vt = 0;
+                if (!m_reader.Read(ptr, &vt, 8)) continue;
+                if (vt < MODULE_BASE + 0x1000ULL ||
+                    vt >= MODULE_BASE + 0xE9D0000ULL) continue;
+                uint64_t head = Read<uint64_t>(ptr + ArcDecrypt::Offsets::UStruct::ChildProperties);
+                if (head < 0x10000ULL || head >= 0x7FFFFFFFFFFFULL) continue;
+                ffSamples.push_back(head);
+                // Walk a few hops via newly-discovered Next to collect more FFields.
+                uint64_t cur = head; int hops = 0;
+                std::unordered_set<uint64_t> seen;
+                while (cur && hops < 8 && ffSamples.size() < 200) {
+                    if (!seen.insert(cur).second) break;
+                    uint64_t nx = Read<uint64_t>(cur + ArcDecrypt::Offsets::FField::Next);
+                    if (!nx || nx < 0x10000ULL || nx >= 0x7FFFFFFFFFFFULL) break;
+                    ffSamples.push_back(nx);
+                    cur = nx; ++hops;
+                }
+            }
+            std::unordered_map<uint64_t, int> cpScore;
+            for (uint64_t ff : ffSamples) {
+                for (uint64_t off = 0x00; off <= 0xC0; off += 0x08) {
+                    uint64_t fc = Read<uint64_t>(ff + off);
+                    if (fc < lo || fc >= hi) continue;
+                    uint64_t castflags = Read<uint64_t>(fc + 0x10);
+                    if (!IsCastFlagsLike(castflags)) continue;
+                    cpScore[off]++;
+                }
+            }
+            std::vector<std::pair<uint64_t,int>> ranked(cpScore.begin(), cpScore.end());
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const auto& a, const auto& b){ return a.second > b.second; });
+            std::printf("[autocal-cp] FField::ClassPrivate brute-force across %zu FField samples (top 6):\n",
+                        ffSamples.size());
+            for (size_t I = 0; I < std::min<size_t>(ranked.size(), 6); ++I) {
+                std::printf("[autocal-cp]   off=+0x%llX hits=%d\n",
+                            (unsigned long long)ranked[I].first, ranked[I].second);
+            }
+            if (!ranked.empty() && ranked[0].second >= 20) {
+                std::printf("[autocal-cp] FField::ClassPrivate drift: 0x%llX -> 0x%llX (auto-fixed)\n",
+                            (unsigned long long)ArcDecrypt::Offsets::FField::ClassPrivate,
+                            (unsigned long long)ranked[0].first);
+                ArcDecrypt::Offsets::FField::ClassPrivate = ranked[0].first;
+            }
+        }
+
         // ── Brute-force FField::Next offset calibration ──────────────────
         // Sample a handful of UClass objects, try every 8-aligned offset in
         // FField in 0x00..0xE8, walk the chain, count valid FField hops.
