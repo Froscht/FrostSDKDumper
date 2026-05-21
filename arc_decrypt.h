@@ -205,7 +205,7 @@ namespace Offsets {
     namespace UFunction {
         inline uint64_t VTable        = 0x000;
         inline uint64_t NextPtr       = 0x098;
-        inline uint64_t FunctionFlags = 0x130;
+        inline uint64_t FunctionFlags = 0x154;   // CL-1201801 (auto-fixed 100/100 hits)
         inline uint64_t NativeFunc    = 0x178;   // CL-1201801 (auto-fixed 99/100 hits)
         inline uint64_t NumParms      = 0xE0;
     }

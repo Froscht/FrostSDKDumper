@@ -936,11 +936,6 @@ public:
             m_fclass_to_type[Fc] = Canonical;
             ++Added;
             ++AddedByType[Canonical];
-            // Print RVA so we can hardcode it for future patches.
-            if (Fc >= MODULE_BASE && Fc < MODULE_BASE + 0x10000000ULL) {
-                std::printf("[fcname-rva] 0x%llX  \"%s\"\n",
-                    (unsigned long long)(Fc - MODULE_BASE), Canonical.c_str());
-            }
         }
 
         std::printf("[fcname-seed] examined=%zu already=%zu read_fail=%zu bad_ci=%zu "
@@ -1778,23 +1773,26 @@ public:
     std::string FormatFunction(const FunctionRecord& fn) {
         std::ostringstream oss;
         std::string ret_type = "void";
-        std::vector<const PropertyRecord*> in_params;
+        std::vector<const PropertyRecord*> InParams;
         for (const auto& par : fn.params) {
-            if (par.name == "ReturnValue") ret_type = par.type_name;
-            else in_params.push_back(&par);
+            if (par.name == "ReturnValue") { ret_type = par.type_name; continue; }
+            const bool IsContextGarbage = par.type_name == "FProperty_Unknown" &&
+                                          par.name.rfind("Prop_CI", 0) == 0;
+            if (!IsContextGarbage)
+                InParams.push_back(&par);
         }
         oss << "// 0x" << std::hex << fn.fn_addr;
         if (fn.native_rva) oss << " (RVA: 0x" << std::hex << fn.native_rva << ")";
         oss << " flags=0x" << std::hex << fn.flags << "\n";
         oss << ret_type << " " << fn.name << "(";
-        bool first = true;
-        for (const auto* par : in_params) {
-            if (!first) oss << ", ";
-            first = false;
+        bool First = true;
+        for (const auto* par : InParams) {
+            if (!First) oss << ", ";
+            First = false;
             oss << par->type_name << " " << par->name;
             if (par->array_dim > 1) oss << "[" << par->array_dim << "]";
         }
-        oss << "); // " << in_params.size() << " params\n";
+        oss << "); // " << InParams.size() << " params\n";
         return oss.str();
     }
 
@@ -1828,13 +1826,44 @@ public:
         return false;
     }
 
+    // A function is junk when every non-ReturnValue parameter has FProperty_Unknown type.
+    // Functions with zero non-return parameters are NOT junk — they may be real events.
+    static bool IsJunkFunction(const FunctionRecord& fn) {
+        int NonRet = 0, UnkCnt = 0;
+        for (const auto& Par : fn.params) {
+            if (Par.name == "ReturnValue") continue;
+            ++NonRet;
+            if (Par.type_name == "FProperty_Unknown") ++UnkCnt;
+        }
+        return NonRet > 0 && NonRet == UnkCnt;
+    }
+
     // ── Dump a single UStruct/UClass to string ──────────────────────────────────
     std::string DumpStruct(const StructRecord& rec) {
-        if (IsJunkClassRecord(rec)) return "";   // skip actor-instance junk
+        if (rec.name.rfind("Class_0x", 0) == 0) return "";
+        if (IsJunkClassRecord(rec)) return "";
+
+        // Build filtered function list — drop functions whose only parameters
+        // are CI=0 unknowns (Blueprint CDO synthetic events, static mesh events).
+        std::vector<const FunctionRecord*> GoodFns;
+        GoodFns.reserve(rec.functions.size());
+        for (const auto& fn : rec.functions)
+            if (!IsJunkFunction(fn))
+                GoodFns.push_back(&fn);
+
+        std::vector<const PropertyRecord*> GoodProps;
+        GoodProps.reserve(rec.properties.size());
+        for (const auto& pr : rec.properties) {
+            const bool IsGarbage = pr.name.rfind("Prop_CI", 0) == 0 &&
+                                   pr.type_name == "FProperty_Unknown";
+            if (!IsGarbage)
+                GoodProps.push_back(&pr);
+        }
+
+        // Skip namespaces that have nothing useful after filtering.
+        if (GoodProps.empty() && GoodFns.empty()) return "";
+
         std::ostringstream oss;
-        // rec.package now holds the FULL UE5 path ("/Script/Engine",
-        // "/Game/Pioneer/Items/BP_X"). Legacy non-path names (basename or
-        // "Unknown") fall through with a "/Script/" prefix for back-compat.
         const std::string& pkg = rec.package;
         oss << "// " << (rec.is_class ? "Class" : "Struct") << " "
             << (!pkg.empty() && pkg[0] == '/' ? pkg : "/Script/" + pkg)
@@ -1844,7 +1873,6 @@ public:
             << " (" << std::dec << rec.props_size << " bytes)\n";
         if (!rec.super_name.empty())
             oss << "// Inherits: " << rec.super_name << " (0x" << std::hex << rec.super_addr << ")\n";
-        // Walk full inheritance chain
         if (rec.super_addr) {
             oss << "// Inheritance chain:\n";
             uint64_t cur = rec.super_addr;
@@ -1862,7 +1890,8 @@ public:
         }
         oss << "namespace " << rec.name << " {\n";
         std::unordered_map<std::string, int> NameCount;
-        for (const auto& pr : rec.properties) {
+        for (const auto* prp : GoodProps) {
+            const auto& pr = *prp;
             std::string type_decl;
             if (pr.array_dim > 1)
                 type_decl = pr.type_name + "[" + std::to_string(pr.array_dim) + "]";
@@ -1888,10 +1917,10 @@ public:
                 oss << " // size=0x" << std::hex << pr.elem_size;
             oss << "\n";
         }
-        if (!rec.functions.empty()) {
-            oss << "\n// === Functions (" << rec.functions.size() << ") ===\n";
-            for (const auto& fn : rec.functions)
-                oss << FormatFunction(fn);
+        if (!GoodFns.empty()) {
+            oss << "\n// === Functions (" << GoodFns.size() << ") ===\n";
+            for (const auto* fn : GoodFns)
+                oss << FormatFunction(*fn);
         }
         oss << "} // namespace " << rec.name << "  // size=0x" << std::hex << rec.props_size << "\n\n";
         return oss.str();
@@ -2762,24 +2791,6 @@ public:
                 std::printf("[fcflags] CastFlags seeding produced %zu new FFieldClass mappings (total=%zu)\n",
                     CfAdded, m_fclass_to_type.size());
             }
-            // Dump all mapped FFieldClass RVAs that are in the observed set.
-            std::printf("[fcmap-rvas] All mapped FFieldClass RVAs (observed in pre-pass):\n");
-            std::vector<std::pair<uint64_t,std::string>> RvaList;
-            for (uint64_t Fc : m_observed_fclass_ptrs) {
-                auto It = m_fclass_to_type.find(Fc);
-                if (It == m_fclass_to_type.end()) continue;
-                uint64_t Rva = (Fc >= MODULE_BASE && Fc < MODULE_BASE + 0x10000000ULL)
-                               ? Fc - MODULE_BASE : 0;
-                RvaList.push_back({Rva, It->second});
-            }
-            std::sort(RvaList.begin(), RvaList.end(),
-                [](const auto& A, const auto& B){ return A.second < B.second; });
-            for (const auto& [Rva, Name] : RvaList) {
-                if (Rva)
-                    std::printf("[fcmap-rvas]   { 0x%llX, \"%s\" },\n",
-                        (unsigned long long)Rva, Name.c_str());
-            }
-            std::printf("[fcmap-rvas] Total: %zu\n", RvaList.size());
         }
 
         // ── Pass 2: iterate objects — include all type objects ──────────────────
