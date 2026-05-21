@@ -466,7 +466,7 @@ public:
             // double-deref shape and live-validates each candidate via UWorld
             // → PersistentLevel → Actors, so it can never substitute garbage.
             applyTrusted("GNames",       ArcDecrypt::RVA_GNAMES_BASE,        scan.FindGNamesRVA());
-            applyStrict ("FNameKeyTbl",  ArcDecrypt::RVA_FNAME_KEY_TABLE,
+            applyTrusted("FNameKeyTbl",  ArcDecrypt::RVA_FNAME_KEY_TABLE,
                   scan.FindFNameKeyTableRVA(ArcDecrypt::RVA_FNAME_KEY_TABLE,
                                             ArcDecrypt::RVA_GNAMES_BASE));
             auto st = scan.FindObjArraySimdTables();
@@ -946,6 +946,12 @@ public:
             // scores against a type-shape oracle, and overwrites the global
             // only on strong consensus. Failed probes leave the compile-time
             // fallback intact and log loudly.
+            //
+            // Pre-seed g_DiscoveredFClassGlobals with hardcoded CL-1201801
+            // RVAs before DiscoverAll so Probe 10 (FProperty sub-pointers)
+            // has a populated fclass_to_type map even when Phase 8 auto-
+            // discovery yields 0 entries (FFieldClass globals not sigscanned).
+            AutoDiscovery::SeedHardcodedFClassGlobals_CL1201801();
             AutoOffsets::DiscoverAll(m_reader, MODULE_BASE,
                                      m_gobj.GetSeedObjects(), m_fname);
         }
@@ -1294,24 +1300,20 @@ public:
             }
 
             // ── Phase 6.5: FName keystream RVA = SIMD-block + 0xA0 ────────
-            // The FName keystream lives at a fixed +0xA0 inside the SIMD-
-            // constants block — both globals are referenced ~equally many
-            // times by the FName fn body, so the GNames-walk picks them up
-            // as candidates side-by-side. The heap-probe tie-break
-            // distinguishes them: FNamePool has a heap pointer (PASS), the
-            // SIMD block has only inline constants (FAIL). Take the highest-
-            // ref FAIL candidate as the SIMD block; keystream = block + 0xA0.
-            //
-            // Why: hardcoded `RVA_FNAME_KEY_TABLE = 0xDAF88EC` was correct
-            // on CL-1177146 but moved on CL-1177678. Without auto-discovery
-            // the static `DecryptNameString` XORs against the wrong keystream
-            // and produces garbage even when the resolver itself is healthy.
+            // Only applies when the FName decryptor is NOT yet initialized —
+            // if keytable was already probed and validated (m_fname.IsInitialized()),
+            // the SIMD-block+0xA0 inference is irrelevant (and on CL-1201801+ the
+            // key table no longer sits at SimdBlock+0xA0 anyway).
             if (AutoDiscovery::g_DiscoveredGNames.SimdBlockRva) {
                 uint64_t Hard = ArcDecrypt::RVA_FNAME_KEY_TABLE;
                 uint64_t Live = AutoDiscovery::g_DiscoveredGNames.SimdBlockRva + 0xA0;
                 if (Live == Hard) {
                     std::printf("[autodisc] FName keystream RVA matches constant 0x%llX\n",
                         (unsigned long long)Live);
+                } else if (m_fname.IsInitialized()) {
+                    std::printf("[autodisc] FName keystream drift (0x%llX → 0x%llX) suppressed — "
+                                "keytable already validated at compile-time RVA\n",
+                        (unsigned long long)Hard, (unsigned long long)Live);
                 } else {
                     std::printf("[autodisc] FName keystream RVA drift: 0x%llX → 0x%llX "
                                 "(auto-fixed via SIMD-block + 0xA0)\n",

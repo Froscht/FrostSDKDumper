@@ -3096,4 +3096,56 @@ inline FFieldClassNameParams     g_DiscoveredFFieldClassName;
 inline std::vector<FFieldClassGlobal> g_DiscoveredFClassGlobals;
 inline GUObjectArrayLayout       g_DiscoveredGObjLayout;
 
+// Seed g_DiscoveredFClassGlobals with hardcoded CL-1201801 FFieldClass RVAs so
+// AutoOffsets::DiscoverAll (Probe 10) has a populated fclass_to_type map even
+// when Phase 8 (DiscoverFFieldClassGlobals) finds nothing.  Call this BEFORE
+// AutoOffsets::DiscoverAll.
+inline void SeedHardcodedFClassGlobals_CL1201801() {
+    static const std::pair<uint64_t, const char*> kSeeds[] = {
+        { 0xE3B4A80, "FArrayProperty" },
+        { 0xE3B3DC0, "FArrayProperty" },
+        { 0xE3B3930, "FArrayProperty" },
+        { 0xE3B3A30, "FBoolProperty" },
+        { 0xE3B3AB0, "FByteProperty" },
+        { 0xE3ABBB0, "FByteProperty" },
+        { 0xE3B3B30, "FClassProperty" },
+        { 0xE3B3C30, "FDelegateProperty" },
+        { 0xE3B44D0, "FDoubleProperty" },
+        { 0xE3ABD20, "FFieldPathProperty" },
+        { 0xE3B4450, "FFloatProperty" },
+        { 0xE3B4150, "FInt16Property" },
+        { 0xE3B4250, "FInt64Property" },
+        { 0xE3B40D0, "FInt8Property" },
+        { 0xE3B41D0, "FIntProperty" },
+        { 0xE3B3CC0, "FInterfaceProperty" },
+        { 0xE3B3D40, "FLazyObjectProperty" },
+        { 0xE3B3ED0, "FMulticastInlineDelegateProperty" },
+        { 0xE3B3F50, "FMulticastSparseDelegateProperty" },
+        { 0xE3B3FD0, "FNameProperty" },
+        { 0xE3B45E0, "FObjectProperty" },
+        { 0xE3B3BB0, "FObjectProperty" },
+        { 0xE3B4660, "FOptionalProperty" },
+        { 0xE3B4B00, "FSoftClassProperty" },
+        { 0xE3B4B80, "FSoftObjectProperty" },
+        { 0xE3B4CD0, "FStructProperty" },
+        { 0xE3B60A0, "FTextProperty" },
+        { 0xE3B4C50, "FTextProperty" },
+        { 0xE3B42D0, "FUInt16Property" },
+        { 0xE3B4350, "FUInt32Property" },
+        { 0xE3B43D0, "FUInt64Property" },
+        { 0xE3B4D60, "FWeakObjectProperty" },
+        { 0xE3B4550, "FWeakObjectProperty" },
+    };
+    std::unordered_map<uint64_t, bool> existing;
+    for (const auto& g : g_DiscoveredFClassGlobals)
+        existing[g.TargetRva] = true;
+    for (auto [rva, type] : kSeeds) {
+        if (existing.count(rva)) continue;
+        FFieldClassGlobal g;
+        g.TargetRva = rva;
+        g.TypeName  = type;
+        g_DiscoveredFClassGlobals.push_back(std::move(g));
+    }
+}
+
 }  // namespace AutoDiscovery

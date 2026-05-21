@@ -108,13 +108,10 @@ namespace gobjects
         bool Init() {
             if (m_initialized) return true;
 
-            // ── Patch 20260519 path (preferred) ──────────────────────────
-            // GUObjectArray @ 0xE4F8ED0; NumElements PLAIN u32 @ +0x1C;
-            // encrypted chunks-table m128 @ +0x1A0 (= 0xE4F9070).
-            // Cipher: ROL64(45) → shufflelo(30) → XOR(0x0B982F16865A5F21).
-            // Decrypted ptr P points to a chunks-manager struct; chunks-array
-            // ptr embedded inside (vtable[2] call in IDA; for external read
-            // we scan common offsets P+0x40..0x80 for a heap ptr).
+            // ── CL-1201801 path (preferred) ──────────────────────────────
+            // RVA_GOBJECT_ARRAY_BASE is a pointer variable; FCA heap ptr is
+            // encrypted at module+0xE3B6270. Decrypts via ROL32(26)+PSHUFB+ROL16(4).
+            // NumElements at FCA+0x30; chunks_array via vtable[8] Vt2Interpret.
             if (InitPatch20260519()) {
                 return true;
             }
@@ -1608,88 +1605,30 @@ namespace gobjects
         }
 
         // ─────────────────────────────────────────────────────────────────
-        // InitPatch20260519 — chunks-table encrypted @ GUObjectArray + 0x1A0
-        // Cipher: ROL64(45) → shufflelo(30) → XOR(0x0B982F16865A5F21).
-        // Decrypted ptr P → chunks_manager struct; chunks_array somewhere
-        // in P+0x40..0x80 (vtable[2] returns it in IDA; we scan for heap ptr).
-        // NumElements: plain u32 @ base+0x1C.
-        // Each chunk: 65536 FUObjectItems × 20 bytes; HIWORD(idx) = chunk_idx,
-        // LOWORD(idx) = slot.
+        // InitPatch20260519 — CL-1201801 (ARC Steam patch 2026-05-21)
+        // RVA_GOBJECT_ARRAY_BASE (0xE4F8F60) is now a POINTER VARIABLE holding
+        // the encrypted FCA heap address; the FCA itself lives on the heap.
+        //
+        // FCA ptr decrypt (xmmword @ module+0xE3B6270):
+        //   ROL32(26) per dword → PSHUFB(mask@0xB1E8ED0) → ROL16(4) per word → lo64
+        //
+        // NumElements (at FCA+0x30):
+        //   shufflelo(0x8C) → srli_epi64(18) → XOR(mask@0xB23C120) → lo32 ^ 0xDB155ED3
+        //
+        // chunks_array: vtable[8] of FCA's embedded vtable object.
+        //   vtable_ptr = *(qword*)(FCA+0x60)
+        //   vtable8_fn = *(qword*)(vtable_ptr+0x40)
+        //   chunks_array = Vt2Interpret(vtable8_fn, FCA+0x90)
+        //
+        // Each chunk: 65536 × FUObjectItem (20 bytes); Object at +0.
         // ─────────────────────────────────────────────────────────────────
         bool InitPatch20260519() {
-            // ── CL-1195482 layout (verified via IDA on 2026-05-19 evening dump) ──
-            // GUObjectArray @ 0xE4F8F60. Encrypted chunks-mgr blob @ +0x110
-            // (= 0xE4F9070). NumElements is NOT plain — it lives inside the
-            // decrypted chunks-mgr struct at +0x90, encrypted with a separate
-            // PSHUFLW(0xE3)+XOR+ROL16(12) pipeline. xmmword_B34B0D0 is the mask.
-            constexpr uint64_t kChunksEncOff = 0x110;
-            constexpr uint64_t kCipherXor = 0x0B982F16865A5F21ULL;
-            constexpr uint64_t kNumElEncOff = 0x90;       // inside decrypted chunks_mgr
-            constexpr uint64_t kRvaNumElXor = 0xB34B0D0;  // 16B mask, low 8 used
-
-            uint64_t base = m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE;
-
-            // Step 1: read encrypted chunks-mgr ptr blob at base+0x110.
-            alignas(16) uint8_t enc_buf[16] = {};
-            if (!m_reader.Read(base + kChunksEncOff, enc_buf, 16)) {
-                std::printf("[p519] read encrypted chunks-mgr blob @ base+0x%llX failed\n",
-                            (unsigned long long)kChunksEncOff);
-                return false;
-            }
-            __m128i enc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc_buf));
-
-            // Step 2: decrypt — ROL64(45) → shufflelo(30) → XOR(cipher) → lo64
-            __m128i rolled = _mm_or_si128(_mm_slli_epi64(enc, 45),
-                                          _mm_srli_epi64(enc, 64 - 45));
-            __m128i shuffled = _mm_shufflelo_epi16(rolled, 30);
-            uint64_t lo64 = static_cast<uint64_t>(_mm_cvtsi128_si64(shuffled));
-            uint64_t P = lo64 ^ kCipherXor;
-
-            std::printf("[p519] decrypted chunks-mgr ptr = 0x%llX\n", (unsigned long long)P);
-
-            // Sanity: must be a heap pointer
-            if (P < 0x10000ULL || P > 0x7FFFFFFFFFFFULL) {
-                std::printf("[p519] decrypted ptr out of heap range\n");
-                return false;
-            }
-
-            // Step 3: decrypt NumElements at chunks_mgr+0x90.
-            // Pipeline: PSHUFLW(0xE3) → XOR(xmmword_B34B0D0 low 8 bytes) → ROL16(12) → low32.
-            alignas(16) uint8_t numel_enc[16] = {};
-            if (!m_reader.Read(P + kNumElEncOff, numel_enc, 16)) {
-                std::printf("[p519] read encrypted NumElements @ P+0x%llX failed\n",
-                            (unsigned long long)kNumElEncOff);
-                return false;
-            }
-            alignas(16) uint8_t numel_mask[16] = {};
-            if (!m_reader.Read(m_base + kRvaNumElXor, numel_mask, 16)) {
-                std::printf("[p519] read NumElements XOR mask @ 0x%llX failed\n",
-                            (unsigned long long)(m_base + kRvaNumElXor));
-                return false;
-            }
-            __m128i ne_v   = _mm_loadu_si128(reinterpret_cast<const __m128i*>(numel_enc));
-            __m128i ne_mask = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(numel_mask));
-            __m128i ne_shuf = _mm_shufflelo_epi16(ne_v, 0xE3);
-            __m128i ne_xor  = _mm_xor_si128(ne_shuf, ne_mask);
-            __m128i ne_rol  = _mm_or_si128(_mm_slli_epi16(ne_xor, 12), _mm_srli_epi16(ne_xor, 4));
-            uint32_t num_elements = static_cast<uint32_t>(_mm_cvtsi128_si32(ne_rol));
-
-            if (num_elements < 1000 || num_elements > 4000000) {
-                std::printf("[p519] decrypted NumElements=%u implausible\n", num_elements);
-                return false;
-            }
-            std::printf("[p519] NumElements=%u (decrypted @ chunks_mgr+0x%llX)\n",
-                        num_elements, (unsigned long long)kNumElEncOff);
-
-            // Step 4: locate chunks_array. Try direct dereference paths first
-            // (chunks_manager has a vtable @ P+0x40; vtable[2] returns the
-            // chunks_array in IDA — but the chunks_array ptr might just sit
-            // at a fixed offset in the chunks_manager struct, accessible
-            // without calling the function). Probe both P+ offsets AND
-            // Q+ offsets where Q = *(P+0x40).
+            constexpr uint64_t kFcaEncRva     = 0xE3B6270;   // encrypted FCA ptr xmmword
+            constexpr uint64_t kFcaMaskRva    = 0xB1E8ED0;   // PSHUFB mask (16B)
+            constexpr uint64_t kNumElXorRva   = 0xB23C120;   // NumElements XOR const (16B)
+            constexpr uint32_t kNumElFinalXor = 0xDB155ED3u;
             constexpr uint32_t kSlotsPerChunk = 65536;
             constexpr uint32_t kItemStride    = 20;
-            uint32_t num_chunks_needed = (num_elements + kSlotsPerChunk - 1) / kSlotsPerChunk;
 
             auto isHeap = [](uint64_t p) {
                 return p >= 0x10000ULL && p < 0x7FFFFFFFFFFFULL;
@@ -1697,232 +1636,190 @@ namespace gobjects
             auto isModule = [&](uint64_t p) {
                 return p >= m_base && p < m_base + 0x10000000ULL;
             };
-            auto validateAsChunksArray = [&](uint64_t arr, bool verbose=false) -> bool {
+            auto validateAsChunksArray = [&](uint64_t arr) -> bool {
                 if (!isHeap(arr)) return false;
                 uint64_t cp[2] = {};
                 if (!m_reader.Read(arr, cp, 16)) return false;
                 if (!isHeap(cp[0]) || !isHeap(cp[1])) {
-                    if (verbose) std::printf("[p519]     arr=0x%llX cp0=0x%llX cp1=0x%llX (cp not heap)\n",
-                        (unsigned long long)arr, (unsigned long long)cp[0], (unsigned long long)cp[1]);
+                    std::printf("[p519]   validate fail: cp0=0x%llX cp1=0x%llX not heap\n",
+                        (unsigned long long)cp[0], (unsigned long long)cp[1]);
                     return false;
                 }
                 uint64_t obj0 = 0, obj1 = 0;
                 if (!m_reader.Read(cp[0], &obj0, 8) || !m_reader.Read(cp[1], &obj1, 8)) return false;
                 if (!isHeap(obj0) || !isHeap(obj1)) {
-                    if (verbose) std::printf("[p519]     arr=0x%llX cp0=0x%llX obj0=0x%llX obj1=0x%llX (obj not heap)\n",
-                        (unsigned long long)arr, (unsigned long long)cp[0],
+                    std::printf("[p519]   validate fail: obj0=0x%llX obj1=0x%llX not heap\n",
                         (unsigned long long)obj0, (unsigned long long)obj1);
                     return false;
                 }
-                // Stronger check: obj0 has a vtable in module range
                 uint64_t vt0 = 0;
                 if (!m_reader.Read(obj0, &vt0, 8)) return false;
                 if (!isModule(vt0)) {
-                    if (verbose) std::printf("[p519]     arr=0x%llX obj0=0x%llX vt0=0x%llX (vt not module)\n",
-                        (unsigned long long)arr, (unsigned long long)obj0, (unsigned long long)vt0);
+                    std::printf("[p519]   validate fail: vt0=0x%llX not module\n",
+                        (unsigned long long)vt0);
                     return false;
                 }
                 return true;
             };
 
-            uint64_t chunks_array = 0;
-            uint64_t Q = 0;
-            m_reader.Read(P + 0x40, &Q, 8);
-            std::printf("[p519] P=0x%llX  *(P+0x40)=Q=0x%llX (vtable inline at P+0x40)\n",
-                        (unsigned long long)P, (unsigned long long)Q);
-            std::fflush(stdout);
-
-            // CL-1195482 layout: chunks_array is NOT at a fixed offset inside
-            // the chunks_mgr struct. The game retrieves it via vtable[2] call
-            // (`*(Q+0x10)`), passing an encrypted m128 input from P+0x70.
-            // We use Vt2Interpret to emulate the cipher live. Direct probe is
-            // a no-op fallback that almost never succeeds, so we skip it to
-            // avoid the long stall we've seen on this patch.
-            for (uint64_t off = 0x08; off <= 0x80 && !chunks_array; off += 8) {
-                uint64_t cand = 0;
-                if (!m_reader.Read(P + off, &cand, 8)) continue;
-                if (!isHeap(cand) || isModule(cand)) continue;
-                std::printf("[p519] probe P+0x%03llX cand=0x%llX\n",
-                            (unsigned long long)off, (unsigned long long)cand);
-                if (validateAsChunksArray(cand, true)) {
-                    std::printf("[p519] chunks_array via P+0x%llX = 0x%llX\n",
-                                (unsigned long long)off, (unsigned long long)cand);
-                    chunks_array = cand;
-                }
-                // Also try with low-byte stripped (in case low bits are tag bits).
-                if (!chunks_array && (cand & 0xF)) {
-                    uint64_t stripped = cand & ~0xFULL;
-                    std::printf("[p519]   also try stripped=0x%llX\n",
-                                (unsigned long long)stripped);
-                    if (validateAsChunksArray(stripped, true)) {
-                        std::printf("[p519] chunks_array via P+0x%llX (stripped) = 0x%llX\n",
-                                    (unsigned long long)off, (unsigned long long)stripped);
-                        chunks_array = stripped;
-                    }
-                }
+            // Step 1: decrypt FCA heap ptr from module+kFcaEncRva.
+            // ROL32(26) per dword → PSHUFB(mask) → ROL16(4) per word → lo64
+            alignas(16) uint8_t enc_buf[16]  = {};
+            alignas(16) uint8_t mask_buf[16] = {};
+            if (!m_reader.Read(m_base + kFcaEncRva, enc_buf, 16)) {
+                std::printf("[p519] read FCA enc blob @ RVA 0x%llX failed\n",
+                            (unsigned long long)kFcaEncRva);
+                return false;
             }
-
-            // (Diagnostic vtable[2] body dump removed — it was the buffered-
-            // stdout culprit during patch-1.29.x debugging. The Vt2Interpret
-            // path below logs its own progress.)
-
-            // Ensure PEB is known before Vt2Interpret needs it. FindPEB() is a
-            // /proc/<pid>/maps scan + heap-probe; cheap, ~50ms.
-            if (m_pebAddr == 0) {
-                m_pebAddr = FindPEB();
-                std::printf("[p519] FindPEB() => 0x%llX\n", (unsigned long long)m_pebAddr);
-                std::fflush(stdout);
+            if (!m_reader.Read(m_base + kFcaMaskRva, mask_buf, 16)) {
+                std::printf("[p519] read FCA PSHUFB mask @ RVA 0x%llX failed\n",
+                            (unsigned long long)kFcaMaskRva);
+                return false;
             }
-
-            // Dynamic decrypt: interpret vtable[2] live with Zydis.
-            // The cipher VARIES per process launch (37 vtable variants picked by
-            // heap-pointer hash in sub_49EFF0). All variants follow the same
-            // template: load encrypted 8B from [rdx], SIMD massage (shufflelo/
-            // ROL16/ROL32/PXOR-with-rdata-mask), then XOR with broadcast(PEB+const)
-            // ± a 64-bit const, then RET. We decode the function bytes at runtime
-            // and execute each operation in software.
-            if (!chunks_array && Q && m_pebAddr) {
-                uint64_t vt2_fn = 0;
-                if (m_reader.Read(Q + 16, &vt2_fn, 8) && isModule(vt2_fn)) {
-                    std::printf("[p519] Vt2Interpret on vt2_fn=0x%llX, input=P+0x70=0x%llX\n",
-                                (unsigned long long)vt2_fn, (unsigned long long)(P + 0x70));
-                    std::fflush(stdout);
-                    uint64_t cand = Vt2Interpret(vt2_fn, P + 0x70);
-                    std::printf("[p519] Vt2Interpret => 0x%llX\n",
-                                (unsigned long long)cand);
-                    std::fflush(stdout);
-                    if (validateAsChunksArray(cand, true)) {
-                        chunks_array = cand;
-                        std::printf("[p519] chunks_array via Vt2Interpret = 0x%llX\n",
-                                    (unsigned long long)cand);
-                    }
+            {
+                __m128i Enc  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc_buf));
+                __m128i Mask = _mm_loadu_si128(reinterpret_cast<const __m128i*>(mask_buf));
+                __m128i R32  = _mm_or_si128(_mm_slli_epi32(Enc, 26), _mm_srli_epi32(Enc, 6));
+                __m128i Shuf = _mm_shuffle_epi8(R32, Mask);
+                __m128i R16  = _mm_or_si128(_mm_slli_epi16(Shuf, 4), _mm_srli_epi16(Shuf, 12));
+                uint64_t FcaAddr = static_cast<uint64_t>(_mm_cvtsi128_si64(R16));
+                std::printf("[p519] FCA addr = 0x%llX\n", (unsigned long long)FcaAddr);
+                if (!isHeap(FcaAddr)) {
+                    std::printf("[p519] FCA addr out of heap range\n");
+                    return false;
                 }
-            }
 
-            // (Removed: hardcoded vt2-cipher direct decrypt — its constants
-            //  (0x49199A55, 0x725BFAF9AE494AF3) only matched pre-CL-1195482
-            //  vtable variants. Vt2Interpret above handles all 37 variants
-            //  dynamically, so the static fallback was always wrong-or-no-op.)
-#if 0
-            // Decrypt chunks_array from P+0x70 using IDA-confirmed vtable[2] cipher:
-            //   xmm0 = load_si64([P+0x70])                         ; 8 bytes encrypted
-            //   xmm0 = ROL16(xmm0, 13) per 16-bit lane
-            //   xmm1 = shufflelo(xmm0, 0x8D)
-            //   key  = (0x49199A55 + PEB) XOR 0x725BFAF9AE494AF3
-            //   xmm0 = broadcast(key) as (lo32, hi32, lo32, hi32)
-            //   result = xmm1 XOR xmm0
-            //   chunks_array = result.lo64
-            if (!chunks_array) {
+                // Step 2: decode NumElements from FCA+0x30.
+                // shufflelo(0x8C) → srli_epi64(18) → XOR(kNumElXorRva lo64) → lo32 ^ kNumElFinalXor
+                alignas(16) uint8_t ne_buf[16]  = {};
+                alignas(16) uint8_t ne_mask[16] = {};
+                if (!m_reader.Read(FcaAddr + 0x30, ne_buf, 16)) {
+                    std::printf("[p519] read NumElements blob @ FCA+0x30 failed\n");
+                    return false;
+                }
+                if (!m_reader.Read(m_base + kNumElXorRva, ne_mask, 16)) {
+                    std::printf("[p519] read NumElements XOR mask @ RVA 0x%llX failed\n",
+                                (unsigned long long)kNumElXorRva);
+                    return false;
+                }
+                __m128i NeV    = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ne_buf));
+                __m128i NeMask = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ne_mask));
+                __m128i NeShuf = _mm_shufflelo_epi16(NeV, 0x8C);
+                __m128i NeSrl  = _mm_srli_epi64(NeShuf, 18);
+                __m128i NeXor  = _mm_xor_si128(NeSrl, NeMask);
+                uint32_t NumElements = static_cast<uint32_t>(_mm_cvtsi128_si32(NeXor)) ^ kNumElFinalXor;
+                std::printf("[p519] NumElements = %u\n", NumElements);
+                if (NumElements < 1000 || NumElements > 4000000) {
+                    std::printf("[p519] NumElements %u implausible\n", NumElements);
+                    return false;
+                }
+
+                uint32_t NumChunksNeeded = (NumElements + kSlotsPerChunk - 1) / kSlotsPerChunk;
+
+                // Step 3: get vtable[8] function for chunks_array decrypt.
+                // vtable_ptr = *(FCA+0x60); vtable8_fn = *(vtable_ptr+0x40)
+                uint64_t VtablePtr = 0;
+                if (!m_reader.Read(FcaAddr + 0x60, &VtablePtr, 8) || !isModule(VtablePtr)) {
+                    std::printf("[p519] FCA vtable ptr @ FCA+0x60 = 0x%llX (not module)\n",
+                                (unsigned long long)VtablePtr);
+                    return false;
+                }
+                uint64_t Vtable8Fn = 0;
+                if (!m_reader.Read(VtablePtr + 0x40, &Vtable8Fn, 8) || !isModule(Vtable8Fn)) {
+                    std::printf("[p519] vtable[8] fn @ vtable+0x40 = 0x%llX (not module)\n",
+                                (unsigned long long)Vtable8Fn);
+                    return false;
+                }
+                std::printf("[p519] FCA=0x%llX vtable_ptr=0x%llX vtable8_fn=0x%llX\n",
+                            (unsigned long long)FcaAddr, (unsigned long long)VtablePtr,
+                            (unsigned long long)Vtable8Fn);
+
+                // Step 4: PEB + Vt2Interpret → chunks_array.
+                // vtable[8] cipher: MOV EAX, imm32 → ADD RAX, GS:[0x60] → MOVDQA XMM1, [RDX]
+                //                   → PSHUFB/PXOR/etc. → return XMM0.lo64
                 if (m_pebAddr == 0) {
                     m_pebAddr = FindPEB();
-                    std::printf("[p519] FindPEB() => 0x%llX\n",
-                                (unsigned long long)m_pebAddr);
+                    std::printf("[p519] FindPEB() => 0x%llX\n", (unsigned long long)m_pebAddr);
+                    std::fflush(stdout);
                 }
+
+                uint64_t ChunksArray = 0;
                 if (m_pebAddr) {
-                    constexpr uint32_t kPebAdd  = 0x49199A55u;
-                    constexpr uint64_t kXorConst = 0x725BFAF9AE494AF3ULL;
+                    uint64_t Cand = Vt2Interpret(Vtable8Fn, FcaAddr + 0x90);
+                    std::printf("[p519] Vt2Interpret => 0x%llX\n", (unsigned long long)Cand);
+                    std::fflush(stdout);
+                    if (validateAsChunksArray(Cand)) {
+                        ChunksArray = Cand;
+                        std::printf("[p519] chunks_array via Vt2Interpret = 0x%llX\n",
+                                    (unsigned long long)ChunksArray);
+                    }
+                }
 
-                    alignas(16) uint8_t enc70[16] = {};
-                    if (m_reader.Read(P + 0x70, enc70, 8)) {
-                        __m128i xmm0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc70));
-                        __m128i xmm1 = _mm_srli_epi16(xmm0, 3);
-                        xmm0 = _mm_slli_epi16(xmm0, 13);
-                        xmm0 = _mm_or_si128(xmm0, xmm1);              // ROL16(13)
-                        xmm1 = _mm_shufflelo_epi16(xmm0, 0x8D);
+                if (!ChunksArray) {
+                    std::printf("[p519] Vt2Interpret failed, trying heap scan (num_chunks=%u)\n",
+                                NumChunksNeeded);
+                    uint64_t VtLo = m_base + 0x1000ULL;
+                    uint64_t VtHi = m_base + 0x10000000ULL;
+                    ChunksArray = ProbeChunkTableNoPEB(NumChunksNeeded, VtLo, VtHi);
+                    if (ChunksArray) {
+                        std::printf("[p519] chunks_array via heap-scan = 0x%llX\n",
+                                    (unsigned long long)ChunksArray);
+                    }
+                }
 
-                        uint64_t peb_plus = static_cast<uint64_t>(kPebAdd) + m_pebAddr;
-                        uint64_t key64    = peb_plus ^ kXorConst;
-                        __m128i  keyV     = _mm_set1_epi64x(static_cast<int64_t>(key64));
-                        // pshufd 0x44 broadcasts low 64 bits — set1_epi64 already does that
+                if (!ChunksArray) {
+                    std::printf("[p519] no chunks_array found\n");
+                    return false;
+                }
 
-                        __m128i result = _mm_xor_si128(xmm1, keyV);
-                        uint64_t cand = static_cast<uint64_t>(_mm_cvtsi128_si64(result));
+                // Step 5: walk chunks_array → flatten to m_worldFallbackObjects.
+                uint32_t NumChunks = NumChunksNeeded;
+                m_worldFallbackObjects.clear();
+                m_worldFallbackObjects.reserve(NumElements);
 
-                        std::printf("[p519] decrypted chunks_array (vt2 cipher) = 0x%llX "
-                                    "(peb=0x%llX add=0x%X key=0x%llX)\n",
-                                    (unsigned long long)cand,
-                                    (unsigned long long)m_pebAddr,
-                                    kPebAdd, (unsigned long long)key64);
-                        if (validateAsChunksArray(cand, true)) {
-                            chunks_array = cand;
-                            std::printf("[p519] chunks_array validated = 0x%llX\n",
-                                        (unsigned long long)cand);
+                uint64_t ChunkPtrs[1024] = {};
+                if (NumChunks > 1024) NumChunks = 1024;
+                if (!m_reader.Read(ChunksArray, ChunkPtrs, NumChunks * 8)) {
+                    std::printf("[p519] read chunk_ptrs batch failed\n");
+                    return false;
+                }
+
+                uint32_t ValidChunks = 0;
+                for (uint32_t Ci = 0; Ci < NumChunks; ++Ci) {
+                    uint64_t Chunk = ChunkPtrs[Ci];
+                    if (!Chunk || !isHeap(Chunk)) continue;
+                    uint32_t SlotsInChunk = kSlotsPerChunk;
+                    if (Ci == NumChunks - 1) {
+                        uint32_t Rem = NumElements - (Ci * kSlotsPerChunk);
+                        if (Rem < SlotsInChunk) SlotsInChunk = Rem;
+                    }
+                    std::vector<uint8_t> ChunkBuf(SlotsInChunk * kItemStride);
+                    if (!m_reader.Read(Chunk, ChunkBuf.data(), ChunkBuf.size())) continue;
+                    for (uint32_t Si = 0; Si < SlotsInChunk; ++Si) {
+                        uint64_t Obj = 0;
+                        std::memcpy(&Obj, ChunkBuf.data() + Si * kItemStride, 8);
+                        if (isHeap(Obj)) {
+                            m_worldFallbackObjects.push_back(Obj);
                         }
                     }
-                } else {
-                    std::printf("[p519] PEB unavailable, cannot apply vtable[2] cipher\n");
+                    ++ValidChunks;
                 }
-            }
-#endif
 
-            // Last resort: heap-scan via ProbeChunkTableNoPEB.
-            // We don't have the module vt range here exactly; use [m_base, m_base+0xF0F5000)
-            // as a permissive vtable range.
-            if (!chunks_array) {
-                std::printf("[p519] direct/indirect probe failed, trying heap scan (num_chunks=%u)...\n",
-                            num_chunks_needed);
-                uint64_t vt_lo = m_base + 0x1000ULL;
-                uint64_t vt_hi = m_base + 0x10000000ULL;
-                chunks_array = ProbeChunkTableNoPEB(num_chunks_needed, vt_lo, vt_hi);
-                if (chunks_array) {
-                    std::printf("[p519] chunks_array via heap-scan = 0x%llX\n",
-                                (unsigned long long)chunks_array);
+                std::printf("[p519] walked %u chunks, collected %zu objects\n",
+                            ValidChunks, m_worldFallbackObjects.size());
+
+                if (m_worldFallbackObjects.size() < 1000) {
+                    std::printf("[p519] too few objects\n");
+                    m_worldFallbackObjects.clear();
+                    return false;
                 }
+
+                m_arrayBase = FcaAddr;
+                m_numElements = static_cast<int32_t>(NumElements);
+                m_useWorldFallback = true;
+                m_initialized = true;
+                return true;
             }
-
-            if (!chunks_array) {
-                std::printf("[p519] no chunks_array found via any probe\n");
-                return false;
-            }
-
-            // Step 5: walk chunks_array → flatten to m_worldFallbackObjects.
-            // Each chunk: 65536 × FUObjectItem (20 bytes). HIWORD(idx) = chunk_idx.
-            uint32_t num_chunks = num_chunks_needed;
-            m_worldFallbackObjects.clear();
-            m_worldFallbackObjects.reserve(num_elements);
-
-            uint64_t chunk_ptrs[1024] = {};
-            if (num_chunks > 1024) num_chunks = 1024;
-            if (!m_reader.Read(chunks_array, chunk_ptrs, num_chunks * 8)) {
-                std::printf("[p519] read chunks_array batch failed\n");
-                return false;
-            }
-
-            uint32_t valid_chunks = 0;
-            for (uint32_t ci = 0; ci < num_chunks; ++ci) {
-                uint64_t chunk = chunk_ptrs[ci];
-                if (!chunk || chunk < 0x10000ULL || chunk > 0x7FFFFFFFFFFFULL) continue;
-                uint32_t slots_in_this_chunk = kSlotsPerChunk;
-                if (ci == num_chunks - 1) {
-                    slots_in_this_chunk = num_elements - (ci * kSlotsPerChunk);
-                }
-                // Read chunk in bulk (slots * 20 bytes)
-                std::vector<uint8_t> chunk_buf(slots_in_this_chunk * kItemStride);
-                if (!m_reader.Read(chunk, chunk_buf.data(), chunk_buf.size())) continue;
-                for (uint32_t si = 0; si < slots_in_this_chunk; ++si) {
-                    uint64_t obj = 0;
-                    std::memcpy(&obj, chunk_buf.data() + si * kItemStride, 8);
-                    if (obj >= 0x10000ULL && obj <= 0x7FFFFFFFFFFFULL) {
-                        m_worldFallbackObjects.push_back(obj);
-                    }
-                }
-                ++valid_chunks;
-            }
-
-            std::printf("[p519] walked %u chunks, collected %zu objects\n",
-                        valid_chunks, m_worldFallbackObjects.size());
-
-            if (m_worldFallbackObjects.size() < 1000) {
-                std::printf("[p519] too few objects, giving up\n");
-                m_worldFallbackObjects.clear();
-                return false;
-            }
-
-            m_arrayBase = base;
-            m_numElements = static_cast<int32_t>(num_elements);
-            m_useWorldFallback = true;
-            m_initialized = true;
-            return true;
         }
 
         // ── Patch 20260421: primary init path ────────────────────────────

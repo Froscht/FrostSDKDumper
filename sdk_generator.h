@@ -630,54 +630,47 @@ public:
     // Tier-1 name-heuristic mistakes (e.g. NameProperty mislabeled as
     // ObjectProperty because a property named "Owner" pointed to it).
     void SeedHardcodedFClassMap_20260421() {
-        // 20260428 type-global RVAs — extracted from IDA via xrefs to the type
-        // registration function sub_3E3010(global_ptr, type_name_wstring, ...).
-        // These are the values stored at FField+0x88 — the per-FProperty-subclass
-        // global state pointer. Different from FField::ClassPrivate at +0x20
-        // (which is often 0 for engine reflection-stripped FFields in 20260428).
+        // CL-1201801 (2026-05-21) FFieldClass RVAs — live-extracted via
+        // fcname-rva pass (FFieldClass::NamePrivate decode at +0x40).
+        // All in .data section (0xE034000..0xE7A7000).
         static const std::pair<uint64_t, const char*> kSeeds[] = {
-            { 0xDE0CF70, "FEnumProperty" },
-            { 0xDE0D050, "FField" },
-            { 0xDE0D0C0, "FFieldPathProperty" },
-            { 0xDE14C30, "FProperty" },
-            { 0xDE14CA0, "FArrayProperty" },
-            { 0xDE14D10, "FObjectPropertyBase" },
-            { 0xDE14D80, "FBoolProperty" },
-            { 0xDE14DF0, "FByteProperty" },
-            { 0xDE14E60, "FClassProperty" },
-            { 0xDE14ED0, "FClassPtrProperty" },
-            { 0xDE14F40, "FDelegateProperty" },
-            { 0xDE14FC0, "FInterfaceProperty" },
-            { 0xDE15030, "FLazyObjectProperty" },
-            { 0xDE150A0, "FMapProperty" },
-            { 0xDE15120, "FMulticastDelegateProperty" },
-            { 0xDE15190, "FMulticastInlineDelegateProperty" },
-            { 0xDE15200, "FMulticastSparseDelegateProperty" },
-            { 0xDE15270, "FNameProperty" },
-            { 0xDE152E0, "FNumericProperty" },
-            { 0xDE15350, "FInt8Property" },
-            { 0xDE153C0, "FInt16Property" },
-            { 0xDE15430, "FIntProperty" },
-            { 0xDE154A0, "FInt64Property" },
-            { 0xDE15510, "FUInt16Property" },
-            { 0xDE15580, "FUInt32Property" },
-            { 0xDE155F0, "FUInt64Property" },
-            { 0xDE15660, "FFloatProperty" },
-            { 0xDE156D0, "FDoubleProperty" },
-            { 0xDE15740, "FObjectProperty" },
-            { 0xDE157C0, "FObjectProperty" },
-            { 0xDE15830, "FOptionalProperty" },
-            { 0xDE15C40, "FSetProperty" },
-            { 0xDE15CB0, "FSoftClassProperty" },
-            { 0xDE15D20, "FSoftObjectProperty" },
-            { 0xDE15DE0, "FStrProperty" },
-            { 0xDE15E50, "FStructProperty" },
-            { 0xDE15ED0, "FWeakObjectProperty" },
-            { 0xDE17200, "FTextProperty" },
+            { 0xE3B4A80, "FArrayProperty" },
+            { 0xE3B3DC0, "FArrayProperty" },
+            { 0xE3B3930, "FArrayProperty" },
+            { 0xE3B3A30, "FBoolProperty" },
+            { 0xE3B3AB0, "FByteProperty" },
+            { 0xE3ABBB0, "FByteProperty" },
+            { 0xE3B3B30, "FClassProperty" },
+            { 0xE3B3C30, "FDelegateProperty" },
+            { 0xE3B44D0, "FDoubleProperty" },
+            { 0xE3ABD20, "FFieldPathProperty" },
+            { 0xE3B4450, "FFloatProperty" },
+            { 0xE3B4150, "FInt16Property" },
+            { 0xE3B4250, "FInt64Property" },
+            { 0xE3B40D0, "FInt8Property" },
+            { 0xE3B41D0, "FIntProperty" },
+            { 0xE3B3CC0, "FInterfaceProperty" },
+            { 0xE3B3D40, "FLazyObjectProperty" },
+            { 0xE3B3ED0, "FMulticastInlineDelegateProperty" },
+            { 0xE3B3F50, "FMulticastSparseDelegateProperty" },
+            { 0xE3B3FD0, "FNameProperty" },
+            { 0xE3B45E0, "FObjectProperty" },
+            { 0xE3B3BB0, "FObjectProperty" },
+            { 0xE3B4660, "FOptionalProperty" },
+            { 0xE3B4B00, "FSoftClassProperty" },
+            { 0xE3B4B80, "FSoftObjectProperty" },
+            { 0xE3B4CD0, "FStructProperty" },
+            { 0xE3B60A0, "FTextProperty" },
+            { 0xE3B4C50, "FTextProperty" },
+            { 0xE3B42D0, "FUInt16Property" },
+            { 0xE3B4350, "FUInt32Property" },
+            { 0xE3B43D0, "FUInt64Property" },
+            { 0xE3B4D60, "FWeakObjectProperty" },
+            { 0xE3B4550, "FWeakObjectProperty" },
         };
         for (auto [rva, type] : kSeeds)
             m_fclass_to_type[MODULE_BASE + rva] = type;
-        std::printf("[fcmap] seeded %zu hardcoded FFieldClass mappings (patch 20260428)\n",
+        std::printf("[fcmap] seeded %zu hardcoded FFieldClass mappings (CL-1201801)\n",
             sizeof(kSeeds)/sizeof(kSeeds[0]));
     }
 
@@ -927,6 +920,7 @@ public:
             }
             if (Name.empty()) { ++NoName; continue; }
             // Prefer the canonical "F"-prefixed form.
+            // Normalise to F-prefixed canonical form if possible, otherwise use raw name.
             std::string Canonical;
             if (m_canonical_property_type_names.count(Name)) {
                 Canonical = "F" + Name;
@@ -936,11 +930,17 @@ public:
             } else if (m_canonical_property_type_names.count("F" + Name)) {
                 Canonical = "F" + Name;
             } else {
-                ++NotCanonical; continue;
+                Canonical = Name;  // non-canonical but valid — keep it
+                ++NotCanonical;
             }
             m_fclass_to_type[Fc] = Canonical;
             ++Added;
             ++AddedByType[Canonical];
+            // Print RVA so we can hardcode it for future patches.
+            if (Fc >= MODULE_BASE && Fc < MODULE_BASE + 0x10000000ULL) {
+                std::printf("[fcname-rva] 0x%llX  \"%s\"\n",
+                    (unsigned long long)(Fc - MODULE_BASE), Canonical.c_str());
+            }
         }
 
         std::printf("[fcname-seed] examined=%zu already=%zu read_fail=%zu bad_ci=%zu "
@@ -1861,13 +1861,20 @@ public:
             }
         }
         oss << "namespace " << rec.name << " {\n";
+        std::unordered_map<std::string, int> NameCount;
         for (const auto& pr : rec.properties) {
             std::string type_decl;
             if (pr.array_dim > 1)
                 type_decl = pr.type_name + "[" + std::to_string(pr.array_dim) + "]";
             else
                 type_decl = pr.type_name;
-            std::string name_padded = pr.name;
+            std::string out_name = pr.name;
+            auto& cnt = NameCount[out_name];
+            if (cnt > 0) {
+                out_name += "_" + std::to_string(cnt);
+            }
+            ++cnt;
+            std::string name_padded = out_name;
             if (name_padded.size() < 40)
                 name_padded.append(40 - name_padded.size(), ' ');
             oss << "constexpr uint32_t " << name_padded << " = 0x" << std::hex << pr.offset << ";";
@@ -2593,7 +2600,7 @@ public:
                 for (uint64_t cls : classSamples) {
                     uint64_t head = Read<uint64_t>(cls + ArcDecrypt::Offsets::UStruct::ChildProperties);
                     if (!IsRealFField(head)) continue;
-                    for (uint64_t nxo = 0x00; nxo <= 0xE8; nxo += 0x08) {
+                    for (uint64_t nxo = 0x00; nxo <= 0x78; nxo += 0x08) {
                         uint64_t cur = head;
                         std::unordered_set<uint64_t> seen;
                         int hops = 0;
@@ -2710,6 +2717,11 @@ public:
             // fails (which happens when FFieldClass has no uint32 typeidx
             // field, e.g. CL-1177146).
             CalibrateFClassNameSlotOffset();
+            if (m_fclass_nameslot_offset < 0) {
+                m_fclass_nameslot_offset = static_cast<int32_t>(ArcDecrypt::v20260519::FFIELD_CLASS_NAME_OFF);
+                std::printf("[fcname-cal] calibration below threshold — pinning FFieldClass NamePrivate offset to compile-time 0x%X\n",
+                    m_fclass_nameslot_offset);
+            }
             size_t NameAdded = SeedFClassMapByNameSlot();
             if (NameAdded > 0) {
                 std::printf("[fcname-seed] FName-slot seeding produced %zu new FFieldClass mappings (total=%zu)\n",
@@ -2750,6 +2762,24 @@ public:
                 std::printf("[fcflags] CastFlags seeding produced %zu new FFieldClass mappings (total=%zu)\n",
                     CfAdded, m_fclass_to_type.size());
             }
+            // Dump all mapped FFieldClass RVAs that are in the observed set.
+            std::printf("[fcmap-rvas] All mapped FFieldClass RVAs (observed in pre-pass):\n");
+            std::vector<std::pair<uint64_t,std::string>> RvaList;
+            for (uint64_t Fc : m_observed_fclass_ptrs) {
+                auto It = m_fclass_to_type.find(Fc);
+                if (It == m_fclass_to_type.end()) continue;
+                uint64_t Rva = (Fc >= MODULE_BASE && Fc < MODULE_BASE + 0x10000000ULL)
+                               ? Fc - MODULE_BASE : 0;
+                RvaList.push_back({Rva, It->second});
+            }
+            std::sort(RvaList.begin(), RvaList.end(),
+                [](const auto& A, const auto& B){ return A.second < B.second; });
+            for (const auto& [Rva, Name] : RvaList) {
+                if (Rva)
+                    std::printf("[fcmap-rvas]   { 0x%llX, \"%s\" },\n",
+                        (unsigned long long)Rva, Name.c_str());
+            }
+            std::printf("[fcmap-rvas] Total: %zu\n", RvaList.size());
         }
 
         // ── Pass 2: iterate objects — include all type objects ──────────────────
