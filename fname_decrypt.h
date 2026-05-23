@@ -151,14 +151,10 @@ public:
 
         if (Use519) {
             std::memcpy(m_keyTable, Kt519, sizeof(Kt519));
-            FNAME_KEY_TABLE_OFF = Rva519;  // keep helper var in sync
+            FNAME_KEY_TABLE_OFF = Rva519;
             m_pipeline = Pipeline::Build20260519;
             std::printf("[fname] Pipeline = Build20260519 (keytable @ 0x%llX, %d nz)\n",
                 (unsigned long long)(m_base + Rva519), Nz519);
-            if (!LoadBuild20260519SimdMasks()) {
-                std::printf("[fname] WARNING: SIMD mask load for 20260519 failed — "
-                            "ResolveNamePtr will return 0 until masks are reachable\n");
-            }
         } else if (Use146) {
             std::memcpy(m_keyTable, Kt146, sizeof(Kt146));
             FNAME_KEY_TABLE_OFF = Rva146;
@@ -180,30 +176,6 @@ public:
     bool IsInitialized() const { return m_keyLoaded; }
 
 private:
-    // Load all 9 SIMD-stage masks for the 2026-05-19 pipeline. Each lives at a
-    // fixed RVA inside the patched binary; if a read fails (e.g. cold page),
-    // the corresponding mask is left zero and the resolver returns 0 for any
-    // CI that flows through it — callers will fall back to emu / fail-soft.
-    bool LoadBuild20260519SimdMasks() {
-        auto Load = [&](uint64_t Rva, __m128i& Out) -> bool {
-            alignas(16) uint8_t Buf[16] = {};
-            if (!m_reader.Read(m_base + Rva, Buf, 16)) return false;
-            Out = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Buf));
-            return true;
-        };
-        bool Ok = true;
-        Ok &= Load(ArcDecrypt::v20260519::RVA_UOBJ_SLOT_XOR,       m_v519_uobjSlotXor);
-        Ok &= Load(ArcDecrypt::v20260519::RVA_STAGE_A1_PSHUFB,     m_v519_stageA1Pshufb);
-        Ok &= Load(ArcDecrypt::v20260519::RVA_STAGE_A1_XOR,        m_v519_stageA1Xor);
-        Ok &= Load(ArcDecrypt::v20260519::RVA_STAGE_A2_XOR,        m_v519_stageA2Xor);
-        Ok &= Load(ArcDecrypt::v20260519::RVA_STAGE_A3_AND,        m_v519_stageA3AndMask);
-        Ok &= Load(ArcDecrypt::v20260519::RVA_STAGE_A3_ANDNOT,     m_v519_stageA3AndnotMask);
-        Ok &= Load(ArcDecrypt::v20260519::RVA_STAGE_A3_XOR,        m_v519_stageA3Xor);
-        Ok &= Load(ArcDecrypt::v20260519::RVA_STAGE_A3_PSHUFB_OUT, m_v519_stageA3PshufbOut);
-        Ok &= Load(ArcDecrypt::v20260519::RVA_BLOCK_DECRYPT_XOR,   m_v519_blockXor);
-        m_v519_masksLoaded = Ok;
-        return Ok;
-    }
 public:
 
     // Re-read the key table from the current `RVA_FNAME_KEY_TABLE` value.
@@ -1057,99 +1029,59 @@ public:
     //             v ^= A3_XOR ; v = ROL16(v, 12) ; v = pshufb(v, A3_PSHUFB_OUT)
     //   Outputs:   v6 = lo32(v); name_offset = u16(v6); chunk_offset = (v6>>8)&0xFFFF00
     //
-    //   Block-pair hash on chunk+0x70D0 (4 rounds ROL32(13), ADD 0x22243756):
-    //   v11 = u8(-109*v10 + 86) ^ u8((P*v10+ADD)>>16); bidx1=v11&7, bidx2=(v11+1)&7
-    //
-    //   Block decrypt @ (chunk + 0x70E0 + 32*bidx):
-    //     pre = shufflelo(raw, 30) ^ m_v519_blockXor ; raw64 = lo64(pre)
-    //
-    //   FNV fold (ADDITIVE form):
-    //     fv1 = P_FNV * ROL64(v13_raw, 57) + 0x61E912C25C5F0996
-    //     fv2 = P_FNV * ROL64(fv1, 56)     + 0x61E912C25C5F0996
-    //
-    //   R = ROL64(v13_raw, 11) + (ROL64(block2_raw, 11) ^ fv2) + 2*name_offset
-    //   name_ptr = bswap64(R ^ 0xA05F743A)
+    // CL-1201801 shard hash-table resolver. The binary's 3-function chain
+    // (sub_2337C0 → sub_23A6B0 → sub_236E80) uses PSHUFB+ROL64+XOR layers
+    // that algebraically cancel to identity: NameOff = CI & 0xFFFF,
+    // ChunkOff = (CI >> 8) & 0xFFFF00. The triple bswap64+XOR across the
+    // three return paths also cancels: entry_ptr = v14 directly.
     uint64_t ResolveNamePtr_Build20260519(int32_t CompIndex) {
-        if (CompIndex <= 0 || !m_v519_masksLoaded) return 0;
+        if (CompIndex <= 0 || !m_keyLoaded) return 0;
         using namespace ArcDecrypt::v20260519;
 
-        // ── Stage A1/A2/A3 (chunk_offset + name_offset) ──
-        __m128i v = _mm_cvtsi32_si128(CompIndex);
-        // A1
-        v = _mm_shuffle_epi8(v, m_v519_stageA1Pshufb);
-        v = _mm_or_si128(_mm_slli_epi16(v, 4), _mm_srli_epi16(v, 12));    // ROL16(4)
-        v = _mm_xor_si128(v, m_v519_stageA1Xor);
-        // A2
-        v = _mm_xor_si128(v, m_v519_stageA2Xor);
-        v = _mm_or_si128(_mm_slli_epi16(v, 12), _mm_srli_epi16(v, 4));    // ROL16(12)
-        v = _mm_shuffle_epi32(v, 0x44);                                   // pshufd duplicate lo64
-        v = _mm_or_si128(_mm_slli_epi16(v, 4), _mm_srli_epi16(v, 12));    // ROL16(4)
-        v = _mm_xor_si128(v, m_v519_stageA1Xor);
-        // A3
-        v = _mm_move_epi64(v);                                            // zero hi 64
-        v = _mm_or_si128(_mm_and_si128(v,    m_v519_stageA3AndMask),
-                         _mm_andnot_si128(v, m_v519_stageA3AndnotMask));
-        v = _mm_xor_si128(v, m_v519_stageA3Xor);
-        v = _mm_or_si128(_mm_slli_epi16(v, 12), _mm_srli_epi16(v, 4));    // ROL16(12)
-        v = _mm_shuffle_epi8(v, m_v519_stageA3PshufbOut);
+        uint32_t Ci       = static_cast<uint32_t>(CompIndex);
+        uint16_t NameOff  = static_cast<uint16_t>(Ci & 0xFFFFu);
+        uint32_t ChunkOff = (Ci >> 8) & 0xFFFF00u;
 
-        uint32_t v6 = static_cast<uint32_t>(_mm_cvtsi128_si32(v));
-        uint16_t NameOff   = static_cast<uint16_t>(v6);
-        uint32_t ChunkOff  = (v6 >> 8) & 0xFFFF00u;
-
-        // ── Block-pair selector hash ──
         uint64_t ChunkAddr = m_base + RVA_GNAMEPOOL + ChunkOff;
-        uint64_t HashAddr  = ChunkAddr + CHUNK_HASH_SEED_OFF;
+        uint64_t HashAddr  = ChunkAddr + SHARD_HASH_SEED_OFF;
         uint32_t HLo = static_cast<uint32_t>(HashAddr);
         uint32_t HHi = static_cast<uint32_t>(HashAddr >> 32);
 
-        uint32_t h1  = fn_rotl32(HASH_PRIME * fn_rotl32(HLo, 13) + BHASH_ADD, 13);
-        uint32_t h2  = fn_rotl32(HASH_PRIME * h1 + HHi + BHASH_ADD, 13);
-        uint32_t v10 = fn_rotl32(HASH_PRIME * h2 + BHASH_ADD, 13);
+        uint32_t S1 = fn_rotl32(HLo, SHARD_HASH_ROL_A);
+        uint32_t S2 = HASH_PRIME * S1 + SHARD_HASH_ADD;
+        uint32_t S3 = fn_rotl32(S2, SHARD_HASH_ROL_B);
+        uint32_t S4 = HASH_PRIME * S3 + HHi + SHARD_HASH_ADD;
+        uint32_t S5 = fn_rotl32(S4, SHARD_HASH_ROL_A);
+        uint32_t S6 = HASH_PRIME * S5 + SHARD_HASH_ADD;
+        uint32_t V9 = HASH_PRIME * (S6 >> 6) + SHARD_HASH_ADD;
 
-        uint8_t a = static_cast<uint8_t>(static_cast<uint32_t>(-109) * v10
-                                         + static_cast<uint32_t>(BHASH_INNER_BIAS));
-        uint8_t b = static_cast<uint8_t>((HASH_PRIME * v10 + BHASH_ADD) >> 16);
-        uint8_t v11 = static_cast<uint8_t>(a ^ b);
+        uint8_t V10   = static_cast<uint8_t>(V9) ^ static_cast<uint8_t>(V9 >> 16);
+        uint8_t Bidx1 = V10 & 7u;
+        uint8_t Bidx2 = (V10 + 1u) & 7u;
 
-        uint8_t bidx1 = v11 & 7u;
-        uint8_t bidx2 = (v11 + 1u) & 7u;
-
-        // ── Block reads + decrypt ──
-        uint64_t BlockBase = ChunkAddr + CHUNK_BLOCK_BASE_OFF;
+        uint64_t BlockBase = ChunkAddr + SHARD_BLOCK_BASE_OFF;
         alignas(16) uint8_t Sb1[16] = {}, Sb2[16] = {};
-        if (!m_reader.Read(BlockBase + 32ULL * bidx1, Sb1, 16)) return 0;
-        if (!m_reader.Read(BlockBase + 32ULL * bidx2, Sb2, 16)) return 0;
+        if (!m_reader.Read(BlockBase + 32ULL * Bidx1, Sb1, 16)) return 0;
+        if (!m_reader.Read(BlockBase + 32ULL * Bidx2, Sb2, 16)) return 0;
 
         auto DecBlock = [&](const uint8_t* Raw) -> uint64_t {
-            __m128i V    = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Raw));
-            __m128i Shuf = _mm_shufflelo_epi16(V, 30);
-            __m128i X    = _mm_xor_si128(Shuf, m_v519_blockXor);
+            __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Raw));
+            V = _mm_shufflelo_epi16(V, BLOCK_SHUF_A);
+            V = _mm_or_si128(_mm_slli_epi64(V, BLOCK_ROL),
+                             _mm_srli_epi64(V, 64 - BLOCK_ROL));
+            V = _mm_shufflelo_epi16(V, BLOCK_SHUF_B);
             uint64_t Lo;
-            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), X);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
             return Lo;
         };
-        uint64_t v13_raw    = DecBlock(Sb1);
-        uint64_t block2_raw = DecBlock(Sb2);
+        uint64_t Block1 = DecBlock(Sb1);
+        uint64_t Block2 = DecBlock(Sb2);
 
-        // ── FNV fold (additive offset) ──
-        uint64_t fv1 = FNV_PRIME * fn_rotl64(v13_raw, FNV_ROL1) + FNV_ADD;
-        uint64_t fv2 = FNV_PRIME * fn_rotl64(fv1,     FNV_ROL2) + FNV_ADD;
+        uint64_t Fv1 = FNV_PRIME * fn_rotl64(Block1, FNV_ROL1) + FNV_ADD;
+        uint64_t Fv2 = FNV_PRIME * fn_rotl64(Fv1,    FNV_ROL2) + FNV_ADD;
 
-        // ── Result ──
-        uint64_t v13_rol    = fn_rotl64(v13_raw, 11);
-        uint64_t block2_rol = fn_rotl64(block2_raw, 11);
-        uint64_t Result     = v13_rol + (block2_rol ^ fv2) + 2ULL * NameOff;
-
-        // CL-1195482 final op: the live FName resolver chain
-        //   v11      = bswap64(R ^ 0xA05F743A)
-        //   v8       = v11 ^ 0xC03C00000000
-        //   name_ptr = bswap64(v8 ^ 0x3A749F9C00000000)
-        // Verified math: bswap(bswap(R ^ K1) ^ K2 ^ K3) = R when K1 = bswap(K2 ^ K3).
-        // Here K1=0xA05F743A, K2^K3 = 0x3A745FA000000000, bswap = 0xA05F743A ✓.
-        // So name_ptr = R. The chain is pure obfuscation in the binary —
-        // emit the value unchanged. (Cross-verified with FName.txt reference.)
-        return Result;
+        uint64_t EntryPtr = Block1 + (Block2 ^ Fv2) + 2ULL * NameOff;
+        return EntryPtr;
     }
 
     uint64_t ResolveNamePtr(int32_t comp_index) {
@@ -1239,25 +1171,14 @@ public:
         }
     }
 
-    // ── DecryptNameString (Build 2026-05-19) ─────────────────────────────
-    // RE'd from FNameEntry_AppendNameToString @ 0x247D10. Different bit layout
-    // and a real stateful LCG per pair (NOT the simple per-pair-index XOR of
-    // CL-1177146). Verified against ESP implementation.
+    // ── DecryptNameString (CL-1201801) ───────────────────────────────────
+    // RE'd from FNameEntry_DecryptAndAppend @ sub_24AB20. Header format and
+    // decrypt algorithm changed from LCG-based to sequential keytable walk.
     //   Header:
-    //     length = (h & 0x7F) | ((h >> 5) & 0x380)    // 10-bit length
-    //     isWide = (h & 0x8000) != 0                   // bit15
-    //   Narrow LCG: u8 seed = length - 107; advance: seed = -71*seed - 124
-    //     k0 = keytable[seed & 0x3F]     ; byte[i]   ^= (u8)(k0 >> 3)
-    //     k1 = keytable[(107*(u8)seed - 77) & 0x3F]
-    //                                    ; byte[i+1] ^= (u8)(k1 >> 3)
-    //   Wide LCG:   u32 seed = length + 45717; advance: seed = 2090044089*seed - 382688636
-    //     k0 = keytable[(u8)seed & 0x3F] ; word[i]   ^= k0
-    //     k1 = keytable[(107*(u8)seed - 77) & 0x3F]
-    //                                    ; word[i+1] ^= k1
-    //   Keytable: our local 64-entry table is read from RVA +0x08 (= the +4
-    //   word offset into the parent SIMD constants block); the binary's
-    //   "(seed & 0x3F) + 4" word indexing therefore maps directly to our
-    //   `keyTable[seed & 0x3F]`.
+    //     length = (h & 0x3F) | ((h >> 1) & 0x3C0)    // 10-bit (6+4)
+    //     isWide = (h & 0x40) != 0                     // bit 6
+    //   Narrow: byte[i] ^= (u8)(keytable[((len - 93 + i) & 0x3F)] >> 3)
+    //   Wide:   word[i] ^=      keytable[((len - 93 + i) & 0x3F)]
     std::string DecryptNameString_Build20260519(uint64_t NameEntryPtr) {
         using namespace ArcDecrypt::v20260519;
 
@@ -1265,72 +1186,43 @@ public:
         if (!m_reader.Read(NameEntryPtr, &Header, 2) || !Header) return {};
 
         int  Length = static_cast<int>((Header & HDR_LENGTH_LO_MASK)
-                                       | ((static_cast<unsigned>(Header) >> 5) & HDR_LENGTH_HI_MASK));
+                                       | ((static_cast<unsigned>(Header) >> HDR_LENGTH_HI_SHIFT) & HDR_LENGTH_HI_MASK));
         bool IsWide = (Header & HDR_IS_WIDE_BIT) != 0;
         if (Length <= 0 || Length > 1023) return {};
 
-        auto key_at = [&](uint8_t idx) -> uint16_t {
-            return m_keyTable[idx & KEY_INDEX_MASK];
-        };
+        uint8_t KeyStart = static_cast<uint8_t>(Length + KEY_INIT_BIAS_NARROW);
 
         if (!IsWide) {
             std::vector<uint8_t> Bytes(Length, 0);
             if (!m_reader.Read(NameEntryPtr + 2, Bytes.data(), Length)) return {};
 
-            int8_t seed = static_cast<int8_t>(Length + KEY_INIT_BIAS_NARROW);
-            int i = 0;
-            for (; i + 1 < Length; i += 2) {
-                uint8_t k0 = static_cast<uint8_t>(key_at(static_cast<uint8_t>(seed)) >> 3);
-                uint8_t k1_idx = static_cast<uint8_t>(
-                    (KEY_PAIR_MUL * static_cast<int>(seed) - KEY_PAIR_SUB));
-                uint8_t k1 = static_cast<uint8_t>(key_at(k1_idx) >> 3);
-                Bytes[i]     ^= k0;
-                Bytes[i + 1] ^= k1;
-                seed = static_cast<int8_t>(KEY_LCG_MUL_NARROW * static_cast<int>(seed)
-                                           + KEY_LCG_ADD_NARROW);
-            }
-            if (i < Length) {
-                uint8_t k = static_cast<uint8_t>(key_at(static_cast<uint8_t>(seed)) >> 3);
-                Bytes[i] ^= k;
+            for (int I = 0; I < Length; ++I) {
+                Bytes[I] ^= static_cast<uint8_t>(m_keyTable[(KeyStart + I) & KEY_INDEX_MASK] >> 3);
             }
 
-            std::string out;
-            out.reserve(Length);
-            for (int j = 0; j < Length; ++j) {
-                uint8_t c = Bytes[j];
-                if (!c) break;
-                out.push_back(static_cast<char>(c));
+            std::string Out;
+            Out.reserve(Length);
+            for (int J = 0; J < Length; ++J) {
+                if (!Bytes[J]) break;
+                Out.push_back(static_cast<char>(Bytes[J]));
             }
-            return out;
+            return Out;
         } else {
             std::vector<uint16_t> Wides(Length, 0);
             if (!m_reader.Read(NameEntryPtr + 2, Wides.data(),
                                static_cast<size_t>(Length) * sizeof(uint16_t))) return {};
 
-            uint32_t seed = static_cast<uint32_t>(Length) + KEY_INIT_BIAS_WIDE;
-            int i = 0;
-            for (; i + 1 < Length; i += 2) {
-                uint16_t k0 = key_at(static_cast<uint8_t>(seed));
-                uint8_t  k1_idx = static_cast<uint8_t>(
-                    KEY_PAIR_MUL * static_cast<int>(static_cast<uint8_t>(seed)) - KEY_PAIR_SUB);
-                uint16_t k1 = key_at(k1_idx);
-                Wides[i]     ^= k0;
-                Wides[i + 1] ^= k1;
-                seed = KEY_LCG_MUL_WIDE * seed + KEY_LCG_ADD_WIDE;
-            }
-            if (i < Length) {
-                uint16_t k = key_at(static_cast<uint8_t>(seed));
-                Wides[i] ^= k;
+            for (int I = 0; I < Length; ++I) {
+                Wides[I] ^= m_keyTable[(KeyStart + I) & KEY_INDEX_MASK];
             }
 
-            std::string out;
-            out.reserve(Length);
-            for (int j = 0; j < Length; ++j) {
-                uint16_t c = Wides[j];
-                if (!c) break;
-                out.push_back(static_cast<char>(c & 0xFFu));
+            std::string Out;
+            Out.reserve(Length);
+            for (int J = 0; J < Length; ++J) {
+                if (!Wides[J]) break;
+                Out.push_back(static_cast<char>(Wides[J] & 0xFFu));
             }
-            return out;
+            return Out;
         }
     }
 
@@ -1777,17 +1669,6 @@ private:
     // ── Pipeline selection (set in Init()) ──
     Pipeline       m_pipeline = Pipeline::CL1177146;
 
-    // ── Build 2026-05-19 SIMD masks (loaded from binary in LoadBuild20260519SimdMasks) ──
-    bool           m_v519_masksLoaded = false;
-    __m128i        m_v519_uobjSlotXor{};       // RVA_UOBJ_SLOT_XOR
-    __m128i        m_v519_stageA1Pshufb{};     // RVA_STAGE_A1_PSHUFB
-    __m128i        m_v519_stageA1Xor{};        // RVA_STAGE_A1_XOR
-    __m128i        m_v519_stageA2Xor{};        // RVA_STAGE_A2_XOR
-    __m128i        m_v519_stageA3AndMask{};    // RVA_STAGE_A3_AND
-    __m128i        m_v519_stageA3AndnotMask{}; // RVA_STAGE_A3_ANDNOT
-    __m128i        m_v519_stageA3Xor{};        // RVA_STAGE_A3_XOR
-    __m128i        m_v519_stageA3PshufbOut{};  // RVA_STAGE_A3_PSHUFB_OUT
-    __m128i        m_v519_blockXor{};          // RVA_BLOCK_DECRYPT_XOR
 };
 
 // ── Free-function shims ────────────────────────────────────────────────────

@@ -236,7 +236,7 @@ constexpr uint64_t MODULE_BASE = 0x140000000;
 // Values are the latest verified patch's defaults; older patches kept as
 // comments so a stale sig-scan or a partial revert can fall back gracefully.
 inline uint64_t RVA_GWORLD              = 0xE706C58;   // 20260519 (CL-1177146: 0xDFDB4D8, 20260428: 0xE024F68)
-inline uint64_t RVA_GNAMES_BASE         = 0xE23DA00;   // 20260519 (CL-1177146: 0xDBB3F80, 20260428: 0xDB5BE80)
+inline uint64_t RVA_GNAMES_BASE         = 0xE0ED7D0;   // CL-1201801 live (was 0xE23DA00; CL-1177146: 0xDBB3F80, 20260428: 0xDB5BE80)
 inline uint64_t RVA_FNAME_KEY_TABLE     = 0xDE5B6E0;   // CL-1201801 (= SIMD consts block 0xDE5B6D8 + 8); 20260519: 0xE17C7FC; CL-1177146: 0xDAF88EC
 inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xE4F8F60;   // CL-1195482 (Steam 19.05 evening; was 0xE4F8ED0 in pre-CL-1195482 morning build)
 constexpr uint64_t GOBJ_ENCRYPTED_OFF   = 0x30;        // legacy pipeline offset (unused on 20260428: NumElements is plain at +0x38)
@@ -367,7 +367,7 @@ namespace Patch20260421 {
     //           find_fname_func.h::ExtractEntryHandleXor; verified in IDA jjn1
     //           decompile of FName_ToString_20260428 @ 0x23AD40)
     // 20260421: 0x59B07C3D00000000
-    inline uint64_t ENTRY_HANDLE_XOR = 0x9CB9AD0A00000000ULL;
+    inline uint64_t ENTRY_HANDLE_XOR = 0x91BB95D79830CB3DULL;
     inline void SetEntryHandleXor(uint64_t v) { ENTRY_HANDLE_XOR = v; }
 
     // Secondary XOR seen on (entry + 192) field in FName_ToString:
@@ -848,20 +848,12 @@ namespace Patch20260421 {
 //   +0x08 offset in the SIMD constants block, so the "+4 word" bias is baked in.
 // =============================================================================
 namespace v20260519 {
-    // ── RVAs (build 2026-05-19) ───────────────────────────────────────────
-    constexpr uint64_t RVA_GNAMEPOOL              = 0xE0ED7D0ULL;  // CL-1201801 (was 0xE23DA00 on CL-1195482)
-    constexpr uint64_t RVA_GNAMEPOOL_INIT_GUARD   = 0xE0ED7C8ULL;  // CL-1201801
-    constexpr uint64_t RVA_FNAME_SIMD_CONSTS      = 0xDE5B6D8ULL;  // CL-1201801 (was 0xE17C7F4)
-    constexpr uint64_t RVA_FNAME_KEYTABLE         = RVA_FNAME_SIMD_CONSTS + 0x08ULL;  // 0xDE5B6E0
+    // ── RVAs (build 2026-05-19, CL-1201801) ─────────────────────────────
+    constexpr uint64_t RVA_GNAMEPOOL              = 0xE0FAA80ULL;  // CL-1201801 (was 0xE0ED7D0 on CL-1195482)
+    constexpr uint64_t RVA_GNAMEPOOL_INIT_GUARD   = 0xE0FAA78ULL;  // CL-1201801
+    constexpr uint64_t RVA_FNAME_SIMD_CONSTS      = 0xE0397F4ULL;  // CL-1201801 (was 0xDE5B6D8 on CL-1195482)
+    constexpr uint64_t RVA_FNAME_KEYTABLE         = RVA_FNAME_SIMD_CONSTS + 168ULL;  // 0xE03989C (was +0x08)
 
-    constexpr uint64_t RVA_STAGE_A1_PSHUFB        = 0xB331000ULL;
-    constexpr uint64_t RVA_STAGE_A1_XOR           = 0xB331010ULL;
-    constexpr uint64_t RVA_STAGE_A2_XOR           = 0xB3311B0ULL;
-    constexpr uint64_t RVA_STAGE_A3_ANDNOT        = 0xB331230ULL;
-    constexpr uint64_t RVA_STAGE_A3_AND           = 0xB331240ULL;
-    constexpr uint64_t RVA_STAGE_A3_XOR           = 0xB331250ULL;
-    constexpr uint64_t RVA_STAGE_A3_PSHUFB_OUT    = 0xB331260ULL;
-    constexpr uint64_t RVA_BLOCK_DECRYPT_XOR      = 0xB331020ULL;
     constexpr uint64_t RVA_UOBJ_SLOT_XOR          = 0xB1F0B90ULL;   // CL-1201801 (was 0xB34B0E0 on CL-1195482)
 
     constexpr uint64_t RVA_GUOBJECTARRAY          = 0xE4F8F60ULL;   // CL-1195482
@@ -874,21 +866,26 @@ namespace v20260519 {
     constexpr uint32_t HASH_PRIME           = 0x01000193u;      // FNV32 prime (shared)
     constexpr uint32_t SLOT_HASH_ADD        = 0x8F957A95u;      // CL-1201801
     constexpr uint32_t SLOT_INNER_BIAS      = 0x0001DFE0u;      // 122832
-    constexpr uint32_t BHASH_ADD            = 0x22243756u;      // 572647254
-    constexpr int32_t  BHASH_INNER_BIAS     = 86;               // +86 in slot byte
 
-    constexpr uint64_t CHUNK_HASH_SEED_OFF  = 0x70D0;           // was 0x7000
-    constexpr uint64_t CHUNK_BLOCK_BASE_OFF = 0x70E0;           // was 0x7010
+    // ── Shard hash-table constants (CL-1201801) ──────────────────────────
+    // FNamePool is now a sharded hash-table. CI → (NameOff, ChunkOff) via
+    // identity PSHUFB chain. Each shard has a block-pair at +0xA0 selected
+    // by FNV32 hash of the shard address + 0x90.
+    constexpr uint32_t SHARD_HASH_ADD       = 0x4A3617A2u;      // FNV32 offset for shard hash (disasm-verified, decompiler showed wrong 0x4A3FAF42)
+    constexpr uint64_t SHARD_HASH_SEED_OFF  = 0x90ULL;          // hash input addr offset within shard (was 0x70D0)
+    constexpr uint64_t SHARD_BLOCK_BASE_OFF = 0xA0ULL;          // block-pair base within shard (was 0x70E0)
+    constexpr int      SHARD_HASH_ROL_A     = 19;               // first & third ROL32 in hash chain
+    constexpr int      SHARD_HASH_ROL_B     = 26;               // second ROL32 in hash chain
+
+    // Block decrypt: shufflelo(SHUF_A) → ROL64(BLOCK_ROL) → shufflelo(SHUF_B) → lo64
+    constexpr int      BLOCK_SHUF_A         = 0x8D;
+    constexpr int      BLOCK_ROL            = 46;
+    constexpr int      BLOCK_SHUF_B         = 0x4B;
 
     constexpr uint64_t FNV_PRIME            = 0x100000001B3ULL;
-    constexpr uint64_t FNV_ADD              = 0x61E912C25C5F0996ULL; // ADDED (was SUBTRACTED -0x679E1C621411ACFA)
-    constexpr int      FNV_ROL1             = 57;
-    constexpr int      FNV_ROL2             = 56;
-
-    constexpr uint64_t PTR_XOR_FINAL        = 0x3C000000ULL;    // CL-1195482: simple XOR, no bswap.
-                                                                // (Pre-CL-1195482 had bswap+0xA05F743A; CL-1195482 added
-                                                                //  post-A3 XOR(0xC03C00000000) + post-bswap XOR(0x3A749F9C00000000)
-                                                                //  which mathematically cancel down to internal ^ 0x3C000000.)
+    constexpr uint64_t FNV_ADD              = 0xBF571668EC20FA62ULL; // CL-1201801 (was 0x61E912C25C5F0996 on CL-1195482)
+    constexpr int      FNV_ROL1             = 29;                // CL-1201801 (was 57)
+    constexpr int      FNV_ROL2             = 30;                // CL-1201801 (was 56)
 
     constexpr uint64_t UOBJ_SLOT_XOR_64     = 0xD22BC6399DD7BE75ULL;  // CL-1201801 (was 0xEA99FC6989F63908)
     constexpr int      UOBJ_SLOT_ROL32      = 0;                // CL-1201801: no ROL32 step (was 9 on CL-1195482)
@@ -912,27 +909,18 @@ namespace v20260519 {
     constexpr uint32_t FFIELD_CLASS_NAME_OFF   = 0x40;
 
     constexpr int      KEY_TABLE_SIZE       = 64;
-    constexpr int      KEY_TABLE_BIAS       = 4;
     constexpr uint8_t  KEY_INDEX_MASK       = 0x3F;
 
-    // Narrow LCG: seed8 = -71 * seed8 - 124
-    constexpr int8_t   KEY_LCG_MUL_NARROW   = -71;
-    constexpr int8_t   KEY_LCG_ADD_NARROW   = -124;
-    constexpr int8_t   KEY_INIT_BIAS_NARROW = -107;
+    // CL-1201801: sequential keytable walk (no LCG).
+    // key[i] = keytable[(init + i) & 0x3F]; narrow XOR >>3, wide XOR full u16.
+    constexpr int8_t   KEY_INIT_BIAS_NARROW = -93;           // CL-1201801 (was -107 on CL-1195482)
+    constexpr int16_t  KEY_INIT_BIAS_WIDE   = -93;           // CL-1201801 (was 45717 on CL-1195482)
 
-    // Wide LCG: seed32 = 2090044089 * seed32 - 382688636
-    constexpr uint32_t KEY_LCG_MUL_WIDE     = 2090044089u;
-    constexpr uint32_t KEY_LCG_ADD_WIDE     = (uint32_t)-382688636;
-    constexpr uint32_t KEY_INIT_BIAS_WIDE   = 45717u;
-
-    // Per-pair "second key": idx2 = (107 * (u8)seed - 77) & 0x3F
-    constexpr int      KEY_PAIR_MUL         = 107;
-    constexpr int      KEY_PAIR_SUB         = 77;
-
-    // Header bit-layout
-    constexpr uint16_t HDR_LENGTH_LO_MASK   = 0x007F;       // bits 0..6 of hdr → bits 0..6 of length
-    constexpr uint16_t HDR_LENGTH_HI_MASK   = 0x0380;       // ((hdr >> 5) & 0x380) → bits 7..9 of length
-    constexpr uint16_t HDR_IS_WIDE_BIT      = 0x8000;
+    // Header bit-layout (CL-1201801)
+    constexpr uint16_t HDR_LENGTH_LO_MASK   = 0x003F;       // bits 0..5 (was 0x007F: bits 0..6)
+    constexpr uint16_t HDR_LENGTH_HI_MASK   = 0x03C0;       // ((hdr >> 1) & 0x3C0) → bits 6..9 (was 0x0380)
+    constexpr int      HDR_LENGTH_HI_SHIFT  = 1;             // (was 5)
+    constexpr uint16_t HDR_IS_WIDE_BIT      = 0x0040;        // bit 6 (was 0x8000 = bit 15)
 } // namespace v20260519
 
 } // namespace ArcDecrypt
