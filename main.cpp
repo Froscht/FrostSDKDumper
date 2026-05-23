@@ -867,6 +867,69 @@ public:
                 }
             }
 
+            // ── Phase 1.6: validate ScriptStruct vtable via named seed objects ──
+            // Phase 1.5 often picks a parent vtable (UStruct base) instead of
+            // the derived UScriptStruct vtable. Validate by scanning seed
+            // objects whose names match struct-oracle names (Vector, Rotator,
+            // etc.) and reading their actual vtable pointer.
+            {
+                auto& VT = AutoDiscovery::g_DiscoveredVTables;
+                const auto& Seeds = m_gobj.GetSeedObjects();
+                uint64_t WantVt = VT.ScriptStructRVA ? MODULE_BASE + VT.ScriptStructRVA : 0;
+
+                std::unordered_map<uint64_t, int> VtHits;
+                int Probed = 0;
+                size_t Step = std::max<size_t>(1, Seeds.size() / 16000);
+                for (size_t I = 0; I < Seeds.size() && Probed < 200; I += Step) {
+                    uint64_t Obj = Seeds[I];
+                    if (!Obj) continue;
+                    std::string N = Resolver(Obj);
+                    if (N.empty()) continue;
+                    bool Match = false;
+                    for (const char* Oracle : AutoDiscovery::VTableOracles::ScriptStruct) {
+                        if (N == Oracle) { Match = true; break; }
+                    }
+                    if (!Match) continue;
+                    uint64_t Vt = 0;
+                    if (!m_reader.Read(Obj, &Vt, 8)) continue;
+                    if (Vt < MODULE_BASE || Vt >= MODULE_BASE + AutoDiscovery::g_DiscoveredBounds.ImageSize) continue;
+                    VtHits[Vt]++;
+                    Probed++;
+                }
+
+                if (Probed > 0) {
+                    uint64_t BestVt = 0;
+                    int BestCount = 0;
+                    for (auto& [Vt, Cnt] : VtHits) {
+                        if (Cnt > BestCount) { BestCount = Cnt; BestVt = Vt; }
+                    }
+                    uint64_t BestRva = BestVt - MODULE_BASE;
+                    if (BestVt && BestRva != VT.ScriptStructRVA) {
+                        std::printf("[autodisc] Phase 1.6: ScriptStruct vtable corrected 0x%llX → 0x%llX (%d oracle objects probed)\n",
+                            (unsigned long long)VT.ScriptStructRVA, (unsigned long long)BestRva, Probed);
+                        VT.ScriptStructRVA = BestRva;
+                    } else if (BestVt && BestRva == VT.ScriptStructRVA) {
+                        std::printf("[autodisc] Phase 1.6: ScriptStruct vtable 0x%llX confirmed (%d oracle objects)\n",
+                            (unsigned long long)VT.ScriptStructRVA, Probed);
+                    }
+                } else if (WantVt) {
+                    int ObjsWithVt = 0;
+                    size_t Step2 = std::max<size_t>(1, Seeds.size() / 16000);
+                    for (size_t I = 0; I < Seeds.size() && ObjsWithVt < 1; I += Step2) {
+                        uint64_t Obj = Seeds[I];
+                        if (!Obj) continue;
+                        uint64_t Vt = 0;
+                        if (!m_reader.Read(Obj, &Vt, 8)) continue;
+                        if (Vt == WantVt) ObjsWithVt++;
+                    }
+                    if (ObjsWithVt == 0) {
+                        std::printf("[autodisc] Phase 1.6: ScriptStruct vtable 0x%llX has 0 matching objects — clearing\n",
+                            (unsigned long long)VT.ScriptStructRVA);
+                        VT.ScriptStructRVA = 0;
+                    }
+                }
+            }
+
             // Re-run the heap vtable scan with the (possibly fresh) discovered
             // map. Idempotent — duplicates against the seed list are dropped.
             m_gobj.RunDiscoveredVtableScan();
