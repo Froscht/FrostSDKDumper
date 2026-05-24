@@ -465,19 +465,20 @@ public:
     // CL-1177146 value, used until discovery has run.
     static constexpr uint64_t FFIELD_NAME_XOR_CL1177146 = 0x9A492C85DDF6F193ULL;
     uint64_t DecryptFFieldNameSlot(const uint8_t enc[16]) const {
-        // CL-1201801 FField NamePrivate decode (PRIMARY for Build20260519 pipeline).
-        // Verified IDA sub_1403B8A70 @ 0x1403B8A70, constants @ .rdata 0xB23EF10/0xB23EF20.
-        // Algorithm: lo64(FField+0x40) → XOR(KEY1) → ROL32(17)/lane → PSHUFLW(0x1E) → XOR(KEY2) → ROL64(32)
         if (m_pipeline == Pipeline::Build20260519) {
-            using namespace ArcDecrypt::v20260519;
+            const auto& Masks = AutoDiscovery::g_DiscoveredFFieldMasks;
+            uint64_t UseKey1 = Masks.Valid ? Masks.Key1 : ArcDecrypt::v20260519::FFIELD_NAME_KEY1;
+            uint64_t UseKey2 = Masks.Valid ? Masks.Key2 : ArcDecrypt::v20260519::FFIELD_NAME_KEY2;
+            int      UseRol32 = Masks.Valid ? Masks.Rol32Amount : ArcDecrypt::v20260519::FFIELD_NAME_ROL32;
+            int      UseRol64 = Masks.Valid ? Masks.Rol64Amount : ArcDecrypt::v20260519::FFIELD_NAME_ROL64;
             __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
-            V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(FFIELD_NAME_KEY1)));
-            V = _mm_or_si128(_mm_slli_epi32(V, FFIELD_NAME_ROL32), _mm_srli_epi32(V, 32 - FFIELD_NAME_ROL32));
-            V = _mm_shufflelo_epi16(V, FFIELD_NAME_SHUF);
-            V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(FFIELD_NAME_KEY2)));
+            V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(UseKey1)));
+            V = _mm_or_si128(_mm_slli_epi32(V, UseRol32), _mm_srli_epi32(V, 32 - UseRol32));
+            V = _mm_shufflelo_epi16(V, 0x1E);
+            V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(UseKey2)));
             uint64_t Lo;
             _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
-            uint64_t Out = (Lo << FFIELD_NAME_ROL64) | (Lo >> (64 - FFIELD_NAME_ROL64));
+            uint64_t Out = (Lo << UseRol64) | (Lo >> (64 - UseRol64));
             uint32_t Ci  = static_cast<uint32_t>(Out);
             if (Ci > 1 && Ci < 0x2000000u) return Out;
         }
@@ -1352,7 +1353,28 @@ public:
         std::string s = StaticResolve(comp_index);
         if (IsLenientName(s)) return s;
         std::string e = TryEmuFallback(comp_index);
-        return IsLenientName(e) ? e : std::string{};
+        if (IsLenientName(e)) return e;
+        if (m_lenientFailCount < 20) {
+            ++m_lenientFailCount;
+            uint64_t nptr = ResolveNamePtrFull(comp_index);
+            uint32_t ci_u = static_cast<uint32_t>(comp_index);
+            uint16_t name_off = static_cast<uint16_t>(ci_u & 0xFFFFu);
+            uint32_t chunk_off = (ci_u >> 8) & 0xFFFF00u;
+            std::printf("[fname-dbg] CI=%d (0x%X) chunk_off=0x%X name_off=0x%X entry_ptr=0x%llX",
+                comp_index, ci_u, chunk_off, name_off, (unsigned long long)nptr);
+            if (nptr) {
+                uint8_t hdr_bytes[4] = {};
+                bool ok = m_reader.Read(nptr, hdr_bytes, 4);
+                std::printf(" hdr_read=%s hdr=[%02X %02X %02X %02X]",
+                    ok ? "ok" : "FAIL", hdr_bytes[0], hdr_bytes[1], hdr_bytes[2], hdr_bytes[3]);
+                if (ok) {
+                    std::string raw = DecryptNameString(nptr);
+                    std::printf(" decrypt='%s'", raw.empty() ? "<empty>" : raw.c_str());
+                }
+            }
+            std::printf(" emu='%s'\n", e.empty() ? "<empty>" : e.c_str());
+        }
+        return {};
     }
 
     // ── Patch 20260421: 8-byte obfuscated handle → name string ───────────
@@ -1663,6 +1685,7 @@ private:
     EmuFallback    m_emuFallback;
     std::unordered_map<int32_t, std::string> m_emuCache;
     bool           m_emuPrimary = false;       // see SetEmuPrimary()
+    int            m_lenientFailCount = 0;
     uint64_t       m_primaryHandleOffset = 0;  // 0 = no calibration yet, fall back to candidate list
     uint64_t       m_ffieldNameOff = 0;        // 0 = uncalibrated; first valid offset wins
 

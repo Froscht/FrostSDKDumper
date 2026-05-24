@@ -193,7 +193,7 @@ namespace Offsets {
         //   off=+0x178 hits= 1/32
         // auto-offsets probe identifies PropertiesSize at +0x100 (auto-fixed
         // from 0x190 by live oracle, 100/200 hits).
-        inline uint64_t SuperStruct     = 0x150;   // CL-1201801 (was 0x130; auto-fixed 24/100 hits)
+        inline uint64_t SuperStruct     = 0xB0;    // CL-1201801 (live-verified: Actor+0xB0=Object, Pawn+0xB0=Actor, Object+0xB0=0)
         inline uint64_t Children        = 0x178;   // unverified — not critical for FField walk
         inline uint64_t ChildProperties = 0x108;   // CL-1201801 (was 0x168; confirmed via FField.Owner backref)
         inline uint64_t PropertiesSize  = 0x110;   // CL-1201801 (auto-fixed 100/200 hits)

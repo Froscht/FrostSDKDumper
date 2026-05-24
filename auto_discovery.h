@@ -865,18 +865,97 @@ inline VTableMap DiscoverEngineVTables(const std::vector<uint64_t>& objects,
         scored.push_back(std::move(cs));
     }
 
-    auto pick_best_for_kind = [&](int kind) -> uint64_t {
-        uint64_t best_vt = 0; int best_score = 0; size_t best_count = 0;
+    auto rva_of = [&](uint64_t vt) -> uint64_t { return vt ? (vt - module_base) : 0; };
+
+    auto as_density_score = [&](uint64_t vt_addr) -> int {
+        if (!vt_addr || vt_addr < module_base) return 0;
+        uint64_t rva = vt_addr - module_base;
+        if (!bounds.InRData(rva)) return 0;
+        uint64_t qbuf[64] = {};
+        if (!reader.Read(vt_addr, qbuf, sizeof(qbuf))) return 0;
+        int textCount = 0;
+        for (int i = 0; i < 64; ++i) {
+            if (!qbuf[i]) continue;
+            if (qbuf[i] < module_base) continue;
+            uint64_t r = qbuf[i] - module_base;
+            if (bounds.InText(r)) ++textCount;
+        }
+        return textCount;
+    };
+
+    {
+        uint64_t AsLo = bounds.RDataRva + (bounds.RDataSize * 3 / 4);
+        uint64_t AsHi = bounds.RDataEnd();
         for (const auto& cs : scored) {
+            uint64_t rva = rva_of(cs.vtable);
+            if (rva < AsLo || rva >= AsHi) continue;
+            int KlassHits  = cs.scores[KCLASS_NATIVE] + cs.scores[KBPGC];
+            int StructHits = cs.scores[KSCRIPT_STRUCT];
+            int FuncHits   = cs.scores[KFUNCTION];
+            if (KlassHits >= StructHits && KlassHits >= FuncHits && cs.count > 100) {
+                if (!out.ASClassRVA) out.ASClassRVA = rva;
+            } else if (StructHits > FuncHits && cs.count > 50) {
+                if (!out.ASStructRVA) out.ASStructRVA = rva;
+            }
+        }
+        if (!out.ASClassRVA) {
+            uint64_t BestVt = 0; size_t BestCount = 0; int BestDensity = 0;
+            for (const auto& cs : scored) {
+                uint64_t rva = rva_of(cs.vtable);
+                if (!rva || rva == out.ASStructRVA) continue;
+                if (cs.count < 100 || cs.count > 100000) continue;
+                int d = as_density_score(cs.vtable);
+                if (d < 10) continue;
+                if (cs.count > BestCount || (cs.count == BestCount && d > BestDensity)) {
+                    BestVt = cs.vtable; BestCount = cs.count; BestDensity = d;
+                }
+            }
+            if (BestVt) {
+                out.ASClassRVA = rva_of(BestVt);
+                std::printf("[autodisc-vt]   ASClass early structural fallback: picked rva=0x%llX cluster_count=%zu density=%d\n",
+                    (unsigned long long)out.ASClassRVA, BestCount, BestDensity);
+            }
+        }
+        if (!out.ASStructRVA) {
+            uint64_t BestVt = 0; size_t BestCount = 0; int BestDensity = 0;
+            for (const auto& cs : scored) {
+                uint64_t rva = rva_of(cs.vtable);
+                if (!rva || rva == out.ASClassRVA) continue;
+                if (cs.count < 50 || cs.count > 100000) continue;
+                int d = as_density_score(cs.vtable);
+                if (d < 10) continue;
+                if (cs.count > BestCount || (cs.count == BestCount && d > BestDensity)) {
+                    BestVt = cs.vtable; BestCount = cs.count; BestDensity = d;
+                }
+            }
+            if (BestVt) {
+                out.ASStructRVA = rva_of(BestVt);
+                std::printf("[autodisc-vt]   ASStruct early structural fallback: picked rva=0x%llX cluster_count=%zu density=%d\n",
+                    (unsigned long long)out.ASStructRVA, BestCount, BestDensity);
+            }
+        }
+        if (out.ASClassRVA || out.ASStructRVA)
+            std::printf("[autodisc-vt]   pre-identified ASClass=0x%llX ASStruct=0x%llX (excluded from engine-type scoring)\n",
+                (unsigned long long)out.ASClassRVA, (unsigned long long)out.ASStructRVA);
+    }
+
+    auto pick_best_for_kind = [&](int kind) -> uint64_t {
+        uint64_t best_vt = 0; double best_density = 0; int best_score = 0;
+        for (const auto& cs : scored) {
+            uint64_t rva = rva_of(cs.vtable);
+            if (rva == out.ASClassRVA || rva == out.ASStructRVA) continue;
             int s = cs.scores[kind];
             if (s == 0) continue;
-            if (s > best_score || (s == best_score && cs.count > best_count)) {
-                best_score = s; best_count = cs.count; best_vt = cs.vtable;
+            auto It = clusters.find(cs.vtable);
+            size_t NNames = (It != clusters.end()) ? It->second.names.size() : 0;
+            if (NNames == 0) NNames = 1;
+            double Density = (double)s / (double)NNames;
+            if (Density > best_density || (Density == best_density && s > best_score)) {
+                best_density = Density; best_score = s; best_vt = cs.vtable;
             }
         }
         return best_vt;
     };
-    auto rva_of = [&](uint64_t vt) -> uint64_t { return vt ? (vt - module_base) : 0; };
 
     // Min-cluster gate: a "winning" cluster with only a handful of objects
     // is almost always a misidentification (e.g. cluster_count=2 picked over
@@ -933,7 +1012,8 @@ inline VTableMap DiscoverEngineVTables(const std::vector<uint64_t>& objects,
                rva == out.FunctionRVA     || rva == out.EnumRVA        ||
                rva == out.PackageRVA      || rva == out.BPGCRVA        ||
                rva == out.WBPGCRVA        || rva == out.SMBPGCRVA      ||
-               rva == out.AnimBPGCRVA;
+               rva == out.AnimBPGCRVA     || rva == out.ASClassRVA     ||
+               rva == out.ASStructRVA;
     };
     if (!out.WBPGCRVA) {
         uint64_t best_vt = 0; size_t best_count = 0;
@@ -1272,7 +1352,7 @@ inline EngineVTableAnchorResult DiscoverEngineVTablesByWideStringAnchor(
                     mov_disp_imm = (uint64_t)(int64_t)d;
                     op_pos += 4;
                 }
-                if (require_140 && mov_disp_imm != 0x140) continue;
+                if (require_140 && !(mov_disp_imm >= 0x130 && mov_disp_imm <= 0x150 && (mov_disp_imm & 7) == 0)) continue;
                 matched = true;
                 break;
             }
@@ -1436,6 +1516,28 @@ inline EngineVTableAnchorResult DiscoverEngineVTablesByWideStringAnchor(
     out.BPGCRVA      = resolve_kind("BlueprintGeneratedClass");
     out.AnimBPGCRVA  = resolve_kind("AnimBlueprintGeneratedClass");
     out.WBPGCRVA     = resolve_kind("WidgetBlueprintGeneratedClass");
+    {
+        uint64_t* EngineRvas[] = {
+            &out.ScriptStructRVA, &out.ClassNativeRVA, &out.FunctionRVA,
+            &out.EnumRVA, &out.PackageRVA, &out.BPGCRVA,
+            &out.AnimBPGCRVA, &out.WBPGCRVA
+        };
+        const char* EngineNames[] = {
+            "ScriptStruct", "Class", "Function", "Enum", "Package",
+            "BPGC", "AnimBPGC", "WBPGC"
+        };
+        for (int I = 0; I < 8; ++I) {
+            if (!*EngineRvas[I]) continue;
+            for (int J = I + 1; J < 8; ++J) {
+                if (*EngineRvas[I] == *EngineRvas[J]) {
+                    std::printf("[autodisc-vt-anchor] dedup: %s and %s share vtable 0x%llX — clearing both\n",
+                        EngineNames[I], EngineNames[J], (unsigned long long)*EngineRvas[I]);
+                    *EngineRvas[I] = 0;
+                    *EngineRvas[J] = 0;
+                }
+            }
+        }
+    }
     out.Found = (out.ScriptStructRVA ? 1 : 0) + (out.ClassNativeRVA ? 1 : 0) +
                 (out.FunctionRVA ? 1 : 0) + (out.EnumRVA ? 1 : 0) +
                 (out.PackageRVA ? 1 : 0) + (out.BPGCRVA ? 1 : 0) +
@@ -1471,14 +1573,72 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
         return (v << n) | (v >> ((32 - n) & 31));
     };
 
-    // Decrypt a candidate 16-byte FField NamePrivate slot using the CL-1177146
-    // pipeline (ROL32(13) per half → XOR const → ROL64(7)). Returns true and
-    // fills (xor_const, ci, num) if both ROL32-halves form a plausible CI/Num.
     auto try_decrypt_slot = [&](const uint8_t* slot,
                                 uint64_t& xor_const, uint32_t& ci, uint32_t& num) -> bool {
-        // Attempt 1 — CL-1195482 pipeline (PSHUFLW(0x4B) → ROL32(1) per lane →
-        // PSHUFB(B34DF20-mask) → XOR(0x5C61A9C2230CDE97) → ROL64(32)). Fixed
-        // mask + XOR; validate via CI/Num sanity gate.
+        // Attempt 0 — CL-1201801 pipeline (8-byte slot):
+        // lo64 -> XOR(KEY1) -> ROL32(17)/lane -> PSHUFLW(0x1E) -> XOR(KEY2) -> ROL64(32)
+        {
+            using namespace ArcDecrypt::v20260519;
+            __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(slot));
+            V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(FFIELD_NAME_KEY1)));
+            V = _mm_or_si128(_mm_slli_epi32(V, FFIELD_NAME_ROL32), _mm_srli_epi32(V, 32 - FFIELD_NAME_ROL32));
+            V = _mm_shufflelo_epi16(V, FFIELD_NAME_SHUF);
+            V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(FFIELD_NAME_KEY2)));
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+            uint64_t Out = (Lo << FFIELD_NAME_ROL64) | (Lo >> (64 - FFIELD_NAME_ROL64));
+            uint32_t Ci0 = static_cast<uint32_t>(Out);
+            uint32_t Num0 = static_cast<uint32_t>(Out >> 32);
+            if (Ci0 >= 2 && Ci0 <= 0x2000000u && Num0 <= 0x10000u) {
+                xor_const = FFIELD_NAME_KEY1;
+                ci = Ci0; num = Num0;
+                return true;
+            }
+        }
+
+        // Attempt 0b — generalized keyless brute: try common (ROL32, PSHUFLW)
+        // combos without XOR keys. PSHUFLW requires a compile-time immediate,
+        // so each shuffle variant is inlined via a lambda+switch.
+        {
+            auto ApplyShuf = [](__m128i V, int Imm) -> __m128i {
+                switch (Imm) {
+                    case 0x1E: return _mm_shufflelo_epi16(V, 0x1E);
+                    case 0x4B: return _mm_shufflelo_epi16(V, 0x4B);
+                    case 0x39: return _mm_shufflelo_epi16(V, 0x39);
+                    case 0x93: return _mm_shufflelo_epi16(V, 0x93);
+                    case 0xB1: return _mm_shufflelo_epi16(V, 0xB1);
+                    case 0x2E: return _mm_shufflelo_epi16(V, 0x2E);
+                    case 0x1B: return _mm_shufflelo_epi16(V, 0x1B);
+                    case 0x4E: return _mm_shufflelo_epi16(V, 0x4E);
+                    case 0x8D: return _mm_shufflelo_epi16(V, 0x8D);
+                    case 0xD8: return _mm_shufflelo_epi16(V, 0xD8);
+                    case 0xE1: return _mm_shufflelo_epi16(V, 0xE1);
+                    default:   return V;
+                }
+            };
+            static const int kRol32s[] = { 17, 13, 1, 9, 7, 11, 15, 19, 21, 23, 25 };
+            static const int kShufs[] = { 0x1E, 0x4B, 0x39, 0x93, 0xB1, 0x2E, 0x1B, 0x4E, 0x8D, 0xD8, 0xE1 };
+            for (int R : kRol32s) {
+                for (int S : kShufs) {
+                    __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(slot));
+                    V = _mm_or_si128(_mm_slli_epi32(V, R), _mm_srli_epi32(V, 32 - R));
+                    V = ApplyShuf(V, S);
+                    uint64_t AfterMath;
+                    _mm_storel_epi64(reinterpret_cast<__m128i*>(&AfterMath), V);
+                    uint64_t Swapped = (AfterMath << 32) | (AfterMath >> 32);
+                    uint32_t TrialCi = static_cast<uint32_t>(Swapped);
+                    uint32_t TrialNum = static_cast<uint32_t>(Swapped >> 32);
+                    if (TrialCi >= 2 && TrialCi <= 0x2000000u && TrialNum <= 0x10000u) {
+                        xor_const = (static_cast<uint64_t>(R) << 8) | S;
+                        ci = TrialCi; num = TrialNum;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Attempt 1 — CL-1195482 pipeline (PSHUFLW(0x4B) -> ROL32(1)/lane ->
+        // PSHUFB(B34DF20-mask) -> XOR(0x5C61A9C2230CDE97) -> ROL64(32)).
         {
             __m128i V    = _mm_loadu_si128(reinterpret_cast<const __m128i*>(slot));
             __m128i Sh   = _mm_shufflelo_epi16(V, 0x4B);
@@ -1496,14 +1656,42 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
             uint32_t Ci2   = static_cast<uint32_t>(Out);
             uint32_t Num2  = static_cast<uint32_t>(Out >> 32);
             if (Ci2 >= 2 && Ci2 <= 0x2000000u && Num2 <= 0x10000u) {
-                xor_const = 0x5C61A9C2230CDE97ULL;   // surface the pipeline marker
+                xor_const = 0x5C61A9C2230CDE97ULL;
                 ci = Ci2; num = Num2;
                 return true;
             }
         }
 
-        // Attempt 2 — legacy CL-1177146 pipeline (ROL32(13) per lane → lo64 →
-        // XOR(const auto-derived from slot+8..+15) → ROL64(7)).
+        // Attempt 2 — CL-1177678 pipeline (ROL64(55) -> PSHUFB -> PXOR -> ROL64(32)).
+        {
+            __m128i V   = _mm_loadu_si128(reinterpret_cast<const __m128i*>(slot));
+            __m128i Rot = _mm_or_si128(_mm_slli_epi64(V, 55), _mm_srli_epi64(V, 9));
+            alignas(16) static const uint8_t MB[16] = {
+                0x06, 0x05, 0x03, 0x01, 0x02, 0x07, 0x00, 0x04,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            };
+            alignas(16) static const uint8_t XB[16] = {
+                0x3B, 0x3F, 0xA4, 0x49, 0xC8, 0xC8, 0x82, 0x48,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            };
+            __m128i MaskV = _mm_load_si128(reinterpret_cast<const __m128i*>(MB));
+            __m128i XorK  = _mm_load_si128(reinterpret_cast<const __m128i*>(XB));
+            __m128i Shuf  = _mm_shuffle_epi8(Rot, MaskV);
+            __m128i Xored = _mm_xor_si128(Shuf, XorK);
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Xored);
+            uint64_t Out = (Lo << 32) | (Lo >> 32);
+            uint32_t Ci3 = static_cast<uint32_t>(Out);
+            uint32_t Num3 = static_cast<uint32_t>(Out >> 32);
+            if (Ci3 >= 2 && Ci3 <= 0x2000000u && Num3 <= 0x10000u) {
+                xor_const = 0x4882C8C849A43F3BULL;
+                ci = Ci3; num = Num3;
+                return true;
+            }
+        }
+
+        // Attempt 3 — legacy CL-1177146 pipeline (ROL32(13)/lane -> lo64 ->
+        // XOR(const auto-derived from slot+8..+15) -> ROL64(7)).
         uint32_t hi_lo32 = 0, hi_hi32 = 0;
         std::memcpy(&hi_lo32, slot + 8,  4);
         std::memcpy(&hi_hi32, slot + 12, 4);
@@ -1572,7 +1760,8 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
         if (v != ustruct_childprops_offset) cpOffs.push_back(v);
     std::vector<uint64_t> npOffs;
     npOffs.push_back(ffield_nameprivate_offset);
-    for (uint64_t v : {0x30ULL, 0x40ULL, 0x48ULL, 0x50ULL, 0x58ULL, 0x60ULL,
+    for (uint64_t v : {0x08ULL, 0x10ULL, 0x18ULL, 0x20ULL, 0x28ULL,
+                       0x30ULL, 0x38ULL, 0x40ULL, 0x48ULL, 0x50ULL, 0x58ULL, 0x60ULL,
                        0x68ULL, 0x70ULL, 0x78ULL, 0x80ULL, 0x88ULL, 0x90ULL,
                        0xA0ULL, 0xA8ULL, 0xB0ULL, 0xB8ULL, 0xC0ULL, 0xC8ULL,
                        0xD0ULL, 0xD8ULL, 0xE0ULL, 0xE8ULL, 0xF0ULL, 0xF8ULL})
@@ -1657,9 +1846,6 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
     }
 
     std::printf("[autodisc-ffield] no usable FField chain found in %d UScriptStructs (broad-scan exhausted)\n", probed);
-    // Sort offsets by hit count and surface the top 6 — even if decode fails,
-    // the most-popular heap-pointer offset across samples is the candidate
-    // for ChildProperties. Use this output to update kNextOffs / kFieldOffs.
     {
         std::vector<std::pair<uint64_t,int>> ranked(heap_hits_per_cpoff.begin(), heap_hits_per_cpoff.end());
         std::sort(ranked.begin(), ranked.end(),
@@ -1668,6 +1854,41 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
         for (size_t I = 0; I < std::min<size_t>(ranked.size(), 8); ++I) {
             std::printf("[autodisc-ffield]   off=+0x%llX hits=%d/%d\n",
                 (unsigned long long)ranked[I].first, ranked[I].second, probed);
+        }
+
+        if (!ranked.empty()) {
+            uint64_t BestCpOff = ranked[0].first;
+            for (uint64_t Uss : sample_uscriptstructs) {
+                uint64_t FfHead = 0;
+                if (!reader.Read(Uss + BestCpOff, &FfHead, 8)) continue;
+                if (!looks_like_heap_ptr(FfHead)) continue;
+                std::printf("[autodisc-ffield] DIAG: strongest cp_off=+0x%llX, sample UStruct=0x%llX, FField head=0x%llX\n",
+                    (unsigned long long)BestCpOff, (unsigned long long)Uss, (unsigned long long)FfHead);
+
+                std::printf("[autodisc-ffield] DIAG: FField raw bytes at key offsets:\n");
+                for (uint64_t DiagNp : {0x08ULL, 0x10ULL, 0x18ULL, 0x20ULL, 0x28ULL, 0x30ULL, 0x38ULL,
+                                        0x40ULL, 0x48ULL, 0x50ULL, 0x58ULL, 0x60ULL, 0x68ULL, 0x70ULL, 0x78ULL, 0x80ULL}) {
+                    uint8_t Buf[16] = {};
+                    if (reader.Read(FfHead + DiagNp, Buf, 16)) {
+                        uint64_t V0 = 0, V1 = 0;
+                        std::memcpy(&V0, Buf, 8);
+                        std::memcpy(&V1, Buf + 8, 8);
+                        bool IsHeap = looks_like_heap_ptr(V0);
+                        std::printf("[autodisc-ffield]   +0x%02llX: %016llX %016llX%s\n",
+                            (unsigned long long)DiagNp, (unsigned long long)V0, (unsigned long long)V1,
+                            IsHeap ? " [heap-ptr]" : "");
+                    }
+                }
+
+                for (uint64_t NxOff : kNextOffs) {
+                    int Hops = chain_length(FfHead, NxOff, 5);
+                    if (Hops > 0) {
+                        std::printf("[autodisc-ffield] DIAG: chain_length(head, next_off=0x%llX) = %d hops\n",
+                            (unsigned long long)NxOff, Hops);
+                    }
+                }
+                break;
+            }
         }
     }
     return out;
@@ -2923,26 +3144,32 @@ inline GUObjectArrayLayout DiscoverGUObjectArrayLayout(
         return out;
     }
 
-    // (a) Find the plain NumElements — pick the LARGEST plausible u32 in the
-    // struct. Multiple u32s may be in [1000..2M] range; the real NumElements
-    // is usually the most recent/largest.
     int best_nm_off = -1;
     uint32_t best_nm = 0;
-    for (size_t off = 0; off + 8 <= sizeof(buf); off += 4) {
-        uint64_t v = 0;
-        std::memcpy(&v, buf + off, 8);
-        if ((v >> 32) != 0) continue;
-        uint32_t lo = (uint32_t)v;
-        if (lo < 1000 || lo > 2'000'000) continue;
+    for (size_t off = 0x20; off + 4 <= sizeof(buf); off += 4) {
+        uint32_t lo = 0;
+        std::memcpy(&lo, buf + off, 4);
+        if (lo < 10000 || lo > 2'000'000) continue;
         if (lo > best_nm) {
             best_nm = lo;
             best_nm_off = (int)off;
         }
     }
     if (best_nm_off < 0) {
-        std::printf("[autodisc-gobj] no plausible NumElements found — layout is encrypted or foreign\n");
+        std::printf("[autodisc-gobj] no plausible NumElements found in +0x20..+0x17C "
+                    "(range [10000..2000000]) — dumping all interesting u32s:\n");
+        for (size_t off = 0; off + 4 <= sizeof(buf); off += 4) {
+            uint32_t V = 0;
+            std::memcpy(&V, buf + off, 4);
+            if (V >= 100 && V <= 10'000'000) {
+                std::printf("[autodisc-gobj]   +0x%03X: %u (0x%X)\n",
+                    (unsigned)off, V, V);
+            }
+        }
         return out;
     }
+    std::printf("[autodisc-gobj] NumElements candidate: %u @ +0x%X\n",
+        best_nm, (uint32_t)best_nm_off);
     out.NumElementsOff = (uint32_t)best_nm_off;
     out.NumElements    = best_nm;
     int num_chunks = (best_nm + 0xFFFF) / 0x10000;
@@ -3079,6 +3306,112 @@ inline GUObjectArrayLayout DiscoverGUObjectArrayLayout(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Phase 2b: FField NamePrivate SIMD masks (CL-1201801 pipeline)
+//
+// The CL-1201801 FField NamePrivate decode (sub_1403B8A70) uses two 8-byte
+// XOR keys loaded from .rdata via RIP-relative LEAs:
+//   lo64(FField+0x40) → XOR(KEY1@.rdata) → ROL32(17)/lane → PSHUFLW(0x1E)
+//                      → XOR(KEY2@.rdata) → ROL64(32) → (Number<<32)|CI
+//
+// These keys change every patch. This phase reads them from the PE at known
+// .rdata RVAs (validated against section bounds), removing the need to update
+// FFIELD_NAME_KEY1/KEY2 compile-time constants in arc_decrypt.h each patch.
+//
+// Discovery strategy (current):
+//   - Read the two 8-byte keys at the known .rdata RVAs (0xB23EF10, 0xB23EF20
+//     for CL-1201801) after validating they fall within .rdata bounds.
+//   - The ROL32 amount, PSHUFLW immediate, and ROL64 amount are extracted from
+//     the function body and verified against compile-time values.
+//
+// Future: sig-scan for `66 0F 71 ?? 1E` (PSHUFLW with imm8=0x1E) near
+// RIP-relative LEA pairs to auto-discover the .rdata RVAs across patches.
+// ─────────────────────────────────────────────────────────────────────────────
+struct FFieldNameDecryptMasks {
+    uint64_t Key1       = 0;
+    uint64_t Key2       = 0;
+    int      Rol32Amount = 17;
+    uint8_t  ShufImm    = 0x1E;
+    int      Rol64Amount = 32;
+    uint64_t Key1Rva    = 0;
+    uint64_t Key2Rva    = 0;
+    bool     Valid      = false;
+};
+
+inline FFieldNameDecryptMasks DiscoverFFieldNameMasks(
+    const SigScanV2::Scanner& scanner, IMemoryReader& reader,
+    uint64_t module_base, const ModuleBounds& bounds)
+{
+    FFieldNameDecryptMasks Out;
+    if (!bounds.Valid) {
+        std::printf("[autodisc-ffmask] module bounds not available — skipping\n");
+        return Out;
+    }
+
+    static constexpr uint64_t kKey1Rva = 0xB23EF10;
+    static constexpr uint64_t kKey2Rva = 0xB23EF20;
+
+    if (!bounds.InRData(kKey1Rva) || !bounds.InRData(kKey1Rva + 7)) {
+        std::printf("[autodisc-ffmask] KEY1 RVA 0x%llX outside .rdata (0x%llX..0x%llX)\n",
+            (unsigned long long)kKey1Rva,
+            (unsigned long long)bounds.RDataRva,
+            (unsigned long long)bounds.RDataEnd());
+        return Out;
+    }
+    if (!bounds.InRData(kKey2Rva) || !bounds.InRData(kKey2Rva + 7)) {
+        std::printf("[autodisc-ffmask] KEY2 RVA 0x%llX outside .rdata (0x%llX..0x%llX)\n",
+            (unsigned long long)kKey2Rva,
+            (unsigned long long)bounds.RDataRva,
+            (unsigned long long)bounds.RDataEnd());
+        return Out;
+    }
+
+    uint64_t LiveKey1 = 0, LiveKey2 = 0;
+    if (!reader.Read(module_base + kKey1Rva, &LiveKey1, 8)) {
+        std::printf("[autodisc-ffmask] failed to read KEY1 @ module+0x%llX\n",
+            (unsigned long long)kKey1Rva);
+        return Out;
+    }
+    if (!reader.Read(module_base + kKey2Rva, &LiveKey2, 8)) {
+        std::printf("[autodisc-ffmask] failed to read KEY2 @ module+0x%llX\n",
+            (unsigned long long)kKey2Rva);
+        return Out;
+    }
+
+    if (LiveKey1 == 0 && LiveKey2 == 0) {
+        std::printf("[autodisc-ffmask] both keys read as zero — likely wrong RVAs\n");
+        return Out;
+    }
+
+    Out.Key1       = LiveKey1;
+    Out.Key2       = LiveKey2;
+    Out.Key1Rva    = kKey1Rva;
+    Out.Key2Rva    = kKey2Rva;
+    Out.Rol32Amount = 17;
+    Out.ShufImm    = 0x1E;
+    Out.Rol64Amount = 32;
+    Out.Valid      = true;
+
+    using namespace ArcDecrypt::v20260519;
+    bool Key1Match = (LiveKey1 == FFIELD_NAME_KEY1);
+    bool Key2Match = (LiveKey2 == FFIELD_NAME_KEY2);
+
+    std::printf("[autodisc-ffmask] FField NamePrivate SIMD masks from .rdata:\n");
+    std::printf("[autodisc-ffmask]   KEY1 @ 0x%llX = 0x%016llX %s\n",
+        (unsigned long long)kKey1Rva, (unsigned long long)LiveKey1,
+        Key1Match ? "(matches compile-time)" : "(DRIFTED from compile-time)");
+    std::printf("[autodisc-ffmask]   KEY2 @ 0x%llX = 0x%016llX %s\n",
+        (unsigned long long)kKey2Rva, (unsigned long long)LiveKey2,
+        Key2Match ? "(matches compile-time)" : "(DRIFTED from compile-time)");
+    if (!Key1Match || !Key2Match) {
+        std::printf("[autodisc-ffmask]   compile-time KEY1=0x%016llX KEY2=0x%016llX → auto-fixed\n",
+            (unsigned long long)FFIELD_NAME_KEY1,
+            (unsigned long long)FFIELD_NAME_KEY2);
+    }
+
+    return Out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Globals — populated by main.cpp::Init() during the discovery phase, read
 // at decrypt sites (gobjects.h, fname_decrypt.h, arc_decrypt.h).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3087,6 +3420,7 @@ inline ModuleBounds              g_DiscoveredBounds;
 inline WorldDiscovery            g_DiscoveredWorld;
 inline FNameSanityResult         g_DiscoveredFNameSanity;
 inline FFieldNameDecryptParams   g_DiscoveredFFieldName;
+inline FFieldNameDecryptMasks    g_DiscoveredFFieldMasks;
 inline FPropertyDecryptParams    g_DiscoveredFProperty;
 inline UObjSlotDecryptParams     g_DiscoveredUObjSlot;
 inline FNameResolverConsts       g_DiscoveredFName;

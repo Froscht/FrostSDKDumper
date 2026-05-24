@@ -550,28 +550,31 @@ public:
         for (const char* n : kBuiltin) m_canonical_property_type_names.insert(n);
     }
 
-    bool LoadDynamicPropertyTypeTable() {
-        constexpr uint64_t TABLE_RVA = 0xDBB64C0;
-        constexpr size_t   TABLE_LEN = 703;
-        m_type_idx_to_name.clear();
-        m_canonical_property_type_names.clear();
-        SeedCanonicalPropertyTypeNamesFromBuiltin();
-        std::vector<uint32_t> handles(TABLE_LEN, 0);
-        if (!m_reader.Read(MODULE_BASE + TABLE_RVA, handles.data(), TABLE_LEN * sizeof(uint32_t))) {
-            std::printf("[ptable] failed to read property-type table @ 0x%llX\n",
-                (unsigned long long)(MODULE_BASE + TABLE_RVA));
+    bool TryDecodePropertyTypeTable(uint64_t TableAddr, size_t TableLen, const char* Tag) {
+        std::vector<uint32_t> Handles(TableLen, 0);
+        if (!m_reader.Read(TableAddr, Handles.data(), TableLen * sizeof(uint32_t))) {
+            std::printf("[ptable] failed to read %s @ 0x%llX\n",
+                Tag, (unsigned long long)TableAddr);
             return false;
         }
         size_t Decoded = 0;
         size_t Nonzero = 0;
-        for (size_t I = 0; I < TABLE_LEN; ++I) {
-            uint32_t H = handles[I];
+        size_t DiagShown = 0;
+        for (size_t I = 0; I < TableLen; ++I) {
+            uint32_t H = Handles[I];
             if (!H) continue;
             ++Nonzero;
+            if (DiagShown < 5) {
+                int32_t DiagCi = static_cast<int32_t>(H);
+                std::string DiagName = m_fname.CompIndexToNameLenient(DiagCi);
+                std::printf("[ptable-diag] %s [%zu] raw=0x%08X ci=%d name='%s'\n",
+                    Tag, I, H, DiagCi, DiagName.c_str());
+                ++DiagShown;
+            }
             int32_t Ci = static_cast<int32_t>(H);
             std::string Name = m_fname.CompIndexToNameLenient(Ci);
             if (Name.empty()) continue;
-            bool NameOk = !Name.empty();
+            bool NameOk = true;
             for (char C : Name) {
                 if (!((C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||
                       (C >= '0' && C <= '9') || C == '_')) {
@@ -583,9 +586,39 @@ public:
             m_canonical_property_type_names.insert(Name);
             ++Decoded;
         }
-        std::printf("[ptable] dynamic property-type table: %zu/%zu non-zero handles, %zu decoded names\n",
-            Nonzero, TABLE_LEN, Decoded);
-        m_dynamic_type_table_loaded = (Decoded >= 8);
+        std::printf("[ptable] %s: %zu/%zu non-zero handles, %zu decoded names\n",
+            Tag, Nonzero, TableLen, Decoded);
+        return (Decoded >= 8);
+    }
+
+    bool LoadDynamicPropertyTypeTable() {
+        constexpr size_t   TABLE_LEN = 703;
+        constexpr uint64_t TABLE_STRUCT_OFF = 0x2540;
+
+        m_type_idx_to_name.clear();
+        m_canonical_property_type_names.clear();
+        SeedCanonicalPropertyTypeNamesFromBuiltin();
+
+        uint64_t GNamePoolRva = ArcDecrypt::v20260519::RVA_GNAMEPOOL;
+        uint64_t PrimaryTableAddr = MODULE_BASE + GNamePoolRva + TABLE_STRUCT_OFF;
+
+        constexpr uint64_t LEGACY_TABLE_RVA = 0xDBB64C0;
+        uint64_t LegacyTableAddr = MODULE_BASE + LEGACY_TABLE_RVA;
+
+        std::printf("[ptable] trying primary (GNamePool+0x%llX) @ RVA 0x%llX\n",
+            (unsigned long long)TABLE_STRUCT_OFF,
+            (unsigned long long)(GNamePoolRva + TABLE_STRUCT_OFF));
+
+        bool Ok = TryDecodePropertyTypeTable(PrimaryTableAddr, TABLE_LEN, "primary");
+
+        if (!Ok && PrimaryTableAddr != LegacyTableAddr) {
+            std::printf("[ptable] primary failed, trying legacy @ RVA 0x%llX\n",
+                (unsigned long long)LEGACY_TABLE_RVA);
+            m_type_idx_to_name.clear();
+            Ok = TryDecodePropertyTypeTable(LegacyTableAddr, TABLE_LEN, "legacy");
+        }
+
+        m_dynamic_type_table_loaded = Ok;
         if (m_dynamic_type_table_loaded) {
             size_t Shown = 0;
             std::vector<std::pair<int32_t, std::string>> Sorted(
@@ -2497,11 +2530,11 @@ public:
                 total_fn, m_owner_to_funcs.size());
         }
 
-        // ── Patch 20260430 / CL-1177146 PRIMARY: read property-type table at module+0xDBB64C0
-        //    dynamically and decode each non-zero FName handle. Provides the
-        //    canonical set of property type names (e.g. "BoolProperty",
-        //    "DoubleProperty", "ArrayProperty") used to validate FFieldClass
-        //    name reads downstream.
+        // ── Read property-type table (GNamePool+0x2540) dynamically and decode
+        //    each non-zero FName handle. Provides the canonical set of property
+        //    type names (e.g. "BoolProperty", "DoubleProperty", "ArrayProperty")
+        //    used to validate FFieldClass name reads downstream. RVA computed
+        //    from v20260519::RVA_GNAMEPOOL; falls back to legacy 0xDBB64C0.
         bool DynamicOk = LoadDynamicPropertyTypeTable();
         if (!DynamicOk) {
             std::printf("[ptable] dynamic load failed — relying on hardcoded map only\n");

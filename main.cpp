@@ -334,6 +334,15 @@ public:
                 }
             }
 
+            // ── Phase 2b: FField NamePrivate SIMD masks ──────────────
+            // Read the two XOR keys from .rdata at known RVAs. These change
+            // every patch — reading them live eliminates the need to update
+            // FFIELD_NAME_KEY1/KEY2 in arc_decrypt.h after each update.
+            AutoDiscovery::g_DiscoveredFFieldMasks =
+                AutoDiscovery::DiscoverFFieldNameMasks(
+                    m_sigScanner, m_reader, MODULE_BASE,
+                    AutoDiscovery::g_DiscoveredBounds);
+
             // ── Phase 4: UObject 4-slot decrypt SIMD constants ─────────
             // Locate the slot decrypt fn body via PSHUFB+PXOR rip-rel pair,
             // extract the .rdata table RVAs and the scalar XOR const.
@@ -2380,6 +2389,101 @@ public:
         if (SDKGen::Generator::kEmitDumper7) {
             gen.EmitDumper7(sdk, ".");
         }
+
+        DumpBoneArrays(object_ptrs, addr_to_name, addr_to_fullname);
+    }
+
+    void DumpBoneArrays(
+            const std::vector<std::pair<int32_t, uint64_t>>& ObjectPtrs,
+            const std::unordered_map<uint64_t, std::string>& AddrToName,
+            const std::unordered_map<uint64_t, std::string>& AddrToFullname)
+    {
+        constexpr uint64_t kBoneArrayOffset = 0xD8;
+        constexpr uint32_t kBoneInfoStride  = 12;
+        constexpr uint32_t kMaxBones        = 2048;
+
+        std::vector<uint64_t> SkeletonAddrs;
+        for (const auto& [Idx, ObjPtr] : ObjectPtrs) {
+            auto It = AddrToName.find(ObjPtr);
+            if (It == AddrToName.end()) continue;
+            uint64_t ClsPtr = m_fname.GetClassPrivate(ObjPtr);
+            std::string ClsName = m_fname.GetName(ClsPtr);
+            if (ClsName == "Skeleton")
+                SkeletonAddrs.push_back(ObjPtr);
+        }
+        if (SkeletonAddrs.empty()) {
+            std::printf("[bones] no USkeleton objects found\n");
+            return;
+        }
+        std::printf("[bones] found %zu USkeleton objects\n", SkeletonAddrs.size());
+
+        std::ofstream Out("dump_bones.txt");
+        if (!Out) { std::printf("[bones] failed to open dump_bones.txt\n"); return; }
+        Out << "// ============================================================\n";
+        Out << "// ARC Raiders – Skeleton Bone Dump\n";
+        Out << "// USkeleton objects: " << SkeletonAddrs.size() << "\n";
+        Out << "// ============================================================\n\n";
+
+        uint32_t TotalSkeletons = 0, TotalBones = 0;
+
+        for (uint64_t SkelPtr : SkeletonAddrs) {
+            auto FullIt = AddrToFullname.find(SkelPtr);
+            std::string SkelName = (FullIt != AddrToFullname.end()) ? FullIt->second : "???";
+
+            uint64_t ArrPtr = 0;
+            uint32_t ArrCount = 0, ArrMax = 0;
+            if (!m_reader.Read(SkelPtr + kBoneArrayOffset, &ArrPtr, 8)) continue;
+            if (!m_reader.Read(SkelPtr + kBoneArrayOffset + 8, &ArrCount, 4)) continue;
+            if (!m_reader.Read(SkelPtr + kBoneArrayOffset + 12, &ArrMax, 4)) continue;
+
+            if (ArrCount == 0 || ArrCount > kMaxBones || ArrPtr < 0x10000ULL) continue;
+
+            std::vector<uint8_t> Buf(ArrCount * kBoneInfoStride);
+            if (!m_reader.Read(ArrPtr, Buf.data(), Buf.size())) continue;
+
+            struct BoneInfo { int32_t CompIndex; int32_t Number; int32_t ParentIndex; };
+            std::vector<BoneInfo> Bones(ArrCount);
+            for (uint32_t i = 0; i < ArrCount; ++i) {
+                std::memcpy(&Bones[i].CompIndex,   Buf.data() + i * kBoneInfoStride + 0, 4);
+                std::memcpy(&Bones[i].Number,      Buf.data() + i * kBoneInfoStride + 4, 4);
+                std::memcpy(&Bones[i].ParentIndex, Buf.data() + i * kBoneInfoStride + 8, 4);
+            }
+
+            bool AnyValid = false;
+            for (uint32_t i = 0; i < ArrCount; ++i) {
+                if (Bones[i].CompIndex > 0) { AnyValid = true; break; }
+            }
+            if (!AnyValid) continue;
+
+            Out << "// " << SkelName << "  (0x" << std::hex << SkelPtr << ")\n";
+            Out << "// Bones: " << std::dec << ArrCount << "\n";
+            Out << "enum class " << [&]() -> std::string {
+                std::string S = SkelName;
+                size_t Dot = S.rfind('.');
+                if (Dot != std::string::npos) S = S.substr(Dot + 1);
+                for (char& C : S) if (C == '-' || C == ' ' || C == '/') C = '_';
+                return S;
+            }() << "_Bones {\n";
+
+            for (uint32_t i = 0; i < ArrCount; ++i) {
+                std::string BoneName = m_fname.CompIndexToName(Bones[i].CompIndex);
+                if (BoneName.empty())
+                    BoneName = "Bone_CI" + std::to_string(Bones[i].CompIndex);
+                if (Bones[i].Number > 0)
+                    BoneName += "_" + std::to_string(Bones[i].Number);
+
+                Out << "    " << BoneName << " = " << std::dec << i;
+                Out << ", // parent=" << Bones[i].ParentIndex << "\n";
+            }
+            Out << "};\n\n";
+
+            ++TotalSkeletons;
+            TotalBones += ArrCount;
+        }
+
+        Out.close();
+        std::printf("[bones] dumped %u skeletons, %u total bones → dump_bones.txt\n",
+            TotalSkeletons, TotalBones);
     }
 
     void Run() {

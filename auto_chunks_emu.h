@@ -472,29 +472,43 @@ inline Result Discover(IMemoryReader& reader, uint64_t module_base,
     Result out;
     if (!bounds.Valid) return out;
 
-    // Read NumElements. The field has migrated across patches:
-    //   CL-1177146: +0x30  (plain u32)
-    //   CL-1177678: +0xFC  (plain u32 — listener arrays / serial-counter
-    //                       ahead of it pushed the count further out)
-    // Probe both; first one in the plausible live-count range (1000..2M) wins.
-    // The encrypted chunks_manager pipeline at GUObjectArray+0xC0 is unchanged
-    // across both — only the count field moved.
     uint64_t guobj_abs = module_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE;
     uint32_t num_elements = 0;
-    static constexpr uint32_t kCountOffs[] = { 0xFC, 0x30 };
     uint32_t count_off_used = 0;
-    for (uint32_t off : kCountOffs) {
-        uint32_t cand = 0;
-        if (!reader.Read(guobj_abs + off, &cand, 4)) continue;
-        if (cand >= 1000 && cand <= 2'000'000) {
-            num_elements = cand;
-            count_off_used = off;
-            break;
+
+    uint8_t GobjBuf[0x180] = {};
+    if (!reader.Read(guobj_abs, GobjBuf, sizeof(GobjBuf))) {
+        std::printf("[autoemu] failed to read GUObjectArray @ 0x%llX\n",
+                    (unsigned long long)guobj_abs);
+        return out;
+    }
+
+    uint32_t BestNm = 0;
+    uint32_t BestOff = 0;
+    for (uint32_t Off = 0x20; Off + 4 <= sizeof(GobjBuf); Off += 4) {
+        uint32_t Cand = 0;
+        std::memcpy(&Cand, GobjBuf + Off, 4);
+        if (Cand >= 10000 && Cand <= 2'000'000 && Cand > BestNm) {
+            BestNm = Cand;
+            BestOff = Off;
         }
     }
+    if (BestNm) {
+        num_elements = BestNm;
+        count_off_used = BestOff;
+    }
+
     if (!num_elements) {
-        std::printf("[autoemu] no NumElements found at +0xFC or +0x30 in plausible range; "
-                    "skipping emu discovery\n");
+        std::printf("[autoemu] no NumElements in [10000..2000000] found scanning "
+                    "GUObjectArray +0x20..+0x17C; dumping all u32 candidates:\n");
+        for (uint32_t Off = 0; Off + 4 <= sizeof(GobjBuf); Off += 4) {
+            uint32_t V = 0;
+            std::memcpy(&V, GobjBuf + Off, 4);
+            if (V >= 100 && V <= 10'000'000) {
+                std::printf("[autoemu]   +0x%02X: %u (0x%X)\n", Off, V, V);
+            }
+        }
+        std::printf("[autoemu] skipping emu discovery\n");
         return out;
     }
     std::printf("[autoemu] NumElements=%u @ +0x%X (good)\n", num_elements, count_off_used);

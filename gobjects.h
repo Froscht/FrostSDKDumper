@@ -1449,10 +1449,20 @@ namespace gobjects
                     }
                     case ZYDIS_MNEMONIC_POR: {
                         int xd = getXmmIdx(ops[0]);
-                        int xs = getXmmIdx(ops[1]);
-                        if (xd < 0 || xs < 0) goto unsupported;
+                        if (xd < 0) goto unsupported;
                         __m128i a = _mm_loadu_si128((const __m128i*)xmm[xd]);
-                        __m128i b = _mm_loadu_si128((const __m128i*)xmm[xs]);
+                        __m128i b;
+                        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                            int xs = getXmmIdx(ops[1]);
+                            if (xs < 0) goto unsupported;
+                            b = _mm_loadu_si128((const __m128i*)xmm[xs]);
+                        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                                   ops[1].mem.base == ZYDIS_REGISTER_RIP) {
+                            uint64_t target = insn_rip_after + (int64_t)ops[1].mem.disp.value;
+                            alignas(16) uint8_t tmp[16] = {};
+                            if (!m_reader.Read(target, tmp, 16)) goto unsupported;
+                            b = _mm_loadu_si128((const __m128i*)tmp);
+                        } else goto unsupported;
                         _mm_storeu_si128((__m128i*)xmm[xd], _mm_or_si128(a, b));
                         break;
                     }
@@ -1584,8 +1594,50 @@ namespace gobjects
                         std::memcpy(xmm[xd], out_dwords, 16);
                         break;
                     }
+                    case ZYDIS_MNEMONIC_PADDW:
+                    case ZYDIS_MNEMONIC_PADDD:
+                    case ZYDIS_MNEMONIC_PADDQ:
+                    case ZYDIS_MNEMONIC_PSUBW:
+                    case ZYDIS_MNEMONIC_PSUBD:
+                    case ZYDIS_MNEMONIC_PSUBQ:
+                    case ZYDIS_MNEMONIC_PANDN:
+                    case ZYDIS_MNEMONIC_PAND:
+                    case ZYDIS_MNEMONIC_PMULLW:
+                    case ZYDIS_MNEMONIC_PMULLD: {
+                        int xd = getXmmIdx(ops[0]);
+                        if (xd < 0) goto unsupported;
+                        alignas(16) uint8_t Src[16] = {};
+                        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                            int xs = getXmmIdx(ops[1]);
+                            if (xs < 0) goto unsupported;
+                            std::memcpy(Src, xmm[xs], 16);
+                        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                                   ops[1].mem.base == ZYDIS_REGISTER_RIP) {
+                            uint64_t target = insn_rip_after + (int64_t)ops[1].mem.disp.value;
+                            if (!m_reader.Read(target, Src, 16)) goto unsupported;
+                        } else {
+                            goto unsupported;
+                        }
+                        __m128i A = _mm_loadu_si128(reinterpret_cast<const __m128i*>(xmm[xd]));
+                        __m128i B = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Src));
+                        __m128i R;
+                        switch (inst.mnemonic) {
+                            case ZYDIS_MNEMONIC_PADDW:  R = _mm_add_epi16(A, B); break;
+                            case ZYDIS_MNEMONIC_PADDD:  R = _mm_add_epi32(A, B); break;
+                            case ZYDIS_MNEMONIC_PADDQ:  R = _mm_add_epi64(A, B); break;
+                            case ZYDIS_MNEMONIC_PSUBW:  R = _mm_sub_epi16(A, B); break;
+                            case ZYDIS_MNEMONIC_PSUBD:  R = _mm_sub_epi32(A, B); break;
+                            case ZYDIS_MNEMONIC_PSUBQ:  R = _mm_sub_epi64(A, B); break;
+                            case ZYDIS_MNEMONIC_PANDN:  R = _mm_andnot_si128(A, B); break;
+                            case ZYDIS_MNEMONIC_PAND:   R = _mm_and_si128(A, B); break;
+                            case ZYDIS_MNEMONIC_PMULLW: R = _mm_mullo_epi16(A, B); break;
+                            case ZYDIS_MNEMONIC_PMULLD: R = _mm_mullo_epi32(A, B); break;
+                            default: R = A; break;
+                        }
+                        _mm_storeu_si128(reinterpret_cast<__m128i*>(xmm[xd]), R);
+                        break;
+                    }
                     case ZYDIS_MNEMONIC_RET: {
-                        // Result is in xmm0 (calling convention for __m128i return)
                         uint64_t out;
                         std::memcpy(&out, xmm[0], 8);
                         return out;
@@ -1858,28 +1910,29 @@ namespace gobjects
             if (!canonical_ok) {
                 std::printf("[p28] canonical chunk walk failed, falling back to structural scan\n");
 
-                // CL-1177146 layout: NumElements is plain at +0x30 (was +0x38 in
-                // 20260428). Try both offsets to stay compatible across patches.
-                uint64_t num_at_30 = 0;
-                uint64_t num_at_38 = 0;
-                m_reader.Read(base + 0x30, &num_at_30, 8);
-                m_reader.Read(base + 0x38, &num_at_38, 8);
-                uint64_t num_plain = 0;
-                uint64_t num_off = 0;
-                auto Looks = [](uint64_t v) {
-                    uint32_t lo = static_cast<uint32_t>(v & 0xFFFFFFFFu);
-                    return lo >= 1000 && lo <= 2000000 && (v >> 32) == 0;
-                };
-                if (Looks(num_at_30)) { num_plain = num_at_30; num_off = 0x30; }
-                else if (Looks(num_at_38)) { num_plain = num_at_38; num_off = 0x38; }
-                else {
-                    std::printf("[p28] +0x30=0x%llX +0x38=0x%llX neither looks like plain NumElements\n",
-                        (unsigned long long)num_at_30, (unsigned long long)num_at_38);
+                uint8_t StructBuf[0x180] = {};
+                if (!m_reader.Read(base, StructBuf, sizeof(StructBuf))) {
+                    std::printf("[p28] failed to read GUObjectArray @ 0x%llX\n",
+                        (unsigned long long)base);
                     return false;
                 }
-                max_elements = static_cast<int32_t>(num_plain & 0xFFFFFFFFu);
-                std::printf("[p28] NumElements (plain @ +0x%llX, fallback) = %d\n",
-                    (unsigned long long)num_off, max_elements);
+                uint32_t BestNm = 0;
+                uint32_t BestOff = 0;
+                for (uint32_t Off = 0x20; Off + 4 <= sizeof(StructBuf); Off += 4) {
+                    uint32_t V = 0;
+                    std::memcpy(&V, StructBuf + Off, 4);
+                    if (V >= 10000 && V <= 2'000'000 && V > BestNm) {
+                        BestNm = V;
+                        BestOff = Off;
+                    }
+                }
+                if (!BestNm) {
+                    std::printf("[p28] no plausible NumElements in +0x20..+0x17C\n");
+                    return false;
+                }
+                max_elements = static_cast<int32_t>(BestNm);
+                std::printf("[p28] NumElements (plain @ +0x%X, fallback) = %d\n",
+                    BestOff, max_elements);
 
                 if (!StructuralScanFUObjectItems(max_elements, objects)) {
                     std::printf("[p28] structural chunk scan failed\n");
