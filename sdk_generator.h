@@ -1524,7 +1524,8 @@ public:
     // ── Read a single FProperty chain from any FField* head pointer ─────────
     // Shared by ReadProperties (UStruct::ChildProperties) and UFunction params.
     std::vector<PropertyRecord> ReadPropertyChain(uint64_t ff_head, int max_props = 2048,
-                                                   bool is_param = false) {
+                                                   bool is_param = false,
+                                                   uint64_t expected_owner = 0) {
         std::vector<PropertyRecord> result;
         std::unordered_set<uint64_t> visited;
         std::vector<PropertyRecord> sub_props;  // Array Inner / Map Key+Val sub-properties
@@ -1585,6 +1586,7 @@ public:
                 if (ff_owner_clean != 0 && (ff_owner_clean < 0x10000ULL || ff_owner_clean >= 0x800000000000ULL))
                     break;
                 if (ff_owner_clean == 0) break;
+                if (expected_owner && ff_owner_clean != expected_owner) break;
             }
 
             PropertyRecord pr{};
@@ -1916,7 +1918,7 @@ public:
                 if (head <= 0x10000 || head >= 0x800000000000ULL) continue;
                 uint64_t hvt = Read<uint64_t>(head);
                 if (hvt < MODULE_BASE || hvt >= MODULE_BASE + 0x10000000ULL) continue;
-                auto chain = ReadPropertyChain(head, 64, /*is_param=*/true);
+                auto chain = ReadPropertyChain(head, 64, /*is_param=*/true, /*expected_owner=*/fn_addr);
                 for (auto& p : chain) {
                     std::string key = p.name + ":" + std::to_string(p.offset);
                     if (seen.insert(key).second)
@@ -3355,12 +3357,8 @@ public:
             // slot at +0x50/+0x30), so bogus offsets fail fast and only real
             // FField chain heads contribute properties.
             static constexpr uint64_t kChainOffs[] = {
-                0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8,
-                0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8,
-                0x100, 0x108, 0x110, 0x118, 0x120, 0x128, 0x130, 0x138, 0x140,
-                0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x178, 0x180, 0x188,
-                0x190, 0x198, 0x1A0, 0x1A8, 0x1B0, 0x1B8, 0x1C0, 0x1C8, 0x1D0,
-                0x1D8, 0x1E0, 0x1E8, 0x1F0, 0x1F8, 0x200,
+                0xB0, 0xB8, 0xC8, 0xD0, 0xE8, 0xF0, 0xF8,
+                0x100, 0x108, 0x110, 0x118, 0x120,
             };
             // +0xC0 is a UScriptStruct-only FField chain head on newer patches
             // (full chain, vs +0xB0's subset). On UClass it overlaps with
