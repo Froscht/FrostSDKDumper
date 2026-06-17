@@ -1579,6 +1579,12 @@ public:
                     AnyNonZero(ArcDecrypt::Offsets::FField::NameEncrypted) ||
                     AnyNonZero(0x30);
                 if (!slot_present) break;
+
+                uint64_t ff_owner = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Owner);
+                uint64_t ff_owner_clean = ff_owner & ~1ULL;
+                if (ff_owner_clean != 0 && (ff_owner_clean < 0x10000ULL || ff_owner_clean >= 0x800000000000ULL))
+                    break;
+                if (ff_owner_clean == 0) break;
             }
 
             PropertyRecord pr{};
@@ -2443,8 +2449,8 @@ public:
             // Adding this u8-shape gate catches those.
             auto looks_like_ufunc_struct = [&](uint64_t obj_ptr) -> bool {
                 uint64_t qB0 = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UFunction::NumParms);
-                if ((qB0 >> 8) != 0) return false;       // high 56 bits must be zero
-                if ((qB0 & 0xFF) > 64) return false;     // NumParms range
+                if ((qB0 >> 8) != 0) return false;
+                if ((qB0 & 0xFF) > 64) return false;
                 return true;
             };
 

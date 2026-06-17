@@ -170,6 +170,11 @@ public:
         std::printf("[+] FName key table OK (first: 0x%04X 0x%04X 0x%04X 0x%04X)\n",
             m_keyTable[0], m_keyTable[1], m_keyTable[2], m_keyTable[3]);
 
+        if (m_pipeline == Pipeline::CL1177146 && AutoDiscovery::g_DiscoveredUObjSlot.Valid) {
+            m_pipeline = Pipeline::Build20260519;
+            std::printf("[fname] Pipeline upgraded CL1177146 → Build20260519 (UObjSlot auto-disc valid)\n");
+        }
+
         m_keyLoaded = true;
         return true;
     }
@@ -1518,15 +1523,12 @@ public:
     // the static SIMD pipeline if emu fails — used on patches where the
     // FNamePool resolver / FNameEntry decrypt has drifted.
     std::string CompIndexToName(int32_t comp_index) {
-        // Emu-primary: skip static entirely. ResolveNamePtrFull's compile-time
-        // BLOCK1_XOR / BLOCK2_AND constants drift every patch — on a relocated
-        // build the static path returns plausible-looking but wrong garbage,
-        // which would defeat the IsStrictName filter half the time. Trusting
-        // emu only is both correct and faster than running the static path
-        // first to throw the result away.
         if (m_emuPrimary) {
             std::string e = TryEmuFallback(comp_index);
-            return IsStrictName(e) ? e : std::string{};
+            if (IsStrictName(e)) return e;
+            std::string s = StaticResolve(comp_index);
+            if (IsStrictName(s)) return s;
+            return {};
         }
         std::string s = StaticResolve(comp_index);
         if (IsStrictName(s)) return s;
@@ -1539,7 +1541,10 @@ public:
     std::string CompIndexToNameLenient(int32_t comp_index) {
         if (m_emuPrimary) {
             std::string e = TryEmuFallback(comp_index);
-            return IsLenientName(e) ? e : std::string{};
+            if (IsLenientName(e)) return e;
+            std::string s = StaticResolve(comp_index);
+            if (IsLenientName(s)) return s;
+            return {};
         }
         std::string s = StaticResolve(comp_index);
         if (IsLenientName(s)) return s;
@@ -1623,7 +1628,6 @@ public:
         return CompIndexToName(ci);
     }
 
-    // ── FField address → name string (patch 20260409) ───────────────────
     std::string GetFFieldName(uint64_t ff_addr) {
         int32_t ci = DecryptFFieldNameCI(ff_addr);
         if (ci <= 0) return {};
