@@ -116,6 +116,7 @@ public:
 
     void SetBase(uint64_t b) { m_base = b; }
     Pipeline ActivePipeline() const { return m_pipeline; }
+    void ForcePipeline(Pipeline p) { m_pipeline = p; }
 
     bool Init() {
         if (m_keyLoaded) return true;
@@ -226,6 +227,7 @@ public:
                     : "static decrypt path is primary");
     }
     bool EmuPrimary() const { return m_emuPrimary; }
+    bool HasEmuFallback() const { return !!m_emuFallback; }
 
     // Emu-only path. Skips StaticResolve entirely — for callers that know
     // the static pipeline produces wrong-but-printable garbage on this
@@ -245,7 +247,7 @@ public:
 
     // ── Step 1: slot index from object address (UObject::GetNamePrivate) ──
     uint32_t GetSlotIndex(uint64_t obj_base) const {
-        if (m_pipeline == Pipeline::Build20260519) {
+        if (m_pipeline == Pipeline::Build20260519 || AutoDiscovery::g_DiscoveredUObjSlot.Valid) {
             return Build20260519_ObjNameSlot(obj_base);
         }
         return ArcDecrypt::GetFNameSlotIndex(obj_base);
@@ -264,19 +266,33 @@ public:
     //   OUTER = (slot_byte + 1) & 3
     //   CLASS =  slot_byte & 3
     static uint8_t Build20260519_ObjSlotMixByte(uint64_t obj_ptr) {
-        using namespace ArcDecrypt::v20260519;
+        const bool Is616 = AutoDiscovery::g_DiscoveredUObjSlot.Valid;
+        const uint32_t P   = 0x01000193u;
+        const uint32_t ADD = Is616 ? ArcDecrypt::v20260616::SLOT_HASH_ADD
+                                   : ArcDecrypt::v20260519::SLOT_HASH_ADD;
         uint64_t p = obj_ptr + 0x10;
         uint32_t lo32 = static_cast<uint32_t>(p);
         uint32_t hi32 = static_cast<uint32_t>(p >> 32);
 
-        uint32_t h = fn_rotl32(lo32, 17);
-        h = HASH_PRIME * h + SLOT_HASH_ADD;
-        h = fn_rotl32(h, 19);
-        h = HASH_PRIME * h + hi32 + SLOT_HASH_ADD;
-        h = fn_rotl32(h, 17);
-        h = HASH_PRIME * h + SLOT_HASH_ADD;
-        h >>= 13;
-        uint32_t v12 = HASH_PRIME * h + SLOT_HASH_ADD;
+        uint32_t h;
+        if (Is616) {
+            h = fn_rotl32(lo32, 26);
+            h = P * h + ADD;
+            h = fn_rotl32(h, 27);
+            h = P * h + hi32 + ADD;
+            h >>= 6;
+            h = P * h + ADD;
+            h >>= 5;
+        } else {
+            h = fn_rotl32(lo32, 17);
+            h = P * h + ADD;
+            h = fn_rotl32(h, 19);
+            h = P * h + hi32 + ADD;
+            h = fn_rotl32(h, 17);
+            h = P * h + ADD;
+            h >>= 13;
+        }
+        uint32_t v12 = P * h + ADD;
 
         return static_cast<uint8_t>(v12) ^ static_cast<uint8_t>(v12 >> 16);
     }
@@ -375,6 +391,18 @@ public:
     // (= ROL64(real_ptr, 32) is its own inverse). Callers that want the
     // raw pointer should swap halves: `((u32)dec << 32) | (dec >> 32)`.
     uint64_t DecryptUObjSlotNew(const uint8_t enc[16]) const {
+        const auto& Disc = AutoDiscovery::g_DiscoveredUObjSlot;
+        if (Disc.Valid) {
+            __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
+            alignas(16) uint8_t FullMask[16] = {};
+            std::memcpy(FullMask, Disc.ShufMaskBytes, 8);
+            __m128i Mask = _mm_load_si128(reinterpret_cast<const __m128i*>(FullMask));
+            __m128i Shuffled = _mm_shuffle_epi8(V, Mask);
+            __m128i Xored = _mm_xor_si128(Shuffled, _mm_set_epi64x(0, static_cast<int64_t>(Disc.XorScalar)));
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Xored);
+            return fn_rotl64(Lo, Disc.Rol64Amount);
+        }
         if (m_pipeline == Pipeline::Build20260519) {
             return DecryptUObjSlot_Build20260519(enc);
         }
@@ -396,6 +424,18 @@ public:
     // ── Build20260519 UObject CLASS/OUTER slot decoder ───────────────────
     // Same PSHUFLW+XOR but ROL64(5) — result is the raw pointer directly.
     uint64_t DecryptUObjSlotPtr_Build20260519(const uint8_t enc[16]) const {
+        const auto& Disc = AutoDiscovery::g_DiscoveredUObjSlot;
+        if (Disc.Valid) {
+            __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
+            alignas(16) uint8_t FullMask[16] = {};
+            std::memcpy(FullMask, Disc.ShufMaskBytes, 8);
+            __m128i Mask = _mm_load_si128(reinterpret_cast<const __m128i*>(FullMask));
+            __m128i Shuffled = _mm_shuffle_epi8(V, Mask);
+            __m128i Xored = _mm_xor_si128(Shuffled, _mm_set_epi64x(0, static_cast<int64_t>(Disc.XorScalar)));
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Xored);
+            return Lo;
+        }
         using namespace ArcDecrypt::v20260519;
         __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
         __m128i S = _mm_shufflelo_epi16(V, 0xB1);
@@ -465,6 +505,85 @@ public:
     // CL-1177146 value, used until discovery has run.
     static constexpr uint64_t FFIELD_NAME_XOR_CL1177146 = 0x9A492C85DDF6F193ULL;
     uint64_t DecryptFFieldNameSlot(const uint8_t enc[16]) const {
+        {
+            using namespace ArcDecrypt::v20260616;
+            __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
+            V = _mm_shufflelo_epi16(V, FFIELD_NAME_SHUF_IMM);
+            V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(FFIELD_NAME_XOR_KEY)));
+            V = _mm_or_si128(_mm_add_epi16(V, V), _mm_srli_epi16(V, 15));
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+            uint64_t Out = (Lo << FFIELD_NAME_ROL64) | (Lo >> (64 - FFIELD_NAME_ROL64));
+            uint32_t CiN = static_cast<uint32_t>(Out);
+            if (CiN > 1 && CiN < 0x2000000u) return Out;
+        }
+
+        {
+            const auto& Disc = AutoDiscovery::g_DiscoveredFFieldName;
+            if (Disc.Valid && Disc.TwoShuffle) {
+                auto ApplyShuf = [](__m128i V, uint8_t Imm) -> __m128i {
+                    switch (Imm) {
+                        case 0x1E: return _mm_shufflelo_epi16(V, 0x1E);
+                        case 0x72: return _mm_shufflelo_epi16(V, 0x72);
+                        case 0x4B: return _mm_shufflelo_epi16(V, 0x4B);
+                        case 0x39: return _mm_shufflelo_epi16(V, 0x39);
+                        case 0x93: return _mm_shufflelo_epi16(V, 0x93);
+                        case 0xB1: return _mm_shufflelo_epi16(V, 0xB1);
+                        case 0x2E: return _mm_shufflelo_epi16(V, 0x2E);
+                        case 0x1B: return _mm_shufflelo_epi16(V, 0x1B);
+                        case 0x4E: return _mm_shufflelo_epi16(V, 0x4E);
+                        case 0x8D: return _mm_shufflelo_epi16(V, 0x8D);
+                        case 0xD8: return _mm_shufflelo_epi16(V, 0xD8);
+                        case 0xE1: return _mm_shufflelo_epi16(V, 0xE1);
+                        default:   return V;
+                    }
+                };
+                __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
+                V = ApplyShuf(V, Disc.ShufImm1);
+                uint64_t Mid;
+                _mm_storel_epi64(reinterpret_cast<__m128i*>(&Mid), V);
+                Mid = (Mid << Disc.TsRol64) | (Mid >> (64 - Disc.TsRol64));
+                V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&Mid));
+                V = ApplyShuf(V, Disc.ShufImm2);
+                uint64_t Out;
+                _mm_storel_epi64(reinterpret_cast<__m128i*>(&Out), V);
+                uint32_t Ci = static_cast<uint32_t>(Out);
+                if (Ci > 1 && Ci < 0x2000000u) return Out;
+            }
+        }
+
+        {
+            const auto& Disc = AutoDiscovery::g_DiscoveredFFieldName;
+            if (Disc.Valid && !Disc.TwoShuffle && Disc.XorConst == 0 && Disc.Rol32Amount > 0) {
+                auto ApplyShuf = [](__m128i V, uint8_t Imm) -> __m128i {
+                    switch (Imm) {
+                        case 0x1E: return _mm_shufflelo_epi16(V, 0x1E);
+                        case 0x72: return _mm_shufflelo_epi16(V, 0x72);
+                        case 0x4B: return _mm_shufflelo_epi16(V, 0x4B);
+                        case 0x39: return _mm_shufflelo_epi16(V, 0x39);
+                        case 0x93: return _mm_shufflelo_epi16(V, 0x93);
+                        case 0xB1: return _mm_shufflelo_epi16(V, 0xB1);
+                        case 0x2E: return _mm_shufflelo_epi16(V, 0x2E);
+                        case 0x1B: return _mm_shufflelo_epi16(V, 0x1B);
+                        case 0x4E: return _mm_shufflelo_epi16(V, 0x4E);
+                        case 0x8D: return _mm_shufflelo_epi16(V, 0x8D);
+                        case 0xD8: return _mm_shufflelo_epi16(V, 0xD8);
+                        case 0xE1: return _mm_shufflelo_epi16(V, 0xE1);
+                        default:   return V;
+                    }
+                };
+                __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
+                V = _mm_or_si128(_mm_slli_epi32(V, Disc.Rol32Amount),
+                                 _mm_srli_epi32(V, 32 - Disc.Rol32Amount));
+                V = ApplyShuf(V, Disc.ShufImm1);
+                uint64_t Lo;
+                _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+                uint64_t Out = (Lo << Disc.Rol64Amount) | (Lo >> (64 - Disc.Rol64Amount));
+                uint32_t Ci = static_cast<uint32_t>(Out);
+                if (Ci > 1 && Ci < 0x2000000u) return Out;
+            }
+        }
+
         if (m_pipeline == Pipeline::Build20260519) {
             const auto& Masks = AutoDiscovery::g_DiscoveredFFieldMasks;
             uint64_t UseKey1 = Masks.Valid ? Masks.Key1 : ArcDecrypt::v20260519::FFIELD_NAME_KEY1;
@@ -578,7 +697,7 @@ public:
         };
 
         // Tier 0: hash-picked NAME slot.
-        uint32_t ns = (m_pipeline == Pipeline::Build20260519)
+        uint32_t ns = (m_pipeline == Pipeline::Build20260519 || AutoDiscovery::g_DiscoveredUObjSlot.Valid)
                           ? Build20260519_ObjNameSlot(obj_base)
                           : ObjNameSlot(obj_base);
         if (int32_t ci = try_slot(static_cast<int>(ns))) return ci;
@@ -614,7 +733,7 @@ public:
     std::array<uint64_t, 4> GetAllClassCandidates(uint64_t obj_base) {
         std::array<uint64_t, 4> out{};
         if (!obj_base || !m_keyLoaded) return out;
-        bool Is519 = (m_pipeline == Pipeline::Build20260519);
+        bool Is519 = (m_pipeline == Pipeline::Build20260519 || AutoDiscovery::g_DiscoveredUObjSlot.Valid);
         for (int slot = 0; slot < 4; ++slot) {
             alignas(16) uint8_t enc[16] = {};
             uint64_t addr = obj_base + 0x20 + static_cast<uint64_t>(slot) * 0x20;
@@ -639,7 +758,7 @@ public:
 
     uint64_t GetClassPrivate(uint64_t obj_base) {
         if (!obj_base || !m_keyLoaded) return 0;
-        bool Is519 = (m_pipeline == Pipeline::Build20260519);
+        bool Is519 = (m_pipeline == Pipeline::Build20260519 || AutoDiscovery::g_DiscoveredUObjSlot.Valid);
         uint32_t cs = Is519 ? Build20260519_ObjClassSlot(obj_base) : ObjClassSlot(obj_base);
         auto tryDecode = [&](int slot) -> uint64_t {
             alignas(16) uint8_t enc[16] = {};
@@ -802,10 +921,44 @@ public:
         for (int i = 0; i < 16; ++i) if (enc[i]) { nonzero = true; break; }
         if (!nonzero) return 0;
 
+        if (AutoDiscovery::g_DiscoveredUObjSlot.Valid) {
+            using namespace ArcDecrypt::v20260616;
+            alignas(16) uint64_t K2[2] = { FCLASS_NAME_XOR2, FCLASS_NAME_XOR2 };
+            alignas(16) uint64_t K1[2] = { FCLASS_NAME_XOR1, FCLASS_NAME_XOR1 };
+            __m128i V     = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
+            __m128i Step1 = _mm_xor_si128(V, _mm_load_si128(reinterpret_cast<const __m128i*>(K2)));
+            __m128i Step2 = _mm_shufflelo_epi16(Step1, FCLASS_NAME_SHUF_DEC);
+            __m128i Step3 = _mm_or_si128(
+                _mm_slli_epi32(Step2, FCLASS_NAME_ROR32),
+                _mm_srli_epi32(Step2, 32 - FCLASS_NAME_ROR32));
+            __m128i Step4 = _mm_xor_si128(Step3, _mm_load_si128(reinterpret_cast<const __m128i*>(K1)));
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Step4);
+            uint32_t Ci = static_cast<uint32_t>(Lo >> 32);
+            if (Ci > 1 && Ci < 0x2000000u) return static_cast<uint64_t>(Ci);
+        }
+
+        {
+            const auto& Disc = AutoDiscovery::g_DiscoveredFFieldClassName;
+            if (Disc.Valid) {
+                __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
+                alignas(16) uint64_t XorBuf[2] = { Disc.XorLo64, Disc.XorLo64 };
+                __m128i xored = _mm_xor_si128(v, _mm_load_si128(reinterpret_cast<const __m128i*>(XorBuf)));
+                const int rol32 = Disc.Rol32Amount ? Disc.Rol32Amount : 7;
+                __m128i rot = _mm_or_si128(
+                    _mm_slli_epi32(xored, rol32),
+                    _mm_srli_epi32(xored, 32 - rol32));
+                __m128i s = _mm_shufflelo_epi16(rot, 0x1B);
+                uint64_t lo;
+                _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo), s);
+                const int rol64 = Disc.Rol64Amount ? Disc.Rol64Amount : 32;
+                uint64_t Out = (lo << rol64) | (lo >> (64 - rol64));
+                uint32_t Ci = static_cast<uint32_t>(Out);
+                if (Ci > 1 && Ci < 0x2000000u) return Out;
+            }
+        }
+
         if (m_pipeline == Pipeline::Build20260519) {
-            // CL-1201801: PSHUFB(mask@0xB2220E0) → PXOR(key@0xB2220F0) → lo64 → ROL64(27)
-            // Verified sub_14034F690 (FField chain walker).
-            // PSHUFB byte-permutation mask (lo8): [6,5,3,1,2,4,7,0] → permute input bytes.
             using namespace ArcDecrypt::v20260519;
             alignas(16) static const uint8_t PshufbMask[16] = {
                 0x06, 0x05, 0x03, 0x01, 0x02, 0x04, 0x07, 0x00,
@@ -817,34 +970,20 @@ public:
             __m128i Xord = _mm_xor_si128(Shuf, _mm_set_epi64x(0, static_cast<int64_t>(FFIELD_CLASS_NAME_KEY)));
             uint64_t Lo;
             _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Xord);
-            return (Lo << FFIELD_CLASS_NAME_ROL64) | (Lo >> (64 - FFIELD_CLASS_NAME_ROL64));
+            uint64_t Out = (Lo << FFIELD_CLASS_NAME_ROL64) | (Lo >> (64 - FFIELD_CLASS_NAME_ROL64));
+            uint32_t Ci = static_cast<uint32_t>(Out);
+            if (Ci > 1 && Ci < 0x2000000u) return Out;
         }
 
-        const auto& Disc = AutoDiscovery::g_DiscoveredFFieldClassName;
-        if (!Disc.Valid) return 0;
-
-        // Legacy CL-1177146 / CL-1177678: PXOR → ROL32(7) → PSHUFLW(0x1B) → lo64 → ROL64(32)
-        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-        alignas(16) uint64_t XorBuf[2] = { Disc.XorLo64, Disc.XorLo64 };
-        __m128i xored = _mm_xor_si128(v, _mm_load_si128(reinterpret_cast<const __m128i*>(XorBuf)));
-        const int rol32 = Disc.Rol32Amount ? Disc.Rol32Amount : 7;
-        __m128i rot = _mm_or_si128(
-            _mm_slli_epi32(xored, rol32),
-            _mm_srli_epi32(xored, 32 - rol32));
-        __m128i s = _mm_shufflelo_epi16(rot, 0x1B);
-        uint64_t lo;
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(&lo), s);
-        const int rol64 = Disc.Rol64Amount ? Disc.Rol64Amount : 32;
-        return (lo << rol64) | (lo >> (64 - rol64));
+        return 0;
     }
 
     uint64_t DecryptFFieldClassNameSlot(uint64_t fclass_addr) {
         if (!fclass_addr) return 0;
         const auto& Disc = AutoDiscovery::g_DiscoveredFFieldClassName;
-        uint32_t NameOff = (m_pipeline == Pipeline::Build20260519)
-            ? ArcDecrypt::v20260519::FFIELD_CLASS_NAME_OFF
-            : (Disc.Valid ? Disc.NamePrivateOffset : 0u);
-        if (NameOff == 0 && m_pipeline != Pipeline::Build20260519) return 0;
+        uint32_t NameOff = Disc.Valid ? Disc.NamePrivateOffset
+            : (m_pipeline == Pipeline::Build20260519 ? ArcDecrypt::v20260519::FFIELD_CLASS_NAME_OFF : 0u);
+        if (NameOff == 0) return 0;
 
         alignas(16) uint8_t enc[16] = {};
         if (!m_reader.Read(fclass_addr + NameOff, enc, 16)) return 0;
@@ -1037,36 +1176,80 @@ public:
     // three return paths also cancels: entry_ptr = v14 directly.
     uint64_t ResolveNamePtr_Build20260519(int32_t CompIndex) {
         if (CompIndex <= 0 || !m_keyLoaded) return 0;
-        using namespace ArcDecrypt::v20260519;
 
+        const bool Is616 = AutoDiscovery::g_DiscoveredUObjSlot.Valid;
         uint32_t Ci       = static_cast<uint32_t>(CompIndex);
         uint16_t NameOff  = static_cast<uint16_t>(Ci & 0xFFFFu);
         uint32_t ChunkOff = (Ci >> 8) & 0xFFFF00u;
 
-        uint64_t ChunkAddr = m_base + RVA_GNAMEPOOL + ChunkOff;
-        uint64_t HashAddr  = ChunkAddr + SHARD_HASH_SEED_OFF;
-        uint32_t HLo = static_cast<uint32_t>(HashAddr);
-        uint32_t HHi = static_cast<uint32_t>(HashAddr >> 32);
+        uint64_t GnpRva = ArcDecrypt::RVA_GNAMES_BASE
+                         ? ArcDecrypt::RVA_GNAMES_BASE
+                         : ArcDecrypt::v20260519::RVA_GNAMEPOOL;
+        uint64_t ChunkAddr = m_base + GnpRva + ChunkOff;
 
-        uint32_t S1 = fn_rotl32(HLo, SHARD_HASH_ROL_A);
-        uint32_t S2 = HASH_PRIME * S1 + SHARD_HASH_ADD;
-        uint32_t S3 = fn_rotl32(S2, SHARD_HASH_ROL_B);
-        uint32_t S4 = HASH_PRIME * S3 + HHi + SHARD_HASH_ADD;
-        uint32_t S5 = fn_rotl32(S4, SHARD_HASH_ROL_A);
-        uint32_t S6 = HASH_PRIME * S5 + SHARD_HASH_ADD;
-        uint32_t V9 = HASH_PRIME * (S6 >> 6) + SHARD_HASH_ADD;
+        uint8_t Bidx1, Bidx2;
+        uint64_t BlockBase;
 
-        uint8_t V10   = static_cast<uint8_t>(V9) ^ static_cast<uint8_t>(V9 >> 16);
-        uint8_t Bidx1 = V10 & 7u;
-        uint8_t Bidx2 = (V10 + 1u) & 7u;
+        if (Is616) {
+            namespace V616 = ArcDecrypt::v20260616;
+            uint64_t HashAddr = ChunkAddr + V616::SHARD_HASH_SEED_OFF;
+            uint32_t HLo = static_cast<uint32_t>(HashAddr);
+            uint32_t HHi = static_cast<uint32_t>(HashAddr >> 32);
 
-        uint64_t BlockBase = ChunkAddr + SHARD_BLOCK_BASE_OFF;
+            uint32_t S1 = fn_rotl32(HLo, V616::SHARD_HASH_ROL_A);
+            uint32_t S2 = V616::HASH_PRIME * S1 + V616::SHARD_HASH_ADD;
+            uint32_t S3 = fn_rotl32(S2, V616::SHARD_HASH_ROL_B);
+            uint32_t S4 = V616::HASH_PRIME * S3 + HHi + V616::SHARD_HASH_ADD;
+            uint32_t S5 = fn_rotl32(S4, V616::SHARD_HASH_ROL_A);
+            uint32_t S6 = V616::HASH_PRIME * S5 + V616::SHARD_HASH_ADD;
+            uint32_t V20 = fn_rotl32(S6, V616::SHARD_HASH_ROL_B);
+
+            uint8_t Pa = static_cast<uint8_t>(static_cast<int8_t>(-109) * static_cast<int>(V20) + 54);
+            uint8_t Pb = static_cast<uint8_t>((V616::HASH_PRIME * V20 + V616::SHARD_HASH_ADD) >> 16);
+            uint8_t V10 = Pa ^ Pb;
+            Bidx1 = V10 & 7u;
+            Bidx2 = (V10 + 1u) & 7u;
+            BlockBase = ChunkAddr + V616::SHARD_BLOCK_BASE_OFF;
+        } else {
+            using namespace ArcDecrypt::v20260519;
+            uint64_t HashAddr = ChunkAddr + SHARD_HASH_SEED_OFF;
+            uint32_t HLo = static_cast<uint32_t>(HashAddr);
+            uint32_t HHi = static_cast<uint32_t>(HashAddr >> 32);
+
+            uint32_t S1 = fn_rotl32(HLo, SHARD_HASH_ROL_A);
+            uint32_t S2 = HASH_PRIME * S1 + SHARD_HASH_ADD;
+            uint32_t S3 = fn_rotl32(S2, SHARD_HASH_ROL_B);
+            uint32_t S4 = HASH_PRIME * S3 + HHi + SHARD_HASH_ADD;
+            uint32_t S5 = fn_rotl32(S4, SHARD_HASH_ROL_A);
+            uint32_t S6 = HASH_PRIME * S5 + SHARD_HASH_ADD;
+            uint32_t V9 = HASH_PRIME * (S6 >> 6) + SHARD_HASH_ADD;
+
+            uint8_t V10 = static_cast<uint8_t>(V9) ^ static_cast<uint8_t>(V9 >> 16);
+            Bidx1 = V10 & 7u;
+            Bidx2 = (V10 + 1u) & 7u;
+            BlockBase = ChunkAddr + SHARD_BLOCK_BASE_OFF;
+        }
+
         alignas(16) uint8_t Sb1[16] = {}, Sb2[16] = {};
         if (!m_reader.Read(BlockBase + 32ULL * Bidx1, Sb1, 16)) return 0;
         if (!m_reader.Read(BlockBase + 32ULL * Bidx2, Sb2, 16)) return 0;
 
         auto DecBlock = [&](const uint8_t* Raw) -> uint64_t {
             __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Raw));
+            if (Is616) {
+                namespace V616 = ArcDecrypt::v20260616;
+                V = _mm_or_si128(_mm_slli_epi64(V, V616::ENTRY_ROL64),
+                                 _mm_srli_epi64(V, 64 - V616::ENTRY_ROL64));
+                alignas(16) uint8_t Mask[16], Xk[16];
+                std::memcpy(Mask, V616::ENTRY_PSHUFB_MASK, 16);
+                std::memcpy(Xk,   V616::ENTRY_XOR_MASK,    16);
+                V = _mm_shuffle_epi8(V, _mm_load_si128(reinterpret_cast<const __m128i*>(Mask)));
+                V = _mm_xor_si128(V, _mm_load_si128(reinterpret_cast<const __m128i*>(Xk)));
+                uint64_t Lo;
+                _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+                return Lo ^ V616::ENTRY_XOR;
+            }
+            using namespace ArcDecrypt::v20260519;
             V = _mm_shufflelo_epi16(V, BLOCK_SHUF_A);
             V = _mm_or_si128(_mm_slli_epi64(V, BLOCK_ROL),
                              _mm_srli_epi64(V, 64 - BLOCK_ROL));
@@ -1078,8 +1261,16 @@ public:
         uint64_t Block1 = DecBlock(Sb1);
         uint64_t Block2 = DecBlock(Sb2);
 
-        uint64_t Fv1 = FNV_PRIME * fn_rotl64(Block1, FNV_ROL1) + FNV_ADD;
-        uint64_t Fv2 = FNV_PRIME * fn_rotl64(Fv1,    FNV_ROL2) + FNV_ADD;
+        uint64_t Fv1, Fv2;
+        if (Is616) {
+            namespace V616 = ArcDecrypt::v20260616;
+            Fv1 = V616::FNV_PRIME * fn_rotl64(Block1, V616::FNV_ROL1) + V616::FNV_ADD;
+            Fv2 = V616::FNV_PRIME * fn_rotl64(Fv1,    V616::FNV_ROL2) + V616::FNV_ADD;
+        } else {
+            using namespace ArcDecrypt::v20260519;
+            Fv1 = FNV_PRIME * fn_rotl64(Block1, FNV_ROL1) + FNV_ADD;
+            Fv2 = FNV_PRIME * fn_rotl64(Fv1,    FNV_ROL2) + FNV_ADD;
+        }
 
         uint64_t EntryPtr = Block1 + (Block2 ^ Fv2) + 2ULL * NameOff;
         return EntryPtr;
@@ -1465,8 +1656,8 @@ public:
             if (ptr < 0x100000ULL || ptr >= 0x800000000000ULL) return 0;
             return ptr;
         };
-        // Tier 0: hash-based outer-slot selection (RE'd from UObject::GetOuter).
-        uint32_t os = ObjOuterSlot(obj_ptr);
+        uint32_t os = (m_pipeline == Pipeline::Build20260519 || AutoDiscovery::g_DiscoveredUObjSlot.Valid)
+                          ? Build20260519_ObjOuterSlot(obj_ptr) : ObjOuterSlot(obj_ptr);
         uint64_t p = tryDecode(static_cast<int>(os));
         if (p) return p;
         // Fallback: any heap-pointer slot distinct from class.

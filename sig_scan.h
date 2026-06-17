@@ -63,6 +63,15 @@ public:
 
     void SetPEFallback(PEFileReader* pe) { m_pe = pe; }
 
+    void SetSectionBounds(uint64_t TextStart, uint64_t TextEnd,
+                          uint64_t RDataStart, uint64_t RDataEnd,
+                          uint64_t DataStart, uint64_t DataEnd) {
+        m_textStart  = TextStart;  m_textEnd  = TextEnd;
+        m_rdataStart = RDataStart; m_rdataEnd = RDataEnd;
+        m_dataStart  = DataStart;  m_dataEnd  = DataEnd;
+        m_hasDynBounds = true;
+    }
+
     // Live → PE-fallback page read. Signatures authored against IDA's static
     // view match equally on live memory and on-disk PE.
     bool ReadPage(uint64_t addr, uint8_t* out, size_t len) {
@@ -364,13 +373,18 @@ public:
     }
 
 private:
-    // Section RVA ranges (stable across 2026 builds; update if PE layout shifts).
-    // Used to sanity-check LEA displacements — a .data global resolving into
-    // .text means the signature drifted and the match is poisoned, so we zero
-    // the RVA and let the caller fall back to the hardcoded constant.
-    bool InTextRVA(uint64_t rva)  const { return rva >= 0x1000      && rva < 0xACB4000; }
-    bool InRDataRVA(uint64_t rva) const { return rva >= 0xACB9000   && rva < 0xDA4F000; }
-    bool InDataRVA(uint64_t rva)  const { return rva >= 0xDA4F000   && rva < 0xE1B4000; }
+    bool InTextRVA(uint64_t rva) const {
+        if (m_hasDynBounds) return rva >= m_textStart && rva < m_textEnd;
+        return rva >= 0x1000 && rva < 0xB3DD000;
+    }
+    bool InRDataRVA(uint64_t rva) const {
+        if (m_hasDynBounds) return rva >= m_rdataStart && rva < m_rdataEnd;
+        return rva >= 0xB3E3000 && rva < 0xE2B0000;
+    }
+    bool InDataRVA(uint64_t rva) const {
+        if (m_hasDynBounds) return rva >= m_dataStart && rva < m_dataEnd;
+        return rva >= 0xE2B0000 && rva < 0xEA3C000;
+    }
 
     static bool MatchAt(const uint8_t* buf, const Pattern& pat) {
         const size_t n = pat.bytes.size();
@@ -402,6 +416,11 @@ private:
     uint64_t      m_size;
     Decoder       m_decoder;
     PEFileReader* m_pe = nullptr;
+
+    bool     m_hasDynBounds = false;
+    uint64_t m_textStart  = 0, m_textEnd  = 0;
+    uint64_t m_rdataStart = 0, m_rdataEnd = 0;
+    uint64_t m_dataStart  = 0, m_dataEnd  = 0;
 };
 
 } // namespace SigScan

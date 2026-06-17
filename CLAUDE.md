@@ -6,8 +6,19 @@ External SDK dumper for ARC Raiders (Unreal Engine 5, Theia-obfuscated). Reads g
 Build: `g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 -o FrostDumper main.cpp build/Zydis.o -lcapstone -lunicorn -lm`
 Run: `sudo ./build_and_run.sh [PID]`
 
-## Current Patch: CL-1201801 (2026-05-19)
-Last verified: 22.8s dump, 99.2% naming, ~204K properties, 4004 structs, 2878 enums.
+## Current Patch: CL-1233465 (2026-06-17)
+Last verified: 0% FProperty_Unknown, 216718 properties (196312 named, 90.6%), 35468 classes, 4386 structs, 247 enums, 29261 functions.
+Game in main menu (reduced object count vs in-match). Config-loading from decrypt_export.json skips 6+ discovery phases.
+
+### CL-1233465 Theia Limitations
+- UScriptStruct::ChildProperties stripped → struct field listings impossible
+- UEnum::Names TArray stripped → enum value listings impossible
+- UObject name slots zeroed for UScriptStruct/UEnum → FField-style name at +0x88/+0x90 used instead
+- All FProperty subclasses share the same vtable → FFieldClass-only or structural probing for type detection
+- FFieldClass hardcoded map (CL-1201801 addresses) disabled — wrong addresses on CL-1233465
+- ProbePropertyTypeStructural() is the PRIMARY type detector (sub-pointers + elem_size + bool fields)
+
+Previous patch (CL-1201801): 99.85% naming, ~298K properties, 33200 classes, 11194 structs, 2881 enums, 55106 functions.
 
 ## Architecture
 
@@ -100,33 +111,50 @@ Base: obj + 0x20, stride 0x20 (4 slots)
 XOR(0xC88F612129941481) → ROL32(17) → PSHUFLW(0x1E) → XOR(0x018A6E394CF4AED0) → ROL64(32)
 ```
 
-### FField/FProperty Layout (CL-1201801)
+### FField/FProperty Layout (CL-1233465)
 | Field | Offset | Notes |
 |-------|--------|-------|
-| FField::NamePrivate | +0x30 | Encrypted FName CI |
-| FField::Next | +0x48 | Next FField in chain |
-| FField::ClassPrivate | +0x50 | FFieldClass pointer |
-| FField::Owner | +0x58 | Owner UStruct |
-| FProperty::PropertyFlags | +0x88 | uint64 flags |
-| FProperty::Offset_Internal | +0x94 | bswap(real ^ 0xBAB939DB) |
-| FProperty::ArrayDim | +0xC0 | int32 |
-| FProperty::ElementSize | +0xC8 | int32 |
-| FStructProperty::Struct | +0xE8 | UScriptStruct* |
-| FArrayProperty::Inner | +0xF8 | FProperty* |
-| FMapProperty::KeyProp | +0xE8 | FProperty* |
-| FMapProperty::ValueProp | +0xF0 | FProperty* |
-| FEnumProperty::UnderlyingProp | +0xE8 | FProperty* (numeric) |
-| FEnumProperty::Enum | +0xF0 | UEnum* |
-| FBoolProperty specifics | +0xC0..+0xC4 | FieldSize/ByteOffset/ByteMask/FieldMask |
+| FField::VTable | +0x00 | vtable pointer (ALL FProperty subclasses share one vtable!) |
+| FField::NamePrivate | +0x90 | Encrypted FName CI |
+| FField::SaltSentinel | +0x98 | Session salt |
+| FField::Owner | +0xA8 | Owner UStruct (tagged: bit0=1 if UObject) |
+| FField::Next | +0xB0 | Next FField in chain |
+| FField::ClassPrivate | +0xC0 | FFieldClass pointer (only valid for ~24% of FFields) |
+| FProperty::PropertyFlags | +0xD0 | uint64 flags |
+| FProperty::Offset_Internal | +0xE4 | bswap(real ^ 0xEAABEC11) |
+| FProperty::ArrayDim | +0x110 | int32 |
+| FProperty::ElementSize | +0x118 | int32 |
+| FStructProperty::Struct | +0x130 | UScriptStruct* |
+| FObjectProperty::PropertyClass | +0x130 | UClass* |
+| FEnumProperty::UnderlyingProp | +0x130 | FProperty* (numeric) |
+| FEnumProperty::Enum | +0x138 | UEnum* |
+| FMapProperty::KeyProp | +0x130 | FProperty* |
+| FMapProperty::ValueProp | +0x138 | FProperty* |
+| FBoolProperty::FieldSize | +0x138 | byte (1/2/4/8) |
+| FBoolProperty::ByteOffset | +0x139 | byte index |
+| FBoolProperty::ByteMask | +0x13A | 1-bit mask (0x01..0x80) |
+| FBoolProperty::FieldMask | +0x13B | all-bools-in-byte mask |
+| FArrayProperty::Inner | +0x140 | FProperty* |
 
-### UStruct/UClass/UEnum Layout
+### UStruct/UClass/UEnum Layout (CL-1233465)
 | Field | Offset | Notes |
 |-------|--------|-------|
 | UStruct::SuperStruct | +0xB0 | UStruct* parent |
-| UStruct::ChildProperties | +0xB8 | FField* head (scan 0x80-0x140) |
-| UStruct::PropertiesSize | +0x110 | int32 total struct size |
+| UStruct::ChildProperties | +0x118 | FField* head (NULL for UScriptStruct — Theia strips it) |
+| UStruct::PropertiesSize | +0xE0 | int32 total struct size |
 | UFunction::NativeFunc | +0x178 | void* native function pointer |
-| UEnum::Names | +0xA8 or +0xB0 | TArray<TPair<FName,int64>> |
+| UEnum::Names | +0xB0 | TArray<TPair<FName,int64>> (stripped by Theia — always empty) |
+
+### Property Type Detection (CL-1233465)
+All FProperty subclasses share the same vtable on CL-1233465 (Theia virtualizes them).
+Type detection uses ProbePropertyTypeStructural() which checks:
+1. elem_size == 80 → MapProperty/SetProperty (check sub-FField at +0x130/+0x138)
+2. Valid FField at +0x140 with reasonable inner elem_size → ArrayProperty
+3. elem_size == 40 → SoftObjectProperty/SoftClassProperty
+4. Bool fields at +0x138..+0x13B → BoolProperty (FieldSize, ByteMask pattern)
+5. Valid UObject at +0x130 AND +0x138 → EnumProperty or ClassProperty
+6. Valid UObject at +0x130 only → StructProperty or ObjectProperty (disambiguated by vtable RVA)
+7. elem_size fallback: 0→Bool, 1→Byte, 2→UInt16, 4→Int, 8→Double, 16→Str, 24→Text, 32→Delegate, 48→MulticastDelegate, >8→Struct
 
 ## IDA Signatures (CL-1201801, IDA format, wildcard operands)
 
@@ -179,14 +207,21 @@ Bool-specific field init. FieldSize/ByteOffset/ByteMask/FieldMask setup.
 7. **If GObjectArray count wrong**: NumElements offset moved (+0x30 vs +0xFC); probed as u32, range [10000,2M]
 
 ### Offset drift history
-| Field | CL-1177146 | CL-1177678 | CL-1201801 |
-|-------|-----------|-----------|-----------|
-| FField::NamePrivate | +0x70 | +0x30 | +0x30 |
-| FField::Next | +0x80 | +0x48 | +0x48 |
-| FField::ClassPrivate | +0x90 | +0x50 | +0x50 |
-| FProperty::Offset_Internal | +0xC4 | +0x88 | +0x94 |
-| FStructProperty::Struct | +0x108 | +0xC8 | +0xE8 |
-| FArrayProperty::Inner | +0xF0 | +0xC8 | +0xF8 |
+| Field | CL-1177146 | CL-1177678 | CL-1201801 | CL-1233465 |
+|-------|-----------|-----------|-----------|-----------|
+| FField::NamePrivate | +0x70 | +0x30 | +0x40 | +0x90 |
+| FField::Next | +0x80 | +0x48 | +0x50 | +0xB0 |
+| FField::ClassPrivate | +0x90 | +0x50 | +0x60 | +0xC0 |
+| FField::Owner | +0x10 | +0x10 | +0x70 | +0xA8 |
+| FProperty::Offset_Internal | +0xC4 | +0x88 | +0x94 | +0xE4 |
+| FProperty::ElementSize | — | — | +0xC8 | +0x118 |
+| FProperty::ArrayDim | — | — | +0xC0 | +0x110 |
+| FStructProperty::Struct | +0x108 | +0xC8 | +0xE8 | +0x130 |
+| FArrayProperty::Inner | +0xF0 | +0xC8 | +0xF8 | +0x140 |
+| FBoolProperty::FieldSize | — | — | +0xF0 | +0x138 |
+| UStruct::ChildProperties | +0x168 | +0xB0 | +0x108 | +0x118 |
+| UStruct::PropertiesSize | — | — | +0x110 | +0xE0 |
+| PropertyOffsetXor | — | — | 0xBAB939DB | 0xEAABEC11 |
 
 ## Critical Rules (Learned from Past Bugs)
 

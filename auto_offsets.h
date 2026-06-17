@@ -541,55 +541,95 @@ inline void ProbeUEnumNames(Context& ctx, const std::vector<uint64_t>& enums) {
         }
     }
     auto [best, hits] = PickMode(counts);
-    ApplyOffset("UEnum::Names", ArcDecrypt::Offsets::UEnum::Names,
-                best, hits, (int)enums.size(), 3);
+    int slot_hits = 0;
+    auto it = counts.find(ArcDecrypt::Offsets::UEnum::Names);
+    if (it != counts.end()) slot_hits = it->second;
+    ApplyOffsetSticky("UEnum::Names", ArcDecrypt::Offsets::UEnum::Names,
+                best, hits, slot_hits, (int)enums.size(), 3);
 }
 
 // ─────────────────────────────────────────────────────────────────
 // Probe 8: UClass::FuncMap_*
-// TArray of TPair<FName, UFunction*> at some offset. Probe for shape where
-// TPair[0].Value (at +8) is a UFunction (vtable matches FunctionRVA).
+// TSparseArray (inside TSet inside TMap) of TPair<FName, UFunction*>.
+// Layout at FuncMap base:
+//   +0x00: Data ptr (TSparseArray::Data::Data)
+//   +0x08: Num (int32, total slots incl. free)
+//   +0x0C: Max (int32)
+//   +0x10: AllocationFlags ptr (TBitArray::Data)
+//   +0x18: AllocationFlags Num (int32)
+//   +0x1C: AllocationFlags Max (int32)
+//   +0x20: FirstFreeIndex (int32, -1 if no free)
+//   +0x24: NumFreeIndices (int32)
+// Each element is stride 0x18: TPair<FName(8),UFunction*(8)> + HashNextId(4) + HashIndex(4).
+// Probe for shape where first valid element's Value (at data+0x08) has
+// module vtable AND a .text NativeFunc at +0x178 (confirms UFunction,
+// not UClass/UScriptStruct which share the same vtable on CL-1233465).
 // ─────────────────────────────────────────────────────────────────
 inline void ProbeUClassFuncMap(Context& ctx, const std::vector<uint64_t>& classes) {
     if (classes.empty() || !ctx.vtables.FunctionRVA) {
         std::printf("[autoff] UClass::FuncMap_* — no UClass samples or no Function vtable\n");
         return;
     }
-    uint64_t want_vt = ctx.module_base + ctx.vtables.FunctionRVA;
-    std::unordered_map<uint64_t, int> counts;
-    for (uint64_t cls : classes) {
-        for (uint64_t off = 0x180; off <= 0x320; off += 8) {
-            uint64_t data = 0;
-            uint32_t num = 0, mx = 0;
-            if (!R(*ctx.reader, cls + off,      data)) continue;
-            if (!R(*ctx.reader, cls + off + 8,  num))  continue;
-            if (!R(*ctx.reader, cls + off + 12, mx))   continue;
-            if (!IsHeapPtr(data)) continue;
-            if (num < 1 || num > 1024) continue;
-            if (mx < num || mx > 4096) continue;
-            uint64_t fn = 0;
-            if (!R(*ctx.reader, data + 8, fn)) continue;
-            if (!IsHeapNonModule(fn, ctx.module_base, ctx.bounds.ImageSize)) continue;
-            uint64_t vt = 0;
-            if (!R(*ctx.reader, fn, vt)) continue;
-            if (vt != want_vt) continue;
-            counts[off]++;
+    uint64_t WantVt = ctx.module_base + ctx.vtables.FunctionRVA;
+    std::unordered_map<uint64_t, int> Counts;
+    for (uint64_t Cls : classes) {
+        for (uint64_t Off = 0x180; Off <= 0x320; Off += 8) {
+            uint64_t Data = 0;
+            uint32_t Num = 0, Mx = 0;
+            if (!R(*ctx.reader, Cls + Off,      Data)) continue;
+            if (!R(*ctx.reader, Cls + Off + 8,  Num))  continue;
+            if (!R(*ctx.reader, Cls + Off + 12, Mx))   continue;
+            if (!IsHeapPtr(Data)) continue;
+            if (Num < 1 || Num > 1024) continue;
+            if (Mx < Num || Mx > 4096) continue;
+            uint64_t AllocFlagsPtr = 0;
+            if (!R(*ctx.reader, Cls + Off + 0x10, AllocFlagsPtr)) continue;
+            if (!IsHeapPtr(AllocFlagsPtr)) continue;
+            bool FoundValidEntry = false;
+            uint32_t ScanLimit = std::min(Num, (uint32_t)8);
+            for (uint32_t I = 0; I < ScanLimit; ++I) {
+                uint64_t Fn = 0;
+                if (!R(*ctx.reader, Data + (uint64_t)I * 0x18 + 8, Fn)) continue;
+                if (!IsHeapNonModule(Fn, ctx.module_base, ctx.bounds.ImageSize)) continue;
+                uint64_t Vt = 0;
+                if (!R(*ctx.reader, Fn, Vt)) continue;
+                if (!IsModulePtr(Vt, ctx.module_base, ctx.bounds.ImageSize)) continue;
+                uint64_t NativeFunc = 0;
+                R(*ctx.reader, Fn + ArcDecrypt::Offsets::UFunction::NativeFunc, NativeFunc);
+                bool HasNative = IsTextPtr(NativeFunc, ctx.module_base, ctx.bounds);
+                uint64_t QNumParms = 0;
+                R(*ctx.reader, Fn + ArcDecrypt::Offsets::UFunction::NumParms, QNumParms);
+                bool ParmShape = (QNumParms >> 8) == 0 && (QNumParms & 0xFF) <= 64;
+                if (HasNative || ParmShape) {
+                    FoundValidEntry = true;
+                    break;
+                }
+            }
+            if (!FoundValidEntry) continue;
+            Counts[Off]++;
         }
     }
-    auto [best, hits] = PickMode(counts);
-    if (best == 0 || hits < 3) {
+    auto [Best, Hits] = PickMode(Counts);
+    if (Best == 0 || Hits < 3) {
         std::printf("[autoff] UClass::FuncMap_PairsData      probe weak (best=0x%llX hits=%d) — keeping 0x%llX\n",
-            (unsigned long long)best, hits,
+            (unsigned long long)Best, Hits,
             (unsigned long long)ArcDecrypt::Offsets::UClass::FuncMap_PairsData);
         return;
     }
     ApplyOffset("UClass::FuncMap_PairsData", ArcDecrypt::Offsets::UClass::FuncMap_PairsData,
-                best, hits, (int)classes.size(), 3);
-    ArcDecrypt::Offsets::UClass::FuncMap_Num = best + 8;
-    ArcDecrypt::Offsets::UClass::FuncMap_Max = best + 12;
+                Best, Hits, (int)classes.size(), 3);
+    ArcDecrypt::Offsets::UClass::FuncMap_Num            = Best + 8;
+    ArcDecrypt::Offsets::UClass::FuncMap_Max            = Best + 12;
+    ArcDecrypt::Offsets::UClass::FuncMap_AllocFlags     = Best + 0x10;
+    ArcDecrypt::Offsets::UClass::FuncMap_AllocFlagsNum  = Best + 0x18;
+    ArcDecrypt::Offsets::UClass::FuncMap_FirstFreeIdx   = Best + 0x20;
+    ArcDecrypt::Offsets::UClass::FuncMap_NumFreeIndices = Best + 0x24;
     std::printf("[autoff] UClass::FuncMap_Num/Max set to +0x%llX/+0x%llX (derived)\n",
         (unsigned long long)ArcDecrypt::Offsets::UClass::FuncMap_Num,
         (unsigned long long)ArcDecrypt::Offsets::UClass::FuncMap_Max);
+    std::printf("[autoff] UClass::FuncMap_AllocFlags set to +0x%llX, NumFreeIndices at +0x%llX\n",
+        (unsigned long long)ArcDecrypt::Offsets::UClass::FuncMap_AllocFlags,
+        (unsigned long long)ArcDecrypt::Offsets::UClass::FuncMap_NumFreeIndices);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -907,11 +947,35 @@ inline void DiscoverAll(IMemoryReader& reader, uint64_t module_base,
     auto u_funcs = FilterByVtable(objects, reader,
         ctx.vtables.FunctionRVA ? module_base + ctx.vtables.FunctionRVA : 0, 100);
 
-    // Combined sample for UStruct probes (UClass + UScriptStruct both have layout)
+    bool SharedVtable = !ctx.vtables.ClassNativeRVA && ctx.vtables.FunctionRVA;
+    if (u_classes.empty()) {
+        std::vector<uint64_t> ClassLikeRvas;
+        if (ctx.vtables.ASClassRVA)  ClassLikeRvas.push_back(ctx.vtables.ASClassRVA);
+        if (ctx.vtables.BPGCRVA)     ClassLikeRvas.push_back(ctx.vtables.BPGCRVA);
+        if (ctx.vtables.WBPGCRVA)    ClassLikeRvas.push_back(ctx.vtables.WBPGCRVA);
+        if (ctx.vtables.AnimBPGCRVA) ClassLikeRvas.push_back(ctx.vtables.AnimBPGCRVA);
+        if (ctx.vtables.SMBPGCRVA)   ClassLikeRvas.push_back(ctx.vtables.SMBPGCRVA);
+        if (SharedVtable)            ClassLikeRvas.push_back(ctx.vtables.FunctionRVA);
+        for (uint64_t Rva : ClassLikeRvas) {
+            auto Batch = FilterByVtable(objects, reader, module_base + Rva, 200);
+            u_classes.insert(u_classes.end(), Batch.begin(), Batch.end());
+        }
+        std::printf("[autoff] UClass fallback: collected %zu candidates from %zu vtable families\n",
+            u_classes.size(), ClassLikeRvas.size());
+    }
+
+    if (u_structs.empty() && ctx.vtables.ASStructRVA) {
+        u_structs = FilterByVtable(objects, reader, module_base + ctx.vtables.ASStructRVA, 100);
+        std::printf("[autoff] UStruct fallback via ASStruct: %zu candidates\n", u_structs.size());
+    }
+
     std::vector<uint64_t> ustructs_all;
     ustructs_all.reserve(u_structs.size() + u_classes.size());
     ustructs_all.insert(ustructs_all.end(), u_structs.begin(), u_structs.end());
     ustructs_all.insert(ustructs_all.end(), u_classes.begin(), u_classes.end());
+    if (SharedVtable && u_funcs.size() > 0) {
+        ustructs_all.insert(ustructs_all.end(), u_funcs.begin(), u_funcs.end());
+    }
 
     std::printf("[autoff] samples: classes=%zu structs=%zu enums=%zu funcs=%zu (combined=%zu)\n",
         u_classes.size(), u_structs.size(), u_enums.size(), u_funcs.size(), ustructs_all.size());

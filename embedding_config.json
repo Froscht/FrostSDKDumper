@@ -1,0 +1,42 @@
+{
+  "embedding_configuration": {
+    "primary": {
+      "provider": "lm_studio",
+      "model": "text-embedding-qwen3-embedding-0.6b",
+      "base_url": "http://192.168.1.50:1234/v1/embeddings",
+      "description": "High-quality LM Studio embeddings for semantic search"
+    },
+    "fallback": {
+      "provider": "ollama",
+      "model": "qwen3-embedding:0.6b",
+      "base_url": "http://localhost:11434/api/embeddings",
+      "description": "Fast local Ollama embeddings"
+    },
+    "options": {
+      "openai": {
+        "provider": "openai",
+        "model": "text-embedding-3-small",
+        "base_url": "https://api.openai.com/v1",
+        "api_key": "your-openai-api-key-here",
+        "description": "OpenAI embeddings (requires API key)"
+      }
+    }
+  },
+  "instructions": {
+    "setup": [
+      "1. Edit this file to configure your preferred embedding providers",
+      "2. Configure 'primary' for your main embedding service",
+      "3. Configure 'fallback' for backup when primary fails",
+      "4. For Ollama: Make sure model is pulled (ollama pull nomic-embed-text:latest)",
+      "5. For LM Studio: Load an embedding model and update base_url if needed",
+      "6. For OpenAI: Add your API key",
+      "7. Restart Friday to apply changes"
+    ],
+    "providers": {
+      "lm_studio": "High quality embeddings, best for semantic search",
+      "ollama": "Fast local embeddings, good for development",
+      "openai": "Premium quality but requires internet and API costs"
+    },
+    "preservation_note": "Existing embeddings are preserved automatically - new embeddings use your configured providers"
+  }
+}

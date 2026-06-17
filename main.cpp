@@ -60,6 +60,7 @@ using FNameDecryptor = FName::FNameDecryptor;
 #include "auto_offsets.h"
 #include "auto_chunks_emu.h"
 #include "auto_export.h"
+#include "config_loader.h"
 #include "sdk_generator.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -267,6 +268,12 @@ public:
     SigScanV2::Scanner         m_sigScanner;  // Zydis-aware module cache for autodiscovery
     SigScan::PEFileReader      m_sigPe;       // shared PE fallback for legacy SigScan (open once)
     bool                       m_sigPeReady = false;
+    ConfigLoader::LoadResult   m_configResult;
+
+    std::unordered_map<uint64_t, std::string> m_cachedAddrToName;
+    std::unordered_map<uint64_t, std::string> m_cachedAddrToFullname;
+    std::vector<std::pair<int32_t, uint64_t>> m_cachedObjectPtrs;
+    bool m_hasCachedNames = false;
 
     SDKDumper(int pid)
         : MODULE_BASE(FindModuleBase(pid)),
@@ -279,6 +286,8 @@ public:
     bool Init() {
         if (!m_reader.Open(m_pid)) return false;
         std::cout << "[+] Opened /dev/memreader for PID " << m_pid << "\n";
+
+        m_configResult = ConfigLoader::LoadDiscoveryConfig("decrypt_export.json");
 
         // ── Phase 0: Module bounds (PE header parse) ────────────────────
         // Replaces hardcoded module-size constants (0xE900000, 0xE9AF000)
@@ -318,84 +327,90 @@ public:
                 AutoDiscovery::DiscoverModuleBoundsFromScanner(m_sigScanner);
 
             // ── Phase 3: FProperty Offset_Internal XOR key ─────────────
-            // Sig-scan + Zydis-validate the offset reader fn shape. Runs
-            // here because it doesn't depend on FName / GObjects.
-            AutoDiscovery::g_DiscoveredFProperty =
-                AutoDiscovery::DiscoverFPropertyOffsetXor(m_sigScanner);
             if (AutoDiscovery::g_DiscoveredFProperty.Valid) {
-                uint32_t Hard = ArcDecrypt::Patch20260421::g_PropertyOffsetXor;
-                uint32_t Live = AutoDiscovery::g_DiscoveredFProperty.XorKey;
-                if (Live == Hard) {
-                    std::printf("[autodisc] FProperty Offset XOR matches constant 0x%08X\n", Live);
-                } else {
-                    std::printf("[autodisc] FProperty Offset XOR drift: 0x%08X → 0x%08X (auto-fixed)\n",
-                        Hard, Live);
-                    ArcDecrypt::Patch20260421::g_PropertyOffsetXor = Live;
+                std::printf("[autodisc] Phase 3 skipped — FProperty offset XOR loaded from config (0x%08X)\n",
+                    AutoDiscovery::g_DiscoveredFProperty.XorKey);
+            } else {
+                AutoDiscovery::g_DiscoveredFProperty =
+                    AutoDiscovery::DiscoverFPropertyOffsetXor(m_sigScanner);
+                if (AutoDiscovery::g_DiscoveredFProperty.Valid) {
+                    uint32_t Hard = ArcDecrypt::Patch20260421::g_PropertyOffsetXor;
+                    uint32_t Live = AutoDiscovery::g_DiscoveredFProperty.XorKey;
+                    if (Live == Hard) {
+                        std::printf("[autodisc] FProperty Offset XOR matches constant 0x%08X\n", Live);
+                    } else {
+                        std::printf("[autodisc] FProperty Offset XOR drift: 0x%08X → 0x%08X (auto-fixed)\n",
+                            Hard, Live);
+                        ArcDecrypt::Patch20260421::g_PropertyOffsetXor = Live;
+                    }
                 }
             }
 
             // ── Phase 2b: FField NamePrivate SIMD masks ──────────────
-            // Read the two XOR keys from .rdata at known RVAs. These change
-            // every patch — reading them live eliminates the need to update
-            // FFIELD_NAME_KEY1/KEY2 in arc_decrypt.h after each update.
-            AutoDiscovery::g_DiscoveredFFieldMasks =
-                AutoDiscovery::DiscoverFFieldNameMasks(
-                    m_sigScanner, m_reader, MODULE_BASE,
-                    AutoDiscovery::g_DiscoveredBounds);
+            if (AutoDiscovery::g_DiscoveredFFieldMasks.Valid) {
+                std::printf("[autodisc] Phase 2b skipped — FField name masks loaded from config\n");
+            } else {
+                AutoDiscovery::g_DiscoveredFFieldMasks =
+                    AutoDiscovery::DiscoverFFieldNameMasks(
+                        m_sigScanner, m_reader, MODULE_BASE,
+                        AutoDiscovery::g_DiscoveredBounds);
+            }
 
             // ── Phase 4: UObject 4-slot decrypt SIMD constants ─────────
-            // Locate the slot decrypt fn body via PSHUFB+PXOR rip-rel pair,
-            // extract the .rdata table RVAs and the scalar XOR const.
-            AutoDiscovery::g_DiscoveredUObjSlot =
-                AutoDiscovery::DiscoverUObjSlotDecrypt(m_sigScanner, m_reader);
             if (AutoDiscovery::g_DiscoveredUObjSlot.Valid) {
-                using namespace ArcDecrypt::Patch20260421::UObjSlot20260428;
-                uint64_t Live = AutoDiscovery::g_DiscoveredUObjSlot.XorScalar;
-                if (Live == XOR_SCALAR)
-                    std::printf("[autodisc] UObj slot XOR scalar matches constant 0x%016llX\n",
-                        (unsigned long long)Live);
-                else
-                    std::printf("[autodisc] UObj slot XOR scalar drift: 0x%016llX → 0x%016llX (auto-fixed)\n",
-                        (unsigned long long)XOR_SCALAR, (unsigned long long)Live);
+                std::printf("[autodisc] Phase 4 skipped — UObj slot decrypt loaded from config (xor=0x%016llX)\n",
+                    (unsigned long long)AutoDiscovery::g_DiscoveredUObjSlot.XorScalar);
+            } else {
+                AutoDiscovery::g_DiscoveredUObjSlot =
+                    AutoDiscovery::DiscoverUObjSlotDecrypt(m_sigScanner, m_reader);
+                if (AutoDiscovery::g_DiscoveredUObjSlot.Valid) {
+                    using namespace ArcDecrypt::Patch20260421::UObjSlot20260428;
+                    uint64_t Live = AutoDiscovery::g_DiscoveredUObjSlot.XorScalar;
+                    if (Live == XOR_SCALAR)
+                        std::printf("[autodisc] UObj slot XOR scalar matches constant 0x%016llX\n",
+                            (unsigned long long)Live);
+                    else
+                        std::printf("[autodisc] UObj slot XOR scalar drift: 0x%016llX → 0x%016llX (auto-fixed)\n",
+                            (unsigned long long)XOR_SCALAR, (unsigned long long)Live);
+                }
             }
 
             // ── Phase 7: FFieldClass NamePrivate decode pipeline ───────
-            // Sig-scan for the inlined FFieldClass NamePrivate decode body
-            // (PSRLD 0x1D + PSLLD 3 + POR + PSHUFLW 0x72 + PXOR rip-rel)
-            // and Zydis-walk-back to extract NamePrivate offset, FFieldClass
-            // pointer offset, and live XOR const RVA. Resolves the type-name
-            // gap (~80K properties on CL-1177146 fall back to generic Prop_<n>
-            // names without this — the dumper has only 53 FFieldClass→type
-            // mappings via vtable scan).
-            AutoDiscovery::g_DiscoveredFFieldClassName =
-                AutoDiscovery::DiscoverFFieldClassNameDecrypt(
-                    m_sigScanner, m_reader, MODULE_BASE);
             if (AutoDiscovery::g_DiscoveredFFieldClassName.Valid) {
-                std::printf("[autodisc] FFieldClass NamePrivate auto-discovered: "
-                            "name_off=+0x%X fclass_off=+0x%X xor_lo64=0x%016llX (%d sites)\n",
-                    AutoDiscovery::g_DiscoveredFFieldClassName.NamePrivateOffset,
-                    AutoDiscovery::g_DiscoveredFFieldClassName.FFieldClassOffset,
-                    (unsigned long long)AutoDiscovery::g_DiscoveredFFieldClassName.XorLo64,
-                    AutoDiscovery::g_DiscoveredFFieldClassName.ConsensusSiteCount);
+                std::printf("[autodisc] Phase 7 skipped — FFieldClass name decrypt loaded from config (xor=0x%016llX)\n",
+                    (unsigned long long)AutoDiscovery::g_DiscoveredFFieldClassName.XorLo64);
+            } else {
+                AutoDiscovery::g_DiscoveredFFieldClassName =
+                    AutoDiscovery::DiscoverFFieldClassNameDecrypt(
+                        m_sigScanner, m_reader, MODULE_BASE);
+                if (AutoDiscovery::g_DiscoveredFFieldClassName.Valid) {
+                    std::printf("[autodisc] FFieldClass NamePrivate auto-discovered: "
+                                "name_off=+0x%X fclass_off=+0x%X xor_lo64=0x%016llX (%d sites)\n",
+                        AutoDiscovery::g_DiscoveredFFieldClassName.NamePrivateOffset,
+                        AutoDiscovery::g_DiscoveredFFieldClassName.FFieldClassOffset,
+                        (unsigned long long)AutoDiscovery::g_DiscoveredFFieldClassName.XorLo64,
+                        AutoDiscovery::g_DiscoveredFFieldClassName.ConsensusSiteCount);
+                }
             }
 
             // ── Phase 8: enumerate FFieldClass init callers → (RVA, name) ─
-            // Reads from the on-disk PE (NOT the live module) because
-            // sub_3E80E0 is VMProtected: live memory has different bytes
-            // than the PE on disk. The .data target RVA is what matters at
-            // runtime; we just need static analysis to extract it.
-            if (m_sigPeReady) {
-                AutoDiscovery::g_DiscoveredFClassGlobals =
-                    AutoDiscovery::DiscoverFFieldClassGlobals(
-                        m_sigPe, AutoDiscovery::g_DiscoveredBounds);
-            }
             if (!AutoDiscovery::g_DiscoveredFClassGlobals.empty()) {
-                std::printf("[autodisc] FFieldClass globals discovered: %zu (%s, %s, ...)\n",
-                    AutoDiscovery::g_DiscoveredFClassGlobals.size(),
-                    AutoDiscovery::g_DiscoveredFClassGlobals[0].TypeName.c_str(),
-                    AutoDiscovery::g_DiscoveredFClassGlobals.size() > 1
-                        ? AutoDiscovery::g_DiscoveredFClassGlobals[1].TypeName.c_str()
-                        : "—");
+                std::printf("[autodisc] Phase 8 skipped — %zu FFieldClass globals loaded from config\n",
+                    AutoDiscovery::g_DiscoveredFClassGlobals.size());
+            } else {
+                if (m_sigPeReady) {
+                    AutoDiscovery::g_DiscoveredFClassGlobals =
+                        AutoDiscovery::DiscoverFFieldClassGlobals(
+                            m_sigPe, AutoDiscovery::g_DiscoveredBounds);
+                }
+                if (!AutoDiscovery::g_DiscoveredFClassGlobals.empty()) {
+                    std::printf("[autodisc] FFieldClass globals discovered: %zu (%s, %s, ...)\n",
+                        AutoDiscovery::g_DiscoveredFClassGlobals.size(),
+                        AutoDiscovery::g_DiscoveredFClassGlobals[0].TypeName.c_str(),
+                        AutoDiscovery::g_DiscoveredFClassGlobals.size() > 1
+                            ? AutoDiscovery::g_DiscoveredFClassGlobals[1].TypeName.c_str()
+                            : "—");
+                }
             }
         }
 
@@ -406,9 +421,17 @@ public:
         // a future patch). Scan failures fall back to the hardcoded value.
         {
             SigScan::Scanner<KernelReader> scan(m_reader, MODULE_BASE, ModuleSize);
-            // Open the shared PE-on-disk fallback exactly once (m_sigPe lives
-            // for the SDKDumper lifetime). Reused later by CaptureSimdPebKey
-            // — avoids opening + parsing the 240MB binary three times.
+            if (AutoDiscovery::g_DiscoveredBounds.Valid) {
+                const auto& B = AutoDiscovery::g_DiscoveredBounds;
+                scan.SetSectionBounds(B.TextRva, B.TextEnd(),
+                                      B.RDataRva, B.RDataEnd(),
+                                      B.DataRva, B.DataEnd());
+                std::printf("[sig] Dynamic section bounds from PE header: "
+                            ".text=0x%llX-0x%llX .rdata=0x%llX-0x%llX .data=0x%llX-0x%llX\n",
+                            (unsigned long long)B.TextRva, (unsigned long long)B.TextEnd(),
+                            (unsigned long long)B.RDataRva, (unsigned long long)B.RDataEnd(),
+                            (unsigned long long)B.DataRva, (unsigned long long)B.DataEnd());
+            }
             const std::string& pe_path = GetPEBinaryPath();
             if (!m_sigPeReady && !pe_path.empty() && m_sigPe.Open(pe_path.c_str())) {
                 m_sigPeReady = true;
@@ -487,17 +510,10 @@ public:
         }
 
         // ── Phase 0.5: full GWorld discovery (sigscan → live-validate) ──
-        // Replaces the legacy `applyTrusted("GWorld", ...)` auto-fix which
-        // overwrote the working 0xDFDB4D8 with a wrong 0xE07CFD8 because the
-        // sigscan picked a sibling global within tolerance. Now we:
-        //   1. Sig-scan for the canonical UE5 double-deref load
-        //      (`mov rax, [rip+gworld]; mov rax, [rax]`)
-        //   2. Validate EACH candidate by walking UWorld → PL → Actors and
-        //      cross-checking Levels[0] == PL
-        //   3. Pick the candidate with the most actors
-        //   4. If none validate (game in menu), Valid stays false and we
-        //      keep the compile-time RVA_GWORLD untouched.
-        if (m_sigPeReady) {
+        if (AutoDiscovery::g_DiscoveredWorld.Valid) {
+            std::printf("[autodisc] Phase 0.5 skipped — GWorld loaded from config (rva=0x%llX)\n",
+                (unsigned long long)AutoDiscovery::g_DiscoveredWorld.GWorldRva);
+        } else if (m_sigPeReady) {
             AutoDiscovery::g_DiscoveredWorld = AutoDiscovery::DiscoverGWorld(
                 m_sigScanner, m_reader, MODULE_BASE,
                 AutoDiscovery::g_DiscoveredBounds);
@@ -951,47 +967,24 @@ public:
             // Fall back to UClass samples — they also have FField chains.
             {
                 std::vector<uint64_t> uss_samples;
-                uint64_t want_struct_vt = AutoDiscovery::g_DiscoveredVTables.ScriptStructRVA
-                    ? MODULE_BASE + AutoDiscovery::g_DiscoveredVTables.ScriptStructRVA : 0;
-                uint64_t want_class_vt  = AutoDiscovery::g_DiscoveredVTables.ClassNativeRVA
-                    ? MODULE_BASE + AutoDiscovery::g_DiscoveredVTables.ClassNativeRVA : 0;
-                if (want_struct_vt) {
-                    for (uint64_t obj : m_gobj.GetSeedObjects()) {
-                        if (uss_samples.size() >= 32) break;
-                        uint64_t vt = 0;
-                        if (!m_reader.Read(obj, &vt, 8)) continue;
-                        if (vt == want_struct_vt) uss_samples.push_back(obj);
-                    }
+                const auto& VT = AutoDiscovery::g_DiscoveredVTables;
+                std::vector<uint64_t> WantVts;
+                if (VT.ScriptStructRVA) WantVts.push_back(MODULE_BASE + VT.ScriptStructRVA);
+                if (VT.ClassNativeRVA)  WantVts.push_back(MODULE_BASE + VT.ClassNativeRVA);
+                if (VT.ASClassRVA)      WantVts.push_back(MODULE_BASE + VT.ASClassRVA);
+                if (VT.ASStructRVA)     WantVts.push_back(MODULE_BASE + VT.ASStructRVA);
+                if (VT.BPGCRVA)         WantVts.push_back(MODULE_BASE + VT.BPGCRVA);
+                if (VT.WBPGCRVA)        WantVts.push_back(MODULE_BASE + VT.WBPGCRVA);
+                if (VT.FunctionRVA)     WantVts.push_back(MODULE_BASE + VT.FunctionRVA);
+                std::unordered_set<uint64_t> WantSet(WantVts.begin(), WantVts.end());
+                for (uint64_t Obj : m_gobj.GetSeedObjects()) {
+                    if (uss_samples.size() >= 64) break;
+                    uint64_t Vt = 0;
+                    if (!m_reader.Read(Obj, &Vt, 8)) continue;
+                    if (WantSet.count(Vt)) uss_samples.push_back(Obj);
                 }
-                // CL-1195482: ScriptStruct vtable autodisc often collides with
-                // Class on this build (anchor picks 0xB355650 for both), so the
-                // ScriptStruct samples are usually wrong-class. Always *append*
-                // UClass samples so the broad-scan has real FField-bearing types
-                // to probe.
-                if (want_class_vt) {
-                    size_t before = uss_samples.size();
-                    for (uint64_t obj : m_gobj.GetSeedObjects()) {
-                        if (uss_samples.size() >= 64) break;
-                        uint64_t vt = 0;
-                        if (!m_reader.Read(obj, &vt, 8)) continue;
-                        if (vt == want_class_vt) uss_samples.push_back(obj);
-                    }
-                    if (uss_samples.size() > before) {
-                        std::printf("[autodisc] Phase 2 appended %zu UClass samples (total=%zu)\n",
-                            uss_samples.size() - before, uss_samples.size());
-                    }
-                }
-                if (uss_samples.empty() && want_class_vt) {
-                    for (uint64_t obj : m_gobj.GetSeedObjects()) {
-                        if (uss_samples.size() >= 32) break;
-                        uint64_t vt = 0;
-                        if (!m_reader.Read(obj, &vt, 8)) continue;
-                        if (vt == want_class_vt) uss_samples.push_back(obj);
-                    }
-                    if (!uss_samples.empty()) {
-                        std::printf("[autodisc] Phase 2 falling back to UClass samples (no UScriptStruct vtable detected)\n");
-                    }
-                }
+                std::printf("[autodisc] Phase 2: %zu FField samples from %zu vtable families\n",
+                    uss_samples.size(), WantVts.size());
                 if (!uss_samples.empty()) {
                     AutoDiscovery::g_DiscoveredFFieldName =
                         AutoDiscovery::DiscoverFFieldNameDecrypt(
@@ -1024,8 +1017,13 @@ public:
             // has a populated fclass_to_type map even when Phase 8 auto-
             // discovery yields 0 entries (FFieldClass globals not sigscanned).
             AutoDiscovery::SeedHardcodedFClassGlobals_CL1201801();
-            AutoOffsets::DiscoverAll(m_reader, MODULE_BASE,
-                                     m_gobj.GetSeedObjects(), m_fname);
+            if (m_configResult.SectionsLoaded > 0) {
+                std::printf("[autodisc] Phase 9-15 skipped — layout offsets loaded from config (%d sections)\n",
+                    m_configResult.SectionsLoaded);
+            } else {
+                AutoOffsets::DiscoverAll(m_reader, MODULE_BASE,
+                                         m_gobj.GetSeedObjects(), m_fname);
+            }
         }
 
         // (FProperty Offset_Internal XOR key auto-discovery already ran
@@ -1315,38 +1313,32 @@ public:
                         (unsigned long long)ArcDecrypt::Patch20260421::ENTRY_HANDLE_XOR);
         }
 
-        // ── Phase 5: FNamePool resolver constants (Zydis instruction walk)
-        // Decode the FName function body and dump every imm64 / pshuflw imm /
-        // rol imm / .rdata-LEA target. The dumper currently uses these as
-        // forensic info only (to spot drift); future work can structurally
-        // bind them to FNamePool20260428 constants.
+        // ── Phase 5+6: FName resolver + GNames ────────────────────
         if (AutoDiscovery::g_DiscoveredBounds.Valid) {
-            AutoDiscovery::g_DiscoveredFName =
-                AutoDiscovery::DiscoverFNameResolverConsts(m_sigScanner, fname_rva);
-
-            // ── Phase 6: GNamePool RVA via FName-fn call-chain walk ──
-            // Replaces the dead Apr-14-only `add rdi, 0xC0` AOB. Recursively
-            // follows the first load-bearing call from the FName outer fn
-            // through Stage2_XOR → Core_BlockFNV (depth 2 on CL-1177146)
-            // and picks the most-referenced .data LEA target — that's
-            // GNamePool. Patch-resilient: works regardless of which
-            // pipeline-shape generation the FName resolver uses.
-            // Build the exclude-zone list before calling Phase 6.
-            // The keystream / FName key table sits at RVA_FNAME_KEY_TABLE - 0xF8.
-            // It's referenced 13× from the entry decoder loop on CL-1177146,
-            // would out-vote the real FNamePool (4 refs) without exclusion.
-            std::vector<AutoDiscovery::GNamesExcludeZone> ExcludeZones;
-            {
-                AutoDiscovery::GNamesExcludeZone z;
-                z.CenterRva = ArcDecrypt::RVA_FNAME_KEY_TABLE > 0xF8u
-                    ? (ArcDecrypt::RVA_FNAME_KEY_TABLE - 0xF8u)
-                    : ArcDecrypt::RVA_FNAME_KEY_TABLE;
-                z.Radius = 0x200;
-                ExcludeZones.push_back(z);
+            if (AutoDiscovery::g_DiscoveredFName.Valid) {
+                std::printf("[autodisc] Phase 5 skipped — FName resolver consts loaded from config\n");
+            } else {
+                AutoDiscovery::g_DiscoveredFName =
+                    AutoDiscovery::DiscoverFNameResolverConsts(m_sigScanner, fname_rva);
             }
-            AutoDiscovery::g_DiscoveredGNames =
-                AutoDiscovery::DiscoverGNamesViaFNameWalk(
-                    m_sigScanner, fname_rva, ExcludeZones);
+
+            if (AutoDiscovery::g_DiscoveredGNames.Valid) {
+                std::printf("[autodisc] Phase 6 skipped — GNames loaded from config (rva=0x%llX)\n",
+                    (unsigned long long)AutoDiscovery::g_DiscoveredGNames.GNamesRva);
+            } else {
+                std::vector<AutoDiscovery::GNamesExcludeZone> ExcludeZones;
+                {
+                    AutoDiscovery::GNamesExcludeZone z;
+                    z.CenterRva = ArcDecrypt::RVA_FNAME_KEY_TABLE > 0xF8u
+                        ? (ArcDecrypt::RVA_FNAME_KEY_TABLE - 0xF8u)
+                        : ArcDecrypt::RVA_FNAME_KEY_TABLE;
+                    z.Radius = 0x200;
+                    ExcludeZones.push_back(z);
+                }
+                AutoDiscovery::g_DiscoveredGNames =
+                    AutoDiscovery::DiscoverGNamesViaFNameWalk(
+                        m_sigScanner, fname_rva, ExcludeZones);
+            }
             if (AutoDiscovery::g_DiscoveredGNames.Valid) {
                 uint64_t Hard = ArcDecrypt::RVA_GNAMES_BASE;
                 uint64_t Live = AutoDiscovery::g_DiscoveredGNames.GNamesRva;
@@ -1371,10 +1363,6 @@ public:
                 if (Live == Hard) {
                     std::printf("[autodisc] FName keystream RVA matches constant 0x%llX\n",
                         (unsigned long long)Live);
-                } else if (m_fname.IsInitialized()) {
-                    std::printf("[autodisc] FName keystream drift (0x%llX → 0x%llX) suppressed — "
-                                "keytable already validated at compile-time RVA\n",
-                        (unsigned long long)Hard, (unsigned long long)Live);
                 } else {
                     std::printf("[autodisc] FName keystream RVA drift: 0x%llX → 0x%llX "
                                 "(auto-fixed via SIMD-block + 0xA0)\n",
@@ -1385,6 +1373,11 @@ public:
                             (unsigned long long)Live);
                     } else {
                         std::printf("[autodisc] FName key table re-loaded from corrected RVA\n");
+                    }
+                    if (AutoDiscovery::g_DiscoveredUObjSlot.Valid &&
+                        m_fname.ActivePipeline() != FNameDecryptor::Pipeline::Build20260519) {
+                        m_fname.ForcePipeline(FNameDecryptor::Pipeline::Build20260519);
+                        std::printf("[autodisc] forced pipeline Build20260519 (UObj slot auto-discovered)\n");
                     }
                 }
             } else {
@@ -2222,29 +2215,40 @@ public:
         int32_t obj_count = m_gobj.GetNumElements();
         std::cout << "[+] Object count: " << obj_count << "\n";
 
-        // Build addr→name maps + object list by iterating GObjects
-        std::cout << "[*] Building name map...\n";
         std::unordered_map<uint64_t, std::string> addr_to_name;
         std::unordered_map<uint64_t, std::string> addr_to_fullname;
         std::vector<std::pair<int32_t, uint64_t>> object_ptrs;
-        addr_to_name.reserve(obj_count);
-        addr_to_fullname.reserve(obj_count);
-        object_ptrs.reserve(obj_count);
 
-        for (int32_t i = 0; i < obj_count; ++i) {
-            uint64_t obj_ptr = m_gobj.GetObjectPtr(i);
-            if (!obj_ptr) continue;
-            object_ptrs.push_back({i, obj_ptr});
-            std::string full = m_fname.GetName(obj_ptr);
-            if (!full.empty()) {
-                addr_to_fullname[obj_ptr] = full;
-                size_t dot = full.rfind('.');
-                addr_to_name[obj_ptr] = (dot != std::string::npos) ? full.substr(dot + 1) : full;
+        if (m_hasCachedNames && !m_cachedObjectPtrs.empty()) {
+            std::printf("[sdk] using cached name data from Run() (%zu names, %zu objects)\n",
+                m_cachedAddrToName.size(), m_cachedObjectPtrs.size());
+            addr_to_name     = m_cachedAddrToName;
+            addr_to_fullname = m_cachedAddrToFullname;
+            object_ptrs      = m_cachedObjectPtrs;
+        } else {
+            std::cout << "[*] Building name map (live scan)...\n";
+            addr_to_name.reserve(obj_count);
+            addr_to_fullname.reserve(obj_count);
+            object_ptrs.reserve(obj_count);
+            for (int32_t i = 0; i < obj_count; ++i) {
+                uint64_t obj_ptr = m_gobj.GetObjectPtr(i);
+                if (!obj_ptr) continue;
+                object_ptrs.push_back({i, obj_ptr});
+                std::string full = m_fname.GetName(obj_ptr);
+                if (full.empty()) {
+                    int32_t Ci = m_fname.DecryptFFieldNameCI(obj_ptr - 8);
+                    if (Ci > 1) full = m_fname.CompIndexToNameLenient(Ci);
+                }
+                if (!full.empty()) {
+                    addr_to_fullname[obj_ptr] = full;
+                    size_t dot = full.rfind('.');
+                    addr_to_name[obj_ptr] = (dot != std::string::npos) ? full.substr(dot + 1) : full;
+                }
+                if (i % 10000 == 0)
+                    std::cout << "\r[*] Scanning: " << i << "/" << obj_count << "  " << std::flush;
             }
-            if (i % 10000 == 0)
-                std::cout << "\r[*] Scanning: " << i << "/" << obj_count << "  " << std::flush;
         }
-        std::cout << "\r[+] Name map: " << addr_to_name.size() << " entries\n";
+        std::printf("[+] Name map: %zu entries\n", addr_to_name.size());
 
         // Diagnostic: count UFunction-range vtable objects
         {
@@ -2282,11 +2286,13 @@ public:
             if (rec.is_class) ++n_classes; else ++n_structs;
             n_properties += rec.properties.size();
             n_struct_props += rec.properties.size();
-            n_named += rec.properties.size();
+            for (const auto& p : rec.properties)
+                if (p.name.rfind("Prop_CI", 0) != 0) ++n_named;
             for (const auto& fn : rec.functions) {
                 n_properties += fn.params.size();
                 n_param_props += fn.params.size();
-                n_named      += fn.params.size();
+                for (const auto& p : fn.params)
+                    if (p.name.rfind("Prop_CI", 0) != 0) ++n_named;
                 if (fn.params.empty()) ++fn_0p;
                 else if (fn.params.size() == 1) ++fn_1p;
                 else if (fn.params.size() == 2) ++fn_2p;
@@ -2303,7 +2309,31 @@ public:
         std::printf("[stats] fn_params: 0p=%llu 1p=%llu 2p=%llu 3+p=%llu\n",
             (unsigned long long)fn_0p, (unsigned long long)fn_1p,
             (unsigned long long)fn_2p, (unsigned long long)fn_3p);
-
+        {
+            std::unordered_map<std::string, uint32_t> TypeHist;
+            for (const auto& Rec : sdk.structs)
+                for (const auto& P : Rec.properties) {
+                    std::string Base = P.type_name;
+                    if (Base.find("TArray<") == 0) Base = "TArray<...>";
+                    else if (Base.find("TMap<") == 0) Base = "TMap<...>";
+                    else if (Base.find("TSet<") == 0) Base = "TSet<...>";
+                    else if (Base.find("TSubclassOf<") == 0) Base = "TSubclassOf<...>";
+                    else if (Base.find("TScriptInterface<") == 0) Base = "TScriptInterface<...>";
+                    else if (Base.find("TDelegate<") == 0) Base = "TDelegate<...>";
+                    else if (Base.size() > 2 && Base.back() == '*') Base = "Object*";
+                    TypeHist[Base]++;
+                }
+            std::vector<std::pair<std::string, uint32_t>> Sorted(TypeHist.begin(), TypeHist.end());
+            std::sort(Sorted.begin(), Sorted.end(),
+                      [](const auto& A, const auto& B){ return A.second > B.second; });
+            std::printf("[type-hist] Property type distribution (top 20):\n");
+            for (size_t I = 0; I < std::min<size_t>(Sorted.size(), 20); ++I)
+                std::printf("[type-hist]   %-40s  %u\n", Sorted[I].first.c_str(), Sorted[I].second);
+            uint32_t Unk = TypeHist.count("FProperty_Unknown") ? TypeHist["FProperty_Unknown"] : 0;
+            std::printf("[type-hist] FProperty_Unknown: %u / %llu (%.1f%%)\n",
+                Unk, (unsigned long long)n_struct_props,
+                n_struct_props ? 100.0 * Unk / n_struct_props : 0.0);
+        }
         // ── Write SDK output  ─────────────────────────────────────────────
         std::ofstream sdk_file("SDK_Output.txt");
         if (!sdk_file) { std::cerr << "[-] Cannot open SDK_Output.txt\n"; return; }
@@ -2527,6 +2557,12 @@ public:
         uint32_t valid = 0, failed = 0, empty = 0;
         std::set<std::string>                uniqueNames;
         std::unordered_map<std::string, int> nameCount;
+        m_cachedObjectPtrs.clear();
+        m_cachedObjectPtrs.reserve(obj_count);
+        m_cachedAddrToName.clear();
+        m_cachedAddrToFullname.clear();
+        m_cachedAddrToName.reserve(obj_count);
+        m_cachedAddrToFullname.reserve(obj_count);
 
         for (int32_t i = 0; i < obj_count; ++i) {
             if (i % 5000 == 0) {
@@ -2539,8 +2575,13 @@ public:
                 ++empty;
                 continue;
             }
+            m_cachedObjectPtrs.push_back({i, obj_ptr});
 
             std::string name = m_fname.GetName(obj_ptr);
+            if (name.empty()) {
+                int32_t Ci = m_fname.DecryptFFieldNameCI(obj_ptr - 8);
+                if (Ci > 1) name = m_fname.CompIndexToNameLenient(Ci);
+            }
             if (name.empty()) {
                 fObjects << "[" << i << "] " << Hex(obj_ptr) << " | <no name>\n";
                 ++failed;
@@ -2554,6 +2595,12 @@ public:
             fObjects << "[" << i << "] " << Hex(obj_ptr) << " | " << name << "\n";
             uniqueNames.insert(name);
             nameCount[name]++;
+
+            m_cachedAddrToFullname[obj_ptr] = name;
+            {
+                size_t dot = name.rfind('.');
+                m_cachedAddrToName[obj_ptr] = (dot != std::string::npos) ? name.substr(dot + 1) : name;
+            }
 
             // Build a richer class/package record even when names are short.
             uint64_t cls_ptr = m_fname.GetClassPrivate(obj_ptr);
@@ -2601,6 +2648,10 @@ public:
         fLog << "  valid=" << valid << " failed=" << failed << " empty=" << empty << "\n";
         fLog << "  unique_names=" << uniqueNames.size() << "\n";
         fLog << "  elapsed_ms=" << ms << "\n";
+
+        m_hasCachedNames = true;
+        std::printf("[run] cached %zu names, %zu objects for SDK generator\n",
+            m_cachedAddrToName.size(), m_cachedObjectPtrs.size());
     }
 };
 

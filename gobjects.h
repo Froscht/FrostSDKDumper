@@ -105,6 +105,85 @@ namespace gobjects
         void SetBase(uint64_t b) { m_base = b; }
 
         // Load SIMD tables, decrypt array base, count, and decrypt chunk ptr.
+        uint64_t ProbeDataSectionForGUObjectArray() {
+            const auto& Bounds = AutoDiscovery::g_DiscoveredBounds;
+            if (!Bounds.Valid || !Bounds.DataRva || !Bounds.DataSize) return 0;
+
+            uint64_t DataStart = Bounds.DataRva;
+            uint64_t DataEnd   = Bounds.DataEnd();
+            std::printf("[gobj-probe] Scanning .data 0x%llX-0x%llX for GUObjectArray candidates...\n",
+                (unsigned long long)DataStart, (unsigned long long)DataEnd);
+
+            struct Candidate {
+                uint64_t Rva;
+                uint32_t NumElements;
+                uint32_t Offset;
+            };
+            std::vector<Candidate> Candidates;
+
+            constexpr uint64_t kStep = 0x10;
+            constexpr size_t kProbeSize = 0x180;
+            uint8_t Buf[kProbeSize];
+
+            for (uint64_t Rva = DataStart; Rva + kProbeSize <= DataEnd; Rva += kStep) {
+                if (!m_reader.Read(m_base + Rva, Buf, kProbeSize)) continue;
+
+                bool AllZero = true;
+                for (size_t i = 0; i < 64 && AllZero; ++i)
+                    if (Buf[i]) AllZero = false;
+                if (AllZero) { Rva += 0xF0; continue; }
+
+                uint32_t BestNm = 0, BestOff = 0;
+                for (uint32_t Off = 0x20; Off + 4 <= kProbeSize; Off += 4) {
+                    uint32_t V = 0;
+                    std::memcpy(&V, Buf + Off, 4);
+                    if (V >= 20000 && V <= 2'000'000 && V > BestNm) {
+                        BestNm = V;
+                        BestOff = Off;
+                    }
+                }
+                if (BestNm) {
+                    Candidates.push_back({Rva, BestNm, BestOff});
+                }
+            }
+
+            std::printf("[gobj-probe] Found %zu candidates with plausible NumElements\n",
+                Candidates.size());
+
+            std::sort(Candidates.begin(), Candidates.end(),
+                [](const Candidate& A, const Candidate& B) {
+                    return A.NumElements > B.NumElements;
+                });
+
+            auto IsHeap = [](uint64_t P) { return P >= 0x10000ULL && P < 0x7FFFFFFFFFFFULL; };
+            auto IsModule = [&](uint64_t P) { return P >= m_base && P < m_base + 0x12000000ULL; };
+
+            for (size_t Ci = 0; Ci < Candidates.size() && Ci < 20; ++Ci) {
+                auto& C = Candidates[Ci];
+                std::printf("[gobj-probe]   Candidate #%zu: RVA=0x%llX NumElements=%u (@ +0x%X)\n",
+                    Ci, (unsigned long long)C.Rva, C.NumElements, C.Offset);
+
+                uint8_t Full[kProbeSize];
+                if (!m_reader.Read(m_base + C.Rva, Full, kProbeSize)) continue;
+
+                int HeapPtrs = 0, ModPtrs = 0;
+                for (uint32_t Off = 0; Off + 8 <= kProbeSize; Off += 8) {
+                    uint64_t V = 0;
+                    std::memcpy(&V, Full + Off, 8);
+                    if (IsHeap(V) && !IsModule(V)) ++HeapPtrs;
+                    if (IsModule(V)) ++ModPtrs;
+                }
+
+                if (HeapPtrs >= 1 || ModPtrs >= 1) {
+                    std::printf("[gobj-probe]   Validated: %d heap ptrs, %d module ptrs\n",
+                        HeapPtrs, ModPtrs);
+                    return C.Rva;
+                }
+            }
+
+            return 0;
+        }
+
         bool Init() {
             if (m_initialized) return true;
 

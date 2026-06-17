@@ -188,7 +188,7 @@ inline std::vector<uint64_t> FindGUObjectArrayLoaders(
 {
     std::vector<uint64_t> hits;
     auto try_pat = [&](const char* sig, int disp_off, int total_len) {
-        auto raw = scanner.ScanSection(sig, ".text");
+        auto raw = AutoDiscovery::ScanCodeSections(scanner, sig);
         for (uint64_t rva : raw) {
             const uint8_t* p = scanner.GetLocalPtr(rva);
             if (!p) continue;
@@ -594,9 +594,9 @@ inline Result Discover(IMemoryReader& reader, uint64_t module_base,
         if (!fn) { ++walkback_failed; continue; }
         if (!seen.insert(fn).second) { ++walkback_dup; continue; }
         fn_starts.push_back(fn);
-        if (fn_starts.size() >= 2048) break;
+        if (fn_starts.size() >= 80) break;
     }
-    std::printf("[autoemu] %zu distinct candidate functions (cap=2048, walkback_failed=%zu, dup=%zu)\n",
+    std::printf("[autoemu] %zu distinct candidate functions (cap=80, walkback_failed=%zu, dup=%zu)\n",
         fn_starts.size(), walkback_failed, walkback_dup);
 
     // Inner-blob offset candidates within chunks_manager. CL-1177146 uses
@@ -611,6 +611,7 @@ inline Result Discover(IMemoryReader& reader, uint64_t module_base,
     std::mutex          print_mu;
     std::mutex          result_mu;
     std::atomic<bool>   found{false};
+    std::atomic<bool>   have_stage_a{false};
     std::atomic<size_t> next_idx{0};
 
     auto worker = [&](int tid) {
@@ -621,7 +622,7 @@ inline Result Discover(IMemoryReader& reader, uint64_t module_base,
             std::printf("[autoemu][t%d] EmuEngine init failed\n", tid);
             return;
         }
-        while (!found.load(std::memory_order_relaxed)) {
+        while (!found.load(std::memory_order_relaxed) && !have_stage_a.load(std::memory_order_relaxed)) {
             size_t i = next_idx.fetch_add(1, std::memory_order_relaxed);
             if (i >= fn_starts.size()) break;
             uint64_t fn = fn_starts[i];
@@ -649,6 +650,7 @@ inline Result Discover(IMemoryReader& reader, uint64_t module_base,
                 continue;
             }
             {
+                have_stage_a.store(true, std::memory_order_relaxed);
                 std::lock_guard<std::mutex> g(print_mu);
                 std::printf("[autoemu][t%d]   %zu chunks_manager candidate(s):", tid, cands.size());
                 for (uint64_t c : cands) std::printf(" 0x%llX", (unsigned long long)c);

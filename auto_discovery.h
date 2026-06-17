@@ -56,6 +56,30 @@
 
 namespace AutoDiscovery {
 
+static inline uint64_t fn_rotl64(uint64_t x, int n) { return (x << n) | (x >> (64 - n)); }
+
+inline std::vector<uint64_t> ScanCodeSections(
+    const SigScanV2::Scanner& Scanner, const char* Sig)
+{
+    auto Hits = Scanner.ScanSection(Sig, ".text");
+    for (const char* VmpSec : {"dnv0", "dnv1", "dnv4"}) {
+        auto Extra = Scanner.ScanSection(Sig, VmpSec);
+        Hits.insert(Hits.end(), Extra.begin(), Extra.end());
+    }
+    return Hits;
+}
+
+inline std::vector<uint64_t> ScanCodeSections(
+    const SigScanV2::Scanner& Scanner, const SigScanV2::Pattern& Pat)
+{
+    auto Hits = Scanner.ScanSection(Pat, ".text");
+    for (const char* VmpSec : {"dnv0", "dnv1", "dnv4"}) {
+        auto Extra = Scanner.ScanSection(Pat, VmpSec);
+        Hits.insert(Hits.end(), Extra.begin(), Extra.end());
+    }
+    return Hits;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase 0: Module bounds (PE header parse)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -368,8 +392,8 @@ inline WorldDiscovery DiscoverGWorld(
 
     // ── Strategy 1: sig-scan for `mov rax, [rip+disp]; mov rax, [rax]` ──
     // (canonical UE5 GWorld access — the second `mov` is the giveaway).
-    auto movHits = scanner.ScanSection("48 8B 05 ?? ?? ?? ?? 48 8B 00", ".text");
-    std::printf("[autodisc-gworld] MOV-deref-deref sig hits: %zu\n", movHits.size());
+    auto movHits = ScanCodeSections(scanner, "48 8B 05 ?? ?? ?? ?? 48 8B 00");
+    std::printf("[autodisc-gworld] MOV-deref-deref sig hits (.text+dnv): %zu\n", movHits.size());
     for (uint64_t hitRva : movHits) {
         const uint8_t* p = scanner.GetLocalPtr(hitRva);
         if (!p) continue;
@@ -395,7 +419,7 @@ inline WorldDiscovery DiscoverGWorld(
             "4C 8B 0D ?? ?? ?? ?? 4D 8B 09",  // R9
         };
         for (const char* pat : otherFormPats) {
-            auto hits = scanner.ScanSection(pat, ".text");
+            auto hits = ScanCodeSections(scanner, pat);
             for (uint64_t hitRva : hits) {
                 const uint8_t* p = scanner.GetLocalPtr(hitRva);
                 if (!p) continue;
@@ -687,7 +711,14 @@ struct VTableMap {
     uint32_t ASFunctionStride   = 0x200;
 
     bool Valid() const {
-        return ScriptStructRVA && ClassNativeRVA && FunctionRVA && EnumRVA;
+        int Found = 0;
+        if (ScriptStructRVA) Found++;
+        if (ClassNativeRVA)  Found++;
+        if (FunctionRVA)     Found++;
+        if (EnumRVA)         Found++;
+        if (PackageRVA)      Found++;
+        if (BPGCRVA)         Found++;
+        return Found >= 2;
     }
 };
 
@@ -1554,6 +1585,10 @@ struct FFieldNameDecryptParams {
     int      Rol32Amount = 13;
     int      Rol64Amount = 7;
     bool     Valid       = false;
+    bool     TwoShuffle  = false;
+    uint8_t  ShufImm1    = 0;
+    uint8_t  ShufImm2    = 0;
+    int      TsRol64     = 0;
 };
 
 inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
@@ -1575,6 +1610,26 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
 
     auto try_decrypt_slot = [&](const uint8_t* slot,
                                 uint64_t& xor_const, uint32_t& ci, uint32_t& num) -> bool {
+        // Attempt -1 — CL-1233465 pipeline (8-byte slot):
+        // PSHUFLW(0x1E) → XOR(0x365789E8756FBA38) → ROL16(1) → lo64 → ROL64(32)
+        {
+            using namespace ArcDecrypt::v20260616;
+            __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(slot));
+            V = _mm_shufflelo_epi16(V, FFIELD_NAME_SHUF_IMM);
+            V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(FFIELD_NAME_XOR_KEY)));
+            V = _mm_or_si128(_mm_add_epi16(V, V), _mm_srli_epi16(V, 15));
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+            uint64_t Out = (Lo << FFIELD_NAME_ROL64) | (Lo >> (64 - FFIELD_NAME_ROL64));
+            uint32_t CiN = static_cast<uint32_t>(Out);
+            uint32_t NumN = static_cast<uint32_t>(Out >> 32);
+            if (CiN >= 2 && CiN <= 0x2000000u && NumN <= 0x10000u) {
+                xor_const = FFIELD_NAME_XOR_KEY;
+                ci = CiN; num = NumN;
+                return true;
+            }
+        }
+
         // Attempt 0 — CL-1201801 pipeline (8-byte slot):
         // lo64 -> XOR(KEY1) -> ROL32(17)/lane -> PSHUFLW(0x1E) -> XOR(KEY2) -> ROL64(32)
         {
@@ -1596,7 +1651,7 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
             }
         }
 
-        // Attempt 0b — generalized keyless brute: try common (ROL32, PSHUFLW)
+        // Attempt 0b — generalized keyless brute: try common (ROL32, PSHUFLW, ROL64)
         // combos without XOR keys. PSHUFLW requires a compile-time immediate,
         // so each shuffle variant is inlined via a lambda+switch.
         {
@@ -1613,11 +1668,13 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
                     case 0x8D: return _mm_shufflelo_epi16(V, 0x8D);
                     case 0xD8: return _mm_shufflelo_epi16(V, 0xD8);
                     case 0xE1: return _mm_shufflelo_epi16(V, 0xE1);
+                    case 0x72: return _mm_shufflelo_epi16(V, 0x72);
                     default:   return V;
                 }
             };
             static const int kRol32s[] = { 17, 13, 1, 9, 7, 11, 15, 19, 21, 23, 25 };
-            static const int kShufs[] = { 0x1E, 0x4B, 0x39, 0x93, 0xB1, 0x2E, 0x1B, 0x4E, 0x8D, 0xD8, 0xE1 };
+            static const int kShufs[] = { 0x1E, 0x4B, 0x39, 0x93, 0xB1, 0x2E, 0x1B, 0x4E, 0x8D, 0xD8, 0xE1, 0x72 };
+            static const int kRol64s[] = { 32, 18, 27, 7, 37, 55 };
             for (int R : kRol32s) {
                 for (int S : kShufs) {
                     __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(slot));
@@ -1625,13 +1682,41 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
                     V = ApplyShuf(V, S);
                     uint64_t AfterMath;
                     _mm_storel_epi64(reinterpret_cast<__m128i*>(&AfterMath), V);
-                    uint64_t Swapped = (AfterMath << 32) | (AfterMath >> 32);
-                    uint32_t TrialCi = static_cast<uint32_t>(Swapped);
-                    uint32_t TrialNum = static_cast<uint32_t>(Swapped >> 32);
-                    if (TrialCi >= 2 && TrialCi <= 0x2000000u && TrialNum <= 0x10000u) {
-                        xor_const = (static_cast<uint64_t>(R) << 8) | S;
-                        ci = TrialCi; num = TrialNum;
-                        return true;
+                    for (int R64 : kRol64s) {
+                        uint64_t Out = fn_rotl64(AfterMath, R64);
+                        uint32_t TrialCi = static_cast<uint32_t>(Out);
+                        uint32_t TrialNum = static_cast<uint32_t>(Out >> 32);
+                        if (TrialCi >= 2 && TrialCi <= 0x2000000u && TrialNum <= 0x10000u) {
+                            xor_const = (static_cast<uint64_t>(R) << 16) | (static_cast<uint64_t>(S) << 8) | R64;
+                            ci = TrialCi; num = TrialNum;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // Attempt 0c — two-shuffle pipeline: PSHUFLW(S1) → ROL64(R) → PSHUFLW(S2)
+            // New on CL-120xxxx: no ROL32 step, two shuffles around a ROL64.
+            for (int S1 : kShufs) {
+                for (int R64 : kRol64s) {
+                    for (int S2 : kShufs) {
+                        __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(slot));
+                        V = ApplyShuf(V, S1);
+                        uint64_t Mid;
+                        _mm_storel_epi64(reinterpret_cast<__m128i*>(&Mid), V);
+                        Mid = fn_rotl64(Mid, R64);
+                        V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&Mid));
+                        V = ApplyShuf(V, S2);
+                        uint64_t Out2;
+                        _mm_storel_epi64(reinterpret_cast<__m128i*>(&Out2), V);
+                        uint32_t TrialCi = static_cast<uint32_t>(Out2);
+                        uint32_t TrialNum = static_cast<uint32_t>(Out2 >> 32);
+                        if (TrialCi >= 2 && TrialCi <= 0x2000000u && TrialNum <= 0x10000u) {
+                            xor_const = 0xCC000000ULL | (static_cast<uint64_t>(S1) << 16) |
+                                        (static_cast<uint64_t>(R64) << 8) | S2;
+                            ci = TrialCi; num = TrialNum;
+                            return true;
+                        }
                     }
                 }
             }
@@ -1767,8 +1852,8 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
                        0xD0ULL, 0xD8ULL, 0xE0ULL, 0xE8ULL, 0xF0ULL, 0xF8ULL})
         if (v != ffield_nameprivate_offset) npOffs.push_back(v);
     static const uint64_t kNextOffs[] = {
-        0x48, 0x80, 0x70, 0x68, 0x58, 0x50, 0x60,
-        // CL-1195482 candidates (FField layout shifted +0x80..+0xA0)
+        0xB0, 0x48, 0x80, 0x70, 0x68, 0x58, 0x50, 0x60,
+        0x90, 0x98, 0xA0, 0xA8, 0xB8, 0xC0, 0xC8, 0xD0,
         0xE0, 0xE8, 0xF0, 0xF8, 0x100, 0x108, 0x110, 0x118,
     };
     int probed = 0;
@@ -1820,16 +1905,49 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
             [](const Candidate& a, const Candidate& b) { return a.votes > b.votes; });
         const Candidate& best = cands.front();
         if (best.votes >= 2) {
-            out.XorConst    = best.xor_const;
-            out.Rol32Amount = 13;
-            out.Rol64Amount = 7;
-            out.Valid       = true;
-            std::printf("[autodisc-ffield] broad-scan picked childprops_off=0x%llX nameprivate_off=0x%llX votes=%d XOR=0x%016llX (CI=%u Num=%u from FField 0x%llX)\n",
-                (unsigned long long)best.childprops_off,
-                (unsigned long long)best.nameprivate_off,
-                best.votes, (unsigned long long)best.xor_const,
-                best.example_ci, best.example_num,
-                (unsigned long long)best.example_head);
+            out.Valid = true;
+            uint64_t X = best.xor_const;
+            if ((X & 0xFF000000ULL) == 0xCC000000ULL) {
+                out.TwoShuffle = true;
+                out.ShufImm1   = static_cast<uint8_t>((X >> 16) & 0xFF);
+                out.TsRol64    = static_cast<int>((X >> 8) & 0xFF);
+                out.ShufImm2   = static_cast<uint8_t>(X & 0xFF);
+                out.XorConst   = 0;
+                out.Rol32Amount = 0;
+                out.Rol64Amount = out.TsRol64;
+                std::printf("[autodisc-ffield] broad-scan TWO-SHUFFLE: PSHUFLW(0x%02X)->ROL64(%d)->PSHUFLW(0x%02X) "
+                    "childprops_off=0x%llX nameprivate_off=0x%llX votes=%d (CI=%u Num=%u from FField 0x%llX)\n",
+                    out.ShufImm1, out.TsRol64, out.ShufImm2,
+                    (unsigned long long)best.childprops_off,
+                    (unsigned long long)best.nameprivate_off,
+                    best.votes, best.example_ci, best.example_num,
+                    (unsigned long long)best.example_head);
+            } else if (X > 0xFFFFFFULL) {
+                out.XorConst    = X;
+                out.Rol32Amount = 13;
+                out.Rol64Amount = 7;
+                std::printf("[autodisc-ffield] broad-scan picked childprops_off=0x%llX nameprivate_off=0x%llX votes=%d XOR=0x%016llX (CI=%u Num=%u from FField 0x%llX)\n",
+                    (unsigned long long)best.childprops_off,
+                    (unsigned long long)best.nameprivate_off,
+                    best.votes, (unsigned long long)best.xor_const,
+                    best.example_ci, best.example_num,
+                    (unsigned long long)best.example_head);
+            } else {
+                int R32 = static_cast<int>((X >> 16) & 0xFF);
+                int S   = static_cast<int>((X >> 8) & 0xFF);
+                int R64 = static_cast<int>(X & 0xFF);
+                out.XorConst    = 0;
+                out.Rol32Amount = R32;
+                out.Rol64Amount = R64;
+                out.ShufImm1    = static_cast<uint8_t>(S);
+                std::printf("[autodisc-ffield] broad-scan KEYLESS: ROL32(%d)->PSHUFLW(0x%02X)->ROL64(%d) "
+                    "childprops_off=0x%llX nameprivate_off=0x%llX votes=%d (CI=%u Num=%u from FField 0x%llX)\n",
+                    R32, S, R64,
+                    (unsigned long long)best.childprops_off,
+                    (unsigned long long)best.nameprivate_off,
+                    best.votes, best.example_ci, best.example_num,
+                    (unsigned long long)best.example_head);
+            }
             return out;
         }
         // Surface the top-3 candidates so the user can eyeball drift.
@@ -1948,9 +2066,9 @@ inline FPropertyDecryptParams DiscoverFPropertyOffsetXor(
     // per-call), not an imm32 — so it can't be matched bytewise. The encode
     // site is the cleanest anchor: 5 sites on lh74, 0x48742740 imm =
     // bswap32(0x40277448).
-    auto hits = scanner.ScanSection(
-        "35 ?? ?? ?? ?? 0F C8 89 ?? ?? ?? 00 00", ".text");
-    std::printf("[autodisc-fprop] encode sig hits (xor+bswap+mov[reg+disp32]): %zu\n",
+    auto hits = ScanCodeSections(scanner,
+        "35 ?? ?? ?? ?? 0F C8 89 ?? ?? ?? 00 00");
+    std::printf("[autodisc-fprop] encode sig hits (xor+bswap+mov[reg+disp32], .text+dnv): %zu\n",
         hits.size());
 
     // Histogram of (offset, xor_key) pairs across all validated hits — the
@@ -1981,9 +2099,9 @@ inline FPropertyDecryptParams DiscoverFPropertyOffsetXor(
         if (xor_imm == 0u || xor_imm == 0xFFFFFFFFu) continue;
         if (disp32 < 0x80 || disp32 > 0x140) continue;
 
-        // Decode-form key = bswap32(imm32). The dumper's decryption uses
-        // `real = bswap32(stored ^ key)` so we expose the key in that form.
-        uint32_t decode_key = __builtin_bswap32(xor_imm);
+        // The dumper decodes as `real = bswap32(stored) ^ key`, where key is
+        // the raw imm32 from the encode-side `xor eax, imm32; bswap eax`.
+        uint32_t decode_key = xor_imm;
         uint64_t key = ((uint64_t)disp32 << 32) | decode_key;
         if (pairCounts.empty()) firstValidatedRva = rva;
         ++pairCounts[key];
@@ -2084,8 +2202,8 @@ inline UObjSlotDecryptParams DiscoverUObjSlotDecrypt(
     //      false positives appear once each.
     //   3. Pick the most-referenced pair, require ≥ 3 sites for consensus.
     //   4. If no consensus, leave compile-time XOR_SCALAR alone.
-    auto pshufbHits = scanner.ScanSection("66 0F 38 00 ?? ?? ?? ?? ??", ".text");
-    std::printf("[autodisc-uobj] PSHUFB rip-rel hits: %zu\n", pshufbHits.size());
+    auto pshufbHits = ScanCodeSections(scanner, "66 0F 38 00 ?? ?? ?? ?? ??");
+    std::printf("[autodisc-uobj] PSHUFB rip-rel hits (.text+dnv): %zu\n", pshufbHits.size());
 
     struct PairInfo {
         int      count    = 0;
@@ -2740,32 +2858,40 @@ inline FFieldClassNameParams DiscoverFFieldClassNameDecrypt(
 {
     FFieldClassNameParams out;
 
-    // Sig: `psrld xmm1, 0x19; pslld xmm0, 7; por xmm0, xmm1; pshuflw xmm0, xmm0, 0x1B`
-    // 19 bytes. Verified 33 inlined sites on CL-1177146.
+    // Sig: `psrld xmm1, ??; pslld xmm0, ??; por xmm0, xmm1; pshuflw xmm0, xmm0, 0x1B`
+    // 19 bytes. ROL parameters are wildcarded since they drift per patch
+    // (CL-1177146: ROL32(7) → PSRLD 0x19/PSLLD 0x07,
+    //  CL-120xxxx: ROL32(23) → PSRLD 0x09/PSLLD 0x17).
     //
     // Layout BEFORE this signature in each site (exactly 17 bytes preceding):
     //   `66 0F 6F XX disp8`               (5)  movdqa xmm0, [reg+disp8]   ← name slot load
     //   `66 0F EF 05 disp32`              (8)  pxor   xmm0, [rip+disp32]  ← XOR const
     //   `66 0F 6F C8`                     (4)  movdqa xmm1, xmm0
     static constexpr const char* kSig =
-        "66 0F 72 D1 19 66 0F 72 F0 07 66 0F EB C1 F2 0F 70 C0 1B";
-    auto hits = scanner.ScanSection(kSig, ".text");
-    std::printf("[autodisc-fcname] FFieldClass decode pipeline sig hits: %zu\n", hits.size());
+        "66 0F 72 D1 ?? 66 0F 72 F0 ?? 66 0F EB C1 F2 0F 70 C0 1B";
+    auto hits = ScanCodeSections(scanner, kSig);
+    std::printf("[autodisc-fcname] FFieldClass decode pipeline sig hits (.text+dnv): %zu\n", hits.size());
     if (hits.empty()) return out;
 
     // Histograms across all hits.
     std::unordered_map<uint64_t, int> xorRvaCounts;
     std::unordered_map<uint32_t, int> nameOffCounts;
+    std::unordered_map<uint8_t, int>  rol32Counts;
     int validatedSites = 0;
 
     for (uint64_t hitRva : hits) {
         const uint8_t* p = scanner.GetLocalPtr(hitRva);
         if (!p) continue;
 
+        // Extract ROL32 amount from matched bytes: PSLLD imm8 is at offset 9.
+        uint8_t Rol32Imm = p[9];
+        uint8_t Psrld    = p[4];
+        if (Rol32Imm + Psrld != 32) continue;
+
         // Walk back exactly 12 bytes — that's where PXOR + MOVDQA sit:
         //   hit - 12: 66 0F EF 05 disp32  (PXOR rip-rel, 8 bytes total)
         //   hit -  4: 66 0F 6F C8         (MOVDQA xmm1, xmm0, 4 bytes)
-        //   hit:      66 0F 72 D1 19 ...  (sig start)
+        //   hit:      66 0F 72 D1 ?? ...  (sig start)
         // PXOR opcode `66 0F EF 05`, then disp32. Validate prefix.
         const uint8_t* pxor = p - 12;
         if (pxor[0] != 0x66 || pxor[1] != 0x0F || pxor[2] != 0xEF || pxor[3] != 0x05) continue;
@@ -2789,6 +2915,7 @@ inline FFieldClassNameParams DiscoverFFieldClassNameDecrypt(
         ++validatedSites;
         ++xorRvaCounts[xorRva];
         ++nameOffCounts[namePrivateOff];
+        ++rol32Counts[Rol32Imm];
     }
 
     if (validatedSites < 3) {
@@ -2808,6 +2935,7 @@ inline FFieldClassNameParams DiscoverFFieldClassNameDecrypt(
     };
     auto [bestXor, xorHits]      = pick_mode(xorRvaCounts);
     auto [bestNameOff, nameHits] = pick_mode(nameOffCounts);
+    auto [bestRol32, rolHits]    = pick_mode(rol32Counts);
 
     out.XorConstRva       = bestXor;
     out.NamePrivateOffset = bestNameOff;
@@ -2825,14 +2953,14 @@ inline FFieldClassNameParams DiscoverFFieldClassNameDecrypt(
     }
 
     out.PshuflwImm  = 0x1B;
-    out.Rol32Amount = 7;
+    out.Rol32Amount = bestRol32;
     out.Rol64Amount = 32;
     out.Valid       = true;
 
     std::printf("[autodisc-fcname] consensus across %d sites: xor_rva=0x%llX (lo64=0x%016llX, %d×) "
-                "name_off=+0x%X (%d×)\n",
+                "name_off=+0x%X (%d×) rol32=%d (%d×)\n",
         validatedSites, (unsigned long long)bestXor, (unsigned long long)out.XorLo64,
-        xorHits, out.NamePrivateOffset, nameHits);
+        xorHits, out.NamePrivateOffset, nameHits, bestRol32, rolHits);
     return out;
 }
 
@@ -3335,6 +3463,8 @@ struct FFieldNameDecryptMasks {
     uint64_t Key1Rva    = 0;
     uint64_t Key2Rva    = 0;
     bool     Valid      = false;
+    bool     TwoShuffle = false;
+    uint8_t  ShufImm2   = 0;
 };
 
 inline FFieldNameDecryptMasks DiscoverFFieldNameMasks(
