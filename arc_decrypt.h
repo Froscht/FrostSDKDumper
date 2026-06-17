@@ -908,6 +908,8 @@ namespace v20260616 {
     constexpr uint64_t RVA_GNAMEPOOL               = 0xE376A80ULL;
     constexpr uint64_t RVA_GNAMEPOOL_INIT_GUARD    = 0xE376A78ULL;
     constexpr uint64_t RVA_GWORLD                  = 0xE83FC58ULL;
+    constexpr uint64_t RVA_KEYSTREAM               = 0xE2B57F4ULL;
+    constexpr int      KEYSTREAM_DECRYPT_BASE      = 96;
 
     constexpr uint64_t RVA_UOBJ_SLOT_SHUF         = 0xBB59ED0ULL;
     constexpr uint64_t RVA_UOBJ_SLOT_XOR          = 0xBB59EE0ULL;
@@ -935,10 +937,8 @@ namespace v20260616 {
     constexpr int      FNV_ROL2             = 32;
 
     constexpr uint32_t SHARD_HASH_ADD       = 0xD4CEBC36u;
-    constexpr int      SHARD_HASH_ROL_A     = 27;
-    constexpr int      SHARD_HASH_ROL_B     = 18;
-    constexpr uint64_t SHARD_HASH_SEED_OFF  = 16ULL;
-    constexpr uint64_t SHARD_BLOCK_BASE_OFF = 32ULL;
+    constexpr uint64_t SHARD_HASH_SEED_OFF  = 3152ULL;
+    constexpr uint64_t SHARD_BLOCK_BASE_OFF = 3168ULL;
 
     constexpr uint64_t ENTRY_XOR            = 0xE5C864C1A6B54C7FULL;
     constexpr int      ENTRY_ROL64          = 39;
@@ -948,6 +948,10 @@ namespace v20260616 {
     };
     constexpr uint8_t  ENTRY_XOR_MASK[16] = {
         0xFC, 0x10, 0xD3, 0xFB, 0xCE, 0x56, 0x88, 0x68,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    constexpr uint8_t  ENTRY_BLEND_XOR[16] = {
+        0xCE, 0xFB, 0xFC, 0xD3, 0x56, 0x68, 0x10, 0x88,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
 
@@ -963,14 +967,12 @@ namespace v20260616 {
     constexpr uint8_t  FCLASS_NAME_SHUF_DEC = 0x39;
     constexpr int      FCLASS_NAME_ROR32    = 9;
 
-    constexpr uint16_t HDR_LENGTH_LO_MASK   = 0x003F;
-    constexpr uint16_t HDR_LENGTH_HI_MASK   = 0x03C0;
-    constexpr int      HDR_LENGTH_HI_SHIFT  = 1;
-    constexpr uint16_t HDR_IS_WIDE_BIT      = 0x0040;
-
-    constexpr int8_t   KEY_INIT_BIAS_NARROW = -93;
-    constexpr int16_t  KEY_INIT_BIAS_WIDE   = -93;
-    constexpr int      KEY_TABLE_SIZE       = 64;
+    constexpr uint16_t HDR_IS_WIDE_BIT      = 0x0020;
+    constexpr int8_t   KEY_INIT_BIAS_NARROW = -76;
+    constexpr int      KEY_PAIR_STEP        = -36;
+    constexpr int      KEY_PAIR_OFFSET      = 46;
+    constexpr int16_t  KEY_INIT_BIAS_WIDE   = 21172;
+    constexpr int      KEY_PAIR_STEP_WIDE   = 2012;
     constexpr uint8_t  KEY_INDEX_MASK       = 0x3F;
 } // namespace v20260616
 

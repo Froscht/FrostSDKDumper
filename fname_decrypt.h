@@ -175,6 +175,21 @@ public:
             std::printf("[fname] Pipeline upgraded CL1177146 → Build20260519 (UObjSlot auto-disc valid)\n");
         }
 
+        if (AutoDiscovery::g_DiscoveredUObjSlot.Valid) {
+            namespace V616 = ArcDecrypt::v20260616;
+            uint16_t KsRaw[160] = {};
+            if (m_reader.Read(m_base + V616::RVA_KEYSTREAM, KsRaw, sizeof(KsRaw))) {
+                std::memcpy(m_keyTable616, KsRaw, sizeof(KsRaw));
+                m_ks616Loaded = true;
+                std::printf("[fname] v616 keystream loaded @ 0x%llX (160 entries, base=%d)\n",
+                    (unsigned long long)(m_base + V616::RVA_KEYSTREAM),
+                    V616::KEYSTREAM_DECRYPT_BASE);
+            } else {
+                std::printf("[-] v616 keystream read failed @ 0x%llX\n",
+                    (unsigned long long)(m_base + V616::RVA_KEYSTREAM));
+            }
+        }
+
         m_keyLoaded = true;
         return true;
     }
@@ -1187,9 +1202,10 @@ public:
         uint16_t NameOff  = static_cast<uint16_t>(Ci & 0xFFFFu);
         uint32_t ChunkOff = (Ci >> 8) & 0xFFFF00u;
 
-        uint64_t GnpRva = ArcDecrypt::RVA_GNAMES_BASE
-                         ? ArcDecrypt::RVA_GNAMES_BASE
-                         : ArcDecrypt::v20260519::RVA_GNAMEPOOL;
+        uint64_t GnpRva = Is616 ? ArcDecrypt::v20260616::RVA_GNAMEPOOL
+                         : (ArcDecrypt::RVA_GNAMES_BASE
+                            ? ArcDecrypt::RVA_GNAMES_BASE
+                            : ArcDecrypt::v20260519::RVA_GNAMEPOOL);
         uint64_t ChunkAddr = m_base + GnpRva + ChunkOff;
 
         uint8_t Bidx1, Bidx2;
@@ -1197,20 +1213,19 @@ public:
 
         if (Is616) {
             namespace V616 = ArcDecrypt::v20260616;
-            uint64_t HashAddr = ChunkAddr + V616::SHARD_HASH_SEED_OFF;
-            uint32_t HLo = static_cast<uint32_t>(HashAddr);
-            uint32_t HHi = static_cast<uint32_t>(HashAddr >> 32);
+            uint64_t SeedAddr = ChunkAddr + V616::SHARD_HASH_SEED_OFF;
+            uint32_t SeedLo = static_cast<uint32_t>(SeedAddr);
+            uint32_t SeedHi = static_cast<uint32_t>(SeedAddr >> 32);
+            uint64_t V8 = (16ULL << 32) | SeedLo;
+            uint32_t H = V616::HASH_PRIME * static_cast<uint32_t>(V8 >> 5) + V616::SHARD_HASH_ADD;
+            H = fn_rotl32(H, 18);
+            H = V616::HASH_PRIME * H + SeedHi + V616::SHARD_HASH_ADD;
+            H = fn_rotl32(H, 27);
+            H = V616::HASH_PRIME * H + V616::SHARD_HASH_ADD;
+            uint32_t V9 = fn_rotl32(H, 18);
 
-            uint32_t S1 = fn_rotl32(HLo, V616::SHARD_HASH_ROL_A);
-            uint32_t S2 = V616::HASH_PRIME * S1 + V616::SHARD_HASH_ADD;
-            uint32_t S3 = fn_rotl32(S2, V616::SHARD_HASH_ROL_B);
-            uint32_t S4 = V616::HASH_PRIME * S3 + HHi + V616::SHARD_HASH_ADD;
-            uint32_t S5 = fn_rotl32(S4, V616::SHARD_HASH_ROL_A);
-            uint32_t S6 = V616::HASH_PRIME * S5 + V616::SHARD_HASH_ADD;
-            uint32_t V20 = fn_rotl32(S6, V616::SHARD_HASH_ROL_B);
-
-            uint8_t Pa = static_cast<uint8_t>(static_cast<int8_t>(-109) * static_cast<int>(V20) + 54);
-            uint8_t Pb = static_cast<uint8_t>((V616::HASH_PRIME * V20 + V616::SHARD_HASH_ADD) >> 16);
+            uint8_t Pa = static_cast<uint8_t>(static_cast<int8_t>(-109) * static_cast<int>(V9) + 54);
+            uint8_t Pb = static_cast<uint8_t>((V616::HASH_PRIME * V9 + V616::SHARD_HASH_ADD) >> 16);
             uint8_t V10 = Pa ^ Pb;
             Bidx1 = V10 & 7u;
             Bidx2 = (V10 + 1u) & 7u;
@@ -1239,22 +1254,33 @@ public:
         if (!m_reader.Read(BlockBase + 32ULL * Bidx1, Sb1, 16)) return 0;
         if (!m_reader.Read(BlockBase + 32ULL * Bidx2, Sb2, 16)) return 0;
 
-        auto DecBlock = [&](const uint8_t* Raw) -> uint64_t {
+        auto DecBlock616 = [&](const uint8_t* Raw, bool IsSecond) -> uint64_t {
+            namespace V616 = ArcDecrypt::v20260616;
             __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Raw));
-            if (Is616) {
-                namespace V616 = ArcDecrypt::v20260616;
-                V = _mm_or_si128(_mm_slli_epi64(V, V616::ENTRY_ROL64),
-                                 _mm_srli_epi64(V, 64 - V616::ENTRY_ROL64));
-                alignas(16) uint8_t Mask[16], Xk[16];
-                std::memcpy(Mask, V616::ENTRY_PSHUFB_MASK, 16);
-                std::memcpy(Xk,   V616::ENTRY_XOR_MASK,    16);
+            V = _mm_or_si128(_mm_slli_epi64(V, V616::ENTRY_ROL64),
+                             _mm_srli_epi64(V, 64 - V616::ENTRY_ROL64));
+            alignas(16) uint8_t Mask[16];
+            std::memcpy(Mask, V616::ENTRY_PSHUFB_MASK, 16);
+            if (IsSecond) {
+                alignas(16) uint8_t Bx[16];
+                std::memcpy(Bx, V616::ENTRY_BLEND_XOR, 16);
+                V = _mm_xor_si128(V, _mm_load_si128(reinterpret_cast<const __m128i*>(Bx)));
                 V = _mm_shuffle_epi8(V, _mm_load_si128(reinterpret_cast<const __m128i*>(Mask)));
-                V = _mm_xor_si128(V, _mm_load_si128(reinterpret_cast<const __m128i*>(Xk)));
                 uint64_t Lo;
                 _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
                 return Lo ^ V616::ENTRY_XOR;
             }
+            alignas(16) uint8_t Xk[16];
+            std::memcpy(Xk, V616::ENTRY_XOR_MASK, 16);
+            V = _mm_shuffle_epi8(V, _mm_load_si128(reinterpret_cast<const __m128i*>(Mask)));
+            V = _mm_xor_si128(V, _mm_load_si128(reinterpret_cast<const __m128i*>(Xk)));
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+            return Lo ^ V616::ENTRY_XOR;
+        };
+        auto DecBlock519 = [&](const uint8_t* Raw) -> uint64_t {
             using namespace ArcDecrypt::v20260519;
+            __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Raw));
             V = _mm_shufflelo_epi16(V, BLOCK_SHUF_A);
             V = _mm_or_si128(_mm_slli_epi64(V, BLOCK_ROL),
                              _mm_srli_epi64(V, 64 - BLOCK_ROL));
@@ -1263,8 +1289,14 @@ public:
             _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
             return Lo;
         };
-        uint64_t Block1 = DecBlock(Sb1);
-        uint64_t Block2 = DecBlock(Sb2);
+        uint64_t Block1, Block2;
+        if (Is616) {
+            Block1 = DecBlock616(Sb1, false);
+            Block2 = DecBlock616(Sb2, true);
+        } else {
+            Block1 = DecBlock519(Sb1);
+            Block2 = DecBlock519(Sb2);
+        }
 
         uint64_t Fv1, Fv2;
         if (Is616) {
@@ -1329,7 +1361,9 @@ public:
     std::string DecryptNameString(uint64_t NameEntryPtr) {
         if (!NameEntryPtr || !m_keyLoaded) return {};
 
-        // ── Dispatch on active pipeline ──
+        if (m_ks616Loaded) {
+            return DecryptNameString_CL1233465(NameEntryPtr);
+        }
         if (m_pipeline == Pipeline::Build20260519) {
             return DecryptNameString_Build20260519(NameEntryPtr);
         }
@@ -1411,6 +1445,74 @@ public:
 
             for (int I = 0; I < Length; ++I) {
                 Wides[I] ^= m_keyTable[(KeyStart + I) & KEY_INDEX_MASK];
+            }
+
+            std::string Out;
+            Out.reserve(Length);
+            for (int J = 0; J < Length; ++J) {
+                if (!Wides[J]) break;
+                Out.push_back(static_cast<char>(Wides[J] & 0xFFu));
+            }
+            return Out;
+        }
+    }
+
+    std::string DecryptNameString_CL1233465(uint64_t NameEntryPtr) {
+        namespace V616 = ArcDecrypt::v20260616;
+        if (!m_ks616Loaded) return DecryptNameString_Build20260519(NameEntryPtr);
+
+        uint16_t Header = 0;
+        if (!m_reader.Read(NameEntryPtr, &Header, 2) || !Header) return {};
+
+        int Length = static_cast<int>((Header >> 14) | ((Header >> 4) & 0x3FC));
+        bool IsWide = (Header & V616::HDR_IS_WIDE_BIT) != 0;
+        if (Length <= 0 || Length > 1023) return {};
+
+        if (!IsWide) {
+            std::vector<uint8_t> Buf(Length, 0);
+            if (!m_reader.Read(NameEntryPtr + 2, Buf.data(), Length)) return {};
+
+            uint8_t KeyLo = static_cast<uint8_t>((Length + V616::KEY_INIT_BIAS_NARROW) & 0xFF);
+            uint8_t Kv = static_cast<uint8_t>((KeyLo + V616::KEY_PAIR_OFFSET) & 0xFF);
+            int I = 0;
+            while (I + 1 < Length) {
+                int K1i = ((Kv - V616::KEY_PAIR_OFFSET) & V616::KEY_INDEX_MASK) + V616::KEYSTREAM_DECRYPT_BASE;
+                int K2i = (Kv & V616::KEY_INDEX_MASK) + V616::KEYSTREAM_DECRYPT_BASE;
+                Buf[I]     ^= static_cast<uint8_t>(m_keyTable616[K1i] >> 3);
+                Buf[I + 1] ^= static_cast<uint8_t>(m_keyTable616[K2i] >> 3);
+                I += 2;
+                Kv = static_cast<uint8_t>((Kv + V616::KEY_PAIR_STEP) & 0xFF);
+            }
+            if ((Length & 1) && I < Length) {
+                int Ki = ((Kv - V616::KEY_PAIR_OFFSET) & V616::KEY_INDEX_MASK) + V616::KEYSTREAM_DECRYPT_BASE;
+                Buf[I] ^= static_cast<uint8_t>(m_keyTable616[Ki] >> 3);
+            }
+
+            std::string Out;
+            Out.reserve(Length);
+            for (int J = 0; J < Length; ++J) {
+                if (!Buf[J]) break;
+                Out.push_back(static_cast<char>(Buf[J]));
+            }
+            return Out;
+        } else {
+            std::vector<uint16_t> Wides(Length, 0);
+            if (!m_reader.Read(NameEntryPtr + 2, Wides.data(),
+                               static_cast<size_t>(Length) * sizeof(uint16_t))) return {};
+
+            uint16_t Key = static_cast<uint16_t>((Length + V616::KEY_INIT_BIAS_WIDE) & 0xFFFF);
+            int I = 0;
+            while (I + 1 < Length) {
+                int K1i = (Key & V616::KEY_INDEX_MASK) + V616::KEYSTREAM_DECRYPT_BASE;
+                int K2i = ((Key + V616::KEY_PAIR_OFFSET) & V616::KEY_INDEX_MASK) + V616::KEYSTREAM_DECRYPT_BASE;
+                Wides[I]     ^= m_keyTable616[K1i];
+                Wides[I + 1] ^= m_keyTable616[K2i];
+                I += 2;
+                Key = static_cast<uint16_t>((Key + V616::KEY_PAIR_STEP_WIDE) & 0xFFFF);
+            }
+            if ((Length & 1) && I < Length) {
+                int Ki = (Key & V616::KEY_INDEX_MASK) + V616::KEYSTREAM_DECRYPT_BASE;
+                Wides[I] ^= m_keyTable616[Ki];
             }
 
             std::string Out;
@@ -1877,6 +1979,8 @@ private:
     IMemoryReader& m_reader;
     bool           m_keyLoaded;
     uint16_t       m_keyTable[256];
+    uint16_t       m_keyTable616[160];
+    bool           m_ks616Loaded = false;
     EmuFallback    m_emuFallback;
     std::unordered_map<int32_t, std::string> m_emuCache;
     bool           m_emuPrimary = false;       // see SetEmuPrimary()

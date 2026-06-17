@@ -187,10 +187,10 @@ namespace gobjects
         bool Init() {
             if (m_initialized) return true;
 
-            // ── CL-1201801 path (preferred) ──────────────────────────────
-            // RVA_GOBJECT_ARRAY_BASE is a pointer variable; FCA heap ptr is
-            // encrypted at module+0xE3B6270. Decrypts via ROL32(26)+PSHUFB+ROL16(4).
-            // NumElements at FCA+0x30; chunks_array via vtable[8] Vt2Interpret.
+            if (InitDirect_CL1233465()) {
+                return true;
+            }
+
             if (InitPatch20260519()) {
                 return true;
             }
@@ -1735,6 +1735,130 @@ namespace gobjects
             return 0;
         }
 
+        bool InitDirect_CL1233465() {
+            if (!AutoDiscovery::g_DiscoveredUObjSlot.Valid) return false;
+
+            uint64_t GobjBase = m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE;
+            uint8_t Sb[0x200] = {};
+            if (!m_reader.Read(GobjBase, Sb, sizeof(Sb))) return false;
+
+            uint32_t NumEl = 0;
+            uint32_t NumElOff = 0;
+            for (uint32_t Off = 0x20; Off + 4 <= sizeof(Sb); Off += 4) {
+                uint32_t V = 0;
+                std::memcpy(&V, Sb + Off, 4);
+                if (V >= 10000 && V <= 2'000'000 && V > NumEl) {
+                    NumEl = V;
+                    NumElOff = Off;
+                }
+            }
+            if (!NumEl) return false;
+
+            int NumChunks = (NumEl + 0xFFFF) / 0x10000;
+            int ProbeN = std::min(NumChunks, 4);
+            if (ProbeN < 2) ProbeN = 2;
+
+            constexpr uint32_t kStrides[] = { 20, 24, 32, 16, 8 };
+
+            auto IsHeap = [](uint64_t P) { return P > 0x10000ULL && P < 0x800000000000ULL; };
+            auto IsMod = [&](uint64_t P) { return P >= m_base && P < m_base + 0x10000000ULL; };
+
+            auto TryAsChunks = [&](uint64_t Arr, uint32_t Stride) -> int {
+                if (!IsHeap(Arr) || IsMod(Arr)) return 0;
+                int Valid = 0;
+                for (int I = 0; I < ProbeN; ++I) {
+                    uint64_t ChunkPtr = 0;
+                    if (!m_reader.Read(Arr + (uint64_t)I * 8, &ChunkPtr, 8)) break;
+                    if (!IsHeap(ChunkPtr) || IsMod(ChunkPtr)) break;
+                    uint64_t Obj = 0;
+                    if (!m_reader.Read(ChunkPtr, &Obj, 8)) break;
+                    if (!IsHeap(Obj)) break;
+                    uint64_t Vt = 0;
+                    if (!m_reader.Read(Obj, &Vt, 8)) break;
+                    if (!IsMod(Vt)) break;
+                    ++Valid;
+                }
+                return Valid;
+            };
+
+            uint64_t BestArr = 0;
+            uint32_t BestStride = 20;
+            int BestValid = 0;
+
+            for (uint32_t Off = 0; Off + 8 <= sizeof(Sb); Off += 8) {
+                uint64_t Ptr = 0;
+                std::memcpy(&Ptr, Sb + Off, 8);
+                if (!IsHeap(Ptr) || IsMod(Ptr)) continue;
+
+                for (uint32_t S : kStrides) {
+                    int V = TryAsChunks(Ptr, S);
+                    if (V > BestValid) {
+                        BestValid = V;
+                        BestArr = Ptr;
+                        BestStride = S;
+                    }
+                }
+
+                uint8_t Sub[0x100] = {};
+                if (!m_reader.Read(Ptr, Sub, sizeof(Sub))) continue;
+                for (uint32_t SubOff = 0; SubOff + 8 <= sizeof(Sub); SubOff += 8) {
+                    uint64_t SubPtr = 0;
+                    std::memcpy(&SubPtr, Sub + SubOff, 8);
+                    if (!IsHeap(SubPtr) || IsMod(SubPtr)) continue;
+                    for (uint32_t S : kStrides) {
+                        int V = TryAsChunks(SubPtr, S);
+                        if (V > BestValid) {
+                            BestValid = V;
+                            BestArr = SubPtr;
+                            BestStride = S;
+                        }
+                    }
+                }
+            }
+
+            if (BestValid < 2) {
+                std::printf("[cl1233465] NumElements=%u @ +0x%X but no chunk array found (best=%d)\n",
+                    NumEl, NumElOff, BestValid);
+                return false;
+            }
+
+            std::printf("[cl1233465] GUObjectArray: NumElements=%u @ +0x%X, chunks=0x%llX stride=%u (%d/%d valid)\n",
+                NumEl, NumElOff, (unsigned long long)BestArr, BestStride, BestValid, ProbeN);
+
+            m_numElements = NumEl;
+            m_itemStride = BestStride;
+            m_chunkPtr = BestArr;
+
+            std::vector<uint64_t> Objects;
+            Objects.reserve(NumEl);
+            for (int C = 0; C < NumChunks; ++C) {
+                uint64_t ChunkPtr = 0;
+                if (!m_reader.Read(BestArr + (uint64_t)C * 8, &ChunkPtr, 8) || !ChunkPtr) continue;
+                uint32_t ItemsThisChunk = (C == NumChunks - 1)
+                    ? (NumEl - (uint32_t)C * 65536)
+                    : 65536;
+                size_t ChunkSz = (size_t)ItemsThisChunk * BestStride;
+                std::vector<uint8_t> ChunkBuf(ChunkSz, 0);
+                if (!m_reader.Read(ChunkPtr, ChunkBuf.data(), ChunkSz)) continue;
+                for (uint32_t I = 0; I < ItemsThisChunk; ++I) {
+                    uint64_t Obj = 0;
+                    std::memcpy(&Obj, ChunkBuf.data() + (size_t)I * BestStride, 8);
+                    if (Obj > 0x10000ULL && Obj < 0x800000000000ULL) {
+                        Objects.push_back(Obj);
+                    }
+                }
+            }
+
+            std::printf("[cl1233465] collected %zu UObjects from %d chunks\n",
+                Objects.size(), NumChunks);
+            if (Objects.size() < 1000) return false;
+
+            m_worldFallbackObjects = std::move(Objects);
+            m_useWorldFallback = true;
+            m_initialized = true;
+            return true;
+        }
+
         // ─────────────────────────────────────────────────────────────────
         // InitPatch20260519 — CL-1201801 (ARC Steam patch 2026-05-21)
         // RVA_GOBJECT_ARRAY_BASE (0xE4F8F60) is now a POINTER VARIABLE holding
@@ -2373,20 +2497,48 @@ namespace gobjects
                 return p >= vt_lo && p < vt_hi;
             };
 
-            // Resolve heap map from /proc; fall back to a wide numeric sweep.
-            std::vector<Region> ranges;
-            EnumerateRwHeapRegions(0x100000ULL, ~0ULL, ranges);
-            if (ranges.empty()) {
-                ranges.push_back({0x10000000ULL,  0x80000000ULL});
-                ranges.push_back({0x100000000ULL, 0x400000000ULL});
+            std::vector<Region> AllRanges;
+            EnumerateRwHeapRegions(0x100000ULL, ~0ULL, AllRanges);
+            if (AllRanges.empty()) {
+                AllRanges.push_back({0x10000000ULL,  0x80000000ULL});
+                AllRanges.push_back({0x100000000ULL, 0x400000000ULL});
+            }
+            {
+                uint64_t TotalSz = 0;
+                for (const auto& R : AllRanges) TotalSz += R.hi - R.lo;
+                std::printf("[scan] %zu rw regions total, %.2f GB\n",
+                    AllRanges.size(), (double)TotalSz / (1024.0*1024*1024));
             }
 
-            // 4MB scan window: 64× fewer process_vm_readv calls for the
-            // bulk page reads vs the old 64KB window. The per-slot vtable
-            // check inside the inner loop stays — dropping it for speed
-            // collapsed counts (Pass A's MAX_GAP=0 splits real chunks at
-            // null slots; without vtable filtering, runs are formed on
-            // noise heap-pointer arrays instead of real FUObjectItem chunks).
+            std::vector<Region> ranges;
+            ranges.reserve(AllRanges.size());
+            uint8_t Probe[160] = {};
+            for (const auto& R : AllRanges) {
+                uint64_t Sz = R.hi - R.lo;
+                if (Sz > 0x10000000ULL) continue;
+
+                bool Promising = false;
+                uint64_t SamplePoints[] = { R.lo, R.lo + Sz / 2, R.hi - 160 };
+                for (uint64_t Sp : SamplePoints) {
+                    if (Sp < R.lo || Sp + 160 > R.hi) continue;
+                    if (!m_reader.Read(Sp, Probe, 160)) continue;
+                    int Hits = 0;
+                    for (int I = 0; I + (int)STRIDE <= 160; I += STRIDE) {
+                        uint64_t V = 0;
+                        std::memcpy(&V, Probe + I, 8);
+                        if (is_heap(V)) ++Hits;
+                    }
+                    if (Hits >= 4) { Promising = true; break; }
+                }
+                if (Promising) ranges.push_back(R);
+            }
+            {
+                uint64_t FilteredSz = 0;
+                for (const auto& R : ranges) FilteredSz += R.hi - R.lo;
+                std::printf("[scan] after sampling filter: %zu regions, %.2f GB\n",
+                    ranges.size(), (double)FilteredSz / (1024.0*1024*1024));
+            }
+
             const uint64_t WIN = 0x400000ULL;
             std::vector<uint8_t> buf(WIN);
             uint64_t cur_start = 0;
@@ -2427,9 +2579,9 @@ namespace gobjects
                             ok = m_reader.Read(obj_ptr, &vt, 8) && is_vtable(vt);
                         }
                         if (!ok) {
-                            if (cur_count == 0) continue;   // not in a run
+                            if (cur_count == 0) continue;
                             if (++cur_gap > MAX_GAP) { flush(); }
-                            else { cur_count++; }            // count the null slot in the run
+                            else { cur_count++; }
                             continue;
                         }
                         cur_gap = 0;

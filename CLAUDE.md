@@ -3,12 +3,14 @@
 ## Project Overview
 External SDK dumper for ARC Raiders (Unreal Engine 5, Theia-obfuscated). Reads game memory via `/dev/memreader` kernel module (or `process_vm_readv` fallback). Outputs `SDK_Output.txt` + per-class `.hpp` files. Runs on Linux against Wine-hosted game process.
 
-Build: `g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 -o FrostDumper main.cpp build/Zydis.o -lcapstone -lunicorn -lm`
+Build: `g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 -I KernelDriver/include -o FrostDumper main.cpp build/Zydis.o -lcapstone -lunicorn -lm`
 Run: `sudo ./build_and_run.sh [PID]`
 
-## Current Patch: CL-1233465 (2026-06-17)
-Last verified: 0% FProperty_Unknown, 216718 properties (196312 named, 90.6%), 35468 classes, 4386 structs, 247 enums, 29261 functions.
+## Current Patch: CL-1233465 (2026-06-18)
+Last verified: 0% FProperty_Unknown, 283196 properties (281963 named, 99.56%), 9138 classes, 36028 structs, 2894 enums, 34765 functions.
+131986 UObjects (131732 named, 99.81%). GObj init via autoemu Tier 1 (chunks_manager vt[5]).
 Game in main menu (reduced object count vs in-match). Config-loading from decrypt_export.json skips 6+ discovery phases.
+Static FName pipeline (v616) fully operational — eliminates EMU dependency for CL-1233465.
 
 ### CL-1233465 Theia Limitations
 - UScriptStruct::ChildProperties stripped → struct field listings impossible
@@ -68,19 +70,28 @@ Previous patch (CL-1201801): 99.85% naming, ~298K properties, 33200 classes, 111
 - FField NamePrivate SIMD pipeline (KEY1/KEY2/SHUF/ROL values)
 - GUObjectArray NumElements offset (+0x30 or +0xFC depending on patch)
 
-## Key Constants (CL-1201801 / v20260519)
+## Key Constants (CL-1233465 / v20260616)
 
 ### Globals (RVAs)
 | Name | RVA | Purpose |
 |------|-----|---------|
+| GNamePool | 0xE376A80 | FName string pool base |
+| GNamePool init guard | 0xE376A78 | 1-byte init flag |
+| Keystream table | 0xE2B57F4 | FName entry keystream (160 uint16_t entries, decrypt base +96) |
+| UObj slot PSHUFB mask | 0xBB59ED0 | PSHUFB mask for slot decrypt |
+| UObj slot XOR key | 0xBB59EE0 | XOR key for slot decrypt |
+| GUObjectArray | 0xE632260 | Object array base struct |
+| GWorld | 0xE83FC58 | Current UWorld pointer |
+
+### CL-1201801 Globals (previous patch, for reference)
+| Name | RVA | Purpose |
+|------|-----|---------|
 | GNamePool | 0xE0FAA80 | FName string pool base |
-| GNamePool init guard | 0xE0FAA78 | 1-byte init flag |
 | SIMD constants block | 0xE0397F4 | FName decrypt SIMD tables |
 | Keystream table | 0xE03989C | FName entry keystream (SIMD+0xA8) |
-| UObj slot XOR mask (.rdata) | 0xB1F0B90 | PSHUFB mask for slot decrypt |
+| UObj slot XOR mask | 0xB1F0B90 | PSHUFB mask for slot decrypt |
 | GUObjectArray | 0xE4F8F60 | Object array base struct |
 | GWorld | 0xE706C58 | Current UWorld pointer |
-| PropertyType table | GNamePool+0x2540 | 703 FName handles for property types |
 
 ### Decrypt Constants
 | Constant | Value | Used For |
@@ -95,20 +106,53 @@ Previous patch (CL-1201801): 99.85% naming, ~298K properties, 33200 classes, 111
 | FFIELD_CLASS_NAME_KEY | 0x08EA69F63989FC99 | FFieldClass NamePrivate XOR |
 | PropertyOffsetXor | 0xBAB939DB | bswap32(stored ^ key) = real offset |
 
-### UObject Slot Decode Pipeline (CL-1201801)
+### UObject Slot Decode Pipeline (CL-1233465)
 ```
-NAME slot: PSHUFLW(0xB1) → XOR(0xD22BC6399DD7BE75) → ROL64(37)
-CLASS/OUTER: ROL64(5) on direct pointer
-Slot selector (NAME):  ((Lo8 ^ Hi8) & 3) ^ 2
-Slot selector (CLASS):  t & 3
-Slot selector (OUTER):  (((u8)v ^ byte2(v)) + 1) & 3
-Hash: FNV32(prime=0x01000193, add=0x8F957A95), ROLs 17/19/17 + shift13
+PSHUFB(mask@0xBB59ED0) → XOR(0x4632C279BC9DECB2) → ROL64(32)
+Slot selector: FNV32(prime=0x01000193, add=0x5619A446), PSHUFLW(0x1B), ROL32(9)
+  H = ROL32(Lo, 0x1A) * P + ADD
+  H = ROL32(H, 0x1B) * P + Hi + ADD
+  H >>= 6; H = H * P + ADD; H >>= 5; H = H * P + ADD
+  idx = (H ^ (H>>16)) & 3 ^ 2
 Base: obj + 0x20, stride 0x20 (4 slots)
 ```
 
-### FField NamePrivate Decode (CL-1201801)
+### GNamePool Static Resolve Pipeline (CL-1233465, sub_2404F0)
 ```
-XOR(0xC88F612129941481) → ROL32(17) → PSHUFLW(0x1E) → XOR(0x018A6E394CF4AED0) → ROL64(32)
+CI → V5 (identity, 4-step PSHUFLW+XOR cancels algebraically)
+V5 → WordOff = V5 & 0xFFFF, BlockOff = (V5 >> 8) & 0xFFFF00
+ChunkAddr = PoolBase + BlockOff
+
+Shard Hash (FNV32, 3-step):
+  SeedAddr = ChunkAddr + 3152 (0xC50)
+  V8 = (16 << 32) | Lo32(SeedAddr)
+  H = P * (V8 >> 5) + 0xD4CEBC36; H = ROL32(H, 18)
+  H = P * H + Hi32(SeedAddr) + 0xD4CEBC36; H = ROL32(H, 27)
+  H = P * H + 0xD4CEBC36; V9 = ROL32(H, 18)
+  SlotIdx = ((-109*V9+54)&0xFF ^ (P*V9+ADD)>>16&0xFF) & 7
+
+Block Decode (8 encrypted slots at ChunkAddr + 3168):
+  Slot1: ROL64(raw, 39) → PSHUFB(mask) → XOR(0x685688CEFBD310FC)
+  Slot2: ROL64(raw, 39) → XOR(B423800=0x88106856D3FCFBCE) → PSHUFB(mask)
+  (PSHUFB mask = 02 06 03 01 00 04 07 05)
+
+FNV64 Chain:
+  Base = Slot1_dec ^ 0xE5C864C1A6B54C7F
+  Fnv1 = 0x100000001B3 * ROL64(Base, 54) + 0x124CB31365185276
+  Fnv2 = 0x100000001B3 * ROL64(Fnv1, 32) + 0x124CB31365185276
+  EntryPtr = Base + (Fnv2 ^ Slot2_dec ^ 0xE5C864C1A6B54C7F) + 2*WordOff
+
+String Decrypt (sub_234CE0):
+  Header: length = (hdr >> 14) | ((hdr >> 4) & 0x3FC), wide = hdr & 0x20
+  Narrow: paired key schedule, key_init = (length - 76) & 0xFF
+    KV = key + 46; per pair: ks[(KV-46)&0x3F+96]>>3, ks[KV&0x3F+96]>>3; KV -= 36
+  Wide: key_init = (length + 21172) & 0xFFFF; KV += 2012 per pair
+  Keystream: uint16_t[160] at RVA 0xE2B57F4, decrypt entries at index +96
+```
+
+### FField NamePrivate Decode (CL-1233465)
+```
+PSHUFLW(0x1E) → XOR(0x365789E8756FBA38) → ROL16(1) → ROL64(32)
 ```
 
 ### FField/FProperty Layout (CL-1233465)
