@@ -269,6 +269,9 @@ public:
         }
 
         if (HasModuleVtable(Ptr130) && !LooksBool) {
+            if (ElemSize == 1) {
+                return "FByteProperty";
+            }
             if (IsAnyStructVtable(Ptr130))
                 return "FStructProperty";
             if (IsAnyClassVtable(Ptr130))
@@ -278,6 +281,8 @@ public:
             if (IsKnownUObject(Ptr130)) {
                 if (ElemSize == 8)
                     return "FObjectProperty";
+                if (ElemSize <= 2)
+                    return "FByteProperty";
                 return "FStructProperty";
             }
         }
@@ -1363,8 +1368,7 @@ public:
     void ResolveSubPropertyType(uint64_t ff, std::string& type_name) {
         if (type_name == "FStructProperty") {
             uint64_t sp = Read<uint64_t>(ff + ArcDecrypt::Offsets::FStructProperty::Struct);
-            if (sp && sp > 0x10000 && sp < 0x7FFFFFFFFFFFULL &&
-                (!m_addr_to_name || m_addr_to_name->count(sp))) {
+            if (sp && sp > 0x10000 && sp < 0x7FFFFFFFFFFFULL) {
                 m_known_structs.insert(sp);
                 std::string sn = GetNameTheia(sp);
                 if (!sn.empty()) { type_name = sn; m_resolveStructOk++; }
@@ -1382,7 +1386,7 @@ public:
         if (type_name == "FObjectProperty" || type_name == "FWeakObjectProperty" ||
             type_name == "FSoftObjectProperty" || type_name == "FLazyObjectProperty") {
             uint64_t cp = Read<uint64_t>(ff + ArcDecrypt::Offsets::FObjectProperty::PropertyClass);
-            if (cp && (!m_addr_to_name || m_addr_to_name->count(cp))) {
+            if (cp && cp > 0x10000 && cp < 0x7FFFFFFFFFFFULL) {
                 std::string cn = GetNameTheia(cp);
                 if (!cn.empty()) { type_name = cn + "*"; m_resolveObjOk++; }
                 else { m_resolveObjFail++; if (m_unresolvedShadowSample.size() < 200) m_unresolvedShadowSample.insert(cp); }

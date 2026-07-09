@@ -1,0 +1,439 @@
+{
+  "schema": "frostsdk.decrypt-export/v1",
+  "timestamp": "2026-07-09T09:21:10Z",
+  "patch": "CL-1177678",
+  "module": {
+    "base": "0x140000000",
+    "bounds_valid": true,
+    "image_size": "0x117B4000",
+    "text_rva": "0x1000",
+    "text_size": "0xB4B6000",
+    "rdata_rva": "0xB4BD000",
+    "rdata_size": "0x2F20000",
+    "data_rva": "0xE3DD000",
+    "data_size": "0x791000"
+  },
+  "anchors": {
+    "rva_gworld": "0xE83FC58",
+    "rva_gnames_base": "0xE3E27F4",
+    "rva_fname_key_table": "0xE03989C",
+    "rva_gobject_array_base": "0xE75F150",
+    "rva_simd_objarray_xor": "0xAD2FC50",
+    "rva_elem_mask_a": "0xAD8EE10",
+    "rva_elem_mask_b": "0xAD8EE20",
+    "rva_elem_xor_key": "0xAD8EE30",
+    "rva_cidx_xor1": "0xAD30540"
+  },
+  "offsets": {
+    "ustruct": {
+      "super_struct": "0x98",
+      "children": "0xC8",
+      "child_properties": "0xC8",
+      "properties_size": "0xB8",
+      "min_alignment": "0x94"
+    },
+    "uenum": {
+      "names": "0xB0"
+    },
+    "ufunction": {
+      "vtable": "0x0",
+      "next_ptr": "0x48",
+      "function_flags": "0x128",
+      "native_func": "0x150",
+      "num_parms": "0x12C"
+    },
+    "uclass": {
+      "func_map_pairs_data": "0x218",
+      "func_map_num": "0x220",
+      "func_map_max": "0x224",
+      "func_map_pair_stride": "0x18"
+    },
+    "ffield": {
+      "vtable": "0x0",
+      "class_private": "0x70",
+      "next": "0x60",
+      "owner": "0x58",
+      "name_private": "0x40",
+      "name_encrypted": "0x40",
+      "salt_sentinel": "0x68"
+    },
+    "ffield_class": {
+      "element_size": "0x70"
+    },
+    "fproperty": {
+      "array_dim": "0xC0",
+      "element_size": "0xFC",
+      "offset_internal": "0x94",
+      "offset_xor": "0x57F15E5",
+      "property_flags": "0x80"
+    },
+    "fbool_property": {
+      "field_size": "0xE8",
+      "byte_offset": "0xE9",
+      "byte_mask": "0xEA",
+      "field_mask": "0xEB"
+    },
+    "fproperty_subclass": {
+      "fstruct_property__struct": "0xE8",
+      "fobject_property__property_class": "0xE8",
+      "fenum_property__underlying_prop": "0xE8",
+      "fenum_property__enum": "0xF0",
+      "farray_property__inner": "0xE8",
+      "fset_property__element_prop": "0xE8",
+      "fsoftobject_property__property_class": "0xE8",
+      "fmap_property__key_prop": "0xE8",
+      "fmap_property__value_prop": "0xF0"
+    },
+    "uworld": {
+      "persistent_level": "0xA0",
+      "levels": "0x360"
+    },
+    "uscene_component": {
+      "component_to_world": "0x2E0"
+    }
+  },
+  "patch_constants": {
+    "fname_block": {
+      "fnv_prime": "0x100000001B3",
+      "fnv_offset": "0x2AE2DE663CDF7F3A",
+      "fnv_rol1": 57,
+      "fnv_rol2": 42,
+      "block_pshuflw": 45,
+      "block_rol16": 15,
+      "ptr_xor1": "0x2ECA4D72",
+      "ptr_xor2": "0x20CE00000000",
+      "ptr_xor3": "0x724DEAE000000000",
+      "bhash_add": "0x9583237A",
+      "chunk_block_ptr_off": 216,
+      "ansi_key_base": -25184,
+      "wide_key_base": 40352
+    },
+    "fnv32_slot": {
+      "prime": "0x1000193",
+      "k": "0x866DFAD3",
+      "hash_off": "0x90",
+      "slot_off": "0xA0"
+    },
+    "uobj_slot": {
+      "sentinel": "0xB982F16865A5F21",
+      "rol64": 45,
+      "pshuflw_imm": 30,
+      "fname_rol": 32
+    },
+    "objarray": {
+      "rol32": 20,
+      "rol16": 12
+    },
+    "cidx": {
+      "rol16": 14,
+      "pshuflw_imm": 147,
+      "hdr_xor": "0xA48BA45",
+      "hdr_rol": 30
+    },
+    "uprop": {
+      "fname_offset": "0x50",
+      "fname_xor_key": "0x19AE9873B7A3AC48"
+    },
+    "patch20260421": {
+      "entry_handle_xor": "0x7924197900000000",
+      "entry_field_xor": "0x1C4B859",
+      "rva_gnames_base_new": "0xDB5BE80",
+      "g_property_offset_xor": "0x57F15E5",
+      "uobj_slot_20260428": {
+        "xor_scalar": "0x5EA772D07F910744"
+      }
+    }
+  },
+  "autodiscovery": {
+    "vtables": {
+      "valid": true,
+      "script_struct_rva": "0xB521150",
+      "class_native_rva": "0xB51FE50",
+      "function_rva": "0xB521F60",
+      "enum_rva": "0xBF8DE60",
+      "package_rva": "0xB53F9C0",
+      "bpgc_rva": "0xBCE4710",
+      "wbpgc_rva": "0xBC77CB0",
+      "smbpgc_rva": "0xB5415C0",
+      "anim_bpgc_rva": "0x0",
+      "asclass_rva": "0xC092A50",
+      "asstruct_rva": "0xB4E47B0",
+      "asfunction_rvas": []
+    },
+    "world": {
+      "valid": false,
+      "gworld_rva": "0x0",
+      "gworld_abs": "0x0",
+      "persistent_level_abs": "0x0",
+      "persistent_level_offset": "0x0",
+      "actors_data_offset": "0x0",
+      "actors_count_offset": "0x0",
+      "actors_count": 0,
+      "double_deref": true
+    },
+    "ffield_name_decrypt": {
+      "valid": false,
+      "xor_const": "0x0",
+      "rol32_amount": 13,
+      "rol64_amount": 7
+    },
+    "fproperty_offset_xor": {
+      "valid": true,
+      "offset_reader_rva": "0x452D3D",
+      "offset_internal": "0x94",
+      "xor_key": "0x57F15E5",
+      "validated_hits": 2
+    },
+    "uobj_slot_decrypt": {
+      "valid": false,
+      "shuf_mask_rva": "0x0",
+      "xor_const_rva": "0x0",
+      "xor_scalar": "0x0",
+      "rol64_amount": 32,
+      "shuf_mask_bytes": ["0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00"]
+    },
+    "ffield_class_name": {
+      "valid": false,
+      "xor_const_rva": "0x0",
+      "xor_lo64": "0x0",
+      "ffield_class_offset": "0x0",
+      "name_private_offset": "0x0",
+      "pshuflw_imm": 27,
+      "rol32_amount": 7,
+      "rol64_amount": 32,
+      "consensus_site_count": 0
+    },
+    "gnames": {
+      "valid": true,
+      "gnames_rva": "0xE3E27F4",
+      "ref_count": 6,
+      "simd_block_rva": "0xE3E27F4",
+      "simd_block_refs": 6
+    },
+    "fname_keystream": {
+      "valid": false,
+      "keystream_rva": "0x0",
+      "cluster_base": "0x0",
+      "window_hits": 0
+    },
+    "guobjarray_layout": {
+      "valid": false,
+      "struct_abs": "0x14E75F150",
+      "num_elements_off": "0x88",
+      "num_elements": "0x11CD0",
+      "chunks_array_ptr": "0x0",
+      "num_chunks": 2,
+      "valid_chunks_probed": 0,
+      "indirection_depth": 0,
+      "path_offsets": []
+    },
+    "fname_resolver_consts": {
+      "valid": true,
+      "function_start_rva": "0x235300",
+      "all_imm64": ["0x7924197900000000", "0xD1D6291A3DDD45A6", "0x1BC3B58FFB88504C", "0x100000001B3", "0xEB1E82D44384D6E6", "0xEB1E82D44384D6E6", "0x1BC3B58FFB88504C", "0x100000001B3"],
+      "all_pshuflw_imm": ["0x93", "0x1B", "0x1B", "0x1B", "0x1B"],
+      "all_rol_imm": ["0x0E", "0x33", "0x27", "0x33", "0x27"],
+      "all_rdata_leas": ["0xB4C4C90", "0xB4C4CD0", "0xB4CDFA0", "0xB4CEB40", "0xB4FD4B0", "0xB4FD640", "0xB4FD650"]
+    },
+    "ffield_class_globals": [
+      {
+        "target_rva": "0xE3B4A80",
+        "type_name": "FArrayProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B3DC0",
+        "type_name": "FArrayProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B3930",
+        "type_name": "FArrayProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B3A30",
+        "type_name": "FBoolProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B3AB0",
+        "type_name": "FByteProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3ABBB0",
+        "type_name": "FByteProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B3B30",
+        "type_name": "FClassProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B3C30",
+        "type_name": "FDelegateProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B44D0",
+        "type_name": "FDoubleProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3ABD20",
+        "type_name": "FFieldPathProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B4450",
+        "type_name": "FFloatProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B4150",
+        "type_name": "FInt16Property",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B4250",
+        "type_name": "FInt64Property",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B40D0",
+        "type_name": "FInt8Property",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B41D0",
+        "type_name": "FIntProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B3CC0",
+        "type_name": "FInterfaceProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B3D40",
+        "type_name": "FLazyObjectProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B3ED0",
+        "type_name": "FMulticastInlineDelegateProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B3F50",
+        "type_name": "FMulticastSparseDelegateProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B3FD0",
+        "type_name": "FNameProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B45E0",
+        "type_name": "FObjectProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B3BB0",
+        "type_name": "FObjectProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B4660",
+        "type_name": "FOptionalProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B4B00",
+        "type_name": "FSoftClassProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B4B80",
+        "type_name": "FSoftObjectProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B4CD0",
+        "type_name": "FStructProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B60A0",
+        "type_name": "FTextProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B4C50",
+        "type_name": "FTextProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B42D0",
+        "type_name": "FUInt16Property",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B4350",
+        "type_name": "FUInt32Property",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B43D0",
+        "type_name": "FUInt64Property",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B4D60",
+        "type_name": "FWeakObjectProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      },
+      {
+        "target_rva": "0xE3B4550",
+        "type_name": "FWeakObjectProperty",
+        "flags": "0x0",
+        "cast_flags": "0x0"
+      }
+    ]
+  }
+}

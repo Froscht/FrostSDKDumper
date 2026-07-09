@@ -209,6 +209,24 @@ public:
             }
         }
 
+        if (m_ks707Loaded) {
+            namespace V707 = ArcDecrypt::v20260707;
+            auto LoadMask = [&](uint64_t Rva) -> __m128i {
+                alignas(16) uint8_t Buf[16] = {};
+                m_reader.Read(m_base + Rva, Buf, 16);
+                return _mm_load_si128(reinterpret_cast<const __m128i*>(Buf));
+            };
+            m_seedXor1     = LoadMask(V707::RVA_SEED_XOR1);
+            m_seedBlend    = LoadMask(V707::RVA_SEED_BLEND);
+            m_seedBlendNot = LoadMask(V707::RVA_SEED_BLEND_NOT);
+            m_seedXor2     = LoadMask(V707::RVA_SEED_XOR2);
+            m_seedXor3     = LoadMask(V707::RVA_SEED_XOR3);
+            m_seedXor4     = LoadMask(V707::RVA_SEED_XOR4);
+            m_chunkXor     = LoadMask(V707::RVA_CHUNK_XOR);
+            m_seedLoaded   = true;
+            std::printf("[fname] v707 seed SIMD masks loaded (7 masks from .rdata)\n");
+        }
+
         m_keyLoaded = true;
         return true;
     }
@@ -1176,14 +1194,49 @@ public:
     //             v ^= A3_XOR ; v = ROL16(v, 12) ; v = pshufb(v, A3_PSHUFB_OUT)
     //   Outputs:   v6 = lo32(v); name_offset = u16(v6); chunk_offset = (v6>>8)&0xFFFF00
     //
+    static __m128i RolLow64_128(__m128i V, int Amt) {
+        __m128i Lo = _mm_unpacklo_epi64(V, _mm_setzero_si128());
+        __m128i Left  = _mm_slli_epi64(Lo, Amt);
+        __m128i Right = _mm_srli_epi64(Lo, 64 - Amt);
+        return _mm_or_si128(Left, Right);
+    }
+
+    __m128i ComputeNameSeed(int32_t CompIndex) const {
+        namespace V707 = ArcDecrypt::v20260707;
+        __m128i X = _mm_set_epi32(0, 0, 0, static_cast<int>(CompIndex));
+        X = _mm_xor_si128(X, m_seedXor1);
+        X = RolLow64_128(X, 2);
+        X = _mm_or_si128(_mm_and_si128(X, m_seedBlend),
+                         _mm_andnot_si128(X, m_seedBlendNot));
+        X = _mm_shufflelo_epi16(X, 0x93);
+        X = _mm_xor_si128(X, m_seedXor2);
+        uint64_t Lo;
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), X);
+        X = _mm_set_epi64x(0, static_cast<int64_t>(Lo));
+        X = _mm_shufflelo_epi16(X, 0x39);
+        X = _mm_xor_si128(X, m_seedXor3);
+        X = RolLow64_128(X, 62);
+        X = _mm_xor_si128(_mm_set_epi64x(0, static_cast<int64_t>(V707::SEED_MID_XOR)), X);
+        X = RolLow64_128(X, 2);
+        X = _mm_shufflelo_epi16(X, 0x93);
+        X = _mm_xor_si128(X, m_seedXor4);
+        return X;
+    }
+
     uint64_t ResolveNamePtr_V707(int32_t CompIndex) {
         namespace V707 = ArcDecrypt::v20260707;
-        if (CompIndex <= 0 || !m_ks707Loaded) return 0;
+        if (CompIndex <= 0 || !m_ks707Loaded || !m_seedLoaded) return 0;
 
-        uint32_t Ci       = static_cast<uint32_t>(CompIndex);
-        uint16_t NameOff  = static_cast<uint16_t>(Ci & 0xFFFFu);
-        uint32_t ChunkOff = (Ci >> 8) & 0xFFFF00u;
-        uint64_t ChunkAddr = m_base + V707::RVA_GNAMEPOOL + ChunkOff;
+        __m128i Seed = ComputeNameSeed(CompIndex);
+        uint64_t SeedLo;
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(&SeedLo), Seed);
+        uint64_t Shifted = SeedLo >> 18;
+        __m128i V5Vec = _mm_xor_si128(
+            _mm_set_epi64x(0, static_cast<int64_t>(Shifted)), m_chunkXor);
+        uint32_t V5 = static_cast<uint32_t>(_mm_cvtsi128_si32(V5Vec)) ^ V707::CHUNK_ID_XOR;
+        uint16_t NameOff = static_cast<uint16_t>(V5);
+        uint64_t ChunkAddr = m_base + V707::RVA_GNAMEPOOL +
+                             (static_cast<uint64_t>(V5 >> 8) & 0xFFFF00ULL);
 
         uint64_t HashAddr = ChunkAddr + V707::SHARD_HASH_SEED_OFF;
         uint32_t HLo = static_cast<uint32_t>(HashAddr);
@@ -2010,6 +2063,14 @@ private:
     bool           m_ks616Loaded = false;
     uint16_t       m_keyTable707[64];
     bool           m_ks707Loaded = false;
+    __m128i        m_seedXor1 = {};
+    __m128i        m_seedBlend = {};
+    __m128i        m_seedBlendNot = {};
+    __m128i        m_seedXor2 = {};
+    __m128i        m_seedXor3 = {};
+    __m128i        m_seedXor4 = {};
+    __m128i        m_chunkXor = {};
+    bool           m_seedLoaded = false;
     int            m_lenientFailCount = 0;
     uint64_t       m_primaryHandleOffset = 0;  // 0 = no calibration yet, fall back to candidate list
     uint64_t       m_ffieldNameOff = 0;        // 0 = uncalibrated; first valid offset wins

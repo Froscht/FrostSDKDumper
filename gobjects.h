@@ -187,6 +187,11 @@ namespace gobjects
         bool Init() {
             if (m_initialized) return true;
 
+            if (InitV707()) {
+                return true;
+            }
+            std::printf("[!] V707 path failed, trying CL1233465...\n");
+
             if (InitDirect_CL1233465()) {
                 return true;
             }
@@ -1733,6 +1738,152 @@ namespace gobjects
             }
             std::printf("[vt2] fell off without ret\n");
             return 0;
+        }
+
+        bool InitV707() {
+            namespace V707 = ArcDecrypt::v20260707;
+            constexpr uint64_t kGobjRva = 0xE3B61C0ULL;
+            constexpr uint64_t kPshufbMaskRva = 0xAD97CC0ULL;
+            constexpr uint32_t kItemSize = 0x18;
+            constexpr uint32_t kItemsPerChunk = 65536;
+
+            uint64_t GobjAbs = m_base + kGobjRva;
+
+            uint32_t NumEl = 0;
+            for (uint32_t Off : {0xFCu, 0x30u, 0x44u}) {
+                uint32_t V = 0;
+                if (!m_reader.Read(GobjAbs + Off, &V, 4)) continue;
+                if (V >= 1000 && V <= 2'000'000) { NumEl = V; break; }
+            }
+            if (!NumEl) {
+                std::printf("[v707-gobj] no valid NumElements found at RVA 0x%llX\n",
+                    (unsigned long long)kGobjRva);
+                return false;
+            }
+            std::printf("[v707-gobj] NumElements=%u at RVA 0x%llX\n", NumEl, (unsigned long long)kGobjRva);
+
+            alignas(16) uint8_t EncBytes[16] = {};
+            alignas(16) uint8_t MaskBytes[16] = {};
+            if (!m_reader.Read(GobjAbs + 0xC0, EncBytes, 16) ||
+                !m_reader.Read(m_base + kPshufbMaskRva, MaskBytes, 16)) {
+                std::printf("[v707-gobj] failed to read encrypted blob or PSHUFB mask\n");
+                return false;
+            }
+
+            __m128i X = _mm_loadu_si128(reinterpret_cast<const __m128i*>(EncBytes));
+            __m128i Mask = _mm_loadu_si128(reinterpret_cast<const __m128i*>(MaskBytes));
+            __m128i X1 = _mm_shufflelo_epi16(X, 0x1B);
+            __m128i X2 = _mm_or_si128(_mm_slli_epi16(X1, 3), _mm_srli_epi16(X1, 13));
+            __m128i X3 = _mm_shuffle_epi8(X2, Mask);
+            uint64_t ChunksMgr = 0;
+            std::memcpy(&ChunksMgr, &X3, 8);
+
+            auto IsHeap = [&](uint64_t P) {
+                return P > 0x10000ULL && P < 0x800000000000ULL &&
+                       !(P >= m_base && P < m_base + 0x12000000ULL);
+            };
+            if (!IsHeap(ChunksMgr)) {
+                std::printf("[v707-gobj] chunks_manager 0x%llX not heap\n",
+                    (unsigned long long)ChunksMgr);
+                return false;
+            }
+            std::printf("[v707-gobj] chunks_manager=0x%llX\n", (unsigned long long)ChunksMgr);
+
+            auto SimdDecryptBlob = [&](uint64_t Addr) -> uint64_t {
+                alignas(16) uint8_t E2[16] = {};
+                if (!m_reader.Read(Addr, E2, 16)) return 0;
+                __m128i Y = _mm_loadu_si128(reinterpret_cast<const __m128i*>(E2));
+                __m128i Y1 = _mm_shufflelo_epi16(Y, 0x1B);
+                __m128i Y2 = _mm_or_si128(_mm_slli_epi16(Y1, 3), _mm_srli_epi16(Y1, 13));
+                __m128i Y3 = _mm_shuffle_epi8(Y2, Mask);
+                uint64_t R = 0;
+                std::memcpy(&R, &Y3, 8);
+                return R;
+            };
+
+            auto ValidateChunks = [&](uint64_t Arr) -> int {
+                int V = 0;
+                for (int I = 0; I < 2; ++I) {
+                    uint64_t Cp = 0;
+                    if (!m_reader.Read(Arr + (uint64_t)I * 8, &Cp, 8)) return V;
+                    if (!IsHeap(Cp)) return V;
+                    uint64_t Obj = 0;
+                    if (!m_reader.Read(Cp, &Obj, 8)) return V;
+                    if (!IsHeap(Obj)) return V;
+                    uint64_t Vt = 0;
+                    if (!m_reader.Read(Obj, &Vt, 8)) return V;
+                    if (Vt < m_base || Vt >= m_base + 0x12000000ULL) return V;
+                    ++V;
+                }
+                return V;
+            };
+
+            uint64_t ChunksArr = 0;
+            static constexpr uint32_t kInnerOffs[] = { 0x90, 0xA0, 0xB0, 0x70, 0x80 };
+            for (uint32_t BlobOff : kInnerOffs) {
+                uint64_t Cand = SimdDecryptBlob(ChunksMgr + BlobOff);
+                if (!IsHeap(Cand)) continue;
+                if (ValidateChunks(Cand) >= 2) { ChunksArr = Cand; break; }
+            }
+            if (!ChunksArr) {
+                for (uint32_t Off = 0; Off <= 0x400; Off += 8) {
+                    uint64_t Cand = 0;
+                    if (!m_reader.Read(ChunksMgr + Off, &Cand, 8)) continue;
+                    if (!IsHeap(Cand)) continue;
+                    if (ValidateChunks(Cand) >= 2) { ChunksArr = Cand; break; }
+                }
+            }
+            if (!ChunksArr) {
+                std::printf("[v707-gobj] no chunks array found from chunks_manager\n");
+                return false;
+            }
+            std::printf("[v707-gobj] chunks_array=0x%llX\n", (unsigned long long)ChunksArr);
+
+            uint32_t NumChunks = (NumEl + kItemsPerChunk - 1) / kItemsPerChunk;
+            if (NumChunks > 256) NumChunks = 256;
+
+            std::vector<uint64_t> ChunkPtrs(NumChunks);
+            if (!m_reader.Read(ChunksArr, ChunkPtrs.data(), NumChunks * 8)) {
+                std::printf("[v707-gobj] failed to read chunk pointer array\n");
+                return false;
+            }
+
+            std::vector<uint64_t> Objects;
+            Objects.reserve(NumEl);
+            uint32_t Remaining = NumEl;
+            for (uint32_t Ci = 0; Ci < NumChunks; ++Ci) {
+                uint64_t Chunk = ChunkPtrs[Ci];
+                uint32_t N = std::min(Remaining, kItemsPerChunk);
+                if (!N) break;
+                if (!IsHeap(Chunk)) { Remaining -= N; continue; }
+                std::vector<uint8_t> Buf(N * kItemSize);
+                if (!m_reader.Read(Chunk, Buf.data(), N * kItemSize)) {
+                    Remaining -= N;
+                    continue;
+                }
+                for (uint32_t Ii = 0; Ii < N; ++Ii) {
+                    uint64_t Obj = 0;
+                    std::memcpy(&Obj, Buf.data() + Ii * kItemSize, 8);
+                    if (IsHeap(Obj)) Objects.push_back(Obj);
+                }
+                Remaining -= N;
+            }
+
+            if (Objects.size() < 1000) {
+                std::printf("[v707-gobj] only %zu objects found — too few\n", Objects.size());
+                return false;
+            }
+
+            std::printf("[v707-gobj] walked %u chunks, found %zu UObjects\n",
+                NumChunks, Objects.size());
+
+            m_worldFallbackObjects = std::move(Objects);
+            m_useWorldFallback = true;
+            m_numElements = static_cast<int32_t>(m_worldFallbackObjects.size());
+            m_itemStride = kItemSize;
+            m_initialized = true;
+            std::printf("[+] GObjectArray (V707 chunks): %d objects\n", m_numElements);
+            return true;
         }
 
         bool InitDirect_CL1233465() {

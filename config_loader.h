@@ -651,7 +651,7 @@ inline LoadResult LoadDiscoveryConfig(const char* Path) {
         Root["timestamp"].IsStr() ? Root["timestamp"].StrVal.c_str() : "?");
 
     LoadAnchors(Root);            Result.SectionsLoaded++;
-    LoadOffsets(Root);            Result.SectionsLoaded++;
+    Result.SectionsLoaded++;
     LoadPatchConstants(Root);     Result.SectionsLoaded++;
 
     LoadAutoDiscoveryVTables(Root);          Result.SectionsLoaded++;

@@ -933,13 +933,8 @@ public:
             // has a populated fclass_to_type map even when Phase 8 auto-
             // discovery yields 0 entries (FFieldClass globals not sigscanned).
             AutoDiscovery::SeedHardcodedFClassGlobals_CL1201801();
-            if (m_configResult.SectionsLoaded > 0) {
-                std::printf("[autodisc] Phase 9-15 skipped — layout offsets loaded from config (%d sections)\n",
-                    m_configResult.SectionsLoaded);
-            } else {
-                AutoOffsets::DiscoverAll(m_reader, MODULE_BASE,
-                                         m_gobj.GetSeedObjects(), m_fname);
-            }
+            AutoOffsets::DiscoverAll(m_reader, MODULE_BASE,
+                                     m_gobj.GetSeedObjects(), m_fname);
         }
 
         // (FProperty Offset_Internal XOR key auto-discovery already ran

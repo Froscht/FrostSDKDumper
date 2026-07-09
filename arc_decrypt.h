@@ -997,6 +997,16 @@ namespace v20260707 {
     constexpr uint64_t RVA_GNAMEPOOL          = 0xE4A3A00ULL;
     constexpr uint64_t RVA_KEYTABLE           = 0xE3E28E4ULL;
 
+    constexpr uint64_t RVA_SEED_XOR1          = 0xB4FD4B0ULL;
+    constexpr uint64_t RVA_SEED_BLEND         = 0xB4FD690ULL;
+    constexpr uint64_t RVA_SEED_BLEND_NOT     = 0xB4FD680ULL;
+    constexpr uint64_t RVA_SEED_XOR2          = 0xB4FD6A0ULL;
+    constexpr uint64_t RVA_SEED_XOR3          = 0xB4FD620ULL;
+    constexpr uint64_t RVA_SEED_XOR4          = 0xB4FD4C0ULL;
+    constexpr uint64_t RVA_CHUNK_XOR          = 0xB4FD840ULL;
+    constexpr uint64_t SEED_MID_XOR           = 0xAB76454000000000ULL;
+    constexpr uint32_t CHUNK_ID_XOR           = 0x1DC01268u;
+
     constexpr uint32_t SHARD_HASH_ADD         = 0x282106A6u;
     constexpr uint64_t SHARD_HASH_SEED_OFF    = 0x6FD0ULL;
     constexpr uint64_t SHARD_BLOCK_BASE_OFF   = 0x6FE0ULL;
