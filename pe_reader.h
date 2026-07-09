@@ -4,7 +4,7 @@
 // applying PE base relocations so embedded pointers line up with the live
 // runtime base. Used as a fallback when the live kernel reader can't serve a
 // page (VMProtect keeps cold functions encrypted until first call → reads
-// return 0xCC). Extracted from FrostSDKDumper/emu_engine.h.
+// return 0xCC).
 // =============================================================================
 
 #include <cstdint>

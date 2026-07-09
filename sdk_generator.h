@@ -1,15 +1,5 @@
 #pragma once
 
-// =============================================================================
-// ARC Raiders – SDK Generator  (March 2026 patch)
-//
-// Walks GObjects, finds UClass/UScriptStruct objects, decodes ChildProperties
-// chains to produce .h-style struct output, and enumerates UFunctions.
-//
-// All offsets / decrypt pipelines sourced from arc_decrypt.h (live-verified).
-// Include this header from main.cpp AFTER including arc_decrypt.h and fname_decrypt.h.
-// =============================================================================
-
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -28,18 +18,8 @@
 #include <sys/types.h>
 #endif
 
-// arc_decrypt.h, fname_decrypt.h, and gobjects.h must already be included by the TU.
-
 namespace SDKGen {
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 1. FFieldClass name resolution (structs/records only)
-// ─────────────────────────────────────────────────────────────────────────────
-// FieldClassToTypeName is a Generator member — see below.
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. Struct property record
-// ─────────────────────────────────────────────────────────────────────────────
 struct PropertyRecord {
     std::string name;
     std::string type_name;   // from FFieldClass
@@ -54,9 +34,6 @@ struct PropertyRecord {
     uint8_t     bool_field_size = 0; // FBoolProperty FieldSize (1=bitfield, 4=native)
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. Function record
-// ─────────────────────────────────────────────────────────────────────────────
 struct FunctionRecord {
     std::string                name;
     uint64_t                   flags;       // UFunctionFlags
@@ -65,9 +42,6 @@ struct FunctionRecord {
     std::vector<PropertyRecord> params;     // UFunction ChildProperties (parameters)
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 4a. Struct record (a UClass or UScriptStruct)
-// ─────────────────────────────────────────────────────────────────────────────
 struct StructRecord {
     std::string              name;
     std::string              package;
@@ -80,9 +54,6 @@ struct StructRecord {
     bool                     is_class;      // UClass (vs UScriptStruct)
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 4b. Enum record (a UEnum)
-// ─────────────────────────────────────────────────────────────────────────────
 struct EnumEntry {
     std::string name;
     int64_t     value;
@@ -94,17 +65,11 @@ struct EnumRecord {
     std::vector<EnumEntry> entries;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 4c. Combined SDK result
-// ─────────────────────────────────────────────────────────────────────────────
 struct SDKResult {
     std::vector<StructRecord> structs;
     std::vector<EnumRecord>   enums;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 5. SDK generator core
-// ─────────────────────────────────────────────────────────────────────────────
 class Generator {
 public:
     uint64_t MODULE_BASE;   // runtime module base (passed at construction)
@@ -237,10 +202,31 @@ public:
             uint64_t Vt = Read<uint64_t>(P);
             return (Vt - MODULE_BASE) == ExpectedRva;
         };
+        auto IsKnownUObject = [&](uint64_t P) -> bool {
+            if (!m_addr_to_name) return false;
+            return m_addr_to_name->count(P) > 0;
+        };
 
         uint64_t AsClassRva  = AutoDiscovery::g_DiscoveredVTables.ASClassRVA;
         uint64_t AsStructRva = AutoDiscovery::g_DiscoveredVTables.ASStructRVA;
         uint64_t AsEnumRva   = AutoDiscovery::g_DiscoveredVTables.EnumRVA;
+        const auto& VT = AutoDiscovery::g_DiscoveredVTables;
+        auto IsAnyClassVtable = [&](uint64_t P) -> bool {
+            if (!IsHeapPtr(P)) return false;
+            uint64_t Rva = Read<uint64_t>(P) - MODULE_BASE;
+            return (AsClassRva && Rva == AsClassRva) ||
+                   (VT.BPGCRVA && Rva == VT.BPGCRVA) ||
+                   (VT.WBPGCRVA && Rva == VT.WBPGCRVA) ||
+                   (VT.SMBPGCRVA && Rva == VT.SMBPGCRVA) ||
+                   (VT.AnimBPGCRVA && Rva == VT.AnimBPGCRVA) ||
+                   (VT.ClassNativeRVA && Rva == VT.ClassNativeRVA);
+        };
+        auto IsAnyStructVtable = [&](uint64_t P) -> bool {
+            if (!IsHeapPtr(P)) return false;
+            uint64_t Rva = Read<uint64_t>(P) - MODULE_BASE;
+            return (AsStructRva && Rva == AsStructRva) ||
+                   (VT.ScriptStructRVA && Rva == VT.ScriptStructRVA);
+        };
 
         if (ElemSize == 80) {
             if (IsFFieldLike(Ptr130) && IsFFieldLike(Ptr138))
@@ -278,19 +264,22 @@ public:
             if (AsClassRva && IsUObjectOfVtable(Ptr130, AsClassRva) &&
                 IsUObjectOfVtable(Ptr138, AsClassRva))
                 return "FClassProperty";
-            return "FEnumProperty";
+            if (IsKnownUObject(Ptr130) || IsKnownUObject(Ptr138))
+                return "FEnumProperty";
         }
 
         if (HasModuleVtable(Ptr130) && !LooksBool) {
-            if (AsStructRva && IsUObjectOfVtable(Ptr130, AsStructRva))
+            if (IsAnyStructVtable(Ptr130))
                 return "FStructProperty";
-            if (AsClassRva && IsUObjectOfVtable(Ptr130, AsClassRva))
+            if (IsAnyClassVtable(Ptr130))
                 return "FObjectProperty";
             if (AsEnumRva && IsUObjectOfVtable(Ptr130, AsEnumRva))
                 return "FEnumProperty";
-            if (ElemSize == 8)
-                return "FObjectProperty";
-            return "FStructProperty";
+            if (IsKnownUObject(Ptr130)) {
+                if (ElemSize == 8)
+                    return "FObjectProperty";
+                return "FStructProperty";
+            }
         }
 
         if (HasModuleVtable(Ptr138) && !LooksBool) {
@@ -542,17 +531,18 @@ public:
         for (auto& [rva, sample_ff] : vtbl_sample) {
             if (m_vtable_to_type.count(rva)) continue;
             uint32_t elem = unresolved_vtbls[rva].elem;
-            uint64_t ptr130 = Read<uint64_t>(sample_ff + 0x130);
-            uint64_t ptr138 = Read<uint64_t>(sample_ff + 0x138);
+            uint64_t ptr130 = Read<uint64_t>(sample_ff + ArcDecrypt::Offsets::FStructProperty::Struct);
+            uint64_t ptr138 = Read<uint64_t>(sample_ff + ArcDecrypt::Offsets::FEnumProperty::Enum);
             bool p130_valid = ptr130 >= 0x10000ULL && ptr130 < 0x7FFFFFFFFFFFULL &&
                               !(ptr130 >= MODULE_BASE && ptr130 < MODULE_BASE + 0x10000000ULL);
             bool p138_valid = ptr138 >= 0x10000ULL && ptr138 < 0x7FFFFFFFFFFFULL &&
                               !(ptr138 >= MODULE_BASE && ptr138 < MODULE_BASE + 0x10000000ULL);
-            // Check if ptr130 has a vtable in module range (confirms UObject)
             bool p130_is_uobj = false;
             if (p130_valid) {
                 uint64_t vt130 = Read<uint64_t>(ptr130);
                 p130_is_uobj = (vt130 >= MODULE_BASE && vt130 < MODULE_BASE + 0x10000000ULL);
+                if (p130_is_uobj && m_addr_to_name && !m_addr_to_name->count(ptr130))
+                    p130_is_uobj = false;
             }
 
             std::string tier2_type;
@@ -744,62 +734,6 @@ public:
     }
 
     bool DynamicPropertyTypeTableLoaded() const { return m_dynamic_type_table_loaded; }
-
-    // ── Patch 20260421: hardcoded FFieldClass* → type-name map ──────────
-    // Obtained by scanning live .data for the FFieldClass signature
-    //   10 19 22 2B 34 3D 46 4F  at +0x08  and decoding +0x20 via the
-    // SIMD name-decrypt pipeline, then resolving CI→string via FNameDecryptor.
-    // See SIGNATURES.md §FFieldClass for details. 36 singletons total (34
-    // distinct property types; FObjectProperty has two singletons due to
-    // a secondary helper class sharing the same FName).
-    //
-    // Applied BEFORE Tier 1/2/3 auto-discovery so it supersedes any
-    // Tier-1 name-heuristic mistakes (e.g. NameProperty mislabeled as
-    // ObjectProperty because a property named "Owner" pointed to it).
-    void SeedHardcodedFClassMap_20260421() {
-        // CL-1201801 (2026-05-21) FFieldClass RVAs — live-extracted via
-        // fcname-rva pass (FFieldClass::NamePrivate decode at +0x40).
-        // All in .data section (0xE034000..0xE7A7000).
-        static const std::pair<uint64_t, const char*> kSeeds[] = {
-            { 0xE3B4A80, "FArrayProperty" },
-            { 0xE3B3DC0, "FArrayProperty" },
-            { 0xE3B3930, "FArrayProperty" },
-            { 0xE3B3A30, "FBoolProperty" },
-            { 0xE3B3AB0, "FByteProperty" },
-            { 0xE3ABBB0, "FByteProperty" },
-            { 0xE3B3B30, "FClassProperty" },
-            { 0xE3B3C30, "FDelegateProperty" },
-            { 0xE3B44D0, "FDoubleProperty" },
-            { 0xE3ABD20, "FFieldPathProperty" },
-            { 0xE3B4450, "FFloatProperty" },
-            { 0xE3B4150, "FInt16Property" },
-            { 0xE3B4250, "FInt64Property" },
-            { 0xE3B40D0, "FInt8Property" },
-            { 0xE3B41D0, "FIntProperty" },
-            { 0xE3B3CC0, "FInterfaceProperty" },
-            { 0xE3B3D40, "FLazyObjectProperty" },
-            { 0xE3B3ED0, "FMulticastInlineDelegateProperty" },
-            { 0xE3B3F50, "FMulticastSparseDelegateProperty" },
-            { 0xE3B3FD0, "FNameProperty" },
-            { 0xE3B45E0, "FObjectProperty" },
-            { 0xE3B3BB0, "FObjectProperty" },
-            { 0xE3B4660, "FOptionalProperty" },
-            { 0xE3B4B00, "FSoftClassProperty" },
-            { 0xE3B4B80, "FSoftObjectProperty" },
-            { 0xE3B4CD0, "FStructProperty" },
-            { 0xE3B60A0, "FTextProperty" },
-            { 0xE3B4C50, "FTextProperty" },
-            { 0xE3B42D0, "FUInt16Property" },
-            { 0xE3B4350, "FUInt32Property" },
-            { 0xE3B43D0, "FUInt64Property" },
-            { 0xE3B4D60, "FWeakObjectProperty" },
-            { 0xE3B4550, "FWeakObjectProperty" },
-        };
-        for (auto [rva, type] : kSeeds)
-            m_fclass_to_type[MODULE_BASE + rva] = type;
-        std::printf("[fcmap] seeded %zu hardcoded FFieldClass mappings (CL-1201801)\n",
-            sizeof(kSeeds)/sizeof(kSeeds[0]));
-    }
 
     int32_t CalibrateFClassTypeIdxOffset() {
         if (!m_dynamic_type_table_loaded || m_type_idx_to_name.empty()) return -1;
@@ -1429,7 +1363,8 @@ public:
     void ResolveSubPropertyType(uint64_t ff, std::string& type_name) {
         if (type_name == "FStructProperty") {
             uint64_t sp = Read<uint64_t>(ff + ArcDecrypt::Offsets::FStructProperty::Struct);
-            if (sp && sp > 0x10000 && sp < 0x7FFFFFFFFFFFULL) {
+            if (sp && sp > 0x10000 && sp < 0x7FFFFFFFFFFFULL &&
+                (!m_addr_to_name || m_addr_to_name->count(sp))) {
                 m_known_structs.insert(sp);
                 std::string sn = GetNameTheia(sp);
                 if (!sn.empty()) { type_name = sn; m_resolveStructOk++; }
@@ -1447,7 +1382,7 @@ public:
         if (type_name == "FObjectProperty" || type_name == "FWeakObjectProperty" ||
             type_name == "FSoftObjectProperty" || type_name == "FLazyObjectProperty") {
             uint64_t cp = Read<uint64_t>(ff + ArcDecrypt::Offsets::FObjectProperty::PropertyClass);
-            if (cp) {
+            if (cp && (!m_addr_to_name || m_addr_to_name->count(cp))) {
                 std::string cn = GetNameTheia(cp);
                 if (!cn.empty()) { type_name = cn + "*"; m_resolveObjOk++; }
                 else { m_resolveObjFail++; if (m_unresolvedShadowSample.size() < 200) m_unresolvedShadowSample.insert(cp); }
@@ -1899,7 +1834,7 @@ public:
         for (uint64_t fn_addr : it->second) {
             FunctionRecord fr{};
             fr.fn_addr    = fn_addr;
-            fr.flags      = Read<uint64_t>(fn_addr + ArcDecrypt::Offsets::UFunction::FunctionFlags);
+            fr.flags      = Read<uint32_t>(fn_addr + ArcDecrypt::Offsets::UFunction::FunctionFlags);
             fr.native_rva = 0;
 
             uint64_t native = Read<uint64_t>(fn_addr + ArcDecrypt::Offsets::UFunction::NativeFunc);
@@ -2450,9 +2385,8 @@ public:
             // OverlaySlots, StaticMeshes, Textures, etc. (≈19K bogus passers).
             // Adding this u8-shape gate catches those.
             auto looks_like_ufunc_struct = [&](uint64_t obj_ptr) -> bool {
-                uint64_t qB0 = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UFunction::NumParms);
-                if ((qB0 >> 8) != 0) return false;
-                if ((qB0 & 0xFF) > 64) return false;
+                uint8_t np = Read<uint8_t>(obj_ptr + ArcDecrypt::Offsets::UFunction::NumParms);
+                if (np > 64) return false;
                 return true;
             };
 
@@ -2768,13 +2702,7 @@ public:
         // ── Seed hardcoded FFieldClass→type map BEFORE auto-discovery so
         //    Tier-1 name-heuristic mistakes cannot overwrite authoritative
         //    data. Always run because the hardcoded map keys (FField+0x88
-        //    type-global pointers) are not derivable from the dynamic table
-        //    alone — the dynamic table indexes by EClassCastFlags-style ID,
-        //    not by global pointer. Use it as fallback when the dynamic
-        //    pipeline cannot resolve a particular fclass_ptr.
-        // SeedHardcodedFClassMap_20260421(); // CL-1201801 addresses wrong for CL-1233465
-
-        // ── Auto-discover vtable-to-type mappings (replaces bootstrap + sweep) ──
+        // ── Auto-discover vtable-to-type mappings ──
         AutoDiscoverVTables(object_ptrs, addr_to_name, allTypeAddrs, ssAddr);
 
         // ── Brute-force FField::ClassPrivate offset calibration ─────────
@@ -2911,11 +2839,19 @@ public:
                         std::printf("[autocal-next]   next_off=+0x%llX total_hops=%d\n",
                                     (unsigned long long)ranked[I].first, ranked[I].second);
                     }
-                    if (ranked[0].second >= 10) {
-                        std::printf("[autocal-next] FField::Next drift: 0x%llX -> 0x%llX (auto-fixed)\n",
-                                    (unsigned long long)ArcDecrypt::Offsets::FField::Next,
-                                    (unsigned long long)ranked[0].first);
-                        ArcDecrypt::Offsets::FField::Next = ranked[0].first;
+                    if (ranked[0].second >= 10 && ranked[0].first != ArcDecrypt::Offsets::FField::Next) {
+                        bool ConfigTrusted = (ArcDecrypt::Offsets::FField::Next >= 0x40 &&
+                                              ArcDecrypt::Offsets::FField::Next <= 0x80);
+                        if (ConfigTrusted && ranked[0].first < 0x40) {
+                            std::printf("[autocal-next] ignoring drift 0x%llX -> 0x%llX (config offset in trusted range)\n",
+                                        (unsigned long long)ArcDecrypt::Offsets::FField::Next,
+                                        (unsigned long long)ranked[0].first);
+                        } else {
+                            std::printf("[autocal-next] FField::Next drift: 0x%llX -> 0x%llX (auto-fixed)\n",
+                                        (unsigned long long)ArcDecrypt::Offsets::FField::Next,
+                                        (unsigned long long)ranked[0].first);
+                            ArcDecrypt::Offsets::FField::Next = ranked[0].first;
+                        }
                     }
                 }
             }
@@ -3076,6 +3012,7 @@ public:
         // ── Pass 2: iterate objects — include all type objects ──────────────────
         // An object is a type if: (a) it's in allTypeAddrs (used as class ptr by others),
         // OR (b) GetClassPrivate returns classAddr/ssAddr/enumAddr/validClassTypes.
+        std::unordered_set<uint64_t> processed_enums;
         for (const auto& [idx, obj_ptr] : object_ptrs) {
             if (!obj_ptr || seen.count(obj_ptr)) continue;
             seen.insert(obj_ptr);
@@ -3270,7 +3207,7 @@ public:
                         if (Disc.EnumRVA && VtRva == Disc.EnumRVA) VtConfirmedEnum = true;
                     }
                 }
-                if (!shape_ok && !VtConfirmedEnum) continue;
+                if (!shape_ok && !VtConfirmedEnum && !m_known_enums.count(obj_ptr)) continue;
 
                 EnumRecord erec{};
                 erec.addr    = obj_ptr;
@@ -3290,6 +3227,7 @@ public:
                         erec.entries.push_back({ev, val});
                     }
                 }
+                processed_enums.insert(obj_ptr);
                 result.enums.push_back(std::move(erec));
                 continue;
             }
@@ -3299,7 +3237,17 @@ public:
             rec.addr       = obj_ptr;
             rec.name       = short_name;
             rec.package    = pkg;
-            rec.is_class   = is_class && !is_scriptstruct;
+            if (is_class && is_scriptstruct) {
+                uint64_t Pd = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UClass::FuncMap_PairsData);
+                uint32_t Fn = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UClass::FuncMap_Num);
+                uint32_t Fm = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UClass::FuncMap_Max);
+                bool ValidMap = (Pd > 0x10000 && Pd < 0x7FFFFFFFFFFFULL &&
+                                 Fn <= 4096 && Fm >= Fn && Fm <= 16384);
+                bool HasFuncs = m_owner_to_funcs.count(obj_ptr) > 0;
+                rec.is_class = ValidMap || HasFuncs;
+            } else {
+                rec.is_class = is_class;
+            }
             rec.props_size = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UStruct::PropertiesSize);
 
             // SuperStruct
@@ -3419,56 +3367,83 @@ public:
 
         std::printf("[sdk] After main loop: m_known_structs=%zu m_known_enums=%zu\n",
             m_known_structs.size(), m_known_enums.size());
+
+        {
+            int EnumPass2 = 0;
+            for (const auto& [idx, obj_ptr] : object_ptrs) {
+                if (!obj_ptr) continue;
+                if (!m_known_enums.count(obj_ptr)) continue;
+                if (processed_enums.count(obj_ptr)) continue;
+                auto fn_it = addr_to_name.find(obj_ptr);
+                std::string short_name = (fn_it != addr_to_name.end()) ? fn_it->second : std::string();
+                if (short_name.empty()) continue;
+                EnumRecord erec{};
+                erec.addr    = obj_ptr;
+                erec.name    = short_name;
+                erec.package = resolvePackage(obj_ptr);
+                processed_enums.insert(obj_ptr);
+                result.enums.push_back(std::move(erec));
+                ++EnumPass2;
+            }
+            std::printf("[sdk] Enum pass 2 (late-discovered): %d extra enums\n", EnumPass2);
+        }
         PrintResolveStats();
         DiagnoseShadowResolution();
 
         {
-            std::unordered_set<uint64_t> ConfirmedUScriptStruct;
+            auto HasValidFuncMap = [&](uint64_t Addr) -> bool {
+                uint64_t PairsData = Read<uint64_t>(Addr + ArcDecrypt::Offsets::UClass::FuncMap_PairsData);
+                uint32_t FmNum     = Read<uint32_t>(Addr + ArcDecrypt::Offsets::UClass::FuncMap_Num);
+                uint32_t FmMax     = Read<uint32_t>(Addr + ArcDecrypt::Offsets::UClass::FuncMap_Max);
+                return (PairsData > 0x10000 && PairsData < 0x7FFFFFFFFFFFULL &&
+                        FmNum <= 4096 && FmMax >= FmNum && FmMax <= 16384);
+            };
 
-            for (uint64_t Sp : m_known_structs)
-                ConfirmedUScriptStruct.insert(Sp);
+            std::unordered_set<uint64_t> ConfirmedClass;
 
-            for (const auto& Rec : result.structs) {
-                if (!Rec.is_class) continue;
-                if (ConfirmedUScriptStruct.count(Rec.addr)) continue;
-
-                uint64_t PairsData = Read<uint64_t>(Rec.addr + ArcDecrypt::Offsets::UClass::FuncMap_PairsData);
-                uint32_t FmNum     = Read<uint32_t>(Rec.addr + ArcDecrypt::Offsets::UClass::FuncMap_Num);
-                uint32_t FmMax     = Read<uint32_t>(Rec.addr + ArcDecrypt::Offsets::UClass::FuncMap_Max);
-
-                bool LooksLikeEmptyTMap = (PairsData == 0 && FmNum == 0 && FmMax == 0);
-                bool LooksLikeValidTMap = (PairsData > 0x10000 && PairsData < 0x7FFFFFFFFFFFULL &&
-                                           FmNum <= 4096 && FmMax >= FmNum && FmMax <= 16384);
-                bool HasFuncMapShape = LooksLikeEmptyTMap || LooksLikeValidTMap;
-
-                if (!HasFuncMapShape) {
-                    ConfirmedUScriptStruct.insert(Rec.addr);
+            size_t Promoted = 0;
+            for (auto& Rec : result.structs) {
+                bool Fmap = HasValidFuncMap(Rec.addr);
+                bool HasFuncs = m_owner_to_funcs.count(Rec.addr) > 0;
+                if (Fmap || HasFuncs) {
+                    ConfirmedClass.insert(Rec.addr);
+                    if (!Rec.is_class) ++Promoted;
+                    Rec.is_class = true;
                 }
             }
 
             std::unordered_map<uint64_t, std::vector<uint64_t>> ChildMap;
-            for (const auto& Rec : result.structs) {
+            for (const auto& Rec : result.structs)
                 if (Rec.super_addr)
                     ChildMap[Rec.super_addr].push_back(Rec.addr);
-            }
 
-            std::function<void(uint64_t)> PropagateDown = [&](uint64_t Addr) {
+            std::unordered_map<uint64_t, bool> AddrIsClass;
+            for (const auto& Rec : result.structs)
+                AddrIsClass[Rec.addr] = Rec.is_class;
+
+            std::function<void(uint64_t, bool)> PropagateDown = [&](uint64_t Addr, bool ParentIsClass) {
                 auto Cit = ChildMap.find(Addr);
                 if (Cit == ChildMap.end()) return;
                 for (uint64_t Child : Cit->second) {
-                    if (ConfirmedUScriptStruct.insert(Child).second)
-                        PropagateDown(Child);
+                    if (ParentIsClass && !ConfirmedClass.count(Child)) {
+                        ConfirmedClass.insert(Child);
+                        AddrIsClass[Child] = true;
+                    }
+                    bool ChildIsClass = AddrIsClass.count(Child) ? AddrIsClass[Child] : false;
+                    PropagateDown(Child, ChildIsClass);
                 }
             };
-            for (uint64_t Ss : std::vector<uint64_t>(ConfirmedUScriptStruct.begin(), ConfirmedUScriptStruct.end()))
-                PropagateDown(Ss);
+            for (const auto& Rec : result.structs)
+                if (!Rec.super_addr)
+                    PropagateDown(Rec.addr, Rec.is_class);
 
-            size_t Reclassified = 0;
+            size_t PropPromoted = 0;
             for (auto& Rec : result.structs) {
-                if (!Rec.is_class) continue;
-                if (!ConfirmedUScriptStruct.count(Rec.addr)) continue;
-                Rec.is_class = false;
-                ++Reclassified;
+                auto It = AddrIsClass.find(Rec.addr);
+                if (It != AddrIsClass.end() && It->second && !Rec.is_class) {
+                    Rec.is_class = true;
+                    ++PropPromoted;
+                }
             }
 
             size_t FinalClasses = 0, FinalStructs = 0;
@@ -3476,9 +3451,81 @@ public:
                 if (Rec.is_class) ++FinalClasses;
                 else ++FinalStructs;
             }
-            std::printf("[sdk] Struct/Class reclassification: confirmed_ss=%zu reclassified=%zu "
+            std::printf("[sdk] Struct/Class reclassification: promoted=%zu propagated=%zu "
                 "(final: %zu classes, %zu structs)\n",
-                ConfirmedUScriptStruct.size(), Reclassified, FinalClasses, FinalStructs);
+                Promoted, PropPromoted, FinalClasses, FinalStructs);
+        }
+
+        // ── Pass 7: post-reclassification FuncMap walk ──────────────────────
+        // Passes 1-6 ran before reclassification, so Pass 5's FuncMap walk
+        // only saw ~38 ClassPrivate-confirmed UClass objects. After reclass,
+        // there are thousands. Walk their FuncMaps now.
+        {
+            int Pass7 = 0, Pass7Classes = 0, Pass7Reassigned = 0;
+            for (const auto& Rec : result.structs) {
+                if (!Rec.is_class) continue;
+
+                uint64_t PairsData = Read<uint64_t>(Rec.addr + ArcDecrypt::Offsets::UClass::FuncMap_PairsData);
+                if (PairsData <= 0x10000 || PairsData >= 0x800000000000ULL) continue;
+                uint32_t TotalSlots = Read<uint32_t>(Rec.addr + ArcDecrypt::Offsets::UClass::FuncMap_Num);
+                if (TotalSlots == 0 || TotalSlots > 4096) continue;
+                uint32_t MaxSlots = Read<uint32_t>(Rec.addr + ArcDecrypt::Offsets::UClass::FuncMap_Max);
+                if (MaxSlots < TotalSlots || MaxSlots > 16384) continue;
+
+                uint64_t AllocFlagsPtr = Read<uint64_t>(Rec.addr + ArcDecrypt::Offsets::UClass::FuncMap_AllocFlags);
+                uint32_t AllocFlagsWords = (TotalSlots + 31) / 32;
+                std::vector<uint32_t> AllocBits(AllocFlagsWords, 0xFFFFFFFFu);
+                bool HasAllocFlags = false;
+                if (AllocFlagsPtr > 0x10000 && AllocFlagsPtr < 0x800000000000ULL && AllocFlagsWords > 0)
+                    HasAllocFlags = m_reader.Read(AllocFlagsPtr, AllocBits.data(), AllocFlagsWords * 4);
+
+                ++Pass7Classes;
+                for (uint32_t I = 0; I < TotalSlots; ++I) {
+                    if (HasAllocFlags) {
+                        uint32_t Word = AllocBits[I / 32];
+                        if (!(Word & (1u << (I % 32)))) continue;
+                    }
+
+                    uint64_t Entry = PairsData + (uint64_t)I * ArcDecrypt::Offsets::UClass::FuncMap_PairStride;
+                    uint64_t Ufunc = Read<uint64_t>(Entry + ArcDecrypt::Offsets::UClass::FuncMapPair_UFunction);
+                    if (Ufunc <= 0x10000 || Ufunc >= 0x800000000000ULL) continue;
+
+                    uint64_t UfuncVt = Read<uint64_t>(Ufunc);
+                    if (UfuncVt < MODULE_BASE || UfuncVt >= MODULE_BASE + 0x10000000ULL) continue;
+
+                    uint8_t Np = Read<uint8_t>(Ufunc + ArcDecrypt::Offsets::UFunction::NumParms);
+                    if (Np > 64) continue;
+
+                    uint32_t UfuncFlags = Read<uint32_t>(Ufunc + ArcDecrypt::Offsets::UFunction::FunctionFlags);
+                    if (UfuncFlags == 0 || UfuncFlags > 0x10000000u) continue;
+
+                    uint64_t NativeFunc = Read<uint64_t>(Ufunc + ArcDecrypt::Offsets::UFunction::NativeFunc);
+                    bool HasNative = (NativeFunc >= MODULE_BASE && NativeFunc < MODULE_BASE + 0x10000000ULL);
+                    bool KnownVt = ufunc_vtbls.count(UfuncVt) > 0;
+                    if (!KnownVt && !HasNative) continue;
+
+                    if (func_obj_addrs.count(Ufunc)) {
+                        for (auto& [Own, Fns] : m_owner_to_funcs) {
+                            auto It2 = std::find(Fns.begin(), Fns.end(), Ufunc);
+                            if (It2 != Fns.end()) {
+                                if (Own == 0 && Own != Rec.addr) {
+                                    Fns.erase(It2);
+                                    m_owner_to_funcs[Rec.addr].push_back(Ufunc);
+                                    ++Pass7Reassigned;
+                                }
+                                break;
+                            }
+                        }
+                    } else {
+                        m_owner_to_funcs[Rec.addr].push_back(Ufunc);
+                        func_obj_addrs.insert(Ufunc);
+                        ufunc_vtbls.insert(UfuncVt);
+                        ++Pass7;
+                    }
+                }
+            }
+            std::printf("[sdk] UFunction pass 7 (post-reclass FuncMap): %d new funcs across %d classes "
+                "(%d reassigned from orphans)\n", Pass7, Pass7Classes, Pass7Reassigned);
         }
 
         // ── Pass 3: emit "extra" structs/enums discovered via property walks
@@ -3706,18 +3753,14 @@ public:
         return result;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Dumper-7 style per-package SDK emit
-    // ─────────────────────────────────────────────────────────────────────────
     // Opt-in. When true, EmitDumper7() writes a directory tree similar to the
     // Dumper-7 layout that downstream menus / internal cheats / ESP expect:
-    //     <base>/SDK.hpp
-    //     <base>/SDK/Basic.hpp
-    //     <base>/SDK/<Package>_classes.hpp
-    //     <base>/SDK/<Package>_structs.hpp
-    //     <base>/SDK/<Package>_enums.hpp
-    //     <base>/SDK/<Package>_functions.hpp     (stubs only — no native call wiring)
-    // SDK_Output.txt flat dump is still emitted regardless.
+    //     <base>/sdk.hpp
+    //     <base>/sdk/Basic.hpp
+    //     <base>/sdk/<Package>/<Package>_classes.hpp
+    //     <base>/sdk/<Package>/<Package>_structs.hpp
+    //     <base>/sdk/<Package>/<Package>_enums.hpp
+    //     <base>/sdk/<Package>/<Package>_functions.hpp
     static constexpr bool kEmitDumper7 = true;
 
     // ── Extract last segment of a UE5 path like "/Script/Engine" → "Engine"
@@ -3827,15 +3870,15 @@ public:
     }
 
     // ── Emit a Dumper-7 style SDK tree under <base_dir>/.
-    // Creates <base_dir>/SDK/ and a master <base_dir>/SDK.hpp.
+    // Creates <base_dir>/sdk/ and a master <base_dir>/sdk.hpp.
     void EmitDumper7(const SDKResult& sdk, const std::string& base_dir) {
         if (!kEmitDumper7) return;
 
         D7_Mkdir(base_dir);
-        std::string sdk_dir = base_dir + "/SDK";
+        std::string sdk_dir = base_dir + "/sdk";
         D7_Mkdir(sdk_dir);
         // Per-package subdirectory layout requested by downstream consumers:
-        //   SDK/<Package>/<Package>_classes.hpp etc.
+        //   sdk/<Package>/<Package>_classes.hpp etc.
         // The per-package directory is created lazily before each file write.
 
         // Bucket records by short package name. Use std::map for stable
@@ -3861,9 +3904,6 @@ public:
         {
             std::ofstream f(sdk_dir + "/Basic.hpp");
             f << "#pragma once\n\n";
-            f << "// FrostDumper — Basic.hpp (Dumper-7 style aliases)\n";
-            f << "// Generated alongside SDK_Output.txt — opaque shells only,\n";
-            f << "// downstream consumers must define real layouts as needed.\n\n";
             f << "#include <cstdint>\n#include <cstddef>\n\n";
             f << "#ifdef _MSC_VER\n#pragma pack(push, 0x8)\n#endif\n\n";
             f << "namespace SDK\n{\n\n";
@@ -4020,7 +4060,7 @@ public:
         // we use alphabetical order — Dumper-7's strict dep-graph requires
         // the parser to resolve inherits-from cross-package, which we
         // approximate by emitting all classes after all structs after all
-        // enums in master SDK.hpp.
+        // enums in master sdk.hpp.
         std::vector<std::string> all_pkgs;
         {
             std::unordered_set<std::string> seen_pkg;
@@ -4094,22 +4134,22 @@ public:
             }
         }
 
-        // ── 3. Master SDK.hpp ─────────────────────────────────────────────
+        // ── 3. Master sdk.hpp ─────────────────────────────────────────────
         {
-            std::ofstream m(base_dir + "/SDK.hpp");
+            std::ofstream m(base_dir + "/sdk.hpp");
             m << "#pragma once\n\n";
-            m << "// FrostDumper — master SDK.hpp\n";
+            m << "// FrostDumper — master sdk.hpp\n";
             m << "// Packages: " << std::dec << all_pkgs.size() << "\n\n";
-            m << "#include \"SDK/Basic.hpp\"\n\n";
+            m << "#include \"sdk/Basic.hpp\"\n\n";
             m << "// Enums (no cross-package deps)\n";
             for (const auto& pkg : all_pkgs)
-                if (pkg_enums.count(pkg))   m << "#include \"SDK/" << pkg << "/" << pkg << "_enums.hpp\"\n";
+                if (pkg_enums.count(pkg))   m << "#include \"sdk/" << pkg << "/" << pkg << "_enums.hpp\"\n";
             m << "\n// Structs (may depend on enums)\n";
             for (const auto& pkg : all_pkgs)
-                if (pkg_structs.count(pkg)) m << "#include \"SDK/" << pkg << "/" << pkg << "_structs.hpp\"\n";
+                if (pkg_structs.count(pkg)) m << "#include \"sdk/" << pkg << "/" << pkg << "_structs.hpp\"\n";
             m << "\n// Classes (may depend on structs + enums)\n";
             for (const auto& pkg : all_pkgs)
-                if (pkg_classes.count(pkg)) m << "#include \"SDK/" << pkg << "/" << pkg << "_classes.hpp\"\n";
+                if (pkg_classes.count(pkg)) m << "#include \"sdk/" << pkg << "/" << pkg << "_classes.hpp\"\n";
             m << "\n// Function stub tables (optional)\n";
             for (const auto& pkg : all_pkgs) {
                 bool has = false;
@@ -4119,18 +4159,15 @@ public:
                     for (const auto* c : cit->second) if (!c->functions.empty()) { has = true; break; }
                 if (!has && sit != pkg_structs.end())
                     for (const auto* s : sit->second) if (!s->functions.empty()) { has = true; break; }
-                if (has) m << "// #include \"SDK/" << pkg << "/" << pkg << "_functions.hpp\"\n";
+                if (has) m << "// #include \"sdk/" << pkg << "/" << pkg << "_functions.hpp\"\n";
             }
         }
 
-        std::printf("[dumper7] Wrote SDK tree to %s/SDK/  (packages=%zu enums=%zu structs=%zu classes=%zu fnstubs=%zu)\n",
+        std::printf("[dumper7] Wrote SDK tree to %s/sdk/  (packages=%zu enums=%zu structs=%zu classes=%zu fnstubs=%zu)\n",
             base_dir.c_str(), all_pkgs.size(), f_enums, f_structs, f_classes, f_funcs);
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: format SDK output
-// ─────────────────────────────────────────────────────────────────────────────
 inline std::string FormatSDK(Generator& gen, const SDKResult& sdk) {
     std::ostringstream oss;
     oss << "// ============================================================\n";

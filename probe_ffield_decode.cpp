@@ -16,8 +16,6 @@
 #include "memreader_iface.h"
 #include "arc_decrypt.h"
 #include "sig_scan.h"
-#include "emu_engine.h"
-#include "emu_fname.h"
 #include "find_fname_func.h"
 #include "gobjects.h"
 #include "fname_decrypt.h"

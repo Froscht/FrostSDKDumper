@@ -3553,6 +3553,7 @@ inline FFieldNameDecryptParams   g_DiscoveredFFieldName;
 inline FFieldNameDecryptMasks    g_DiscoveredFFieldMasks;
 inline FPropertyDecryptParams    g_DiscoveredFProperty;
 inline UObjSlotDecryptParams     g_DiscoveredUObjSlot;
+inline bool                      g_UseV707SlotHash = false;
 inline FNameResolverConsts       g_DiscoveredFName;
 inline GNamesDiscovery           g_DiscoveredGNames;
 inline FNameKeystreamDiscovery   g_DiscoveredFNameKey;

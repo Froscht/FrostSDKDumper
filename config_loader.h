@@ -10,7 +10,6 @@
 
 #include "arc_decrypt.h"
 #include "auto_discovery.h"
-#include "auto_chunks_emu.h"
 
 namespace ConfigLoader {
 
@@ -609,25 +608,6 @@ inline void LoadAutoDiscoveryWorld(const JsonValue& Root) {
         (unsigned long long)Wd.GWorldRva, Wd.PersistentLevelOffset, Wd.ActorsCount);
 }
 
-inline void LoadChunksEmu(const JsonValue& Root) {
-    const auto& C = Root["chunks_emu"];
-    if (C.IsNull() || !C["valid"].Bool()) return;
-
-    auto& E = AutoChunksEmu::g_LastResult;
-    E.ChunksManager = C["chunks_manager"].Hex64();
-    E.ChunksArray   = C["chunks_array"].Hex64();
-    E.DecryptFnRva  = C["decrypt_fn_rva"].Hex64();
-    E.VtIndex       = static_cast<int>(C["vt_index"].Int());
-    E.InnerBlobOff  = C["inner_blob_off"].Hex32();
-    E.NumChunks     = static_cast<int>(C["num_chunks"].Int());
-    E.NumElements   = C["num_elements"].Hex32();
-    E.Valid         = true;
-
-    std::printf("[config] loaded chunks_emu: manager=0x%llX array=0x%llX chunks=%d elems=%u\n",
-        (unsigned long long)E.ChunksManager, (unsigned long long)E.ChunksArray,
-        E.NumChunks, E.NumElements);
-}
-
 struct LoadResult {
     bool Loaded = false;
     std::string Patch;
@@ -685,7 +665,6 @@ inline LoadResult LoadDiscoveryConfig(const char* Path) {
     LoadAutoDiscoveryGObjLayout(Root);       Result.SectionsLoaded++;
     LoadAutoDiscoveryFClassGlobals(Root);    Result.SectionsLoaded++;
     LoadAutoDiscoveryWorld(Root);            Result.SectionsLoaded++;
-    LoadChunksEmu(Root);                     Result.SectionsLoaded++;
 
     Result.Loaded = true;
     std::printf("[config] loaded %d sections from %s — auto-discovery will skip phases with valid cached data\n",

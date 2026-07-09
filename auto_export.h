@@ -15,7 +15,6 @@
 //   • All Patch20260421/20260428 mutable constants
 //     (ENTRY_HANDLE_XOR, g_PropertyOffsetXor, UObjSlot XOR scalar, etc.)
 //   • AutoDiscovery probe results (every g_Discovered*.Valid=true struct)
-//   • AutoChunksEmu::Result (chunks_manager / chunks_array / decrypt fn RVA / vt[N])
 //   • FName resolver constants (function start, imm64 / pshuflw / rol imm /
 //     rdata-LEA targets walked from the FName fn body)
 //
@@ -33,7 +32,6 @@
 
 #include "arc_decrypt.h"
 #include "auto_discovery.h"
-#include "auto_chunks_emu.h"
 
 namespace AutoExport {
 
@@ -527,20 +525,6 @@ inline void EmitAutoDiscovery(JsonWriter& W) {
     W.CloseObj();
 }
 
-inline void EmitChunksEmu(JsonWriter& W) {
-    W.OpenObj("chunks_emu");
-    const auto& E = AutoChunksEmu::g_LastResult;
-    W.KBool("valid",            E.Valid);
-    W.KU64("chunks_manager",    E.ChunksManager);
-    W.KU64("chunks_array",      E.ChunksArray);
-    W.KU64("decrypt_fn_rva",    E.DecryptFnRva);
-    W.KI64("vt_index",          E.VtIndex);
-    W.KU64("inner_blob_off",    (uint64_t)E.InnerBlobOff);
-    W.KI64("num_chunks",        E.NumChunks);
-    W.KU64("num_elements",      (uint64_t)E.NumElements);
-    W.CloseObj();
-}
-
 inline bool WriteAll(const char* Path, uint64_t ModuleBase) {
     std::ofstream Os(Path);
     if (!Os) {
@@ -559,7 +543,6 @@ inline bool WriteAll(const char* Path, uint64_t ModuleBase) {
     EmitOffsets(W);
     EmitPatchConstants(W);
     EmitAutoDiscovery(W);
-    EmitChunksEmu(W);
 
     W.CloseObj();
     Os << "\n";

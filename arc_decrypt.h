@@ -116,41 +116,41 @@ namespace Offsets {
     }
     namespace FField {
         inline uint64_t VTable        = 0x00;
-        inline uint64_t ClassPrivate  = 0xC0;     // CL-1233465 (auto-calibrated; was 0x60 on CL-1201801)
-        inline uint64_t Next          = 0xB0;     // CL-1233465 (was 0x50)
-        inline uint64_t Owner         = 0xA8;     // CL-1233465 (was 0x70)
-        inline uint64_t NameEncrypted = 0x90;     // CL-1233465 (was 0x40)
-        inline uint64_t NamePrivate   = 0x90;     // CL-1233465 (was 0x40)
-        inline uint64_t SaltSentinel  = 0x98;     // CL-1233465 (was 0x48)
+        inline uint64_t ClassPrivate  = 0x70;     // CL-1299607 (IDA FField ctor; was 0xC0 on CL-1233465)
+        inline uint64_t Next          = 0x60;     // CL-1299607 (IDA sub_1403DA2A0 result[6].lo64; was 0xB0)
+        inline uint64_t Owner         = 0x58;     // CL-1299607 (IDA sub_1403DA2A0 result[5].hi64; was 0xA8)
+        inline uint64_t NameEncrypted = 0x40;     // CL-1299607 (IDA sub_1403DA2A0 result[4]; was 0x90)
+        inline uint64_t NamePrivate   = 0x40;     // CL-1299607 (IDA sub_1403DA2A0 result[4]; was 0x90)
+        inline uint64_t SaltSentinel  = 0x68;     // CL-1299607 (IDA sub_1403DA2A0 result[6].hi64; was 0x98)
     }
     namespace FFieldClass {
         inline uint64_t ElementSize  = 0x70;
     }
     namespace FProperty {
-        inline uint64_t ArrayDim        = 0x110;  // CL-1233465 (was 0xC0; verified sub_140426D20 ctor +0x110=1 init)
-        inline uint64_t ElementSize     = 0x118;  // CL-1233465 (was 0xC8; follows ArrayDim)
-        inline uint64_t Offset_Internal = 0xE4;   // CL-1233465 (was 0x94; verified sub_140426D20 ctor +0xE4 = bswap(src^0xDA7BEE11))
-        inline uint32_t Offset_XOR      = 0xEAABEC11u;  // CL-1233465 (IDA FBoolProperty ctor; was 0xBAB939DB on CL-1201801)
-        inline uint64_t PropertyFlags   = 0xD0;   // CL-1233465 (was 0x88; verified sub_140426D20 ctor +0xD0 = flags qword)
+        inline uint64_t ArrayDim        = 0xC0;   // CL-1299607 (IDA sub_140432EF0 a1+192=1; was 0x110)
+        inline uint64_t ElementSize     = 0x7C;   // CL-1299607 (IDA sub_1404497D0 a1+124; was 0x118)
+        inline uint64_t Offset_Internal = 0x94;   // CL-1299607 (IDA sub_1404497D0 a1+148=bswap; was 0xE4)
+        inline uint32_t Offset_XOR      = 0x057F15E5u;  // CL-1299607 (IDA FBoolProperty ctor sub_1404497D0; was 0xEAABEC11)
+        inline uint64_t PropertyFlags   = 0x80;   // CL-1299607 (IDA sub_1404497D0 a1+128; was 0xD0)
     }
     namespace FBoolProperty {
-        inline uint64_t FieldSize  = 0x138;  // CL-1233465 (was 0xF0; verified sub_14044ADC0 ctor)
-        inline uint64_t ByteOffset = 0x139;  // CL-1233465 (was 0xF1)
-        inline uint64_t ByteMask   = 0x13A;  // CL-1233465 (was 0xF2)
-        inline uint64_t FieldMask  = 0x13B;  // CL-1233465 (was 0xF3)
+        inline uint64_t FieldSize  = 0xE8;   // CL-1299607 (IDA sub_1404497D0 a1+232; was 0x138)
+        inline uint64_t ByteOffset = 0xE9;   // CL-1299607 (IDA sub_1404497D0 a1+233; was 0x139)
+        inline uint64_t ByteMask   = 0xEA;   // CL-1299607 (IDA sub_1404497D0 a1+234; was 0x13A)
+        inline uint64_t FieldMask  = 0xEB;   // CL-1299607 (IDA sub_1404497D0 a1+235; was 0x13B)
     }
-    namespace FStructProperty  { inline uint64_t Struct        = 0x138; }  // CL-1233465 (verified: +0x130=Next alias, +0x138=shadow UScriptStruct)
-    namespace FObjectProperty  { inline uint64_t PropertyClass = 0x138; }  // CL-1233465 (null for most; Theia strips PropertyClass)
+    namespace FStructProperty  { inline uint64_t Struct        = 0xE8; }   // CL-1299607 (-0x50 shift; was 0x138)
+    namespace FObjectProperty  { inline uint64_t PropertyClass = 0xE8; }   // CL-1299607 (-0x50 shift; was 0x138)
     namespace FEnumProperty    {
-        inline uint64_t UnderlyingProp = 0x138;                             // CL-1233465 (null for most; Theia strips)
-        inline uint64_t Enum           = 0x140;                             // CL-1233465
+        inline uint64_t UnderlyingProp = 0xE8;                              // CL-1299607 (-0x50 shift; was 0x138)
+        inline uint64_t Enum           = 0xF0;                              // CL-1299607 (-0x50 shift; was 0x140)
     }
-    namespace FArrayProperty   { inline uint64_t Inner         = 0x138; }  // CL-1233465 (verified: inner FProperty at +0x138)
-    namespace FSetProperty     { inline uint64_t ElementProp   = 0x138; }  // CL-1233465
-    namespace FSoftObjectProperty { inline uint64_t PropertyClass = 0x138; } // CL-1233465
+    namespace FArrayProperty   { inline uint64_t Inner         = 0xE8; }   // CL-1299607 (-0x50 shift; was 0x138)
+    namespace FSetProperty     { inline uint64_t ElementProp   = 0xE8; }   // CL-1299607 (-0x50 shift; was 0x138)
+    namespace FSoftObjectProperty { inline uint64_t PropertyClass = 0xE8; } // CL-1299607 (-0x50 shift; was 0x138)
     namespace FMapProperty {
-        inline uint64_t KeyProp   = 0x138;                                 // CL-1233465 (verified)
-        inline uint64_t ValueProp = 0x140;                                 // CL-1233465
+        inline uint64_t KeyProp   = 0xE8;                                  // CL-1299607 (-0x50 shift; was 0x138)
+        inline uint64_t ValueProp = 0xF0;                                  // CL-1299607 (-0x50 shift; was 0x140)
     }
     namespace UField {
         inline uint64_t Next            = 0x90;
@@ -174,40 +174,40 @@ namespace Offsets {
         //   off=+0x178 hits= 1/32
         // auto-offsets probe identifies PropertiesSize at +0x100 (auto-fixed
         // from 0x190 by live oracle, 100/200 hits).
-        inline uint64_t SuperStruct     = 0xB0;    // CL-1201801 (live-verified: Actor+0xB0=Object, Pawn+0xB0=Actor, Object+0xB0=0)
-        inline uint64_t Children        = 0x118;   // alias for ChildProperties (FField walk)
-        inline uint64_t ChildProperties = 0x118;   // CL-1233465 (IDA sub_142F27240: mov rax,[rsi+118h])
-        inline uint64_t PropertiesSize  = 0xE0;    // CL-1233465 (live-verified: SMNodeInstance=0x120, Object=0xA0, Class=0x440)
-        inline uint64_t MinAlignment    = 0xE4;    // CL-1233465 (follows PropertiesSize)
+        inline uint64_t SuperStruct     = 0xB0;    // CL-1299607 (live-verified: EmbarkPlayerController→PlayerController→Controller→Actor)
+        inline uint64_t Children        = 0xC8;    // alias for ChildProperties (FField walk)
+        inline uint64_t ChildProperties = 0xC8;    // CL-1299607 (IDA sub_143A848D0 a2+200; was 0x118)
+        inline uint64_t PropertiesSize  = 0x90;    // CL-1299607 (-0x50 shift; was 0xE0)
+        inline uint64_t MinAlignment    = 0x94;    // CL-1299607 (follows PropertiesSize; was 0xE4)
     }
     namespace UEnum {
-        inline uint64_t Names = 0xB0;
+        inline uint64_t Names = 0x60;            // CL-1299607 (-0x50 shift; was 0xB0)
     }
     namespace UFunction {
         inline uint64_t VTable        = 0x000;
-        inline uint64_t NextPtr       = 0x098;
-        inline uint64_t FunctionFlags = 0x154;   // CL-1201801 (auto-fixed 100/100 hits)
-        inline uint64_t NativeFunc    = 0x178;   // CL-1201801 (auto-fixed 99/100 hits)
-        inline uint64_t NumParms      = 0xE0;
+        inline uint64_t NextPtr       = 0x048;   // CL-1299607 (-0x50 shift; was 0x098)
+        inline uint64_t FunctionFlags = 0x128;   // CL-1299607 (live-verified: 0x54020401 = FUNC_Native|... at this offset)
+        inline uint64_t NativeFunc    = 0x150;   // CL-1299607 (live-verified: 0x145F0E3A0 module .text ptr)
+        inline uint64_t NumParms      = 0x12C;   // CL-1299607 (right after FunctionFlags at +0x128)
     }
     namespace UClass {
-        inline uint64_t FuncMap_PairsData      = 0x2D8;
-        inline uint64_t FuncMap_Num            = 0x2E0;
-        inline uint64_t FuncMap_Max            = 0x2E4;
-        inline uint64_t FuncMap_AllocFlags     = 0x2E8;
-        inline uint64_t FuncMap_AllocFlagsNum  = 0x2F0;
-        inline uint64_t FuncMap_FirstFreeIdx   = 0x2F8;
-        inline uint64_t FuncMap_NumFreeIndices = 0x2FC;
+        inline uint64_t FuncMap_PairsData      = 0x218;  // CL-1299607 (live-verified: Actor Num=140, UFunction ptrs confirmed)
+        inline uint64_t FuncMap_Num            = 0x220;  // CL-1299607 (live-verified)
+        inline uint64_t FuncMap_Max            = 0x224;  // CL-1299607 (live-verified)
+        inline uint64_t FuncMap_AllocFlags     = 0x238;  // CL-1299607 (TBitArray secondary ptr, live-verified)
+        inline uint64_t FuncMap_AllocFlagsNum  = 0x240;  // CL-1299607 (NumBits)
+        inline uint64_t FuncMap_FirstFreeIdx   = 0x248;  // CL-1299607 (live-verified: -1 when no free)
+        inline uint64_t FuncMap_NumFreeIndices = 0x24C;  // CL-1299607 (live-verified: 0 when no free)
         inline uint64_t FuncMap_PairStride = 24;
         inline uint64_t FuncMapPair_FName    = 0x00;
         inline uint64_t FuncMapPair_UFunction = 0x08;
     }
     namespace UWorld {
-        inline uint64_t PersistentLevel = 0x0F0;
-        inline uint64_t Levels          = 0x3B0;
+        inline uint64_t PersistentLevel = 0x0A0;  // CL-1299607 (-0x50 shift; was 0x0F0)
+        inline uint64_t Levels          = 0x360;  // CL-1299607 (-0x50 shift; was 0x3B0)
     }
     namespace USceneComponent {
-        inline uint64_t ComponentToWorld = 0x330;
+        inline uint64_t ComponentToWorld = 0x2E0;  // CL-1299607 (-0x50 shift; was 0x330)
     }
 }
 
@@ -346,7 +346,7 @@ namespace Patch20260421 {
     //     entry_ptr = bswap64(handle_qword ^ ENTRY_HANDLE_XOR)
     //
     // Runtime-overridable: extracted from the live game's FName function
-    // body during BootEmuFNameFallback (see find_fname_func.h::ExtractEntryHandleXor).
+    // body during DiscoverFNameConsts (see find_fname_func.h::ExtractEntryHandleXor).
     // If extraction fails, the patch-20260421 default is used.
     // 20260428: 0x9CB9AD0A00000000  (auto-extracted at runtime by
     //           find_fname_func.h::ExtractEntryHandleXor; verified in IDA jjn1
@@ -487,7 +487,7 @@ namespace Patch20260421 {
     // Runtime-overridable XOR key for FProperty::Offset_Internal decrypt.
     // Set by AutoDiscovery::DiscoverFPropertyOffsetXor at init time. Falls
     // back to the CL-1177146 verified value when discovery hasn't run.
-    inline uint32_t g_PropertyOffsetXor = 0xEAABEC11u;   // CL-1233465 (IDA FBoolProperty ctor: v ^ 0xEAABEC11)
+    inline uint32_t g_PropertyOffsetXor = 0x057F15E5u;   // CL-1299607 (IDA FBoolProperty ctor sub_1404497D0; was 0xEAABEC11 on CL-1233465)
 
     inline uint32_t DecryptPropertyOffsetNew(uint32_t stored) {
         // CL-1195482: the IDA *encode* sites do `xor eax, 0xD632B3E9; bswap eax;
@@ -911,19 +911,15 @@ namespace v20260616 {
     constexpr uint64_t RVA_KEYSTREAM               = 0xE2B57F4ULL;
     constexpr int      KEYSTREAM_DECRYPT_BASE      = 96;
 
-    constexpr uint64_t RVA_UOBJ_SLOT_SHUF         = 0xBB59ED0ULL;
-    constexpr uint64_t RVA_UOBJ_SLOT_XOR          = 0xBB59EE0ULL;
-
     constexpr int      SLOT_BASE_OFF        = 0x20;
     constexpr int      SLOT_STRIDE          = 0x20;
+    constexpr int      SLOT_HASH_INPUT_OFF  = 0x10;
 
     constexpr uint32_t HASH_PRIME           = 0x01000193u;
     constexpr uint32_t SLOT_HASH_ADD        = 0x5619A446u;
 
-    constexpr uint8_t  SLOT_HASH_SHUF_IMM  = 0x1B;
-    constexpr int      SLOT_HASH_ROL32      = 9;
-
-    constexpr uint64_t UOBJ_SLOT_XOR_64     = 0x4632C279BC9DECB2ULL;
+    constexpr uint8_t  UOBJ_SLOT_PSHUFB[8]  = { 0x06, 0x05, 0x02, 0x03, 0x04, 0x01, 0x00, 0x07 };
+    constexpr uint64_t UOBJ_SLOT_XOR_64     = 0x5EA772D07F910744ULL;
     constexpr int      UOBJ_SLOT_FINAL_ROL  = 32;
 
     constexpr int      BLOCK_SHUF_A         = 0x93;
@@ -975,5 +971,56 @@ namespace v20260616 {
     constexpr int      KEY_PAIR_STEP_WIDE   = 2012;
     constexpr uint8_t  KEY_INDEX_MASK       = 0x3F;
 } // namespace v20260616
+
+namespace v20260707 {
+    constexpr int      SLOT_BASE_OFF        = 0x20;
+    constexpr int      SLOT_STRIDE          = 0x20;
+    constexpr int      SLOT_HASH_INPUT_OFF  = 0x10;
+
+    constexpr uint32_t HASH_PRIME           = 0x01000193u;
+    constexpr uint32_t SLOT_HASH_ADD        = 0x5A5A703Fu;
+    constexpr int      HASH_ROL1            = 25;
+    constexpr int      HASH_ROL2            = 15;
+    constexpr int      HASH_ROL3            = 25;
+    constexpr int      HASH_ROL4            = 15;
+
+    constexpr uint64_t UOBJ_SLOT_XOR_64     = 0x9A492C85DDF6F193ULL;
+    constexpr int      UOBJ_SLOT_ROL32      = 13;
+    constexpr int      UOBJ_SLOT_FINAL_ROL  = 39;
+
+    constexpr uint8_t  FFIELD_NAME_PSHUFB[8] = { 0x01, 0x03, 0x00, 0x02, 0x05, 0x04, 0x06, 0x07 };
+    constexpr uint64_t FFIELD_NAME_XOR_KEY   = 0x2BC795817F5A4D23ULL;
+    constexpr int      FFIELD_NAME_ROL64     = 32;
+
+    constexpr uint32_t PROPERTY_OFFSET_XOR   = 0x057F15E5u;
+
+    constexpr uint64_t RVA_GNAMEPOOL          = 0xE4A3A00ULL;
+    constexpr uint64_t RVA_KEYTABLE           = 0xE3E28E4ULL;
+
+    constexpr uint32_t SHARD_HASH_ADD         = 0x282106A6u;
+    constexpr uint64_t SHARD_HASH_SEED_OFF    = 0x6FD0ULL;
+    constexpr uint64_t SHARD_BLOCK_BASE_OFF   = 0x6FE0ULL;
+    constexpr int      SHARD_HASH_ROL_A       = 24;
+    constexpr int      SHARD_HASH_ROL_B       = 19;
+    constexpr int      SHARD_HASH_ROL_C       = 24;
+    constexpr int      SHARD_HASH_SHIFT       = 13;
+
+    constexpr int      BLOCK_PSHUFLW          = 0x1B;
+    constexpr int      BLOCK_ROL64            = 10;
+    constexpr uint64_t BLOCK_FNV_XOR          = 0x1BC3B58FFB88504CULL;
+
+    constexpr uint64_t FNV_PRIME              = 0x100000001B3ULL;
+    constexpr uint64_t FNV_ADD                = 0xEB1E82D44384D6E6ULL;
+    constexpr int      FNV_ROL1               = 51;
+    constexpr int      FNV_ROL2               = 39;
+
+    constexpr uint16_t HDR_LENGTH_FORMULA     = 1;
+    constexpr uint16_t HDR_IS_WIDE_BIT        = 0x8000u;
+    constexpr int      KEY_TABLE_SIZE         = 64;
+    constexpr uint8_t  KEY_INDEX_MASK         = 0x3F;
+    constexpr uint32_t KEY_BIAS_NARROW        = 0xFFFF9D4Eu;
+    constexpr uint32_t KEY_BIAS_ADD           = 0xEu;
+    constexpr uint32_t KEY_PAIR_STEP          = 0x29Cu;
+} // namespace v20260707
 
 } // namespace ArcDecrypt

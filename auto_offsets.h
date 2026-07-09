@@ -597,9 +597,9 @@ inline void ProbeUClassFuncMap(Context& ctx, const std::vector<uint64_t>& classe
                 uint64_t NativeFunc = 0;
                 R(*ctx.reader, Fn + ArcDecrypt::Offsets::UFunction::NativeFunc, NativeFunc);
                 bool HasNative = IsTextPtr(NativeFunc, ctx.module_base, ctx.bounds);
-                uint64_t QNumParms = 0;
-                R(*ctx.reader, Fn + ArcDecrypt::Offsets::UFunction::NumParms, QNumParms);
-                bool ParmShape = (QNumParms >> 8) == 0 && (QNumParms & 0xFF) <= 64;
+                uint8_t NumParmsVal = 0;
+                R(*ctx.reader, Fn + ArcDecrypt::Offsets::UFunction::NumParms, NumParmsVal);
+                bool ParmShape = NumParmsVal <= 64;
                 if (HasNative || ParmShape) {
                     FoundValidEntry = true;
                     break;

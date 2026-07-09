@@ -11,7 +11,7 @@
 // We scan .text page-by-page (sliding window so straddling matches survive),
 // resolve the E8 displacement to get the called function's RVA, and report
 // the most-frequent target across all caller hits. That target is the FName
-// decrypt function entry — the one we'll feed to Unicorn in Phase 2.
+// decrypt function entry — used for constant extraction in Phase 5.
 // =============================================================================
 
 #include <algorithm>

@@ -126,7 +126,7 @@ public:
         // 2) Otherwise try the 2026-05-19 keytable RVA. Valid ⇒ new pipeline,
         //    additionally pre-load all 9 SIMD-stage masks.
         // 3) If both yield <16 nonzero u16 entries, fall through and let the
-        //    legacy path's auto-discovery / emu fallback take over.
+        //    legacy path's auto-discovery take over.
         auto TryLoadKeytable = [&](uint64_t Rva, uint16_t* Out) -> int {
             if (!m_reader.Read(m_base + Rva, Out, 64 * sizeof(uint16_t))) return -1;
             int Nz = 0;
@@ -190,6 +190,25 @@ public:
             }
         }
 
+        {
+            namespace V707 = ArcDecrypt::v20260707;
+            uint16_t Kt707[64] = {};
+            if (m_reader.Read(m_base + V707::RVA_KEYTABLE, Kt707, sizeof(Kt707))) {
+                int Nz = 0;
+                for (int I = 0; I < 64; ++I) Nz += (Kt707[I] != 0);
+                if (Nz >= 16) {
+                    std::memcpy(m_keyTable707, Kt707, sizeof(Kt707));
+                    m_ks707Loaded = true;
+                    std::printf("[fname] v707 keytable loaded @ 0x%llX (%d nz, first: 0x%04X 0x%04X 0x%04X 0x%04X)\n",
+                        (unsigned long long)(m_base + V707::RVA_KEYTABLE), Nz,
+                        m_keyTable707[0], m_keyTable707[1], m_keyTable707[2], m_keyTable707[3]);
+                } else {
+                    std::printf("[fname] v707 keytable @ 0x%llX only %d nz — skipped\n",
+                        (unsigned long long)(m_base + V707::RVA_KEYTABLE), Nz);
+                }
+            }
+        }
+
         m_keyLoaded = true;
         return true;
     }
@@ -220,43 +239,7 @@ public:
     void SetPrimaryHandleOffset(uint64_t off) { m_primaryHandleOffset = off; }
     uint64_t PrimaryHandleOffset() const { return m_primaryHandleOffset; }
 
-    // ── Emulation fallback ──────────────────────────────────────────────────
-    // When the static decrypt pipeline cannot resolve a CompIndex (signature
-    // drift, table-key drift, FNV mismatch, …) we hand the CI off to the
-    // game's own FName function running inside Unicorn. The wiring lives in
-    // main.cpp; here we accept an opaque std::function so this header stays
-    // free of any Unicorn / EmuFName include.
-    using EmuFallback = std::function<std::string(int32_t /*comp_index*/)>;
-    void SetEmuFallback(EmuFallback fn) { m_emuFallback = std::move(fn); }
-    void ClearEmuCache() { m_emuCache.clear(); }
-    size_t EmuCacheSize() const { return m_emuCache.size(); }
 
-    // ── Emu-primary mode ────────────────────────────────────────────────────
-    // When set, CompIndexToName / CompIndexToNameLenient / GetName try the
-    // Unicorn-emulated game function FIRST and only fall back to the static
-    // SIMD pipeline if emu fails. Use this on patches where the static path
-    // is broken (FNamePool resolver shape changed, FNameEntry decrypt rotated,
-    // etc.) — wired up automatically by main.cpp::Init() when the Phase 0.6
-    // sanity check on actor names fails. Default = false (static primary).
-    void SetEmuPrimary(bool enabled) {
-        if (m_emuPrimary == enabled) return;
-        m_emuPrimary = enabled;
-        std::printf("[fname] emu-primary mode %s — %s\n",
-            enabled ? "ENABLED" : "DISABLED",
-            enabled ? "all CompIndex resolution routes through Unicorn first"
-                    : "static decrypt path is primary");
-    }
-    bool EmuPrimary() const { return m_emuPrimary; }
-    bool HasEmuFallback() const { return !!m_emuFallback; }
-
-    // Emu-only path. Skips StaticResolve entirely — for callers that know
-    // the static pipeline produces wrong-but-printable garbage on this
-    // patch (e.g. UEnum::Names entries on patch 20260421 store an obfuscated
-    // CompIndex that the standard FNamePool walk maps to the wrong slot).
-    // Routes through sub_23D3E0 in-game (the inline SIMD pipeline).
-    std::string DecryptCIByEmu(int32_t comp_index) {
-        return TryEmuFallback(comp_index);
-    }
 
     void DumpKeyTable(int n) const {
         std::printf("[dbg] FName KeyTable (addr=0x%llX, first %d entries):\n",
@@ -286,16 +269,26 @@ public:
     //   OUTER = (slot_byte + 1) & 3
     //   CLASS =  slot_byte & 3
     static uint8_t Build20260519_ObjSlotMixByte(uint64_t obj_ptr) {
-        const bool Is616 = AutoDiscovery::g_DiscoveredUObjSlot.Valid;
+        const bool Is707 = AutoDiscovery::g_UseV707SlotHash;
+        const bool Is616 = !Is707 && AutoDiscovery::g_DiscoveredUObjSlot.Valid;
         const uint32_t P   = 0x01000193u;
-        const uint32_t ADD = Is616 ? ArcDecrypt::v20260616::SLOT_HASH_ADD
+        const uint32_t ADD = Is707 ? ArcDecrypt::v20260707::SLOT_HASH_ADD
+                           : Is616 ? ArcDecrypt::v20260616::SLOT_HASH_ADD
                                    : ArcDecrypt::v20260519::SLOT_HASH_ADD;
         uint64_t p = obj_ptr + 0x10;
         uint32_t lo32 = static_cast<uint32_t>(p);
         uint32_t hi32 = static_cast<uint32_t>(p >> 32);
 
         uint32_t h;
-        if (Is616) {
+        if (Is707) {
+            h = fn_rotl32(lo32, ArcDecrypt::v20260707::HASH_ROL1);
+            h = P * h + ADD;
+            h = fn_rotl32(h, ArcDecrypt::v20260707::HASH_ROL2);
+            h = P * h + hi32 + ADD;
+            h = fn_rotl32(h, ArcDecrypt::v20260707::HASH_ROL3);
+            h = P * h + ADD;
+            h = fn_rotl32(h, ArcDecrypt::v20260707::HASH_ROL4);
+        } else if (Is616) {
             h = fn_rotl32(lo32, 26);
             h = P * h + ADD;
             h = fn_rotl32(h, 27);
@@ -400,33 +393,19 @@ public:
     }
 
     // ── Decrypt one UObject slot (CL-1177678) ───────────────────────────
-    // Forwards to DecryptUObjSlotCL1177678 — the actual current-patch
-    // algorithm: shufflelo(0x39) → ROL32(26) → PSHUFB(xmmword_ADEAC80) →
-    // lo64 → ROL64(32). The legacy CL-1177146 algorithm (PSHUFB + XOR +
-    // ROL64) doesn't match this patch.
-    //
-    // For NAME slot: result.lo32 = CompIndex, result.hi32 = FName::Number.
-    // For pointer slots (Class/Outer): the same decode produces a 64-bit
-    // value where (hi32 << 32) | lo32 reconstructs the original pointer
-    // (= ROL64(real_ptr, 32) is its own inverse). Callers that want the
-    // raw pointer should swap halves: `((u32)dec << 32) | (dec >> 32)`.
+    // CL-1299607 slot decrypt: ROL32(13) → lo64 → XOR → ROL64(39).
+    // Result layout: hi32 = CompIndex, lo32 = FName::Number (for name slot),
+    // or a raw 64-bit pointer (for class/outer slots).
+    // Callers extracting CompIndex must use (dec >> 32).
     uint64_t DecryptUObjSlotNew(const uint8_t enc[16]) const {
-        const auto& Disc = AutoDiscovery::g_DiscoveredUObjSlot;
-        if (Disc.Valid) {
-            __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-            alignas(16) uint8_t FullMask[16] = {};
-            std::memcpy(FullMask, Disc.ShufMaskBytes, 8);
-            __m128i Mask = _mm_load_si128(reinterpret_cast<const __m128i*>(FullMask));
-            __m128i Shuffled = _mm_shuffle_epi8(V, Mask);
-            __m128i Xored = _mm_xor_si128(Shuffled, _mm_set_epi64x(0, static_cast<int64_t>(Disc.XorScalar)));
-            uint64_t Lo;
-            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Xored);
-            return fn_rotl64(Lo, Disc.Rol64Amount);
-        }
-        if (m_pipeline == Pipeline::Build20260519) {
-            return DecryptUObjSlot_Build20260519(enc);
-        }
-        return DecryptUObjSlotCL1177678(enc);
+        namespace V707 = ArcDecrypt::v20260707;
+        __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
+        __m128i Rot = _mm_or_si128(
+            _mm_slli_epi32(V, V707::UOBJ_SLOT_ROL32),
+            _mm_srli_epi32(V, 32 - V707::UOBJ_SLOT_ROL32));
+        uint64_t Lo;
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Rot);
+        return fn_rotl64(Lo ^ V707::UOBJ_SLOT_XOR_64, V707::UOBJ_SLOT_FINAL_ROL);
     }
 
     // ── Build20260519 UObject NAME slot decoder (verified sub_140498A50) ──
@@ -444,24 +423,7 @@ public:
     // ── Build20260519 UObject CLASS/OUTER slot decoder ───────────────────
     // Same PSHUFLW+XOR but ROL64(5) — result is the raw pointer directly.
     uint64_t DecryptUObjSlotPtr_Build20260519(const uint8_t enc[16]) const {
-        const auto& Disc = AutoDiscovery::g_DiscoveredUObjSlot;
-        if (Disc.Valid) {
-            __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-            alignas(16) uint8_t FullMask[16] = {};
-            std::memcpy(FullMask, Disc.ShufMaskBytes, 8);
-            __m128i Mask = _mm_load_si128(reinterpret_cast<const __m128i*>(FullMask));
-            __m128i Shuffled = _mm_shuffle_epi8(V, Mask);
-            __m128i Xored = _mm_xor_si128(Shuffled, _mm_set_epi64x(0, static_cast<int64_t>(Disc.XorScalar)));
-            uint64_t Lo;
-            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), Xored);
-            return Lo;
-        }
-        using namespace ArcDecrypt::v20260519;
-        __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-        __m128i S = _mm_shufflelo_epi16(V, 0xB1);
-        uint64_t Lo;
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), S);
-        return fn_rotl64(Lo ^ UOBJ_SLOT_XOR_64, UOBJ_SLOT_PTR_ROL);
+        return DecryptUObjSlotNew(enc);
     }
 
     // ── CL-1177678 UObject slot decoder ─────────────────────────────────
@@ -525,6 +487,20 @@ public:
     // CL-1177146 value, used until discovery has run.
     static constexpr uint64_t FFIELD_NAME_XOR_CL1177146 = 0x9A492C85DDF6F193ULL;
     uint64_t DecryptFFieldNameSlot(const uint8_t enc[16]) const {
+        {
+            using namespace ArcDecrypt::v20260707;
+            __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
+            alignas(16) uint8_t PshufMask[16] = {};
+            std::memcpy(PshufMask, FFIELD_NAME_PSHUFB, 8);
+            V = _mm_shuffle_epi8(V, _mm_load_si128(reinterpret_cast<const __m128i*>(PshufMask)));
+            V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(FFIELD_NAME_XOR_KEY)));
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+            uint64_t Out = (Lo << FFIELD_NAME_ROL64) | (Lo >> (64 - FFIELD_NAME_ROL64));
+            uint32_t CiN = static_cast<uint32_t>(Out);
+            if (CiN > 1 && CiN < 0x2000000u) return Out;
+        }
+
         {
             using namespace ArcDecrypt::v20260616;
             __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
@@ -700,6 +676,7 @@ public:
     //   obj=0x88060000 (NAME slot 1) → CI=1700
     int32_t GetCompIndex(uint64_t obj_base) {
         if (!obj_base || !m_keyLoaded) return 0;
+        m_lastHashSlotStale = false;
         auto is_ci = [](uint32_t h) { return h > 1 && h < 0x2000000u; };
 
         auto try_slot = [&](int slot) -> int32_t {
@@ -710,9 +687,9 @@ public:
             for (int b = 0; b < 16; ++b) if (enc[b]) { nonzero = true; break; }
             if (!nonzero) return 0;
 
-            uint64_t dec = DecryptUObjSlotNew(enc);   // dispatches to Build20260519 when active
-            uint32_t lo = static_cast<uint32_t>(dec);   // CI is in low 32 after ROL64(32)
-            if (is_ci(lo)) return static_cast<int32_t>(lo);
+            uint64_t dec = DecryptUObjSlotNew(enc);
+            uint32_t ci = static_cast<uint32_t>(dec >> 32);
+            if (is_ci(ci)) return static_cast<int32_t>(ci);
             return 0;
         };
 
@@ -721,12 +698,11 @@ public:
                           ? Build20260519_ObjNameSlot(obj_base)
                           : ObjNameSlot(obj_base);
         if (int32_t ci = try_slot(static_cast<int>(ns))) return ci;
-        // Tier 1: walk all 4 slots as fallback. Validate each via emu — only
-        // accept the slot whose CI resolves to a non-empty, mostly-printable
-        // string. Without validation, non-name slots (Class/Outer/Inner)
-        // produce in-range-but-bogus CIs that emu-resolves to garbage.
+        m_lastHashSlotStale = true;
+        // Tier 1: walk all 4 slots as fallback. Accept the first slot
+        // whose CI is in valid range.
         auto looks_name = [](const std::string& s) {
-            if (s.empty() || s.size() > 256) return false;
+            if (s.empty() || s.size() > 1024) return false;
             int printable = 0;
             for (unsigned char c : s)
                 if (c >= 32 && c <= 126) ++printable;
@@ -736,14 +712,28 @@ public:
             if (s == static_cast<int>(ns)) continue;
             int32_t ci = try_slot(s);
             if (!ci) continue;
-            if (m_emuFallback) {
-                std::string nm = TryEmuFallback(ci);
-                if (looks_name(nm)) return ci;
-            } else {
-                return ci;  // no validator available — best-effort
-            }
+            return ci;
         }
         return 0;
+    }
+
+    bool WasLastHashSlotStale() const { return m_lastHashSlotStale; }
+
+    bool IsLikelyStaleObj(uint64_t obj_ptr) {
+        if (!obj_ptr || !m_keyLoaded) return true;
+        uint32_t ns = (m_pipeline == Pipeline::Build20260519 || AutoDiscovery::g_DiscoveredUObjSlot.Valid)
+                          ? Build20260519_ObjNameSlot(obj_ptr)
+                          : ObjNameSlot(obj_ptr);
+        alignas(16) uint8_t enc[16] = {};
+        if (!m_reader.Read(obj_ptr + 0x20 + static_cast<uint64_t>(ns) * 0x20, enc, 16))
+            return true;
+        bool nonzero = false;
+        for (int b = 0; b < 16; ++b) if (enc[b]) { nonzero = true; break; }
+        if (!nonzero) return false;
+        uint64_t dec = DecryptUObjSlotNew(enc);
+        uint32_t ci = static_cast<uint32_t>(dec >> 32);
+        if (ci > 1 && ci < 0x2000000u) return false;
+        return true;
     }
 
     // Return ALL pointer-shaped slot decryptions (up to 4). Used by SDK
@@ -765,10 +755,7 @@ public:
             } else {
                 uint64_t dec = DecryptUObjSlotNew(enc);
                 if (!dec) continue;
-                uint32_t lo = static_cast<uint32_t>(dec);
-                uint32_t hi = static_cast<uint32_t>(dec >> 32);
-                if (hi < 0x10000u) continue;
-                ptr = (static_cast<uint64_t>(lo) << 32) | hi;
+                ptr = dec;
                 if (ptr < 0x100000ULL || ptr >= 0x800000000000ULL) continue;
             }
             out[slot] = ptr;
@@ -791,10 +778,7 @@ public:
             }
             uint64_t dec = DecryptUObjSlotNew(enc);
             if (!dec) return 0;
-            uint32_t lo = static_cast<uint32_t>(dec);
-            uint32_t hi = static_cast<uint32_t>(dec >> 32);
-            if (hi < 0x10000u) return 0;
-            uint64_t ptr = (static_cast<uint64_t>(lo) << 32) | hi;
+            uint64_t ptr = dec;
             if (ptr < 0x100000ULL || ptr >= 0x800000000000ULL) return 0;
             return ptr;
         };
@@ -904,7 +888,7 @@ private:
         for (uint8_t b : enc) if (b) { any = true; break; }
         if (!any) return 0;
         uint64_t dec = DecryptUObjSlotNew(enc);
-        return static_cast<int32_t>(dec & 0xFFFFFFFFu);
+        return static_cast<int32_t>(dec >> 32);
     }
 public:
 
@@ -1066,6 +1050,9 @@ public:
     uint64_t ResolveNamePtrFull(int32_t CompIndex) {
         if (CompIndex <= 0 || !m_keyLoaded) return 0;
 
+        if (m_ks707Loaded)
+            return ResolveNamePtr_V707(CompIndex);
+
         // ── Dispatch on active pipeline ──
         if (m_pipeline == Pipeline::Build20260519) {
             return ResolveNamePtr_Build20260519(CompIndex);
@@ -1189,6 +1176,57 @@ public:
     //             v ^= A3_XOR ; v = ROL16(v, 12) ; v = pshufb(v, A3_PSHUFB_OUT)
     //   Outputs:   v6 = lo32(v); name_offset = u16(v6); chunk_offset = (v6>>8)&0xFFFF00
     //
+    uint64_t ResolveNamePtr_V707(int32_t CompIndex) {
+        namespace V707 = ArcDecrypt::v20260707;
+        if (CompIndex <= 0 || !m_ks707Loaded) return 0;
+
+        uint32_t Ci       = static_cast<uint32_t>(CompIndex);
+        uint16_t NameOff  = static_cast<uint16_t>(Ci & 0xFFFFu);
+        uint32_t ChunkOff = (Ci >> 8) & 0xFFFF00u;
+        uint64_t ChunkAddr = m_base + V707::RVA_GNAMEPOOL + ChunkOff;
+
+        uint64_t HashAddr = ChunkAddr + V707::SHARD_HASH_SEED_OFF;
+        uint32_t HLo = static_cast<uint32_t>(HashAddr);
+        uint32_t HHi = static_cast<uint32_t>(HashAddr >> 32);
+
+        uint32_t H = fn_rotl32(HLo, V707::SHARD_HASH_ROL_A);
+        H = V707::HASH_PRIME * H + V707::SHARD_HASH_ADD;
+        H = fn_rotl32(H, V707::SHARD_HASH_ROL_B);
+        H = V707::HASH_PRIME * H + HHi + V707::SHARD_HASH_ADD;
+        H = fn_rotl32(H, V707::SHARD_HASH_ROL_C);
+        H = V707::HASH_PRIME * H + V707::SHARD_HASH_ADD;
+        uint32_t V9H = V707::HASH_PRIME * (H >> V707::SHARD_HASH_SHIFT) + V707::SHARD_HASH_ADD;
+        uint32_t Mix = V9H ^ (V9H >> 16);
+
+        uint32_t Bidx1 = Mix & 7u;
+        uint32_t Bidx2 = (Mix + 1u) & 7u;
+
+        uint64_t BlockBase = ChunkAddr + V707::SHARD_BLOCK_BASE_OFF;
+        uint64_t Raw1 = 0, Raw2 = 0;
+        if (!m_reader.Read(BlockBase + 32ULL * Bidx1, &Raw1, 8)) return 0;
+        if (!m_reader.Read(BlockBase + 32ULL * Bidx2, &Raw2, 8)) return 0;
+        if (!Raw1 && !Raw2) return 0;
+
+        auto DecBlock = [](uint64_t Raw) -> uint64_t {
+            uint64_t Rotated = fn_rotl64(Raw, V707::BLOCK_ROL64);
+            __m128i V = _mm_set_epi64x(0, static_cast<int64_t>(Rotated));
+            V = _mm_shufflelo_epi16(V, V707::BLOCK_PSHUFLW);
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+            return Lo;
+        };
+
+        uint64_t V13 = DecBlock(Raw1) ^ V707::BLOCK_FNV_XOR;
+        uint64_t V15 = DecBlock(Raw2);
+
+        uint64_t Fv1 = V707::FNV_PRIME * fn_rotl64(V13, V707::FNV_ROL1) + V707::FNV_ADD;
+        uint64_t Fv2 = V707::FNV_PRIME * fn_rotl64(Fv1, V707::FNV_ROL2) + V707::FNV_ADD;
+
+        uint64_t EntryPtr = (Fv2 ^ V707::BLOCK_FNV_XOR ^ V15) + V13 + 2ULL * NameOff;
+        if (EntryPtr < 0x10000ULL || EntryPtr >= 0x800000000000ULL) return 0;
+        return EntryPtr;
+    }
+
     // CL-1201801 shard hash-table resolver. The binary's 3-function chain
     // (sub_2337C0 → sub_23A6B0 → sub_236E80) uses PSHUFB+ROL64+XOR layers
     // that algebraically cancel to identity: NameOff = CI & 0xFFFF,
@@ -1361,6 +1399,9 @@ public:
     std::string DecryptNameString(uint64_t NameEntryPtr) {
         if (!NameEntryPtr || !m_keyLoaded) return {};
 
+        if (m_ks707Loaded)
+            return DecryptNameString_V707(NameEntryPtr);
+
         if (m_ks616Loaded) {
             return DecryptNameString_CL1233465(NameEntryPtr);
         }
@@ -1399,6 +1440,69 @@ public:
                 if (WBuf[J]) Result += static_cast<char>(WBuf[J] & 0xFF);
             }
             return Result;
+        }
+    }
+
+    std::string DecryptNameString_V707(uint64_t NameEntryPtr) {
+        namespace V707 = ArcDecrypt::v20260707;
+        if (!NameEntryPtr || !m_ks707Loaded) return {};
+
+        uint16_t Header = 0;
+        if (!m_reader.Read(NameEntryPtr, &Header, 2) || !Header) return {};
+
+        int Length = static_cast<int>(((Header >> 12) | ((Header >> 2) & 0x3F8)) & 0xFFFF);
+        bool IsWide = (Header & V707::HDR_IS_WIDE_BIT) != 0;
+        if (Length <= 0 || Length > 1023) return {};
+
+        if (!IsWide) {
+            std::vector<uint8_t> Buf(Length, 0);
+            if (!m_reader.Read(NameEntryPtr + 2, Buf.data(), Length)) return {};
+
+            uint32_t Eax = (static_cast<uint32_t>(Length) + V707::KEY_BIAS_NARROW) & 0xFFFFFFFFu;
+            int HalfLen = Length & ~1;
+            int K = 0;
+            while (2 * K < HalfLen) {
+                Buf[2 * K]     ^= static_cast<uint8_t>(m_keyTable707[(Eax - V707::KEY_BIAS_ADD) & V707::KEY_INDEX_MASK] >> 3);
+                Buf[2 * K + 1] ^= static_cast<uint8_t>(m_keyTable707[Eax & V707::KEY_INDEX_MASK] >> 3);
+                Eax = (Eax + V707::KEY_PAIR_STEP) & 0xFFFFFFFFu;
+                ++K;
+            }
+            if (Length & 1) {
+                Buf[Length - 1] ^= static_cast<uint8_t>(m_keyTable707[(Eax - V707::KEY_BIAS_ADD) & V707::KEY_INDEX_MASK] >> 3);
+            }
+
+            std::string Out;
+            Out.reserve(Length);
+            for (int J = 0; J < Length; ++J) {
+                if (!Buf[J]) break;
+                Out.push_back(static_cast<char>(Buf[J]));
+            }
+            return Out;
+        } else {
+            std::vector<uint16_t> Wides(Length, 0);
+            if (!m_reader.Read(NameEntryPtr + 2, Wides.data(),
+                               static_cast<size_t>(Length) * sizeof(uint16_t))) return {};
+
+            uint32_t Eax = (static_cast<uint32_t>(Length) + V707::KEY_BIAS_NARROW) & 0xFFFFFFFFu;
+            int HalfLen = Length & ~1;
+            int K = 0;
+            while (2 * K < HalfLen) {
+                Wides[2 * K]     ^= m_keyTable707[(Eax - V707::KEY_BIAS_ADD) & V707::KEY_INDEX_MASK];
+                Wides[2 * K + 1] ^= m_keyTable707[Eax & V707::KEY_INDEX_MASK];
+                Eax = (Eax + V707::KEY_PAIR_STEP) & 0xFFFFFFFFu;
+                ++K;
+            }
+            if (Length & 1) {
+                Wides[Length - 1] ^= m_keyTable707[(Eax - V707::KEY_BIAS_ADD) & V707::KEY_INDEX_MASK];
+            }
+
+            std::string Out;
+            Out.reserve(Length);
+            for (int J = 0; J < Length; ++J) {
+                if (!Wides[J]) break;
+                Out.push_back(static_cast<char>(Wides[J] & 0xFFu));
+            }
+            return Out;
         }
     }
 
@@ -1560,7 +1664,7 @@ public:
         if (!obj_ptr || !m_keyLoaded) return {};
 
         auto isSaneName = [](const std::string& s) {
-            if (s.empty() || s.size() > 128) return false;
+            if (s.empty() || s.size() > 1024) return false;
             int printable = 0;
             for (unsigned char c : s)
                 if (c >= 32 && c <= 126)
@@ -1568,42 +1672,16 @@ public:
             return printable * 5 >= static_cast<int>(s.size()) * 4;
         };
 
-        // Emu-primary path: skip every static FNameEntry/FNamePool-based
-        // resolver. Slot decrypt (GetCompIndex) is the only static piece left
-        // — and that's auto-discovered (Phase 4 + Phase 0 ENTRY_HANDLE_XOR
-        // extract), not patch-bound. Routing through CompIndexToNameLenient
-        // hits Unicorn for the actual CI→string lookup.
-        if (m_emuPrimary && m_emuFallback) {
-            int32_t comp = GetCompIndex(obj_ptr);
-            if (comp > 0) {
-                std::string out = CompIndexToNameLenient(comp);
-                if (isSaneName(out)) return out;
-            }
-            // Last-ditch: the inline-handle path (also static, but uses
-            // auto-extracted ENTRY_HANDLE_XOR — sometimes survives even when
-            // the FNamePool pipeline drifts).
+        if (!m_ks707Loaded) {
             if (m_primaryHandleOffset) {
                 std::string s = GetNameByHandle(obj_ptr, m_primaryHandleOffset);
                 if (isSaneName(s)) return s;
             }
-            return {};
-        }
-
-        // Patch 20260421 primary path: inline encrypted FName handle at
-        // obj+0x28 → bswap64(h ^ sentinel) = FNameEntry*. Try the calibrated
-        // primary offset first (set by SDKDumper::CalibrateInlineHandleOffset
-        // — only fires when the probe finds an offset with ≥25% hit rate);
-        // fall back to the original 3-offset shortlist that's been verified
-        // across recent patches. A wider scan would risk hitting wrong-but-
-        // sane-looking offsets for UFunction-class objects.
-        if (m_primaryHandleOffset) {
-            std::string s = GetNameByHandle(obj_ptr, m_primaryHandleOffset);
-            if (isSaneName(s)) return s;
-        }
-        for (uint64_t off : {uint64_t(0x28), uint64_t(0x18), uint64_t(0x30)}) {
-            if (off == m_primaryHandleOffset) continue;  // already tried
-            std::string s = GetNameByHandle(obj_ptr, off);
-            if (isSaneName(s)) return s;
+            for (uint64_t off : {uint64_t(0x28), uint64_t(0x18), uint64_t(0x30)}) {
+                if (off == m_primaryHandleOffset) continue;
+                std::string s = GetNameByHandle(obj_ptr, off);
+                if (isSaneName(s)) return s;
+            }
         }
 
         int32_t comp = GetCompIndex(obj_ptr);
@@ -1613,6 +1691,7 @@ public:
                 std::string out = DecryptNameString(nptr);
                 if (isSaneName(out)) return out;
             }
+            m_lastHashSlotStale = true;
         }
 
         return {};
@@ -1621,37 +1700,15 @@ public:
     // ── Resolve comp_index → string ──────────────────────────────────────
     // Strict: identifier-shaped only (alphanum + _:./- space). Used for
     // class/enum/struct names that go straight into the SDK output.
-    // When m_emuPrimary is set, hits Unicorn first and only falls back to
-    // the static SIMD pipeline if emu fails — used on patches where the
-    // FNamePool resolver / FNameEntry decrypt has drifted.
+    // Strict: returns empty string if the result is not identifier-shaped.
     std::string CompIndexToName(int32_t comp_index) {
-        if (m_emuPrimary) {
-            std::string e = TryEmuFallback(comp_index);
-            if (IsStrictName(e)) return e;
-            std::string s = StaticResolve(comp_index);
-            if (IsStrictName(s)) return s;
-            return {};
-        }
         std::string s = StaticResolve(comp_index);
-        if (IsStrictName(s)) return s;
-        std::string e = TryEmuFallback(comp_index);
-        return IsStrictName(e) ? e : std::string{};
+        return IsStrictName(s) ? s : std::string{};
     }
 
-    // Lenient: any mostly-printable ASCII. Used for FField names which can
-    // legitimately contain weirder characters.
     std::string CompIndexToNameLenient(int32_t comp_index) {
-        if (m_emuPrimary) {
-            std::string e = TryEmuFallback(comp_index);
-            if (IsLenientName(e)) return e;
-            std::string s = StaticResolve(comp_index);
-            if (IsLenientName(s)) return s;
-            return {};
-        }
         std::string s = StaticResolve(comp_index);
         if (IsLenientName(s)) return s;
-        std::string e = TryEmuFallback(comp_index);
-        if (IsLenientName(e)) return e;
         if (m_lenientFailCount < 20) {
             ++m_lenientFailCount;
             uint64_t nptr = ResolveNamePtrFull(comp_index);
@@ -1670,7 +1727,7 @@ public:
                     std::printf(" decrypt='%s'", raw.empty() ? "<empty>" : raw.c_str());
                 }
             }
-            std::printf(" emu='%s'\n", e.empty() ? "<empty>" : e.c_str());
+            std::printf("\n");
         }
         return {};
     }
@@ -1755,10 +1812,7 @@ public:
             if (!m_reader.Read(addr, enc, 16)) return 0;
             uint64_t dec = DecryptUObjSlotNew(enc);
             if (!dec) return 0;
-            uint32_t lo = static_cast<uint32_t>(dec);
-            uint32_t hi = static_cast<uint32_t>(dec >> 32);
-            if (hi < 0x10000u) return 0;  // FName-shaped, not pointer
-            uint64_t ptr = (static_cast<uint64_t>(lo) << 32) | hi;
+            uint64_t ptr = dec;
             if (ptr < 0x100000ULL || ptr >= 0x800000000000ULL) return 0;
             return ptr;
         };
@@ -1842,10 +1896,7 @@ public:
             if (!m_reader.Read(addr, enc, 16)) return 0;
             uint64_t dec = DecryptUObjSlotNew(enc);
             if (!dec) return 0;
-            uint32_t lo = static_cast<uint32_t>(dec);
-            uint32_t hi = static_cast<uint32_t>(dec >> 32);
-            if (hi < 0x10000u) return 0;  // FName-shaped
-            uint64_t ptr = (static_cast<uint64_t>(lo) << 32) | hi;
+            uint64_t ptr = dec;
             if (ptr < 0x100000ULL || ptr >= 0x800000000000ULL) return 0;
             return ptr;
         };
@@ -1914,15 +1965,11 @@ public:
 
     // ── DecryptSlot16: UObject FName slot → comp_index (int32) ──────────
     uint64_t DecryptSlot16(const uint8_t enc[16]) const {
-        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-        return DecryptFNameRaw(v);
+        return DecryptUObjSlotNew(enc);
     }
 
-    // ── DecryptPtrSlot: UObject pointer slot → heap pointer ──────────────
-    // Same pipeline as FName, but result interpreted as pointer (ROL64(32) applied)
     uint64_t DecryptPtrSlot(const uint8_t enc[16]) const {
-        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-        return fn_rotl64(DecryptFNameRaw(v), 32);
+        return DecryptUObjSlotPtr_Build20260519(enc);
     }
 
 private:
@@ -1935,26 +1982,6 @@ private:
         return DecryptNameString(nptr);
     }
 
-    // Static-path failure → ask Unicorn-emulated game function. Result is
-    // cached (positive and negative) since each emu call costs ~ms. The
-    // cache stores raw emu output (only sanitized for non-printable bytes
-    // and length); callers apply their own strict/lenient filter.
-    std::string TryEmuFallback(int32_t comp_index) {
-        if (!m_emuFallback || comp_index <= 0) return {};
-        auto it = m_emuCache.find(comp_index);
-        if (it != m_emuCache.end()) return it->second;
-        std::string s = m_emuFallback(comp_index);
-        if (s.size() > 256) s.clear();
-        for (unsigned char c : s) {
-            if (c < 32 || c > 126) { s.clear(); break; }
-        }
-        m_emuCache.emplace(comp_index, s);
-        return s;
-    }
-
-    // Strict identifier filter: alphanum + _:./- and space. Reject `?` and
-    // any other non-identifier ASCII so emu garbage like "?????" cannot
-    // sneak through to the SDK as an enum/class name.
     static bool IsStrictName(const std::string& s) {
         if (s.empty() || s.size() > 256) return false;
         for (unsigned char c : s) {
@@ -1981,12 +2008,12 @@ private:
     uint16_t       m_keyTable[256];
     uint16_t       m_keyTable616[160];
     bool           m_ks616Loaded = false;
-    EmuFallback    m_emuFallback;
-    std::unordered_map<int32_t, std::string> m_emuCache;
-    bool           m_emuPrimary = false;       // see SetEmuPrimary()
+    uint16_t       m_keyTable707[64];
+    bool           m_ks707Loaded = false;
     int            m_lenientFailCount = 0;
     uint64_t       m_primaryHandleOffset = 0;  // 0 = no calibration yet, fall back to candidate list
     uint64_t       m_ffieldNameOff = 0;        // 0 = uncalibrated; first valid offset wins
+    bool           m_lastHashSlotStale = false;
 
     // ── Pipeline selection (set in Init()) ──
     Pipeline       m_pipeline = Pipeline::CL1177146;

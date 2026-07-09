@@ -1736,8 +1736,6 @@ namespace gobjects
         }
 
         bool InitDirect_CL1233465() {
-            if (!AutoDiscovery::g_DiscoveredUObjSlot.Valid) return false;
-
             uint64_t GobjBase = m_base + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE;
             uint8_t Sb[0x200] = {};
             if (!m_reader.Read(GobjBase, Sb, sizeof(Sb))) return false;

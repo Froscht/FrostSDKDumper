@@ -1,22 +1,22 @@
 // =============================================================================
 // ARC Raiders – External SDK Dumper (newest patch)
 //
-// Build:  g++ -O2 -std=c++17 -mavx2 -o FrostDumper main.cpp -lunicorn -lcapstone
+// Build:  g++ -O2 -std=c++17 -mavx2 -o FrostDumper main.cpp -lcapstone
 // Run:    sudo ./FrostDumper <pid>          (PID of ARC Raiders / wine process)
 //         sudo ./FrostDumper                (uses auto-detect via /proc)
 //
 // No flags needed — the default does the full automatic pipeline:
 //   1. /dev/memreader open + sig-scan auto-discovery of all critical RVAs
-//   2. Boot Unicorn + locate FName decrypt fn + arm fallback for static-fail CIs
+//   2. Sig-scan FName decrypt fn + auto-discover pipeline constants
 //   3. Enumerate GObjects via canonical chunks_manager vtable[7] path
-//   4. Walk every UClass/UStruct/UEnum and emit SDK_Output.txt
+//   4. Walk every UClass/UStruct/UEnum and emit sdk/SDK_Output.txt
 //
 // Requires:  kernel module loaded (sudo insmod ../KernelDriver/src/memreader.ko)
 // Output:    dump_objects.txt    – full object list (idx, addr, name)
 //            dump_names.txt      – unique FNames sorted
 //            dump_classes.txt    – objects with a class prefix e.g. /Script/...
 //            dump_log.txt        – timestamped run log
-//            SDK_Output.txt      – full SDK struct/enum output
+//            sdk/SDK_Output.txt      – full SDK struct/enum output
 // =============================================================================
 
 #include <iostream>
@@ -41,6 +41,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <immintrin.h>
 #include <glob.h>
 
@@ -51,14 +52,11 @@
 #include "sig_scanner_v2.h"
 #include "insn_decoder.h"
 #include "func_analyzer.h"
-#include "emu_engine.h"
-#include "emu_fname.h"
 #include "find_fname_func.h"
 #include "gobjects.h"
 #include "fname_decrypt.h"
 using FNameDecryptor = FName::FNameDecryptor;
 #include "auto_offsets.h"
-#include "auto_chunks_emu.h"
 #include "auto_export.h"
 #include "config_loader.h"
 #include "sdk_generator.h"
@@ -260,11 +258,6 @@ public:
     FNameDecryptor             m_fname;
     gobjects::GObjectArray     m_gobj;
     int                        m_pid;
-    // Lazily-booted Unicorn engine + FName wrapper. Kept alive for the
-    // entire dumper lifetime so FNameDecryptor's emu-fallback callback
-    // can hit them on demand. Null if boot failed (static path still works).
-    std::unique_ptr<EmuEngine> m_emuEngine;
-    std::unique_ptr<EmuFName>  m_emuFName;
     SigScanV2::Scanner         m_sigScanner;  // Zydis-aware module cache for autodiscovery
     SigScan::PEFileReader      m_sigPe;       // shared PE fallback for legacy SigScan (open once)
     bool                       m_sigPeReady = false;
@@ -356,23 +349,12 @@ public:
                         AutoDiscovery::g_DiscoveredBounds);
             }
 
-            // ── Phase 4: UObject 4-slot decrypt SIMD constants ─────────
-            if (AutoDiscovery::g_DiscoveredUObjSlot.Valid) {
-                std::printf("[autodisc] Phase 4 skipped — UObj slot decrypt loaded from config (xor=0x%016llX)\n",
-                    (unsigned long long)AutoDiscovery::g_DiscoveredUObjSlot.XorScalar);
-            } else {
-                AutoDiscovery::g_DiscoveredUObjSlot =
-                    AutoDiscovery::DiscoverUObjSlotDecrypt(m_sigScanner, m_reader);
-                if (AutoDiscovery::g_DiscoveredUObjSlot.Valid) {
-                    using namespace ArcDecrypt::Patch20260421::UObjSlot20260428;
-                    uint64_t Live = AutoDiscovery::g_DiscoveredUObjSlot.XorScalar;
-                    if (Live == XOR_SCALAR)
-                        std::printf("[autodisc] UObj slot XOR scalar matches constant 0x%016llX\n",
-                            (unsigned long long)Live);
-                    else
-                        std::printf("[autodisc] UObj slot XOR scalar drift: 0x%016llX → 0x%016llX (auto-fixed)\n",
-                            (unsigned long long)XOR_SCALAR, (unsigned long long)Live);
-                }
+            {
+                namespace V707 = ArcDecrypt::v20260707;
+                AutoDiscovery::g_UseV707SlotHash = true;
+                std::printf("[autodisc] Phase 4: using static V707 slot constants (ROL32=%d, XOR=0x%016llX, ROL64=%d)\n",
+                    V707::UOBJ_SLOT_ROL32,
+                    (unsigned long long)V707::UOBJ_SLOT_XOR_64, V707::UOBJ_SLOT_FINAL_ROL);
             }
 
             // ── Phase 7: FFieldClass NamePrivate decode pipeline ───────
@@ -543,9 +525,8 @@ public:
         }
 
         // Earliest snapshot — fires before any failure-prone live-memory
-        // bootstrapping (FName key table read, Unicorn boot, GObjectArray
-        // init). Captures auto-discovery output even when later phases
-        // bail out on a busted memreader / unfortunate game state.
+        // bootstrapping (FName key table read, GObjectArray init).
+        // Captures auto-discovery output even when later phases bail out.
         AutoExport::WriteAll("decrypt_export.json", MODULE_BASE);
 
         // Init FName key table + SIMD tables
@@ -555,13 +536,8 @@ public:
         }
         std::cout << "[+] FName decryptor initialized\n";
 
-        // ── Auto-boot Unicorn FName fallback ────────────────────────────────
-        // Locate the live game's outer FName decrypt function via signature
-        // scan, boot Unicorn with the PE-on-disk fallback, and plumb it into
-        // FNameDecryptor as the "couldn't statically resolve this CI" path.
-        // Failures here are non-fatal: the static decrypt path keeps working,
-        // we just lose the patch-resilient fallback.
-        BootEmuFNameFallback();
+        // ── Auto-discover FName function + pipeline constants ────────────────
+        DiscoverFNameConsts();
 
         // ── Optional: capture SIMD chunk_table-decrypt XOR key live ──────
         // The chunk_table-decrypt function reads the Wine PEB pointer from
@@ -577,49 +553,17 @@ public:
         // probe, both of which still work.
         CaptureSimdPebKey();
 
-        // ── GObjectArray init: 4-tier auto-discovery ─────────────────────
-        // Tier 1 (preferred): function-emulation discovery. Anchor on rip-rel
-        //                     load to GUObjectArray, walk back to fn start,
-        //                     emulate to extract chunks_manager, then emulate
-        //                     vt[N] for chunks_array. Patch-shape independent
-        //                     — Unicorn runs whatever SIMD ops the patch uses.
-        // Tier 2: GUObjectArray field-layout BFS — works only when chunks-
-        //         array is a static field (rare on encrypted patches).
-        // Tier 3: vt[7] emulation w/ compile-time constants — older patches.
-        // Tier 4: structural heap scan — last resort, slow but always works.
+        // ── GObjectArray init: 3-tier auto-discovery ─────────────────────
+        // Tier 1: GUObjectArray field-layout BFS — works when chunks-array
+        //         is discoverable via structural probing.
+        // Tier 2: structural heap scan — last resort, slow but always works.
         m_gobj.SetPid(m_pid);
         bool gobj_ok = false;
 
-        // Tier 1: emulation discovery
-        {
-            const std::string& pe_path = GetPEBinaryPath();
-            const uint64_t EmuMapSize = AutoDiscovery::g_DiscoveredBounds.Valid
-                ? AutoDiscovery::g_DiscoveredBounds.ImageSize : 0xE9AF000ULL;
-            auto emu_result = AutoChunksEmu::Discover(
-                m_reader, MODULE_BASE, m_sigScanner,
-                AutoDiscovery::g_DiscoveredBounds,
-                pe_path.empty() ? nullptr : pe_path.c_str(),
-                EmuMapSize);
-            AutoChunksEmu::g_LastResult = emu_result;
-            // Early snapshot — captures everything discovered so far. If a
-            // later phase hangs (sanity check / auto-offsets / FName boot),
-            // the JSON still has chunks_emu + Phase 3/4/7/8 results.
-            AutoExport::WriteAll("decrypt_export.json", MODULE_BASE);
-            if (emu_result.Valid) {
-                if (m_gobj.InitFromChunksCanonical(emu_result.ChunksArray,
-                                                   emu_result.NumChunks,
-                                                   (int)emu_result.NumElements)) {
-                    std::cout << "[+] GObjectArray initialized via fn-emulation ("
-                              << m_gobj.GetNumElements() << " objects, decrypt fn @ rva=0x"
-                              << std::hex << emu_result.DecryptFnRva << std::dec
-                              << ", vt[" << emu_result.VtIndex << "])\n";
-                    gobj_ok = true;
-                }
-            }
-        }
+        AutoExport::WriteAll("decrypt_export.json", MODULE_BASE);
 
-        // Tier 2: layout BFS
-        if (!gobj_ok) {
+        // Tier 1: layout BFS
+        {
             AutoDiscovery::g_DiscoveredGObjLayout =
                 AutoDiscovery::DiscoverGUObjectArrayLayout(
                     m_reader, MODULE_BASE, ArcDecrypt::RVA_GOBJECT_ARRAY_BASE,
@@ -635,14 +579,9 @@ public:
             }
         }
 
-        // Tier 3: vt[7] (older encrypted layouts)
-        if (!gobj_ok && TryInitViaVtable7()) {
-            std::cout << "[+] GObjectArray initialized via canonical vtable[7] ("
-                      << m_gobj.GetNumElements() << " objects)\n";
-            gobj_ok = true;
-        }
+        // Tier 2: structural heap scan
         if (!gobj_ok) {
-            std::cout << "[+] Going straight to structural scan (no auto-discoverable layout, vt[7] unavailable)\n";
+            std::cout << "[+] Going straight to structural scan (no auto-discoverable layout)\n";
             if (!m_gobj.Init()) {
                 std::cerr << "[-] GObjectArray direct init failed, trying world traversal...\n";
                 m_gobj.PrintDiagnostics();
@@ -700,32 +639,9 @@ public:
                     AutoDiscovery::ValidateFNameOnActors(SanitySample, SanityResolver);
                 if (!AutoDiscovery::g_DiscoveredFNameSanity.Valid) {
                     std::printf("[!] FName sanity check FAILED — static decrypt "
-                                "pipeline is broken on this patch.\n");
-                    // Auto-flip to emu-primary mode if Unicorn FName fallback is
-                    // armed. The game's own FName function inside Unicorn doesn't
-                    // care about pipeline drift in FNamePool / FNameEntry — every
-                    // CompIndexToName / GetName routes through it instead. ~ms per
-                    // call (cached), but eliminates per-patch RE for the entire
-                    // FName resolver + entry decrypt subsystems.
-                    if (m_emuFName) {
-                        std::printf("[!] Flipping FNameDecryptor to EMU-PRIMARY mode "
-                                    "(Unicorn FName fallback is armed — using it as primary)\n");
-                        m_fname.SetEmuPrimary(true);
-                        AutoDiscovery::g_DiscoveredFNameSanity =
-                            AutoDiscovery::ValidateFNameOnActors(SanitySample, SanityResolver);
-                        if (!AutoDiscovery::g_DiscoveredFNameSanity.Valid) {
-                            std::printf("[!] Emu-primary sanity check ALSO failed — "
-                                        "Unicorn FName fn likely mis-located or its slot "
-                                        "decrypt drifted. SDK dump quality will be poor.\n");
-                        } else {
-                            std::printf("[+] Emu-primary sanity check PASSED — "
-                                        "all subsequent name resolution routes through Unicorn\n");
-                        }
-                    } else {
-                        std::printf("[!] Unicorn FName fallback NOT armed — cannot auto-flip. "
-                                    "Investigate FName pipeline (key table, SIMD const, "
-                                    "entry handle XOR, slot decrypt).\n");
-                    }
+                                "pipeline is broken on this patch. "
+                                "Investigate FName pipeline (key table, SIMD const, "
+                                "entry handle XOR, slot decrypt).\n");
                 }
             }
         }
@@ -1031,7 +947,7 @@ public:
         // ArcDecrypt::Patch20260421::g_PropertyOffsetXor.)
 
         // Snapshot every runtime-resolved decryption constant / offset /
-        // anchor to a JSON file next to SDK_Output.txt. Forensic trail for
+        // anchor to a JSON file next to sdk/SDK_Output.txt. Forensic trail for
         // patch days + consumable by external tooling.
         AutoExport::WriteAll("decrypt_export.json", MODULE_BASE);
 
@@ -1151,7 +1067,7 @@ public:
     // For each candidate offset in [0x10..0x80] step 8, read 8 bytes from a
     // sample of live objects, run them through DecryptByHandle, count the
     // ones that yield a sane name. Highest-scoring offset wins. Robust to
-    // ENTRY_HANDLE_XOR drift because BootEmuFNameFallback already updated
+    // ENTRY_HANDLE_XOR drift because DiscoverFNameConsts already updated
     // the XOR before we get here.
     void CalibrateInlineHandleOffset() {
         // Same sanity check the dump phase uses (≥80% printable chars).
@@ -1224,10 +1140,7 @@ public:
         }
     }
 
-    // ── Auto-boot Unicorn-backed FName fallback ──────────────────────────
-    // Best-effort. On any failure we log and continue with no fallback —
-    // the static decrypt path still produces names for the majority of CIs.
-    void BootEmuFNameFallback() {
+    void DiscoverFNameConsts() {
         // 1. Locate the outer FName decrypt entry. Two anchors run in
         //    sequence; whichever finds it first wins. Both must come back
         //    with the same RVA (or the SIMD anchor takes priority — its
@@ -1267,25 +1180,25 @@ public:
         if (find.found && has_clean_prologue(find.best_target_rva)) {
             fname_rva = find.best_target_rva;
             if (simd_rva == fname_rva) {
-                std::printf("[emu-auto] FName decrypt @ rva=0x%llX  (caller+SIMD agree)\n",
+                std::printf("[autodisc] FName decrypt @ rva=0x%llX  (caller+SIMD agree)\n",
                             (unsigned long long)fname_rva);
             } else if (simd_rva) {
-                std::printf("[emu-auto] FName decrypt @ rva=0x%llX  (caller pattern; "
+                std::printf("[autodisc] FName decrypt @ rva=0x%llX  (caller pattern; "
                             "SIMD anchor disagreed at 0x%llX — kept caller as proven)\n",
                             (unsigned long long)fname_rva, (unsigned long long)simd_rva);
             } else {
-                std::printf("[emu-auto] FName decrypt @ rva=0x%llX  (caller pattern; "
+                std::printf("[autodisc] FName decrypt @ rva=0x%llX  (caller pattern; "
                             "SIMD anchor missed — encryption shape may have shifted)\n",
                             (unsigned long long)fname_rva);
             }
         } else if (simd_rva && has_clean_prologue(simd_rva)) {
             fname_rva = simd_rva;
-            std::printf("[emu-auto] FName decrypt @ rva=0x%llX  (SIMD fingerprint; "
+            std::printf("[autodisc] FName decrypt @ rva=0x%llX  (SIMD fingerprint; "
                         "caller pattern %s)\n",
                         (unsigned long long)fname_rva,
                         find.found ? "found wrong target" : "missed");
         } else {
-            std::printf("[emu-auto] FName decrypt not located with clean prologue "
+            std::printf("[autodisc] FName decrypt not located with clean prologue "
                         "(caller=0x%llX simd=0x%llX) — fallback disabled\n",
                         (unsigned long long)(find.found ? find.best_target_rva : 0),
                         (unsigned long long)simd_rva);
@@ -1301,15 +1214,15 @@ public:
         if (live_xor) {
             uint64_t old_xor = ArcDecrypt::Patch20260421::ENTRY_HANDLE_XOR;
             if (live_xor != old_xor) {
-                std::printf("[emu-auto] ENTRY_HANDLE_XOR drifted: 0x%016llX → 0x%016llX (auto-fixed)\n",
+                std::printf("[autodisc] ENTRY_HANDLE_XOR drifted: 0x%016llX → 0x%016llX (auto-fixed)\n",
                             (unsigned long long)old_xor, (unsigned long long)live_xor);
             } else {
-                std::printf("[emu-auto] ENTRY_HANDLE_XOR matches constant (0x%016llX)\n",
+                std::printf("[autodisc] ENTRY_HANDLE_XOR matches constant (0x%016llX)\n",
                             (unsigned long long)live_xor);
             }
             ArcDecrypt::Patch20260421::SetEntryHandleXor(live_xor);
         } else {
-            std::printf("[emu-auto] ENTRY_HANDLE_XOR extraction failed; using constant 0x%016llX\n",
+            std::printf("[autodisc] ENTRY_HANDLE_XOR extraction failed; using constant 0x%016llX\n",
                         (unsigned long long)ArcDecrypt::Patch20260421::ENTRY_HANDLE_XOR);
         }
 
@@ -1406,140 +1319,6 @@ public:
             }
         }
 
-        // 2. Boot Unicorn with PE-on-disk fallback for VMProtect-cold pages.
-        const std::string& pe_path = GetPEBinaryPath();
-        m_emuEngine = std::make_unique<EmuEngine>();
-        const uint64_t EmuMapSize = AutoDiscovery::g_DiscoveredBounds.Valid
-            ? AutoDiscovery::g_DiscoveredBounds.ImageSize : 0xE9AF000ULL;
-        if (!m_emuEngine->Initialize(&m_reader, MODULE_BASE, EmuMapSize,
-                                     pe_path.empty() ? nullptr : pe_path.c_str())) {
-            std::printf("[emu-auto] EmuEngine init failed — fallback disabled\n");
-            m_emuEngine.reset();
-            return;
-        }
-
-        // 3. Init the FName wrapper at the located RVA.
-        m_emuFName = std::make_unique<EmuFName>();
-        if (!m_emuFName->Init(m_emuEngine.get(), MODULE_BASE, fname_rva)) {
-            std::printf("[emu-auto] EmuFName init failed — fallback disabled\n");
-            m_emuFName.reset();
-            m_emuEngine.reset();
-            return;
-        }
-        m_emuFName->SetVerbose(false);          // silence per-call logging
-        m_emuFName->SetGamePeb(0x7FFD0000ULL);  // Wine-canonical PEB
-        m_emuEngine->MapGamePage(0x7FFD0000ULL);
-
-        // 4. Plumb into FNameDecryptor as a FALLBACK. Phase 0.6's runtime
-        //    sanity check on actor names will flip to emu-primary mode if
-        //    the static path is broken; otherwise static stays primary
-        //    because it's ~10x faster than per-CI Unicorn emulation. The
-        //    fallback path uses Unicorn-emulated game function code, with
-        //    results cached in FNameDecryptor::m_emuCache.
-        m_fname.SetEmuFallback([this](int32_t ci) -> std::string {
-            if (ci <= 0 || !m_emuFName) return {};
-            return m_emuFName->DecryptByIndex(static_cast<uint32_t>(ci));
-        });
-        std::printf("[emu-auto] Unicorn FName fallback armed (Phase 0.6 will choose primary)\n");
-    }
-
-    // ── Canonical chunks-array recovery via vtable[7] emulation ──────────
-    // Patch 20260421: chunks_manager's vtable[7] is a ~24-insn inline SIMD
-    // decrypt (not VMP — the earlier belief that it was a bytecode dispatcher
-    // was a disasm misread of `add rax, gs:[0x60]`). Load the 16B blob at
-    // chunks_manager+0x30, call the function inside Unicorn with the target
-    // process's PEB at GS:[0x60], and the decrypted chunks_array arrives in
-    // xmm0.u64[0]. Then hand that off to GObjectArray for full enumeration.
-    bool TryInitViaVtable7() {
-        using namespace ArcDecrypt::Patch20260421;
-
-        // CL-1177146 layout detection: if NumElements is plain at +0x30, the
-        // encrypted chunks_manager pipeline is gone — vt[7] uses stale 20260421
-        // RVAs (RVA_GOBJ_PSHUFB_MASK / RVA_GOBJ_MAX_XOR_KEY) that decrypt to
-        // garbage on CL-1177146. Skip vt[7] entirely; structural scan handles
-        // this layout correctly.
-        {
-            uint64_t NumAt30 = 0;
-            if (m_reader.Read(MODULE_BASE + ArcDecrypt::RVA_GOBJECT_ARRAY_BASE + 0x30,
-                              &NumAt30, 8))
-            {
-                uint32_t Lo = static_cast<uint32_t>(NumAt30 & 0xFFFFFFFFu);
-                if ((NumAt30 >> 32) == 0 && Lo >= 1000 && Lo <= 2000000) {
-                    std::printf("[vt7] CL-1177146 layout detected (+0x30 plain NumElements=%u); "
-                                "skipping vt[7] — structural scan handles this directly\n", Lo);
-                    return false;
-                }
-            }
-        }
-
-        uint8_t enc[16] = {}, mask[8] = {};
-        uint64_t xor_key = 0;
-        if (!m_reader.Read(MODULE_BASE + RVA_GUOBJECT_ARRAY_NEW, enc, 16)) return false;
-        if (!m_reader.Read(MODULE_BASE + RVA_GOBJ_PSHUFB_MASK, mask, 8))   return false;
-        if (!m_reader.Read(MODULE_BASE + RVA_GOBJ_MAX_XOR_KEY, &xor_key, 8)) return false;
-
-        uint64_t chunks_mgr = DecryptGObjChunksManager(enc, mask);
-        if (chunks_mgr < 0x10000 || chunks_mgr >= 0x800000000000) return false;
-
-        uint8_t max_enc[16] = {};
-        if (!m_reader.Read(chunks_mgr + GOBJ_MANAGER_MAX_OFFSET, max_enc, 16)) return false;
-        int32_t max_elements = DecryptGObjMaxElements(max_enc, xor_key);
-        if (max_elements < 1000 || max_elements > 2000000) return false;
-        int num_chunks = (max_elements + 0xFFFF) / 0x10000;  // ceil / ObjectsPerChunk
-
-        uint64_t vtable = 0, vt7 = 0;
-        if (!m_reader.Read(chunks_mgr, &vtable, 8) || !vtable) return false;
-        if (!m_reader.Read(vtable + 0x38, &vt7, 8) || !vt7)    return false;
-
-        uint8_t scratch_in[16] = {};
-        if (!m_reader.Read(chunks_mgr + 0x30, scratch_in, 16)) return false;
-
-        EmuEngine eng;
-        const std::string& pe_path = GetPEBinaryPath();
-        const uint64_t EmuMapSize = AutoDiscovery::g_DiscoveredBounds.Valid
-            ? AutoDiscovery::g_DiscoveredBounds.ImageSize : 0xE9AF000ULL;
-        if (!eng.Initialize(&m_reader, MODULE_BASE, EmuMapSize,
-                            pe_path.empty() ? nullptr : pe_path.c_str())) return false;
-        eng.PreMapRange(chunks_mgr & ~0xFFFULL, 0x4000);
-        eng.PreMapRange(vt7 & ~0xFFFULL, 0x4000);
-
-        constexpr uint64_t FAKE_TEB = 0x00007FFFFFFE0000ULL;
-        constexpr uint64_t FAKE_PEB = 0x7FFD0000ULL;  // Wine-canonical
-        uc_mem_map(eng.UC(), FAKE_TEB, 0x1000, UC_PROT_ALL);
-        uint8_t teb_zero[0x1000] = {};
-        uc_mem_write(eng.UC(), FAKE_TEB, teb_zero, sizeof(teb_zero));
-        uint64_t self = FAKE_TEB;
-        uc_mem_write(eng.UC(), FAKE_TEB + 0x30, &self, 8);
-        uc_mem_write(eng.UC(), FAKE_TEB + 0x60, &FAKE_PEB, 8);
-        eng.SetGSBase(FAKE_TEB);
-        eng.MapGamePage(FAKE_PEB);
-
-        const uint64_t SCRATCH_ADDR = 0x10000ULL;
-        eng.EmuWrite(SCRATCH_ADDR, scratch_in, 16);
-
-        eng.ResetCPU();
-        eng.WriteReg(UC_X86_REG_RCX, chunks_mgr);
-        eng.WriteReg(UC_X86_REG_RDX, SCRATCH_ADDR);
-        uint64_t sentinel = 0xDEAD0000ULL;
-        uint64_t rsp = eng.ReadReg(UC_X86_REG_RSP);
-        rsp -= 8;
-        eng.EmuWrite(rsp, &sentinel, 8);
-        eng.WriteReg(UC_X86_REG_RSP, rsp);
-
-        uc_err er = eng.Run(vt7, sentinel, /*timeout_us*/500'000, /*max*/200);
-        uint8_t xmm0_bytes[16] = {};
-        uc_reg_read(eng.UC(), UC_X86_REG_XMM0, xmm0_bytes);
-        uint64_t chunks_array = 0;
-        std::memcpy(&chunks_array, xmm0_bytes, 8);
-        if (chunks_array < 0x10000 || chunks_array >= 0x800000000000) {
-            std::printf("[vt7] emulation gave implausible xmm0=0x%llX (err=%d)\n",
-                (unsigned long long)chunks_array, (int)er);
-            return false;
-        }
-        std::printf("[vt7] chunks_array=0x%llX  num_chunks=%d  max_elements=%d\n",
-            (unsigned long long)chunks_array, num_chunks, max_elements);
-
-        return m_gobj.InitFromChunksCanonical(chunks_array, num_chunks, max_elements);
     }
 
     // ── World traversal: GWorld → Levels → actors + BFS UClass expansion ─────
@@ -2334,9 +2113,9 @@ public:
                 Unk, (unsigned long long)n_struct_props,
                 n_struct_props ? 100.0 * Unk / n_struct_props : 0.0);
         }
-        // ── Write SDK output  ─────────────────────────────────────────────
-        std::ofstream sdk_file("SDK_Output.txt");
-        if (!sdk_file) { std::cerr << "[-] Cannot open SDK_Output.txt\n"; return; }
+        ::mkdir("sdk", 0755);
+        std::ofstream sdk_file("sdk/SDK_Output.txt");
+        if (!sdk_file) { std::cerr << "[-] Cannot open sdk/SDK_Output.txt\n"; return; }
 
         // Summary header (mirrors reference tool format)
         sdk_file << "// ============================================================\n"
@@ -2408,7 +2187,7 @@ public:
         sdk_file << "} // namespace ARC\n";
         sdk_file.close();
 
-        std::cout << "\n[+] SDK written to SDK_Output.txt\n"
+        std::cout << "\n[+] SDK written to sdk/SDK_Output.txt\n"
                   << "[+]   Classes:    " << n_classes    << "\n"
                   << "[+]   Structs:    " << n_structs    << "\n"
                   << "[+]   Enums:      " << sdk.enums.size() << "\n"
@@ -2428,7 +2207,7 @@ public:
             const std::unordered_map<uint64_t, std::string>& AddrToName,
             const std::unordered_map<uint64_t, std::string>& AddrToFullname)
     {
-        constexpr uint64_t kBoneArrayOffset = 0xD8;
+        constexpr uint64_t kBoneArrayOffset = 0xB8;
         constexpr uint32_t kBoneInfoStride  = 12;
         constexpr uint32_t kMaxBones        = 2048;
 
@@ -2554,7 +2333,8 @@ public:
         fLog << "[" << Now() << "] Dump started. Objects: " << obj_count << "\n";
 
         // ── Iterate via chunked array ─────────────────────────────────────
-        uint32_t valid = 0, failed = 0, empty = 0;
+        uint32_t valid = 0, failed = 0, empty = 0, stale = 0;
+        uint32_t staleVt = 0, staleCi = 0, staleResolve = 0;
         std::set<std::string>                uniqueNames;
         std::unordered_map<std::string, int> nameCount;
         m_cachedObjectPtrs.clear();
@@ -2563,6 +2343,9 @@ public:
         m_cachedAddrToFullname.clear();
         m_cachedAddrToName.reserve(obj_count);
         m_cachedAddrToFullname.reserve(obj_count);
+
+        uint64_t VtLo = MODULE_BASE + 0x1000;
+        uint64_t VtHi = MODULE_BASE + 0xE3DD000;
 
         for (int32_t i = 0; i < obj_count; ++i) {
             if (i % 5000 == 0) {
@@ -2575,6 +2358,14 @@ public:
                 ++empty;
                 continue;
             }
+
+            uint64_t Vt = 0;
+            m_reader.Read(obj_ptr, &Vt, 8);
+            if (Vt < VtLo || Vt >= VtHi || (Vt & 0x7) != 0) {
+                ++stale; ++staleVt;
+                continue;
+            }
+
             m_cachedObjectPtrs.push_back({i, obj_ptr});
 
             std::string name = m_fname.GetName(obj_ptr);
@@ -2583,8 +2374,12 @@ public:
                 if (Ci > 1) name = m_fname.CompIndexToNameLenient(Ci);
             }
             if (name.empty()) {
-                fObjects << "[" << i << "] " << Hex(obj_ptr) << " | <no name>\n";
-                ++failed;
+                if (m_fname.WasLastHashSlotStale()) {
+                    ++stale; ++staleResolve;
+                } else {
+                    fObjects << "[" << i << "] " << Hex(obj_ptr) << " | <no name>\n";
+                    ++failed;
+                }
                 continue;
             }
 
@@ -2624,8 +2419,11 @@ public:
             ++valid;
         }
 
+        uint32_t LiveTotal = valid + failed;
+        double Pct = LiveTotal > 0 ? 100.0 * valid / LiveTotal : 0.0;
         std::cout << "\r[+] Scan done: " << valid << " named, "
-                  << failed << " failed, " << empty << " empty slots\n";
+                  << failed << " failed, " << stale << " stale/freed, " << empty << " empty slots\n";
+        std::printf("  Naming rate (live objects): %u / %u = %.1f%%\n", valid, LiveTotal, Pct);
 
         // ── Write unique names ────────────────────────────────────────────
         fNames << "// Total unique names: " << uniqueNames.size() << "\n\n";
@@ -2639,6 +2437,7 @@ public:
         std::cout << "\n=== Dump Summary ===\n";
         std::cout << "  Total entries : " << obj_count  << "\n";
         std::cout << "  Valid + named  : " << valid      << "\n";
+        std::cout << "  Stale/freed    : " << stale << "  (vtable=" << staleVt << " resolve=" << staleResolve << ")\n";
         std::cout << "  Failed / empty : " << failed << " / " << empty << "\n";
         std::cout << "  Unique names   : " << uniqueNames.size() << "\n";
         std::cout << "  Time           : " << std::fixed << std::setprecision(1) << ms << " ms\n";
@@ -2668,10 +2467,9 @@ int main(int argc, char* argv[]) {
 
     int pid = 0;
     bool do_sdk   = false, do_test = false, do_dump = false, do_probe = false;
-    bool do_emu_smoke = false, do_emu_fname = false, want_help = false;
-    bool do_decrypt_handle = false, do_test_gobj = false, do_dump_gobj_chunks = false;
+    bool want_help = false;
+    bool do_decrypt_handle = false, do_test_gobj = false;
     bool do_scan_chunks = false, do_list_uobjects = false;
-    uint32_t emu_fname_ci = 505;
     uint64_t decrypt_handle_val = 0;
 
     for (int i = 1; i < argc; ++i) {
@@ -2681,15 +2479,7 @@ int main(int argc, char* argv[]) {
         if (arg == "--test")      { do_test  = true; continue; }
         if (arg == "--dump")      { do_dump  = true; continue; }
         if (arg == "--probe")     { do_probe = true; continue; }
-        if (arg == "--emu-smoke") { do_emu_smoke = true; continue; }
-        if (arg == "--emu-fname") {
-            do_emu_fname = true;
-            if (i + 1 < argc && argv[i+1][0] != '-')
-                emu_fname_ci = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
-            continue;
-        }
         if (arg == "--test-gobj")  { do_test_gobj = true; continue; }
-        if (arg == "--dump-gobj-chunks") { do_dump_gobj_chunks = true; continue; }
         if (arg == "--scan-chunks") { do_scan_chunks = true; continue; }
         if (arg == "--list-uobjects") { do_list_uobjects = true; continue; }
         if (arg == "--decrypt-handle") {
@@ -2706,26 +2496,17 @@ int main(int argc, char* argv[]) {
     auto print_help = []() {
         std::cerr <<
             "Usage: sudo ./FrostDumper [<pid>] [mode flags]\n"
-            "No flags → full automatic SDK dump (sig-scan + emu fallback + SDK_Output.txt + dump_*.txt).\n"
+            "No flags → full automatic SDK dump (sig-scan + sdk/SDK_Output.txt + dump_*.txt).\n"
             "Mode flags (override the auto behaviour for development / debugging):\n"
             "  --test       Sample known FName CIs to verify decryptor.\n"
             "  --dump       Enumerate GObjects → dump_*.txt.\n"
-            "  --sdk        Full C++ SDK → SDK_Output.txt.\n"
+            "  --sdk        Full C++ SDK → sdk/SDK_Output.txt.\n"
             "  --probe      FField / property CI probes.\n"
-            "  --emu-smoke  Boot Unicorn engine + PE fallback; map a VMProtect-cold page.\n"
-            "               Runs before dumper.Init() — works from any game state.\n"
-            "  --emu-fname [CI]\n"
-            "               Find FName decrypt by signature, call game's code inside\n"
-            "               Unicorn for CI (default 505 = \"Object\"), print result.\n"
             "  --decrypt-handle <hex>\n"
             "               Patch 20260421 test: apply bswap64(X ^ 0x59B07C3D00000000)\n"
             "               to the given raw FName handle and print the entry pointer.\n"
             "  --test-gobj  Patch 20260421: read live GUObjectArray (0xDDCB420),\n"
             "               apply new decrypt pipeline, print chunks_manager + max.\n"
-            "  --dump-gobj-chunks\n"
-            "               Emulate VMProtected vtable[7] via Unicorn to fetch\n"
-            "               the chunk-ptr-array. BROKEN: VMP anti-emu defeats us;\n"
-            "               left as a probe for further analysis.\n"
             "  --help, -h   This message.\n";
     };
     if (want_help) { print_help(); return 0; }
@@ -2964,121 +2745,6 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // --dump-gobj-chunks: emulate the VMProtected vtable[7] of chunks_manager
-    // to obtain the chunk-pointer-array, then walk FUObjectItems.
-    if (do_dump_gobj_chunks) {
-        if (pid == 0) { pid = FindARCPid(); if (pid <= 0) { std::cerr << "[gobj] no PID\n"; return 1; } }
-        KernelReader r;
-        if (!r.Open(pid)) { std::cerr << "[gobj] reader open failed\n"; return 1; }
-        using namespace ArcDecrypt::Patch20260421;
-        const uint64_t base = 0x140000000ULL;
-
-        uint8_t enc[16] = {}, mask[8] = {};
-        uint64_t xor_key = 0;
-        if (!r.Read(base + RVA_GUOBJECT_ARRAY_NEW, enc, 16) ||
-            !r.Read(base + RVA_GOBJ_PSHUFB_MASK,   mask, 8) ||
-            !r.Read(base + RVA_GOBJ_MAX_XOR_KEY,   &xor_key, 8)) {
-            std::cerr << "[gobj] read constants failed\n"; return 1;
-        }
-        uint64_t chunks_mgr = ArcDecrypt::Patch20260421::DecryptGObjChunksManager(enc, mask);
-        std::printf("[gobj] chunks_manager = 0x%llX\n", (unsigned long long)chunks_mgr);
-
-        // Read chunks_manager's vtable[7] target (offset +0x38 in vtable at [chunks_mgr])
-        uint64_t vtable = 0;
-        if (!r.Read(chunks_mgr, &vtable, 8) || !vtable) {
-            std::cerr << "[gobj] failed reading chunks_manager vtable\n"; return 1;
-        }
-        uint64_t vt7 = 0;
-        if (!r.Read(vtable + 0x38, &vt7, 8) || !vt7) {
-            std::cerr << "[gobj] failed reading vtable[7]\n"; return 1;
-        }
-        std::printf("[gobj] vtable=0x%llX  vtable[7]=0x%llX\n",
-            (unsigned long long)vtable, (unsigned long long)vt7);
-
-        // Read the xmmword at chunks_manager+0x30 (scratch input passed to vt7)
-        uint8_t scratch_in[16] = {};
-        if (!r.Read(chunks_mgr + 0x30, scratch_in, 16)) {
-            std::cerr << "[gobj] failed reading chunks_manager+0x30\n"; return 1;
-        }
-
-        // Boot Unicorn, map live memory on demand.
-        EmuEngine eng;
-        const std::string& pe_path = GetPEBinaryPath();
-        if (!eng.Initialize(&r, base, 0xE9AF000,
-                            pe_path.empty() ? nullptr : pe_path.c_str())) {
-            std::cerr << "[gobj] emu init failed\n"; return 1;
-        }
-        // Pre-map chunks_manager pages + vt7 pages
-        eng.PreMapRange(chunks_mgr & ~0xFFFULL, 0x4000);
-        eng.PreMapRange(vt7 & ~0xFFFULL, 0x4000);
-
-        // Set up fake TEB at 0x7FFFFFFE0000 so GS:[0x60] → PEB works.
-        constexpr uint64_t FAKE_TEB = 0x00007FFFFFFE0000ULL;
-        constexpr uint64_t FAKE_PEB = 0x7FFD0000ULL;
-        uc_mem_map(eng.UC(), FAKE_TEB, 0x1000, UC_PROT_ALL);
-        uint8_t teb_zero[0x1000] = {};
-        uc_mem_write(eng.UC(), FAKE_TEB, teb_zero, sizeof(teb_zero));
-        uint64_t self = FAKE_TEB, stack_b = 0x200000 + 0x100000, stack_l = 0x200000;
-        uc_mem_write(eng.UC(), FAKE_TEB + 0x08, &stack_b, 8);
-        uc_mem_write(eng.UC(), FAKE_TEB + 0x10, &stack_l, 8);
-        uc_mem_write(eng.UC(), FAKE_TEB + 0x30, &self, 8);
-        uc_mem_write(eng.UC(), FAKE_TEB + 0x60, &FAKE_PEB, 8);
-        eng.SetGSBase(FAKE_TEB);
-        eng.MapGamePage(FAKE_PEB);  // PEB page (may be read)
-
-        // vtable[7] is NOT VMProtected (prior belief was wrong — the disasm
-        // `65 48 03 04 25 60 00 00 00` is a SINGLE `add rax, gs:[0x60]`, not a
-        // page-fault trap). It's ~24 inline SIMD instructions that take the
-        // 16B encrypted blob at [rdx] and decrypt to xmm0.u64[0] = chunks_array.
-        // Calling convention: rdx = ADDRESS OF the 16-byte blob; result in xmm0.
-        const uint64_t SCRATCH_ADDR = 0x10000ULL;      // EmuEngine::INPUT_BASE
-        eng.EmuWrite(SCRATCH_ADDR, scratch_in, 16);
-
-        eng.ResetCPU();
-        eng.WriteReg(UC_X86_REG_RCX, chunks_mgr);
-        eng.WriteReg(UC_X86_REG_RDX, SCRATCH_ADDR);
-        uint64_t sentinel = 0xDEAD0000ULL;
-        uint64_t rsp = eng.ReadReg(UC_X86_REG_RSP);
-        rsp -= 8;
-        eng.EmuWrite(rsp, &sentinel, 8);
-        eng.WriteReg(UC_X86_REG_RSP, rsp);
-
-        std::printf("[gobj] running vtable[7] emulation (non-VMP, ~24 insns)...\n");
-        uc_err er = eng.Run(vt7, sentinel, /*timeout_us*/500'000, /*max*/200);
-        uint64_t rax = eng.ReadReg(UC_X86_REG_RAX);
-        // Pull xmm0.u64[0] — that's the actual result per Agent 2's disasm
-        uint8_t xmm0_bytes[16] = {};
-        uc_reg_read(eng.UC(), UC_X86_REG_XMM0, xmm0_bytes);
-        uint64_t xmm0_lo = 0;
-        std::memcpy(&xmm0_lo, xmm0_bytes, 8);
-        std::printf("[gobj] run status: %d (%s)  rax=0x%llX  xmm0.lo64=0x%llX\n",
-            (int)er, uc_strerror(er), (unsigned long long)rax,
-            (unsigned long long)xmm0_lo);
-
-        // Pick xmm0.lo64 first (Agent 2's recipe), fall back to rax.
-        uint64_t chunks_array = 0;
-        if (xmm0_lo >= 0x10000 && xmm0_lo < 0x800000000000) chunks_array = xmm0_lo;
-        else if (rax >= 0x10000 && rax < 0x800000000000)    chunks_array = rax;
-
-        if (!chunks_array) {
-            std::printf("[gobj] emu returned no valid pointer in xmm0 or rax\n");
-            return 1;
-        }
-        std::printf("[gobj] chunk-ptr-array @ 0x%llX\n",
-            (unsigned long long)chunks_array);
-        for (int ci = 0; ci < 8; ++ci) {
-            uint64_t cp = 0;
-            if (!r.Read(chunks_array + 8 * ci, &cp, 8)) break;
-            std::printf("[gobj]   chunk[%d] = 0x%llX\n", ci, (unsigned long long)cp);
-            if (!cp) break;
-            // Probe first FUObjectItem
-            uint64_t obj_ptr = 0;
-            r.Read(cp, &obj_ptr, 8);
-            std::printf("[gobj]     item[0].obj = 0x%llX\n", (unsigned long long)obj_ptr);
-        }
-        return 0;
-    }
-
     // --test-gobj: read live GUObjectArray, apply patch-20260421 decrypt.
     if (do_test_gobj) {
         if (pid == 0) {
@@ -3134,18 +2800,16 @@ int main(int argc, char* argv[]) {
         } else {
             std::printf("[test-gobj] pipeline gave implausible values; review constants\n");
         }
-        std::printf("[test-gobj] TODO: chunk-ptr-array access requires emulating\n");
-        std::printf("[test-gobj]       VMProtected vtable[7] @ chunks_manager[0x38]\n");
+        std::printf("[test-gobj] chunk-ptr-array access requires structural scan (see Init())\n");
         return 0;
     }
 
     // Default behaviour — no flags = full automatic SDK dump.
-    // The `--test`, `--dump`, `--probe`, `--emu-*` flags are diagnostic
+    // The `--test`, `--dump`, `--probe` flags are diagnostic
     // overrides retained for development; passing none of them runs the
-    // canonical pipeline (sig-scan + autodiscovery + Unicorn FName fallback
-    // + SDK_Output.txt). dump_*.txt comes free as side output of DumpSDK's
-    // GObject walk.
-    if (!do_sdk && !do_test && !do_dump && !do_probe && !do_emu_smoke && !do_emu_fname) {
+    // canonical pipeline (sig-scan + autodiscovery + sdk/SDK_Output.txt).
+    // dump_*.txt comes free as side output of DumpSDK's GObject walk.
+    if (!do_sdk && !do_test && !do_dump && !do_probe) {
         do_sdk  = true;
         do_dump = true;
     }
@@ -3159,58 +2823,6 @@ int main(int argc, char* argv[]) {
     if (pid <= 0) { print_help(); return 1; }
 
     SDKDumper dumper(pid);
-
-    // --emu-smoke / --emu-fname run before the heavy dumper Init() so they
-    // work even when the game is mid-loading (chunk-ptr decrypt unavailable).
-    if (do_emu_smoke) {
-        std::printf("\n=== emu smoke test ===\n");
-        if (!dumper.m_reader.Open(pid)) {
-            std::printf("[emu-smoke] /dev/memreader open failed\n"); return 1;
-        }
-        EmuEngine eng;
-        const std::string& pe_path = GetPEBinaryPath();
-        if (!eng.Initialize(&dumper.m_reader, dumper.MODULE_BASE, 0xE9AF000,
-                            pe_path.empty() ? nullptr : pe_path.c_str())) {
-            std::printf("[emu-smoke] init failed\n"); return 1;
-        }
-        uint64_t probe = dumper.MODULE_BASE + 0x22F9A4;
-        bool ok = eng.MapGamePage(probe);
-        std::printf("[emu-smoke] MapGamePage(0x%llX) → %s\n",
-            (unsigned long long)probe, ok ? "mapped" : "FAILED");
-        uint8_t bytes[16] = {};
-        if (ok && eng.EmuRead(probe, bytes, 16)) {
-            std::printf("[emu-smoke] first 16 bytes:");
-            for (int i = 0; i < 16; ++i) std::printf(" %02X", bytes[i]);
-            std::printf("\n");
-        }
-        if (!do_test && !do_dump && !do_sdk && !do_probe && !do_emu_fname) return 0;
-    }
-
-    if (do_emu_fname) {
-        std::printf("\n=== emu FName decrypt (CI=%u) ===\n", emu_fname_ci);
-        if (!dumper.m_reader.IsOpen() && !dumper.m_reader.Open(pid)) {
-            std::printf("[emu-fname] /dev/memreader open failed\n"); return 1;
-        }
-        auto findRes = FNameFuncFinder::Find(dumper.m_reader, dumper.MODULE_BASE);
-        if (!findRes.found) {
-            std::printf("[emu-fname] couldn't locate FName decrypt in .text\n"); return 1;
-        }
-        EmuEngine eng;
-        const std::string& pe_path = GetPEBinaryPath();
-        if (!eng.Initialize(&dumper.m_reader, dumper.MODULE_BASE, 0xE9AF000,
-                            pe_path.empty() ? nullptr : pe_path.c_str())) {
-            std::printf("[emu-fname] engine init failed\n"); return 1;
-        }
-        EmuFName fn;
-        if (!fn.Init(&eng, dumper.MODULE_BASE, findRes.best_target_rva)) {
-            std::printf("[emu-fname] EmuFName init failed\n"); return 1;
-        }
-        fn.SetGamePeb(0x7FFD0000ULL);
-        eng.MapGamePage(0x7FFD0000ULL);
-        std::string s = fn.DecryptByIndex(emu_fname_ci);
-        std::printf("[emu-fname] CI %u → \"%s\"\n", emu_fname_ci, s.c_str());
-        if (!do_test && !do_dump && !do_sdk && !do_probe) return 0;
-    }
 
     if (!dumper.Init()) {
         std::cerr << "[-] Initialization failed. Check:\n";
