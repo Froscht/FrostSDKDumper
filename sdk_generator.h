@@ -3017,25 +3017,144 @@ public:
                 Pre2Walked, m_known_structs.size(), m_known_enums.size());
         }
 
+        // ── Vtable pre-pass: classify every object by vtable RVA ────────────
+        // Builds vtableClassification map: obj_ptr → type category.
+        // This runs BEFORE the main loop so we know the ground-truth vtable
+        // of every object regardless of ClassPrivate slot issues.
+        std::unordered_set<uint64_t> VtStructAddrs, VtClassAddrs, VtEnumAddrs, VtFuncAddrs;
+        {
+            const auto& Disc = AutoDiscovery::g_DiscoveredVTables;
+            uint64_t ImgSize = AutoDiscovery::g_DiscoveredBounds.ImageSize;
+            if (!ImgSize) ImgSize = 0x10000000ULL;
+            uint32_t VpTotal = 0, VpInRange = 0;
+            std::unordered_map<uint64_t, uint32_t> VtHist;
+            for (const auto& [idx, obj_ptr] : object_ptrs) {
+                if (!obj_ptr) continue;
+                ++VpTotal;
+                uint64_t Vt = Read<uint64_t>(obj_ptr);
+                if (Vt < MODULE_BASE || Vt >= MODULE_BASE + ImgSize) continue;
+                ++VpInRange;
+                uint64_t Rva = Vt - MODULE_BASE;
+                VtHist[Rva]++;
+                if (Disc.ScriptStructRVA && Rva == Disc.ScriptStructRVA) {
+                    VtStructAddrs.insert(obj_ptr);
+                } else if (Disc.ASStructRVA && Rva == Disc.ASStructRVA) {
+                    VtStructAddrs.insert(obj_ptr);
+                } else if (Disc.ClassNativeRVA && Rva == Disc.ClassNativeRVA) {
+                    VtClassAddrs.insert(obj_ptr);
+                } else if (Disc.BPGCRVA && Rva == Disc.BPGCRVA) {
+                    VtClassAddrs.insert(obj_ptr);
+                } else if (Disc.WBPGCRVA && Rva == Disc.WBPGCRVA) {
+                    VtClassAddrs.insert(obj_ptr);
+                } else if (Disc.SMBPGCRVA && Rva == Disc.SMBPGCRVA) {
+                    VtClassAddrs.insert(obj_ptr);
+                } else if (Disc.AnimBPGCRVA && Rva == Disc.AnimBPGCRVA) {
+                    VtClassAddrs.insert(obj_ptr);
+                } else if (Disc.ASClassRVA && Rva == Disc.ASClassRVA &&
+                           Disc.ASClassRVA != Disc.PackageRVA) {
+                    VtClassAddrs.insert(obj_ptr);
+                } else if (Disc.EnumRVA && Rva == Disc.EnumRVA) {
+                    VtEnumAddrs.insert(obj_ptr);
+                } else if (Disc.FunctionRVA && Rva == Disc.FunctionRVA) {
+                    VtFuncAddrs.insert(obj_ptr);
+                } else {
+                    for (uint64_t AsfRva : Disc.ASFunctionRVAs) {
+                        if (AsfRva && Rva == AsfRva) { VtFuncAddrs.insert(obj_ptr); break; }
+                    }
+                }
+            }
+            std::printf("[vtpre] Scanned %u objects (%u in-range vtables)\n", VpTotal, VpInRange);
+            std::printf("[vtpre] By vtable: %zu struct, %zu class, %zu enum, %zu func\n",
+                VtStructAddrs.size(), VtClassAddrs.size(), VtEnumAddrs.size(), VtFuncAddrs.size());
+
+            std::vector<std::pair<uint32_t, uint64_t>> VtTop;
+            for (auto& [Rva, Cnt] : VtHist) VtTop.push_back({Cnt, Rva});
+            std::sort(VtTop.rbegin(), VtTop.rend());
+            std::printf("[vtpre] Top vtable RVAs:\n");
+            for (size_t i = 0; i < VtTop.size() && i < 15; ++i) {
+                const char* Tag = "";
+                if (VtTop[i].second == Disc.ScriptStructRVA) Tag = " [ScriptStruct]";
+                else if (VtTop[i].second == Disc.ClassNativeRVA) Tag = " [Class]";
+                else if (VtTop[i].second == Disc.EnumRVA) Tag = " [Enum]";
+                else if (VtTop[i].second == Disc.FunctionRVA) Tag = " [Function]";
+                else if (VtTop[i].second == Disc.BPGCRVA) Tag = " [BPGC]";
+                std::printf("  0x%llX: %u%s\n",
+                    (unsigned long long)VtTop[i].second, VtTop[i].first, Tag);
+            }
+
+            std::unordered_map<uint64_t, std::vector<uint64_t>> VtToAddrs;
+            for (const auto& [idx, obj_ptr] : object_ptrs) {
+                if (!obj_ptr) continue;
+                uint64_t Vt = Read<uint64_t>(obj_ptr);
+                if (Vt < MODULE_BASE || Vt >= MODULE_BASE + ImgSize) continue;
+                uint64_t Rva2 = Vt - MODULE_BASE;
+                if (VtHist.count(Rva2) && VtHist[Rva2] > 500)
+                    if (VtToAddrs[Rva2].size() < 5)
+                        VtToAddrs[Rva2].push_back(obj_ptr);
+            }
+            for (size_t i = 0; i < VtTop.size() && i < 20; ++i) {
+                uint64_t Rva2 = VtTop[i].second;
+                bool Known = (Rva2 == Disc.ScriptStructRVA || Rva2 == Disc.ClassNativeRVA ||
+                              Rva2 == Disc.EnumRVA || Rva2 == Disc.FunctionRVA ||
+                              Rva2 == Disc.BPGCRVA || Rva2 == Disc.PackageRVA ||
+                              Rva2 == Disc.ASStructRVA || Rva2 == Disc.WBPGCRVA ||
+                              Rva2 == Disc.SMBPGCRVA || Rva2 == Disc.AnimBPGCRVA);
+                if (Known) continue;
+                auto It = VtToAddrs.find(Rva2);
+                if (It == VtToAddrs.end() || It->second.empty()) continue;
+                std::printf("[vtpre-id] Unknown vtable 0x%llX (%u objs), sample names: ",
+                    (unsigned long long)Rva2, VtTop[i].first);
+                for (size_t j = 0; j < It->second.size(); ++j) {
+                    auto NIt = addr_to_name.find(It->second[j]);
+                    std::string N = (NIt != addr_to_name.end()) ? NIt->second : "?";
+                    if (j > 0) std::printf(", ");
+                    std::printf("%s", N.c_str());
+                }
+                std::printf("\n");
+            }
+
+            size_t VtSeeded = 0;
+            for (uint64_t A : VtStructAddrs) { if (allTypeAddrs.insert(A).second) ++VtSeeded; }
+            for (uint64_t A : VtClassAddrs)  { if (allTypeAddrs.insert(A).second) ++VtSeeded; }
+            for (uint64_t A : VtEnumAddrs)   { if (allTypeAddrs.insert(A).second) ++VtSeeded; }
+            std::printf("[vtpre] Seeded %zu new type addrs into allTypeAddrs (total=%zu)\n",
+                VtSeeded, allTypeAddrs.size());
+
+            uint32_t FuncInFuncSet = 0, StructInFuncSet = 0, ClassInFuncSet = 0, EnumInFuncSet = 0;
+            for (uint64_t A : VtStructAddrs) if (func_obj_addrs.count(A)) ++StructInFuncSet;
+            for (uint64_t A : VtClassAddrs)  if (func_obj_addrs.count(A)) ++ClassInFuncSet;
+            for (uint64_t A : VtEnumAddrs)   if (func_obj_addrs.count(A)) ++EnumInFuncSet;
+            if (StructInFuncSet || ClassInFuncSet || EnumInFuncSet) {
+                std::printf("[vtpre] WARNING: type objects in func_obj_addrs: %u struct, %u class, %u enum — removing them!\n",
+                    StructInFuncSet, ClassInFuncSet, EnumInFuncSet);
+                for (uint64_t A : VtStructAddrs) func_obj_addrs.erase(A);
+                for (uint64_t A : VtClassAddrs)  func_obj_addrs.erase(A);
+                for (uint64_t A : VtEnumAddrs)   func_obj_addrs.erase(A);
+            }
+        }
+
         // ── Pass 2: iterate objects — include all type objects ──────────────────
         // An object is a type if: (a) it's in allTypeAddrs (used as class ptr by others),
         // OR (b) GetClassPrivate returns classAddr/ssAddr/enumAddr/validClassTypes.
         std::unordered_set<uint64_t> processed_enums;
+        uint32_t SkipNull = 0, SkipSeen = 0, SkipSlash = 0, SkipFunc = 0, SkipCdo = 0, SkipNoName = 0;
+        uint32_t LoopTotal = 0;
         for (const auto& [idx, obj_ptr] : object_ptrs) {
-            if (!obj_ptr || seen.count(obj_ptr)) continue;
+            ++LoopTotal;
+            if (!obj_ptr || seen.count(obj_ptr)) { ++SkipNull; continue; }
             seen.insert(obj_ptr);
 
             auto fn_it = addr_to_name.find(obj_ptr);
             std::string short_name = (fn_it != addr_to_name.end()) ? fn_it->second : std::string();
             if (!short_name.empty() && !IsPlausibleUEName(short_name)) short_name.clear();
-            if (!short_name.empty() && short_name[0] == '/') continue;
-            if (func_obj_addrs.count(obj_ptr)) continue;
+            if (!short_name.empty() && short_name[0] == '/') { ++SkipSlash; continue; }
+            if (func_obj_addrs.count(obj_ptr)) { ++SkipFunc; continue; }
             // Skip CDOs — Default__X objects are class default *instances*,
             // not class definitions. They're already used in pass-1 to recover
             // metaclass addresses; emitting them again as their own type
             // produces 200+ bogus "Default__X" class entries with junk
             // inheritance chains (FNamePool keys decrypt as float / utf16 noise).
-            if (short_name.rfind("Default__", 0) == 0) continue;
+            if (short_name.rfind("Default__", 0) == 0) { ++SkipCdo; continue; }
             // For unnamed objects, only proceed if they're referenced as a type
             if (short_name.empty()) {
                 // Will check is_type_by_ref below; generate a placeholder name
@@ -3079,70 +3198,16 @@ public:
             }
             if (!cls) cls = m_fname.GetClassPrivate(obj_ptr);  // fallback for legacy paths
 
-            // Path V2: vtable-based classification (more reliable than ClassPrivate slots)
-            // Reads the vtable pointer directly from obj_ptr+0x0, computes RVA,
-            // and matches against auto-discovered engine vtable RVAs.
-            // This OVERRIDES Path A because ClassPrivate slot matching is unreliable
-            // on Theia (slot picker hash drifts across patches; different objects
-            // encode their class in different slots, and ssAddrs is often empty).
-            // ScriptStructRVA is validated by Phase 1.6 oracle cross-check.
-            // EnumRVA may be wrong (was UCameraShakePattern on CL-1233465), so
-            // Path C below will still validate — false positives get filtered.
+            // Path V2: vtable-based classification using pre-pass data
+            // Uses VtStructAddrs/VtClassAddrs/VtEnumAddrs from the vtable pre-pass
+            // (single bulk read before the main loop). OVERRIDES Path A.
             {
-                static uint32_t V2EnumCount = 0, V2StructCount = 0, V2ClassCount = 0, V2FuncCount = 0;
-                uint64_t obj_vt = Read<uint64_t>(obj_ptr);
-                if (obj_vt >= MODULE_BASE && obj_vt < MODULE_BASE + 0x10000000ULL) {
-                    uint64_t obj_vt_rva = obj_vt - MODULE_BASE;
-                    const auto& Disc = AutoDiscovery::g_DiscoveredVTables;
-                    if (Disc.EnumRVA && obj_vt_rva == Disc.EnumRVA) {
-                        is_enum = true; is_class_by_cls = false; is_scriptstruct = false;
-                        V2EnumCount++;
-                    } else if (Disc.ScriptStructRVA && Disc.ClassNativeRVA &&
-                               Disc.ScriptStructRVA != Disc.ClassNativeRVA &&
-                               obj_vt_rva == Disc.ScriptStructRVA) {
-                        is_scriptstruct = true; is_class_by_cls = false; is_enum = false;
-                        V2StructCount++;
-                    } else if (Disc.ClassNativeRVA && Disc.ScriptStructRVA &&
-                               Disc.ClassNativeRVA != Disc.ScriptStructRVA &&
-                               obj_vt_rva == Disc.ClassNativeRVA) {
-                        is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
-                        V2ClassCount++;
-                    } else if (Disc.BPGCRVA && obj_vt_rva == Disc.BPGCRVA) {
-                        is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
-                        V2ClassCount++;
-                    } else if (Disc.WBPGCRVA && obj_vt_rva == Disc.WBPGCRVA) {
-                        is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
-                        V2ClassCount++;
-                    } else if (Disc.SMBPGCRVA && obj_vt_rva == Disc.SMBPGCRVA) {
-                        is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
-                        V2ClassCount++;
-                    } else if (Disc.AnimBPGCRVA && obj_vt_rva == Disc.AnimBPGCRVA) {
-                        is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
-                        V2ClassCount++;
-                    } else if (Disc.ASClassRVA && obj_vt_rva == Disc.ASClassRVA) {
-                        is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
-                        V2ClassCount++;
-                    } else if (Disc.ASStructRVA && obj_vt_rva == Disc.ASStructRVA) {
-                        is_scriptstruct = true; is_class_by_cls = false; is_enum = false;
-                        V2StructCount++;
-                    } else if (Disc.FunctionRVA && obj_vt_rva == Disc.FunctionRVA) {
-                        is_scriptstruct = false; is_class_by_cls = false; is_enum = false;
-                        V2FuncCount++;
-                    } else {
-                        for (uint64_t AsfRva : Disc.ASFunctionRVAs) {
-                            if (AsfRva && obj_vt_rva == AsfRva) {
-                                is_scriptstruct = false; is_class_by_cls = false; is_enum = false;
-                                V2FuncCount++;
-                                break;
-                            }
-                        }
-                    }
-                }
-                static uint32_t V2Calls = 0;
-                ++V2Calls;
-                if (V2Calls % 50000 == 0) {
-                    std::printf("[sdk] V2 vtable classify @%u: %u enum, %u struct, %u class, %u func\n",
-                        V2Calls, V2EnumCount, V2StructCount, V2ClassCount, V2FuncCount);
+                if (VtStructAddrs.count(obj_ptr)) {
+                    is_scriptstruct = true; is_class_by_cls = false; is_enum = false;
+                } else if (VtClassAddrs.count(obj_ptr)) {
+                    is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
+                } else if (VtEnumAddrs.count(obj_ptr)) {
+                    is_enum = true; is_class_by_cls = false; is_scriptstruct = false;
                 }
             }
 
@@ -3185,11 +3250,49 @@ public:
             bool is_type_by_ref = is_type_by_ref_early;
 
             // Skip objects that aren't types by either path
-            if (!is_class_by_cls && !is_scriptstruct && !is_enum && !is_type_by_ref) continue;
+            if (!is_class_by_cls && !is_scriptstruct && !is_enum && !is_type_by_ref) {
+                static uint32_t SsVtSkipped = 0;
+                const auto& Disc2 = AutoDiscovery::g_DiscoveredVTables;
+                if (Disc2.ScriptStructRVA) {
+                    uint64_t Vt = Read<uint64_t>(obj_ptr);
+                    if (Vt >= MODULE_BASE && Vt < MODULE_BASE + 0x10000000ULL &&
+                        (Vt - MODULE_BASE) == Disc2.ScriptStructRVA) {
+                        ++SsVtSkipped;
+                        if (SsVtSkipped <= 5)
+                            std::printf("[sdk-diag] struct-vtable obj skipped by type-filter: %s (0x%llX)\n",
+                                short_name.c_str(), (unsigned long long)obj_ptr);
+                    }
+                }
+                static bool PrintedSkip = false;
+                if (!PrintedSkip && SsVtSkipped > 100) {
+                    std::printf("[sdk-diag] WARNING: %u objects with ScriptStruct vtable skipped by type-filter!\n", SsVtSkipped);
+                    PrintedSkip = true;
+                }
+                continue;
+            }
 
-            // Classify: if detected by reference but not by Class decrypt,
-            // it's likely a UClass (most allTypeAddrs entries are UClass objects)
-            bool is_class = is_class_by_cls || (is_type_by_ref && !is_scriptstruct && !is_enum);
+            if (is_type_by_ref && !is_class_by_cls && !is_scriptstruct && !is_enum) {
+                if (VtStructAddrs.count(obj_ptr)) {
+                    is_scriptstruct = true;
+                } else if (VtClassAddrs.count(obj_ptr)) {
+                    is_class_by_cls = true;
+                } else if (VtEnumAddrs.count(obj_ptr)) {
+                    is_enum = true;
+                } else {
+                    uint64_t Cp = m_fname.GetClassPrivate(obj_ptr);
+                    if (Cp > 0x10000 && Cp < 0x7FFFFFFFFFFFULL) {
+                        if (ssAddrs.count(Cp)) {
+                            is_scriptstruct = true;
+                        } else if (validClassTypes.count(Cp)) {
+                            is_class_by_cls = true;
+                        } else if (enumAddrs.count(Cp)) {
+                            is_enum = true;
+                        }
+                    }
+                }
+            }
+
+            bool is_class = is_class_by_cls;
 
             std::string pkg = resolvePackage(obj_ptr);
 
@@ -3423,6 +3526,8 @@ public:
         {
             size_t PreRcClass = 0, PreRcStruct = 0;
             for (const auto& R : result.structs) { if (R.is_class) ++PreRcClass; else ++PreRcStruct; }
+            std::printf("[sdk] Loop stats: total=%u null/seen=%u slash=%u func=%u cdo=%u\n",
+                LoopTotal, SkipNull, SkipSlash, SkipFunc, SkipCdo);
             std::printf("[sdk] After main loop: %zu class, %zu struct, m_known_structs=%zu m_known_enums=%zu\n",
                 PreRcClass, PreRcStruct, m_known_structs.size(), m_known_enums.size());
         }
@@ -3450,47 +3555,108 @@ public:
         DiagnoseShadowResolution();
 
         {
-            auto HasValidFuncMap = [&](uint64_t Addr) -> bool {
+            auto HasValidatedFuncMap = [&](uint64_t Addr) -> bool {
                 uint64_t PairsData = Read<uint64_t>(Addr + ArcDecrypt::Offsets::UClass::FuncMap_PairsData);
                 uint32_t FmNum     = Read<uint32_t>(Addr + ArcDecrypt::Offsets::UClass::FuncMap_Num);
                 uint32_t FmMax     = Read<uint32_t>(Addr + ArcDecrypt::Offsets::UClass::FuncMap_Max);
-                return (PairsData > 0x10000 && PairsData < 0x7FFFFFFFFFFFULL &&
-                        FmNum <= 4096 && FmMax >= FmNum && FmMax <= 16384);
+                if (!(PairsData > 0x10000 && PairsData < 0x7FFFFFFFFFFFULL &&
+                      FmNum > 0 && FmNum <= 4096 && FmMax >= FmNum && FmMax <= 16384))
+                    return false;
+                uint32_t Validated = 0;
+                uint32_t CheckN = FmNum < 8 ? FmNum : 8;
+                for (uint32_t i = 0; i < CheckN; ++i) {
+                    uint64_t HashEntry = PairsData + (uint64_t)i * 24;
+                    uint64_t FuncPtr = Read<uint64_t>(HashEntry + 16);
+                    if (FuncPtr > 0x10000 && FuncPtr < 0x7FFFFFFFFFFFULL &&
+                        func_obj_addrs.count(FuncPtr))
+                        ++Validated;
+                }
+                return Validated >= 1;
             };
+
+            std::unordered_map<uint64_t, StructRecord*> AddrToRec;
+            for (auto& Rec : result.structs)
+                AddrToRec[Rec.addr] = &Rec;
+
+            std::unordered_map<uint64_t, int> SuperChain;
+            std::function<int(uint64_t)> ClassifyBySuper = [&](uint64_t Addr) -> int {
+                auto It = SuperChain.find(Addr);
+                if (It != SuperChain.end()) return It->second;
+                SuperChain[Addr] = 0;
+                if (VtClassAddrs.count(Addr)) { SuperChain[Addr] = 1; return 1; }
+                if (VtStructAddrs.count(Addr)) { SuperChain[Addr] = 2; return 2; }
+                if (VtEnumAddrs.count(Addr)) { SuperChain[Addr] = 3; return 3; }
+                auto Rit = AddrToRec.find(Addr);
+                if (Rit == AddrToRec.end() || Rit->second->super_addr == 0)
+                    return 0;
+                int Parent = ClassifyBySuper(Rit->second->super_addr);
+                SuperChain[Addr] = Parent;
+                return Parent;
+            };
+            for (auto& Rec : result.structs)
+                ClassifyBySuper(Rec.addr);
 
             std::unordered_set<uint64_t> ConfirmedClass;
-
-            size_t DirectConfirmed = 0;
+            size_t DirectConfirmed = 0, ConfByFuncs = 0, ConfByFmap = 0;
+            size_t ConfByChain = 0, OverriddenByChain = 0;
             for (auto& Rec : result.structs) {
-                bool Fmap = HasValidFuncMap(Rec.addr);
-                bool HasFuncs = m_owner_to_funcs.count(Rec.addr) > 0;
-                if (Fmap || HasFuncs) {
+                int Chain = SuperChain.count(Rec.addr) ? SuperChain[Rec.addr] : 0;
+                if (Chain == 2) continue;
+                if (Chain == 1) {
                     ConfirmedClass.insert(Rec.addr);
                     ++DirectConfirmed;
+                    ++ConfByChain;
+                    continue;
+                }
+                bool HasFuncs = m_owner_to_funcs.count(Rec.addr) > 0;
+                if (HasFuncs) {
+                    ConfirmedClass.insert(Rec.addr);
+                    ++DirectConfirmed;
+                    ++ConfByFuncs;
+                } else if (VtClassAddrs.count(Rec.addr)) {
+                    ConfirmedClass.insert(Rec.addr);
+                    ++DirectConfirmed;
+                } else if (HasValidatedFuncMap(Rec.addr)) {
+                    ConfirmedClass.insert(Rec.addr);
+                    ++DirectConfirmed;
+                    ++ConfByFmap;
                 }
             }
-
-            std::unordered_map<uint64_t, std::vector<uint64_t>> ChildMap;
-            for (const auto& Rec : result.structs)
-                if (Rec.super_addr)
-                    ChildMap[Rec.super_addr].push_back(Rec.addr);
-
-            std::function<void(uint64_t)> PropagateDown = [&](uint64_t Addr) {
-                auto Cit = ChildMap.find(Addr);
-                if (Cit == ChildMap.end()) return;
-                for (uint64_t Child : Cit->second) {
-                    if (ConfirmedClass.count(Addr) && !ConfirmedClass.count(Child)) {
-                        ConfirmedClass.insert(Child);
-                    }
-                    PropagateDown(Child);
-                }
-            };
-            for (const auto& Rec : result.structs)
-                if (!Rec.super_addr)
-                    PropagateDown(Rec.addr);
-
-            size_t Promoted = 0, Demoted = 0;
             for (auto& Rec : result.structs) {
+                int Chain = SuperChain.count(Rec.addr) ? SuperChain[Rec.addr] : 0;
+                if (Chain == 2 && m_owner_to_funcs.count(Rec.addr))
+                    ++OverriddenByChain;
+            }
+            std::printf("[sdk] Class confirmation: %zu total (%zu by chain, %zu by funcs, %zu by fmap, %zu funcs-overridden-by-struct-chain)\n",
+                DirectConfirmed, ConfByChain, ConfByFuncs, ConfByFmap, OverriddenByChain);
+
+            size_t Promoted = 0, Demoted = 0, VtLocked = 0, ChainLocked = 0;
+            for (auto& Rec : result.structs) {
+                if (VtStructAddrs.count(Rec.addr)) {
+                    if (Rec.is_class) ++Demoted;
+                    Rec.is_class = false;
+                    ++VtLocked;
+                    continue;
+                }
+                if (VtClassAddrs.count(Rec.addr)) {
+                    if (!Rec.is_class) ++Promoted;
+                    Rec.is_class = true;
+                    ++VtLocked;
+                    continue;
+                }
+                int Chain = SuperChain.count(Rec.addr) ? SuperChain[Rec.addr] : 0;
+                if (Chain == 2) {
+                    if (Rec.is_class) ++Demoted;
+                    Rec.is_class = false;
+                    ++ChainLocked;
+                    continue;
+                }
+                if (Chain == 1) {
+                    if (!Rec.is_class) ++Promoted;
+                    Rec.is_class = true;
+                    ++ChainLocked;
+                    continue;
+                }
                 bool Confirmed = ConfirmedClass.count(Rec.addr) > 0;
                 if (Confirmed && !Rec.is_class) {
                     Rec.is_class = true;
@@ -3506,9 +3672,9 @@ public:
                 if (Rec.is_class) ++FinalClasses;
                 else ++FinalStructs;
             }
-            std::printf("[sdk] Struct/Class reclassification: confirmed=%zu promoted=%zu demoted=%zu "
+            std::printf("[sdk] Struct/Class reclassification: confirmed=%zu promoted=%zu demoted=%zu vtlocked=%zu chainlocked=%zu "
                 "(final: %zu classes, %zu structs)\n",
-                DirectConfirmed, Promoted, Demoted, FinalClasses, FinalStructs);
+                DirectConfirmed, Promoted, Demoted, VtLocked, ChainLocked, FinalClasses, FinalStructs);
         }
 
         // ── Pass 7: post-reclassification FuncMap walk ──────────────────────
