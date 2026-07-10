@@ -280,15 +280,10 @@ public:
         if (!m_reader.Open(m_pid)) return false;
         std::cout << "[+] Opened /dev/memreader for PID " << m_pid << "\n";
 
-        m_configResult = ConfigLoader::LoadDiscoveryConfig("decrypt_export.json");
-
-        // ── Phase 0: Module bounds (PE header parse) ────────────────────
-        // Replaces hardcoded module-size constants (0xE900000, 0xE9AF000)
-        // and section-range bounds in sig_scan.h. PE headers are stable —
-        // this never fails on a healthy module. Falls back to compile-time
-        // estimate (0xE900000) on read failure.
         AutoDiscovery::g_DiscoveredBounds =
             AutoDiscovery::DiscoverModuleBounds(m_reader, MODULE_BASE);
+
+        m_configResult = ConfigLoader::LoadDiscoveryConfig("decrypt_export.json");
         const uint64_t ModuleSize = AutoDiscovery::g_DiscoveredBounds.Valid
             ? AutoDiscovery::g_DiscoveredBounds.ImageSize
             : 0xE900000ULL;
@@ -318,6 +313,25 @@ public:
             // than the standalone PE parse (catches multi-`.data` segments etc.).
             AutoDiscovery::g_DiscoveredBounds =
                 AutoDiscovery::DiscoverModuleBoundsFromScanner(m_sigScanner);
+
+            // ── Phase 2c/2d: FField + FProperty layout from code ──────
+            // Must run FIRST — Theia randomizes struct layouts per session.
+            // All subsequent phases depend on correct offsets.
+            {
+                std::printf("\n=== Phase 2c: FField layout from binary code ===\n");
+                AutoDiscovery::g_DiscoveredFFieldLayout =
+                    AutoDiscovery::DiscoverFFieldLayoutFromCode(
+                        m_sigScanner, m_reader, MODULE_BASE);
+
+                std::printf("\n=== Phase 2d: FProperty layout from binary code ===\n");
+                AutoDiscovery::g_DiscoveredFPropertyLayout =
+                    AutoDiscovery::DiscoverFPropertyLayoutFromCode(
+                        m_sigScanner, m_reader, MODULE_BASE);
+
+                AutoDiscovery::ApplyDiscoveredLayouts(
+                    AutoDiscovery::g_DiscoveredFFieldLayout,
+                    AutoDiscovery::g_DiscoveredFPropertyLayout);
+            }
 
             // ── Phase 3: FProperty Offset_Internal XOR key ─────────────
             if (AutoDiscovery::g_DiscoveredFProperty.Valid) {
@@ -350,11 +364,12 @@ public:
             }
 
             {
-                namespace V707 = ArcDecrypt::v20260707;
-                AutoDiscovery::g_UseV707SlotHash = true;
-                std::printf("[autodisc] Phase 4: using static V707 slot constants (ROL32=%d, XOR=0x%016llX, ROL64=%d)\n",
-                    V707::UOBJ_SLOT_ROL32,
-                    (unsigned long long)V707::UOBJ_SLOT_XOR_64, V707::UOBJ_SLOT_FINAL_ROL);
+                namespace V709 = ArcDecrypt::v20260709;
+                AutoDiscovery::g_UseV709SlotHash = true;
+                AutoDiscovery::g_UseV707SlotHash = false;
+                std::printf("[autodisc] Phase 4: using V709 slot constants (ROL64=%d, PSHUFLW=0x%02X, ROL32per=%d, HashADD=0x%08X)\n",
+                    V709::UOBJ_SLOT_ROL64_FIRST, V709::UOBJ_SLOT_PSHUFLW,
+                    V709::UOBJ_SLOT_ROL32_PER, V709::SLOT_HASH_ADD);
             }
 
             // ── Phase 7: FFieldClass NamePrivate decode pipeline ───────
@@ -876,12 +891,14 @@ public:
             m_gobj.RunDiscoveredVtableScan();
 
             // ── Phase 2: FField NamePrivate XOR const (live extraction) ──
-            // Pick a few objects with FField chains and probe the NamePrivate
-            // XOR const. UScriptStructs are the ideal source (their FFields
-            // live at +0x100 reliably), but Phase 1's vtable cluster scoring
-            // is sometimes flaky and labels Class but misses ScriptStruct.
-            // Fall back to UClass samples — they also have FField chains.
-            {
+            // Skip if Phase 2c already extracted valid decode constants from
+            // binary code — the code-extracted values are authoritative and
+            // the data-math Phase 2 can produce false positives (e.g. XOR=0)
+            // when Theia randomizes struct layouts.
+            if (AutoDiscovery::g_DiscoveredFFieldLayout.Valid &&
+                AutoDiscovery::g_DiscoveredFFieldLayout.XorKey != 0) {
+                std::printf("[autodisc] Phase 2 skipped — FField decode constants already extracted from binary code\n");
+            } else {
                 std::vector<uint64_t> uss_samples;
                 const auto& VT = AutoDiscovery::g_DiscoveredVTables;
                 std::vector<uint64_t> WantVts;
@@ -919,22 +936,114 @@ public:
                 }
             }
 
+            // ── Phase 2c.5: Live-probe Owner + ClassPrivate offsets ──────
+            // Requires: ChildProperties + Next offsets from Phase 2c, plus
+            // GObjects seed list and vtable map from Phase 1.
+            if (AutoDiscovery::g_DiscoveredFFieldLayout.Valid &&
+                (!AutoDiscovery::g_DiscoveredFFieldLayout.OwnerOff ||
+                 !AutoDiscovery::g_DiscoveredFFieldLayout.ClassPrivateOff)) {
+                AutoDiscovery::ProbeFFieldOwnerAndClassPrivate(
+                    AutoDiscovery::g_DiscoveredFFieldLayout,
+                    m_reader, MODULE_BASE,
+                    AutoDiscovery::g_DiscoveredBounds,
+                    m_gobj.GetSeedObjects(),
+                    AutoDiscovery::g_DiscoveredVTables);
+                AutoDiscovery::ApplyDiscoveredLayouts(
+                    AutoDiscovery::g_DiscoveredFFieldLayout,
+                    AutoDiscovery::g_DiscoveredFPropertyLayout);
+            }
+
+            // ── Phase 2c.6: FProperty sub-pointer offset discovery ──────
+            {
+                std::printf("\n=== Phase 2c.6: FProperty sub-pointer offset ===\n");
+                uint32_t SubOff = AutoDiscovery::DiscoverFPropertySubPointerOffset(
+                    m_reader, MODULE_BASE,
+                    AutoDiscovery::g_DiscoveredBounds,
+                    m_gobj.GetSeedObjects(),
+                    AutoDiscovery::g_DiscoveredVTables);
+                if (SubOff) {
+                    AutoDiscovery::g_DiscoveredFPropertyLayout.SubPointerOff = SubOff;
+                    AutoDiscovery::ApplyDiscoveredLayouts(
+                        AutoDiscovery::g_DiscoveredFFieldLayout,
+                        AutoDiscovery::g_DiscoveredFPropertyLayout);
+                }
+            }
+
+            // ── Phase 2f: Build live FFieldClass-to-type map ──────────
+            {
+                std::printf("\n=== Phase 2f: Live FFieldClass-to-type map ===\n");
+                AutoDiscovery::g_LiveFClassMap = AutoDiscovery::BuildLiveFFieldClassMap(
+                    m_reader, MODULE_BASE,
+                    AutoDiscovery::g_DiscoveredBounds,
+                    m_gobj.GetSeedObjects(),
+                    AutoDiscovery::g_DiscoveredVTables);
+                for (auto& [Addr, TypeName] : AutoDiscovery::g_LiveFClassMap) {
+                    uint64_t Rva = Addr - MODULE_BASE;
+                    bool Already = false;
+                    for (const auto& G : AutoDiscovery::g_DiscoveredFClassGlobals) {
+                        if (G.TargetRva == Rva) { Already = true; break; }
+                    }
+                    if (!Already) {
+                        AutoDiscovery::FFieldClassGlobal Entry;
+                        Entry.TargetRva = Rva;
+                        Entry.TypeName  = TypeName;
+                        AutoDiscovery::g_DiscoveredFClassGlobals.push_back(std::move(Entry));
+                    }
+                }
+                std::printf("[live-fclass] g_DiscoveredFClassGlobals now has %zu entries\n",
+                    AutoDiscovery::g_DiscoveredFClassGlobals.size());
+            }
+
+            // If code-discovered ChildProperties offset produced 0 FFields,
+            // the offset is wrong for this session (Theia per-session layout
+            // randomization). Clear it so auto_offsets runtime probe runs.
+            if (AutoDiscovery::g_DiscoveredFFieldLayout.Valid &&
+                AutoDiscovery::g_LiveFClassMap.empty()) {
+                std::printf("[layout-fix] Code-discovered ChildProperties=+0x%X produced 0 FFields "
+                    "— clearing for runtime re-probe\n",
+                    AutoDiscovery::g_DiscoveredFFieldLayout.ChildPropsOff);
+                AutoDiscovery::g_DiscoveredFFieldLayout.ChildPropsOff = 0;
+                AutoDiscovery::g_DiscoveredFFieldLayout.NextOff = 0;
+                AutoDiscovery::g_DiscoveredFFieldLayout.OwnerOff = 0;
+                AutoDiscovery::g_DiscoveredFFieldLayout.ClassPrivateOff = 0;
+                AutoDiscovery::g_DiscoveredFFieldLayout.NamePrivateOff = 0;
+                AutoDiscovery::g_DiscoveredFFieldLayout.Valid = false;
+                ArcDecrypt::Offsets::UStruct::ChildProperties = 0xC8;
+                ArcDecrypt::Offsets::UStruct::Children = 0xC8;
+                ArcDecrypt::Offsets::FField::Next = 0x60;
+                ArcDecrypt::Offsets::FField::ClassPrivate = 0x70;
+            }
+
             // ── Phase 9-15: live structure-offset probe (auto_offsets.h) ──
-            // With vtables (Phase 1), FField NamePrivate XOR (Phase 2), and
-            // FFieldClass globals (Phase 8) settled, every layout offset in
-            // arc_decrypt.h::Offsets:: can be re-derived from live data with
-            // zero hardcoded RVAs. Each probe scans a candidate offset range,
-            // scores against a type-shape oracle, and overwrites the global
-            // only on strong consensus. Failed probes leave the compile-time
-            // fallback intact and log loudly.
-            //
-            // Pre-seed g_DiscoveredFClassGlobals with hardcoded CL-1201801
-            // RVAs before DiscoverAll so Probe 10 (FProperty sub-pointers)
-            // has a populated fclass_to_type map even when Phase 8 auto-
-            // discovery yields 0 entries (FFieldClass globals not sigscanned).
             AutoDiscovery::SeedHardcodedFClassGlobals_CL1201801();
             AutoOffsets::DiscoverAll(m_reader, MODULE_BASE,
                                      m_gobj.GetSeedObjects(), m_fname);
+
+            // If auto_offsets found a new ChildProperties offset, re-run
+            // live FFieldClass map with the corrected offsets.
+            if (AutoDiscovery::g_LiveFClassMap.empty()) {
+                std::printf("\n=== Phase 2f retry: Live FFieldClass-to-type map (post auto_offsets) ===\n");
+                AutoDiscovery::g_LiveFClassMap = AutoDiscovery::BuildLiveFFieldClassMap(
+                    m_reader, MODULE_BASE,
+                    AutoDiscovery::g_DiscoveredBounds,
+                    m_gobj.GetSeedObjects(),
+                    AutoDiscovery::g_DiscoveredVTables);
+                for (auto& [Addr, TypeName] : AutoDiscovery::g_LiveFClassMap) {
+                    uint64_t Rva = Addr - MODULE_BASE;
+                    bool Already = false;
+                    for (const auto& G : AutoDiscovery::g_DiscoveredFClassGlobals) {
+                        if (G.TargetRva == Rva) { Already = true; break; }
+                    }
+                    if (!Already) {
+                        AutoDiscovery::FFieldClassGlobal Entry;
+                        Entry.TargetRva = Rva;
+                        Entry.TypeName  = TypeName;
+                        AutoDiscovery::g_DiscoveredFClassGlobals.push_back(std::move(Entry));
+                    }
+                }
+                std::printf("[live-fclass-retry] g_DiscoveredFClassGlobals now has %zu entries\n",
+                    AutoDiscovery::g_DiscoveredFClassGlobals.size());
+            }
         }
 
         // (FProperty Offset_Internal XOR key auto-discovery already ran
@@ -2014,9 +2123,17 @@ public:
                     if (Ci > 1) full = m_fname.CompIndexToNameLenient(Ci);
                 }
                 if (!full.empty()) {
-                    addr_to_fullname[obj_ptr] = full;
-                    size_t dot = full.rfind('.');
-                    addr_to_name[obj_ptr] = (dot != std::string::npos) ? full.substr(dot + 1) : full;
+                    bool Plausible = full.size() <= 256;
+                    if (Plausible) {
+                        for (unsigned char Cc : full) {
+                            if (Cc < 0x20 || Cc > 0x7E) { Plausible = false; break; }
+                        }
+                    }
+                    if (Plausible) {
+                        addr_to_fullname[obj_ptr] = full;
+                        size_t dot = full.rfind('.');
+                        addr_to_name[obj_ptr] = (dot != std::string::npos) ? full.substr(dot + 1) : full;
+                    }
                 }
                 if (i % 10000 == 0)
                     std::cout << "\r[*] Scanning: " << i << "/" << obj_count << "  " << std::flush;
@@ -2340,7 +2457,10 @@ public:
         m_cachedAddrToFullname.reserve(obj_count);
 
         uint64_t VtLo = MODULE_BASE + 0x1000;
-        uint64_t VtHi = MODULE_BASE + 0xE3DD000;
+        uint64_t VtHi = MODULE_BASE + (AutoDiscovery::g_DiscoveredBounds.Valid
+            ? AutoDiscovery::g_DiscoveredBounds.ImageSize
+            : 0x117E1000ULL);
+        uint32_t ConsecutiveReadFails = 0;
 
         for (int32_t i = 0; i < obj_count; ++i) {
             if (i % 5000 == 0) {
@@ -2355,7 +2475,19 @@ public:
             }
 
             uint64_t Vt = 0;
-            m_reader.Read(obj_ptr, &Vt, 8);
+            if (!m_reader.Read(obj_ptr, &Vt, 8)) {
+                ++ConsecutiveReadFails;
+                if (ConsecutiveReadFails >= 500) {
+                    std::printf("\n[!] %u consecutive read failures — game likely crashed (PID %d)\n",
+                        ConsecutiveReadFails, m_pid);
+                    stale += (obj_count - i);
+                    staleVt += (obj_count - i);
+                    break;
+                }
+                ++stale; ++staleVt;
+                continue;
+            }
+            ConsecutiveReadFails = 0;
             if (Vt < VtLo || Vt >= VtHi || (Vt & 0x7) != 0) {
                 ++stale; ++staleVt;
                 continue;

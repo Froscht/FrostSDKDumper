@@ -740,14 +740,15 @@ namespace gobjects
         // backed by a UObject*) is restrictive enough that we essentially
         // never get a false positive even on multi-GB heaps.
         uint64_t ProbeChunkTableNoPEB(uint32_t num_chunks,
-                                       uint64_t vt_lo, uint64_t vt_hi) {
+                                       uint64_t vt_lo, uint64_t vt_hi,
+                                       uint32_t item_stride_override = 0) {
             if (m_pid <= 0 || num_chunks == 0 || num_chunks > 64) return 0;
 
             std::vector<Region> ranges;
             ranges.reserve(64);
             // Chunk-tables live in small dedicated allocations; engine
             // bookkeeping is at the small end of the heap.
-            EnumerateRwHeapRegions(0x1000ULL, 0xC800000ULL, ranges);
+            EnumerateRwHeapRegions(0x1000ULL, 0x100000000ULL, ranges);
 
             // Pre-build the set of all rw-heap regions so we can verify each
             // candidate chunk-pointer points into one of them.
@@ -810,8 +811,8 @@ namespace gobjects
                         //     were 1360 bytes apart, and chunk[0]'s 1.25 MB
                         //     bulk read failed — caught by (b)/(c).
                         constexpr uint32_t ITEMS_PER_CHUNK = 65536;
-                        constexpr uint32_t ITEM_STRIDE     = 20;
-                        constexpr uint64_t CHUNK_BYTES =
+                        const uint32_t ITEM_STRIDE = item_stride_override ? item_stride_override : 20;
+                        const uint64_t CHUNK_BYTES =
                             static_cast<uint64_t>(ITEMS_PER_CHUNK) * ITEM_STRIDE;
 
                         std::vector<uint64_t> cps(num_chunks, 0);
@@ -870,16 +871,16 @@ namespace gobjects
                         //     0.1–0.7%. cap-8 = 0x8FFFFFFFF was nonsense.
                         bool ok_c = true;
                         constexpr int N_SAMPLES = 32;
-                        constexpr uint64_t LAST_ITEM_OFF =
-                            (ITEMS_PER_CHUNK - 1) * ITEM_STRIDE;
-                        uint8_t sample_buf[ITEM_STRIDE];
+                        const uint64_t LAST_ITEM_OFF =
+                            (uint64_t)(ITEMS_PER_CHUNK - 1) * ITEM_STRIDE;
+                        uint8_t sample_buf[32];
                         for (uint32_t ci = 0; ci < num_chunks && ok_c; ++ci) {
                             // (c.1) full-range readability — read the LAST
                             // item slot of the chunk. If this fails the
                             // chunk pointer is either bogus or the chunk
                             // is much smaller than 1.25 MB.
                             if (!m_reader.Read(cps[ci] + LAST_ITEM_OFF,
-                                               sample_buf, ITEM_STRIDE)) {
+                                               sample_buf, std::min(ITEM_STRIDE, 32u))) {
                                 ok_c = false;
                                 break;
                             }
@@ -889,7 +890,7 @@ namespace gobjects
                                 uint64_t item_off = static_cast<uint64_t>(s) *
                                     (ITEMS_PER_CHUNK / N_SAMPLES) * ITEM_STRIDE;
                                 if (!m_reader.Read(cps[ci] + item_off,
-                                                   sample_buf, ITEM_STRIDE)) continue;
+                                                   sample_buf, std::min(ITEM_STRIDE, 32u))) continue;
                                 ++sampled;
                                 uint64_t obj = 0;
                                 std::memcpy(&obj, sample_buf, 8);
@@ -1762,79 +1763,107 @@ namespace gobjects
             }
             std::printf("[v707-gobj] NumElements=%u at RVA 0x%llX\n", NumEl, (unsigned long long)kGobjRva);
 
-            alignas(16) uint8_t EncBytes[16] = {};
-            alignas(16) uint8_t MaskBytes[16] = {};
-            if (!m_reader.Read(GobjAbs + 0xC0, EncBytes, 16) ||
-                !m_reader.Read(m_base + kPshufbMaskRva, MaskBytes, 16)) {
-                std::printf("[v707-gobj] failed to read encrypted blob or PSHUFB mask\n");
-                return false;
-            }
-
-            __m128i X = _mm_loadu_si128(reinterpret_cast<const __m128i*>(EncBytes));
-            __m128i Mask = _mm_loadu_si128(reinterpret_cast<const __m128i*>(MaskBytes));
-            __m128i X1 = _mm_shufflelo_epi16(X, 0x1B);
-            __m128i X2 = _mm_or_si128(_mm_slli_epi16(X1, 3), _mm_srli_epi16(X1, 13));
-            __m128i X3 = _mm_shuffle_epi8(X2, Mask);
-            uint64_t ChunksMgr = 0;
-            std::memcpy(&ChunksMgr, &X3, 8);
-
             auto IsHeap = [&](uint64_t P) {
                 return P > 0x10000ULL && P < 0x800000000000ULL &&
                        !(P >= m_base && P < m_base + 0x12000000ULL);
             };
-            if (!IsHeap(ChunksMgr)) {
-                std::printf("[v707-gobj] chunks_manager 0x%llX not heap\n",
-                    (unsigned long long)ChunksMgr);
-                return false;
-            }
-            std::printf("[v707-gobj] chunks_manager=0x%llX\n", (unsigned long long)ChunksMgr);
-
-            auto SimdDecryptBlob = [&](uint64_t Addr) -> uint64_t {
-                alignas(16) uint8_t E2[16] = {};
-                if (!m_reader.Read(Addr, E2, 16)) return 0;
-                __m128i Y = _mm_loadu_si128(reinterpret_cast<const __m128i*>(E2));
-                __m128i Y1 = _mm_shufflelo_epi16(Y, 0x1B);
-                __m128i Y2 = _mm_or_si128(_mm_slli_epi16(Y1, 3), _mm_srli_epi16(Y1, 13));
-                __m128i Y3 = _mm_shuffle_epi8(Y2, Mask);
-                uint64_t R = 0;
-                std::memcpy(&R, &Y3, 8);
-                return R;
-            };
-
-            auto ValidateChunks = [&](uint64_t Arr) -> int {
-                int V = 0;
-                for (int I = 0; I < 2; ++I) {
-                    uint64_t Cp = 0;
-                    if (!m_reader.Read(Arr + (uint64_t)I * 8, &Cp, 8)) return V;
-                    if (!IsHeap(Cp)) return V;
-                    uint64_t Obj = 0;
-                    if (!m_reader.Read(Cp, &Obj, 8)) return V;
-                    if (!IsHeap(Obj)) return V;
-                    uint64_t Vt = 0;
-                    if (!m_reader.Read(Obj, &Vt, 8)) return V;
-                    if (Vt < m_base || Vt >= m_base + 0x12000000ULL) return V;
-                    ++V;
-                }
-                return V;
-            };
 
             uint64_t ChunksArr = 0;
-            static constexpr uint32_t kInnerOffs[] = { 0x90, 0xA0, 0xB0, 0x70, 0x80 };
-            for (uint32_t BlobOff : kInnerOffs) {
-                uint64_t Cand = SimdDecryptBlob(ChunksMgr + BlobOff);
-                if (!IsHeap(Cand)) continue;
-                if (ValidateChunks(Cand) >= 2) { ChunksArr = Cand; break; }
-            }
-            if (!ChunksArr) {
-                for (uint32_t Off = 0; Off <= 0x400; Off += 8) {
-                    uint64_t Cand = 0;
-                    if (!m_reader.Read(ChunksMgr + Off, &Cand, 8)) continue;
-                    if (!IsHeap(Cand)) continue;
-                    if (ValidateChunks(Cand) >= 2) { ChunksArr = Cand; break; }
+
+            alignas(16) uint8_t EncBytes[16] = {};
+            alignas(16) uint8_t MaskBytes[16] = {};
+            bool SimdOk = m_reader.Read(GobjAbs + 0xC0, EncBytes, 16) &&
+                          m_reader.Read(m_base + kPshufbMaskRva, MaskBytes, 16);
+
+            alignas(16) uint8_t ValidMask[16] = {};
+            bool MaskValid = SimdOk;
+            if (SimdOk) {
+                std::memcpy(ValidMask, MaskBytes, 16);
+                for (int I = 0; I < 16; ++I) {
+                    if ((ValidMask[I] & 0x80) == 0 && ValidMask[I] > 15) { MaskValid = false; break; }
                 }
             }
+
+            if (MaskValid) {
+                __m128i X = _mm_loadu_si128(reinterpret_cast<const __m128i*>(EncBytes));
+                __m128i Mask = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ValidMask));
+                __m128i X1 = _mm_shufflelo_epi16(X, 0x1B);
+                __m128i X2 = _mm_or_si128(_mm_slli_epi16(X1, 3), _mm_srli_epi16(X1, 13));
+                __m128i X3 = _mm_shuffle_epi8(X2, Mask);
+                uint64_t ChunksMgr = 0;
+                std::memcpy(&ChunksMgr, &X3, 8);
+
+                if (IsHeap(ChunksMgr)) {
+                    std::printf("[v707-gobj] chunks_manager=0x%llX\n", (unsigned long long)ChunksMgr);
+
+                    auto SimdDecryptBlob = [&](uint64_t Addr) -> uint64_t {
+                        alignas(16) uint8_t E2[16] = {};
+                        if (!m_reader.Read(Addr, E2, 16)) return 0;
+                        __m128i Y = _mm_loadu_si128(reinterpret_cast<const __m128i*>(E2));
+                        __m128i Y1 = _mm_shufflelo_epi16(Y, 0x1B);
+                        __m128i Y2 = _mm_or_si128(_mm_slli_epi16(Y1, 3), _mm_srli_epi16(Y1, 13));
+                        __m128i Y3 = _mm_shuffle_epi8(Y2, Mask);
+                        uint64_t R = 0;
+                        std::memcpy(&R, &Y3, 8);
+                        return R;
+                    };
+
+                    auto ValidateChunks = [&](uint64_t Arr) -> int {
+                        int V = 0;
+                        for (int I = 0; I < 2; ++I) {
+                            uint64_t Cp = 0;
+                            if (!m_reader.Read(Arr + (uint64_t)I * 8, &Cp, 8)) return V;
+                            if (!IsHeap(Cp)) return V;
+                            uint64_t Obj = 0;
+                            if (!m_reader.Read(Cp, &Obj, 8)) return V;
+                            if (!IsHeap(Obj)) return V;
+                            uint64_t Vt = 0;
+                            if (!m_reader.Read(Obj, &Vt, 8)) return V;
+                            if (Vt < m_base || Vt >= m_base + 0x12000000ULL) return V;
+                            ++V;
+                        }
+                        return V;
+                    };
+
+                    static constexpr uint32_t kInnerOffs[] = { 0x90, 0xA0, 0xB0, 0x70, 0x80 };
+                    for (uint32_t BlobOff : kInnerOffs) {
+                        uint64_t Cand = SimdDecryptBlob(ChunksMgr + BlobOff);
+                        if (!IsHeap(Cand)) continue;
+                        if (ValidateChunks(Cand) >= 2) { ChunksArr = Cand; break; }
+                    }
+                    if (!ChunksArr) {
+                        for (uint32_t Off = 0; Off <= 0x400; Off += 8) {
+                            uint64_t Cand = 0;
+                            if (!m_reader.Read(ChunksMgr + Off, &Cand, 8)) continue;
+                            if (!IsHeap(Cand)) continue;
+                            if (ValidateChunks(Cand) >= 2) { ChunksArr = Cand; break; }
+                        }
+                    }
+                } else {
+                    std::printf("[v707-gobj] chunks_manager not heap — SIMD decrypt produced garbage\n");
+                }
+            } else {
+                std::printf("[v707-gobj] PSHUFB mask invalid or unreadable — skipping SIMD path\n");
+            }
+
             if (!ChunksArr) {
-                std::printf("[v707-gobj] no chunks array found from chunks_manager\n");
+                std::printf("[v707-gobj] SIMD path failed — trying PEB-free chunk-table heap scan\n");
+                uint32_t NumChunksProbe = (NumEl + kItemsPerChunk - 1) / kItemsPerChunk;
+                if (NumChunksProbe > 64) NumChunksProbe = 64;
+                uint64_t VtLo = m_base;
+                uint64_t VtHi = m_base + 0x12000000ULL;
+                for (uint32_t TryStride : { kItemSize, 20u, 16u }) {
+                    ChunksArr = ProbeChunkTableNoPEB(NumChunksProbe, VtLo, VtHi, TryStride);
+                    if (ChunksArr) {
+                        std::printf("[v707-gobj] heap-scan found chunk_table @ 0x%llX (stride=%u)\n",
+                            (unsigned long long)ChunksArr, TryStride);
+                        break;
+                    }
+                }
+            }
+
+            if (!ChunksArr) {
+                std::printf("[v707-gobj] no chunks array found\n");
                 return false;
             }
             std::printf("[v707-gobj] chunks_array=0x%llX\n", (unsigned long long)ChunksArr);
@@ -1848,6 +1877,33 @@ namespace gobjects
                 return false;
             }
 
+            uint32_t ActualItemSize = kItemSize;
+            if (IsHeap(ChunkPtrs[0])) {
+                constexpr uint32_t kProbeCount = 256;
+                constexpr uint32_t kCandStrides[] = { 16, 20, 24, 32 };
+                int BestHits = 0;
+                uint32_t BestStride = kItemSize;
+                for (uint32_t Stride : kCandStrides) {
+                    uint64_t BufSize = (uint64_t)kProbeCount * Stride;
+                    std::vector<uint8_t> ProbeBuf(BufSize);
+                    if (!m_reader.Read(ChunkPtrs[0], ProbeBuf.data(), BufSize)) continue;
+                    int Hits = 0;
+                    for (uint32_t I = 0; I < kProbeCount; ++I) {
+                        uint64_t Obj = 0;
+                        std::memcpy(&Obj, ProbeBuf.data() + (uint64_t)I * Stride, 8);
+                        if (!IsHeap(Obj)) continue;
+                        uint64_t Vt = 0;
+                        if (!m_reader.Read(Obj, &Vt, 8)) continue;
+                        if (Vt >= m_base && Vt < m_base + 0x12000000ULL) ++Hits;
+                    }
+                    std::printf("[v707-gobj] stride=%u: %d/%u valid UObjects in chunk[0] sample\n",
+                        Stride, Hits, kProbeCount);
+                    if (Hits > BestHits) { BestHits = Hits; BestStride = Stride; }
+                }
+                ActualItemSize = BestStride;
+                std::printf("[v707-gobj] auto-detected item stride = %u\n", ActualItemSize);
+            }
+
             std::vector<uint64_t> Objects;
             Objects.reserve(NumEl);
             uint32_t Remaining = NumEl;
@@ -1856,14 +1912,14 @@ namespace gobjects
                 uint32_t N = std::min(Remaining, kItemsPerChunk);
                 if (!N) break;
                 if (!IsHeap(Chunk)) { Remaining -= N; continue; }
-                std::vector<uint8_t> Buf(N * kItemSize);
-                if (!m_reader.Read(Chunk, Buf.data(), N * kItemSize)) {
+                std::vector<uint8_t> Buf((uint64_t)N * ActualItemSize);
+                if (!m_reader.Read(Chunk, Buf.data(), (uint64_t)N * ActualItemSize)) {
                     Remaining -= N;
                     continue;
                 }
                 for (uint32_t Ii = 0; Ii < N; ++Ii) {
                     uint64_t Obj = 0;
-                    std::memcpy(&Obj, Buf.data() + Ii * kItemSize, 8);
+                    std::memcpy(&Obj, Buf.data() + (uint64_t)Ii * ActualItemSize, 8);
                     if (IsHeap(Obj)) Objects.push_back(Obj);
                 }
                 Remaining -= N;
@@ -2662,24 +2718,50 @@ namespace gobjects
             std::vector<Region> ranges;
             ranges.reserve(AllRanges.size());
             uint8_t Probe[160] = {};
+            constexpr uint64_t kSubRegionSz = 0x10000000ULL;
             for (const auto& R : AllRanges) {
                 uint64_t Sz = R.hi - R.lo;
-                if (Sz > 0x10000000ULL) continue;
-
-                bool Promising = false;
-                uint64_t SamplePoints[] = { R.lo, R.lo + Sz / 2, R.hi - 160 };
-                for (uint64_t Sp : SamplePoints) {
-                    if (Sp < R.lo || Sp + 160 > R.hi) continue;
-                    if (!m_reader.Read(Sp, Probe, 160)) continue;
-                    int Hits = 0;
-                    for (int I = 0; I + (int)STRIDE <= 160; I += STRIDE) {
-                        uint64_t V = 0;
-                        std::memcpy(&V, Probe + I, 8);
-                        if (is_heap(V)) ++Hits;
-                    }
-                    if (Hits >= 4) { Promising = true; break; }
+                if (Sz >= 0x100000ULL && Sz <= 0x2000000ULL) {
+                    ranges.push_back(R);
+                    continue;
                 }
-                if (Promising) ranges.push_back(R);
+                if (Sz <= kSubRegionSz) {
+                    bool Promising = false;
+                    uint64_t SamplePoints[] = { R.lo, R.lo + Sz / 4, R.lo + Sz / 2, R.lo + 3*Sz/4, R.hi - 160 };
+                    for (uint64_t Sp : SamplePoints) {
+                        if (Sp < R.lo || Sp + 160 > R.hi) continue;
+                        if (!m_reader.Read(Sp, Probe, 160)) continue;
+                        int Hits = 0;
+                        for (int I = 0; I + (int)STRIDE <= 160; I += STRIDE) {
+                            uint64_t V = 0;
+                            std::memcpy(&V, Probe + I, 8);
+                            if (is_heap(V)) ++Hits;
+                        }
+                        if (Hits >= 3) { Promising = true; break; }
+                    }
+                    if (Promising) ranges.push_back(R);
+                } else {
+                    for (uint64_t SubLo = R.lo; SubLo < R.hi; SubLo += kSubRegionSz) {
+                        uint64_t SubHi = std::min(SubLo + kSubRegionSz, R.hi);
+                        uint64_t SubSz = SubHi - SubLo;
+                        if (SubSz < 160) continue;
+                        bool Promising = false;
+                        constexpr int kNumSamples = 8;
+                        for (int Sidx = 0; Sidx < kNumSamples; ++Sidx) {
+                            uint64_t Sp = SubLo + (SubSz * Sidx) / kNumSamples;
+                            if (Sp + 160 > SubHi) continue;
+                            if (!m_reader.Read(Sp, Probe, 160)) continue;
+                            int Hits = 0;
+                            for (int I = 0; I + (int)STRIDE <= 160; I += STRIDE) {
+                                uint64_t V = 0;
+                                std::memcpy(&V, Probe + I, 8);
+                                if (is_heap(V)) ++Hits;
+                            }
+                            if (Hits >= 3) { Promising = true; break; }
+                        }
+                        if (Promising) ranges.push_back({SubLo, SubHi});
+                    }
+                }
             }
             {
                 uint64_t FilteredSz = 0;

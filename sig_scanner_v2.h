@@ -220,6 +220,8 @@ public:
 
     uint64_t   GameBase()   const { return m_base; }
     uint32_t   ModuleSize() const { return m_imageSize; }
+    const uint8_t* CacheData() const { return m_cache.data(); }
+    size_t         CacheSize() const { return m_cache.size(); }
 
     // Returns a pointer into the local cache. Returns nullptr if the page
     // wasn't readable (or if rva is out of range).

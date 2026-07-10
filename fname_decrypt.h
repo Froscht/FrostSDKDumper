@@ -150,25 +150,30 @@ public:
         bool Use519 = (Nz519 >= 16) && (Nz519 >= Nz146);
         bool Use146 = (Nz146 >= 16) && !Use519;
 
+        bool LegacyLoaded = false;
         if (Use519) {
             std::memcpy(m_keyTable, Kt519, sizeof(Kt519));
             FNAME_KEY_TABLE_OFF = Rva519;
             m_pipeline = Pipeline::Build20260519;
+            LegacyLoaded = true;
             std::printf("[fname] Pipeline = Build20260519 (keytable @ 0x%llX, %d nz)\n",
                 (unsigned long long)(m_base + Rva519), Nz519);
         } else if (Use146) {
             std::memcpy(m_keyTable, Kt146, sizeof(Kt146));
             FNAME_KEY_TABLE_OFF = Rva146;
             m_pipeline = Pipeline::CL1177146;
+            LegacyLoaded = true;
             std::printf("[fname] Pipeline = CL1177146 (keytable @ 0x%llX, %d nz)\n",
                 (unsigned long long)(m_base + Rva146), Nz146);
         } else {
-            std::printf("[-] FName key table looks invalid at BOTH known RVAs "
-                        "(146=%d nz, 519=%d nz)\n", Nz146, Nz519);
-            return false;
+            std::printf("[fname] legacy keytables invalid (146=%d nz, 519=%d nz) — trying V707\n",
+                Nz146, Nz519);
+            m_pipeline = Pipeline::Build20260519;
         }
-        std::printf("[+] FName key table OK (first: 0x%04X 0x%04X 0x%04X 0x%04X)\n",
-            m_keyTable[0], m_keyTable[1], m_keyTable[2], m_keyTable[3]);
+        if (LegacyLoaded) {
+            std::printf("[+] FName key table OK (first: 0x%04X 0x%04X 0x%04X 0x%04X)\n",
+                m_keyTable[0], m_keyTable[1], m_keyTable[2], m_keyTable[3]);
+        }
 
         if (m_pipeline == Pipeline::CL1177146 && AutoDiscovery::g_DiscoveredUObjSlot.Valid) {
             m_pipeline = Pipeline::Build20260519;
@@ -192,28 +197,56 @@ public:
 
         {
             namespace V707 = ArcDecrypt::v20260707;
-            uint16_t Kt707[64] = {};
-            if (m_reader.Read(m_base + V707::RVA_KEYTABLE, Kt707, sizeof(Kt707))) {
+            const auto& GN = AutoDiscovery::g_DiscoveredGNames;
+            uint64_t SimdBase = GN.SimdBlockRva ? GN.SimdBlockRva : (V707::RVA_KEYTABLE - 0xF0);
+
+            int BestNz = 0;
+            int BestOff = 0xF0;
+            uint16_t BestKt[64] = {};
+            for (int Off : {0xE8, 0xF0}) {
+                uint16_t Kt[64] = {};
+                uint64_t Rva = SimdBase + Off;
+                if (!m_reader.Read(m_base + Rva, Kt, sizeof(Kt))) continue;
                 int Nz = 0;
-                for (int I = 0; I < 64; ++I) Nz += (Kt707[I] != 0);
-                if (Nz >= 16) {
-                    std::memcpy(m_keyTable707, Kt707, sizeof(Kt707));
-                    m_ks707Loaded = true;
-                    std::printf("[fname] v707 keytable loaded @ 0x%llX (%d nz, first: 0x%04X 0x%04X 0x%04X 0x%04X)\n",
-                        (unsigned long long)(m_base + V707::RVA_KEYTABLE), Nz,
-                        m_keyTable707[0], m_keyTable707[1], m_keyTable707[2], m_keyTable707[3]);
-                } else {
-                    std::printf("[fname] v707 keytable @ 0x%llX only %d nz — skipped\n",
-                        (unsigned long long)(m_base + V707::RVA_KEYTABLE), Nz);
+                for (int I = 0; I < 64; ++I) Nz += (Kt[I] != 0);
+                if (Nz > BestNz) {
+                    BestNz = Nz;
+                    BestOff = Off;
+                    std::memcpy(BestKt, Kt, sizeof(Kt));
                 }
+            }
+
+            if (BestNz >= 16) {
+                std::memcpy(m_keyTable707, BestKt, sizeof(m_keyTable707));
+                std::memcpy(m_keyTableNewPatch, BestKt, sizeof(m_keyTableNewPatch));
+                m_ks707Loaded = true;
+                uint64_t KtRva = SimdBase + BestOff;
+                std::printf("[fname] keytable loaded @ 0x%llX (offset +0x%X, %d nz, first: 0x%04X 0x%04X 0x%04X 0x%04X)\n",
+                    (unsigned long long)(m_base + KtRva), BestOff, BestNz,
+                    BestKt[0], BestKt[1], BestKt[2], BestKt[3]);
+                if (BestOff == 0xE8) {
+                    m_newPatchActive = true;
+                    std::printf("[fname] new patch detected (keytable at +0xE8) — using v20260709 pipeline\n");
+                }
+            } else {
+                std::printf("[fname] keytable @ SimdBase+0xE8/0xF0 only %d nz — skipped\n", BestNz);
             }
         }
 
-        if (m_ks707Loaded) {
+        if (m_ks707Loaded && !m_newPatchActive) {
             namespace V707 = ArcDecrypt::v20260707;
+            int64_t RdataShift = 0;
+            const auto& Bounds = AutoDiscovery::g_DiscoveredBounds;
+            if (Bounds.Valid && Bounds.RDataRva && Bounds.RDataRva != V707::RDATA_BASE_REF) {
+                RdataShift = (int64_t)Bounds.RDataRva - (int64_t)V707::RDATA_BASE_REF;
+                std::printf("[fname] .rdata shift: %+lld (0x%llX → 0x%llX)\n",
+                    (long long)RdataShift,
+                    (unsigned long long)V707::RDATA_BASE_REF,
+                    (unsigned long long)Bounds.RDataRva);
+            }
             auto LoadMask = [&](uint64_t Rva) -> __m128i {
                 alignas(16) uint8_t Buf[16] = {};
-                m_reader.Read(m_base + Rva, Buf, 16);
+                m_reader.Read(m_base + (uint64_t)((int64_t)Rva + RdataShift), Buf, 16);
                 return _mm_load_si128(reinterpret_cast<const __m128i*>(Buf));
             };
             m_seedXor1     = LoadMask(V707::RVA_SEED_XOR1);
@@ -224,7 +257,27 @@ public:
             m_seedXor4     = LoadMask(V707::RVA_SEED_XOR4);
             m_chunkXor     = LoadMask(V707::RVA_CHUNK_XOR);
             m_seedLoaded   = true;
-            std::printf("[fname] v707 seed SIMD masks loaded (7 masks from .rdata)\n");
+            std::printf("[fname] v707 seed SIMD masks loaded (7 masks, rdata_shift=%+lld)\n", (long long)RdataShift);
+        }
+
+        if (m_newPatchActive) {
+            namespace V709 = ArcDecrypt::v20260709;
+            uint64_t FnvXorRva = V709::BLOCK_FNV_XOR_RVA;
+            uint64_t FnvXorVal = 0;
+            if (m_reader.Read(m_base + FnvXorRva, &FnvXorVal, 8) && FnvXorVal) {
+                V709::BLOCK_FNV_XOR = FnvXorVal;
+                std::printf("[fname] v709 FnvXor loaded from RVA 0x%llX = 0x%llX\n",
+                    (unsigned long long)FnvXorRva, (unsigned long long)FnvXorVal);
+            } else {
+                std::printf("[fname] v709 FnvXor read failed @ 0x%llX, using default 0x%llX\n",
+                    (unsigned long long)FnvXorRva, (unsigned long long)V709::BLOCK_FNV_XOR);
+            }
+            m_seedLoaded = true;
+        }
+
+        if (!LegacyLoaded && !m_ks707Loaded) {
+            std::printf("[-] FName: no keytable loaded (legacy invalid, V707 failed)\n");
+            return false;
         }
 
         m_keyLoaded = true;
@@ -287,10 +340,12 @@ public:
     //   OUTER = (slot_byte + 1) & 3
     //   CLASS =  slot_byte & 3
     static uint8_t Build20260519_ObjSlotMixByte(uint64_t obj_ptr) {
-        const bool Is707 = AutoDiscovery::g_UseV707SlotHash;
-        const bool Is616 = !Is707 && AutoDiscovery::g_DiscoveredUObjSlot.Valid;
+        const bool Is709 = AutoDiscovery::g_UseV709SlotHash;
+        const bool Is707 = !Is709 && AutoDiscovery::g_UseV707SlotHash;
+        const bool Is616 = !Is709 && !Is707 && AutoDiscovery::g_DiscoveredUObjSlot.Valid;
         const uint32_t P   = 0x01000193u;
-        const uint32_t ADD = Is707 ? ArcDecrypt::v20260707::SLOT_HASH_ADD
+        const uint32_t ADD = Is709 ? ArcDecrypt::v20260709::SLOT_HASH_ADD
+                           : Is707 ? ArcDecrypt::v20260707::SLOT_HASH_ADD
                            : Is616 ? ArcDecrypt::v20260616::SLOT_HASH_ADD
                                    : ArcDecrypt::v20260519::SLOT_HASH_ADD;
         uint64_t p = obj_ptr + 0x10;
@@ -298,7 +353,15 @@ public:
         uint32_t hi32 = static_cast<uint32_t>(p >> 32);
 
         uint32_t h;
-        if (Is707) {
+        if (Is709) {
+            h = fn_rotl32(lo32, ArcDecrypt::v20260709::SLOT_HASH_ROL1);
+            h = P * h + ADD;
+            h = fn_rotl32(h, ArcDecrypt::v20260709::SLOT_HASH_ROL2);
+            h = P * h + hi32 + ADD;
+            h = fn_rotl32(h, ArcDecrypt::v20260709::SLOT_HASH_ROL3);
+            h = P * h + ADD;
+            h = fn_rotl32(h, ArcDecrypt::v20260709::SLOT_HASH_ROL4);
+        } else if (Is707) {
             h = fn_rotl32(lo32, ArcDecrypt::v20260707::HASH_ROL1);
             h = P * h + ADD;
             h = fn_rotl32(h, ArcDecrypt::v20260707::HASH_ROL2);
@@ -416,6 +479,20 @@ public:
     // or a raw 64-bit pointer (for class/outer slots).
     // Callers extracting CompIndex must use (dec >> 32).
     uint64_t DecryptUObjSlotNew(const uint8_t enc[16]) const {
+        if (m_newPatchActive) {
+            namespace V709 = ArcDecrypt::v20260709;
+            __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
+            __m128i R64 = _mm_or_si128(
+                _mm_slli_epi64(V, V709::UOBJ_SLOT_ROL64_FIRST),
+                _mm_srli_epi64(V, 64 - V709::UOBJ_SLOT_ROL64_FIRST));
+            __m128i Sh = _mm_shufflelo_epi16(R64, V709::UOBJ_SLOT_PSHUFLW);
+            __m128i R32 = _mm_or_si128(
+                _mm_slli_epi32(Sh, V709::UOBJ_SLOT_ROL32_PER),
+                _mm_srli_epi32(Sh, 32 - V709::UOBJ_SLOT_ROL32_PER));
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), R32);
+            return Lo;
+        }
         namespace V707 = ArcDecrypt::v20260707;
         __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
         __m128i Rot = _mm_or_si128(
@@ -505,6 +582,107 @@ public:
     // CL-1177146 value, used until discovery has run.
     static constexpr uint64_t FFIELD_NAME_XOR_CL1177146 = 0x9A492C85DDF6F193ULL;
     uint64_t DecryptFFieldNameSlot(const uint8_t enc[16]) const {
+        auto ApplyShuf = [](__m128i V, uint8_t Imm) -> __m128i {
+            switch (Imm) {
+                case 0x1E: return _mm_shufflelo_epi16(V, 0x1E);
+                case 0x72: return _mm_shufflelo_epi16(V, 0x72);
+                case 0x4B: return _mm_shufflelo_epi16(V, 0x4B);
+                case 0x39: return _mm_shufflelo_epi16(V, 0x39);
+                case 0x93: return _mm_shufflelo_epi16(V, 0x93);
+                case 0xB1: return _mm_shufflelo_epi16(V, 0xB1);
+                case 0x2E: return _mm_shufflelo_epi16(V, 0x2E);
+                case 0x1B: return _mm_shufflelo_epi16(V, 0x1B);
+                case 0x4E: return _mm_shufflelo_epi16(V, 0x4E);
+                case 0x8D: return _mm_shufflelo_epi16(V, 0x8D);
+                case 0xD8: return _mm_shufflelo_epi16(V, 0xD8);
+                case 0xE1: return _mm_shufflelo_epi16(V, 0xE1);
+                case 0x8C: return _mm_shufflelo_epi16(V, 0x8C);
+                default:   return V;
+            }
+        };
+
+        {
+            const auto& Lay = AutoDiscovery::g_DiscoveredFFieldLayout;
+            if (Lay.Valid && Lay.XorKey != 0) {
+                __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
+                V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(Lay.XorKey)));
+                V = _mm_or_si128(_mm_slli_epi16(V, Lay.Rol16Amount),
+                                 _mm_srli_epi16(V, 16 - Lay.Rol16Amount));
+                alignas(16) uint8_t PshufMask[16] = {};
+                std::memcpy(PshufMask, Lay.PshufbMask, 8);
+                V = _mm_shuffle_epi8(V, _mm_load_si128(reinterpret_cast<const __m128i*>(PshufMask)));
+                uint64_t Lo;
+                _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+                uint64_t Out = (Lo << Lay.Rol64Amount) | (Lo >> (64 - Lay.Rol64Amount));
+                uint32_t Ci = static_cast<uint32_t>(Out);
+                if (Ci > 1 && Ci < 0x2000000u) return Out;
+            }
+        }
+
+        {
+            const auto& Disc = AutoDiscovery::g_DiscoveredFFieldName;
+            if (Disc.Valid && !Disc.TwoShuffle && Disc.XorConst == 0 && Disc.Rol32Amount > 0 && Disc.ShufImm1 != 0) {
+                __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
+                V = _mm_or_si128(_mm_slli_epi32(V, Disc.Rol32Amount),
+                                 _mm_srli_epi32(V, 32 - Disc.Rol32Amount));
+                V = ApplyShuf(V, Disc.ShufImm1);
+                uint64_t Lo;
+                _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+                uint64_t Out = (Lo << Disc.Rol64Amount) | (Lo >> (64 - Disc.Rol64Amount));
+                uint32_t Ci = static_cast<uint32_t>(Out);
+                if (Ci > 1 && Ci < 0x2000000u) return Out;
+            }
+        }
+
+        {
+            const auto& Disc = AutoDiscovery::g_DiscoveredFFieldName;
+            if (Disc.Valid && Disc.TwoShuffle && Disc.ShufImm1 != 0) {
+                __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
+                V = ApplyShuf(V, Disc.ShufImm1);
+                uint64_t Mid;
+                _mm_storel_epi64(reinterpret_cast<__m128i*>(&Mid), V);
+                Mid = (Mid << Disc.TsRol64) | (Mid >> (64 - Disc.TsRol64));
+                V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&Mid));
+                V = ApplyShuf(V, Disc.ShufImm2);
+                uint64_t Out;
+                _mm_storel_epi64(reinterpret_cast<__m128i*>(&Out), V);
+                uint32_t Ci = static_cast<uint32_t>(Out);
+                if (Ci > 1 && Ci < 0x2000000u) return Out;
+            }
+        }
+
+        {
+            const auto& Disc = AutoDiscovery::g_DiscoveredFFieldName;
+            if (Disc.Valid && Disc.XorConst != 0) {
+                __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
+                V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(Disc.XorConst)));
+                V = _mm_or_si128(_mm_slli_epi32(V, Disc.Rol32Amount),
+                                 _mm_srli_epi32(V, 32 - Disc.Rol32Amount));
+                V = ApplyShuf(V, Disc.ShufImm1);
+                uint64_t Lo;
+                _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+                uint64_t Out = (Lo << Disc.Rol64Amount) | (Lo >> (64 - Disc.Rol64Amount));
+                uint32_t Ci = static_cast<uint32_t>(Out);
+                if (Ci > 1 && Ci < 0x2000000u) return Out;
+            }
+        }
+
+        {
+            using namespace ArcDecrypt::v20260709;
+            __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
+            V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(FFIELD_NAME_XOR_KEY)));
+            V = _mm_or_si128(_mm_slli_epi16(V, FFIELD_NAME_ROL16),
+                             _mm_srli_epi16(V, 16 - FFIELD_NAME_ROL16));
+            alignas(16) uint8_t PshufMask[16] = {};
+            std::memcpy(PshufMask, FFIELD_NAME_PSHUFB, 8);
+            V = _mm_shuffle_epi8(V, _mm_load_si128(reinterpret_cast<const __m128i*>(PshufMask)));
+            uint64_t Lo;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+            uint64_t Out = (Lo << FFIELD_NAME_ROL64) | (Lo >> (64 - FFIELD_NAME_ROL64));
+            uint32_t CiN = static_cast<uint32_t>(Out);
+            if (CiN > 1 && CiN < 0x2000000u) return Out;
+        }
+
         {
             using namespace ArcDecrypt::v20260707;
             __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
@@ -530,72 +708,6 @@ public:
             uint64_t Out = (Lo << FFIELD_NAME_ROL64) | (Lo >> (64 - FFIELD_NAME_ROL64));
             uint32_t CiN = static_cast<uint32_t>(Out);
             if (CiN > 1 && CiN < 0x2000000u) return Out;
-        }
-
-        {
-            const auto& Disc = AutoDiscovery::g_DiscoveredFFieldName;
-            if (Disc.Valid && Disc.TwoShuffle) {
-                auto ApplyShuf = [](__m128i V, uint8_t Imm) -> __m128i {
-                    switch (Imm) {
-                        case 0x1E: return _mm_shufflelo_epi16(V, 0x1E);
-                        case 0x72: return _mm_shufflelo_epi16(V, 0x72);
-                        case 0x4B: return _mm_shufflelo_epi16(V, 0x4B);
-                        case 0x39: return _mm_shufflelo_epi16(V, 0x39);
-                        case 0x93: return _mm_shufflelo_epi16(V, 0x93);
-                        case 0xB1: return _mm_shufflelo_epi16(V, 0xB1);
-                        case 0x2E: return _mm_shufflelo_epi16(V, 0x2E);
-                        case 0x1B: return _mm_shufflelo_epi16(V, 0x1B);
-                        case 0x4E: return _mm_shufflelo_epi16(V, 0x4E);
-                        case 0x8D: return _mm_shufflelo_epi16(V, 0x8D);
-                        case 0xD8: return _mm_shufflelo_epi16(V, 0xD8);
-                        case 0xE1: return _mm_shufflelo_epi16(V, 0xE1);
-                        default:   return V;
-                    }
-                };
-                __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
-                V = ApplyShuf(V, Disc.ShufImm1);
-                uint64_t Mid;
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(&Mid), V);
-                Mid = (Mid << Disc.TsRol64) | (Mid >> (64 - Disc.TsRol64));
-                V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&Mid));
-                V = ApplyShuf(V, Disc.ShufImm2);
-                uint64_t Out;
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(&Out), V);
-                uint32_t Ci = static_cast<uint32_t>(Out);
-                if (Ci > 1 && Ci < 0x2000000u) return Out;
-            }
-        }
-
-        {
-            const auto& Disc = AutoDiscovery::g_DiscoveredFFieldName;
-            if (Disc.Valid && !Disc.TwoShuffle && Disc.XorConst == 0 && Disc.Rol32Amount > 0) {
-                auto ApplyShuf = [](__m128i V, uint8_t Imm) -> __m128i {
-                    switch (Imm) {
-                        case 0x1E: return _mm_shufflelo_epi16(V, 0x1E);
-                        case 0x72: return _mm_shufflelo_epi16(V, 0x72);
-                        case 0x4B: return _mm_shufflelo_epi16(V, 0x4B);
-                        case 0x39: return _mm_shufflelo_epi16(V, 0x39);
-                        case 0x93: return _mm_shufflelo_epi16(V, 0x93);
-                        case 0xB1: return _mm_shufflelo_epi16(V, 0xB1);
-                        case 0x2E: return _mm_shufflelo_epi16(V, 0x2E);
-                        case 0x1B: return _mm_shufflelo_epi16(V, 0x1B);
-                        case 0x4E: return _mm_shufflelo_epi16(V, 0x4E);
-                        case 0x8D: return _mm_shufflelo_epi16(V, 0x8D);
-                        case 0xD8: return _mm_shufflelo_epi16(V, 0xD8);
-                        case 0xE1: return _mm_shufflelo_epi16(V, 0xE1);
-                        default:   return V;
-                    }
-                };
-                __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
-                V = _mm_or_si128(_mm_slli_epi32(V, Disc.Rol32Amount),
-                                 _mm_srli_epi32(V, 32 - Disc.Rol32Amount));
-                V = ApplyShuf(V, Disc.ShufImm1);
-                uint64_t Lo;
-                _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
-                uint64_t Out = (Lo << Disc.Rol64Amount) | (Lo >> (64 - Disc.Rol64Amount));
-                uint32_t Ci = static_cast<uint32_t>(Out);
-                if (Ci > 1 && Ci < 0x2000000u) return Out;
-            }
         }
 
         if (m_pipeline == Pipeline::Build20260519) {
@@ -1068,6 +1180,9 @@ public:
     uint64_t ResolveNamePtrFull(int32_t CompIndex) {
         if (CompIndex <= 0 || !m_keyLoaded) return 0;
 
+        if (m_newPatchActive)
+            return ResolveNamePtr_NewPatch(CompIndex);
+
         if (m_ks707Loaded)
             return ResolveNamePtr_V707(CompIndex);
 
@@ -1235,7 +1350,12 @@ public:
             _mm_set_epi64x(0, static_cast<int64_t>(Shifted)), m_chunkXor);
         uint32_t V5 = static_cast<uint32_t>(_mm_cvtsi128_si32(V5Vec)) ^ V707::CHUNK_ID_XOR;
         uint16_t NameOff = static_cast<uint16_t>(V5);
-        uint64_t ChunkAddr = m_base + V707::RVA_GNAMEPOOL +
+        uint64_t GnpRva707 = AutoDiscovery::g_DiscoveredGNames.Valid
+                           ? AutoDiscovery::g_DiscoveredGNames.GNamesRva
+                           : (ArcDecrypt::RVA_GNAMES_BASE
+                              ? ArcDecrypt::RVA_GNAMES_BASE
+                              : V707::RVA_GNAMEPOOL);
+        uint64_t ChunkAddr = m_base + GnpRva707 +
                              (static_cast<uint64_t>(V5 >> 8) & 0xFFFF00ULL);
 
         uint64_t HashAddr = ChunkAddr + V707::SHARD_HASH_SEED_OFF;
@@ -1278,6 +1398,131 @@ public:
         uint64_t EntryPtr = (Fv2 ^ V707::BLOCK_FNV_XOR ^ V15) + V13 + 2ULL * NameOff;
         if (EntryPtr < 0x10000ULL || EntryPtr >= 0x800000000000ULL) return 0;
         return EntryPtr;
+    }
+
+    uint64_t ResolveNamePtr_NewPatch(int32_t CompIndex) {
+        namespace V709 = ArcDecrypt::v20260709;
+        if (CompIndex <= 0) return 0;
+
+        uint32_t Ci = static_cast<uint32_t>(CompIndex);
+        uint16_t WordOff = static_cast<uint16_t>(Ci & 0xFFFFu);
+        uint32_t ChunkOff = (Ci >> 8) & 0xFFFF00u;
+
+        uint64_t GnpRva = AutoDiscovery::g_DiscoveredGNames.Valid
+                         ? AutoDiscovery::g_DiscoveredGNames.GNamesRva
+                         : ArcDecrypt::v20260707::RVA_GNAMEPOOL;
+        uint64_t ChunkAddr = m_base + GnpRva + ChunkOff;
+
+        uint64_t SeedAddr = ChunkAddr + V709::SHARD_HASH_SEED_OFF;
+        uint32_t Lo = static_cast<uint32_t>(SeedAddr);
+        uint32_t Hi = static_cast<uint32_t>(SeedAddr >> 32);
+
+        uint32_t H = V709::HASH_PRIME * fn_rotl32(Lo, V709::SHARD_HASH_ROL_A) + V709::SHARD_HASH_ADD;
+        H = V709::HASH_PRIME * fn_rotl32(H, V709::SHARD_HASH_ROL_B) + Hi + V709::SHARD_HASH_ADD;
+        H = V709::HASH_PRIME * fn_rotl32(H, V709::SHARD_HASH_ROL_A) + V709::SHARD_HASH_ADD;
+        uint32_t V8 = fn_rotl32(H, V709::SHARD_HASH_ROL_B);
+
+        uint32_t Final = V709::HASH_PRIME * V8 + V709::SHARD_HASH_ADD;
+        uint32_t Mix = Final ^ (Final >> 16);
+        uint32_t Bidx1 = Mix & 7u;
+        uint32_t Bidx2 = (Mix + 1u) & 7u;
+
+        uint64_t BlockBase = ChunkAddr + V709::SHARD_BLOCK_BASE_OFF;
+        uint64_t Raw1 = 0, Raw2 = 0;
+        if (!m_reader.Read(BlockBase + 32ULL * Bidx1, &Raw1, 8)) return 0;
+        if (!m_reader.Read(BlockBase + 32ULL * Bidx2, &Raw2, 8)) return 0;
+        if (!Raw1 && !Raw2) return 0;
+
+        auto DecBlock = [](uint64_t Raw) -> uint64_t {
+            uint64_t Rotated = fn_rotl64(Raw, V709::BLOCK_ROL64);
+            __m128i V = _mm_set_epi64x(0, static_cast<int64_t>(Rotated));
+            V = _mm_shufflelo_epi16(V, V709::BLOCK_PSHUFLW);
+            uint64_t R;
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(&R), V);
+            return R ^ V709::BLOCK_FNV_XOR;
+        };
+
+        uint64_t V13 = DecBlock(Raw1);
+        uint64_t V15 = DecBlock(Raw2);
+
+        uint64_t Fv1 = V709::FNV_PRIME * fn_rotl64(V13, V709::FNV_ROL1) + V709::FNV_ADD;
+        uint64_t Fv2 = V709::FNV_PRIME * fn_rotl64(Fv1, V709::FNV_ROL2) + V709::FNV_ADD;
+
+        uint64_t RawPtr = V13 + (V15 ^ Fv2) + 2ULL * WordOff;
+        uint64_t Step1 = __builtin_bswap64(RawPtr ^ V709::FNAME_PTR_XOR1);
+        uint64_t Step2 = Step1 ^ V709::FNAME_PTR_XOR2;
+        uint64_t EntryPtr = __builtin_bswap64(Step2 ^ V709::FNAME_PTR_XOR3);
+        if (EntryPtr < 0x10000ULL || EntryPtr >= 0x800000000000ULL) return 0;
+        return EntryPtr;
+    }
+
+    std::string DecryptNameString_NewPatch(uint64_t NameEntryPtr) {
+        namespace V709 = ArcDecrypt::v20260709;
+        if (!NameEntryPtr) return {};
+
+        uint16_t Header = 0;
+        if (!m_reader.Read(NameEntryPtr, &Header, 2) || !Header) return {};
+
+        bool IsWide = (Header & V709::HDR_IS_WIDE_BIT) != 0;
+        int Length = static_cast<int>(Header >> V709::HDR_LENGTH_SHIFT);
+        if (Length <= 0 || Length > 1023) return {};
+
+        int ByteCount = IsWide ? Length * 2 : Length;
+        if (ByteCount > 2048) ByteCount = 2048;
+
+        std::vector<uint8_t> Buf(ByteCount, 0);
+        if (!m_reader.Read(NameEntryPtr + 2, Buf.data(), ByteCount)) return {};
+
+        uint32_t Key = static_cast<uint32_t>(Length) + V709::KEY_INIT_ADD;
+
+        if (!IsWide) {
+            int PairCount = Length / 2;
+            for (int I = 0; I < PairCount; ++I) {
+                uint32_t Idx1 = Key & V709::KEY_INDEX_MASK;
+                Buf[2 * I] ^= static_cast<uint8_t>(m_keyTableNewPatch[Idx1] >> 3);
+
+                uint32_t Idx2 = (Key * V709::KEY_MUL_INNER + V709::KEY_ADD_INNER) & V709::KEY_MASK_INNER;
+                Buf[2 * I + 1] ^= static_cast<uint8_t>(m_keyTableNewPatch[Idx2] >> 3);
+
+                Key = Key * V709::KEY_MUL_ADVANCE + V709::KEY_ADD_ADVANCE;
+            }
+            if (Length & 1) {
+                uint32_t Idx = Key & V709::KEY_INDEX_MASK;
+                Buf[Length - 1] ^= static_cast<uint8_t>(m_keyTableNewPatch[Idx] >> 3);
+            }
+
+            std::string Out;
+            Out.reserve(Length);
+            for (int J = 0; J < Length; ++J) {
+                if (!Buf[J]) break;
+                Out.push_back(static_cast<char>(Buf[J]));
+            }
+            return Out;
+        } else {
+            auto* WBuf = reinterpret_cast<uint16_t*>(Buf.data());
+            int PairCount = Length / 2;
+            for (int I = 0; I < PairCount; ++I) {
+                uint32_t Idx1 = Key & V709::KEY_INDEX_MASK;
+                WBuf[2 * I] ^= m_keyTableNewPatch[Idx1];
+
+                uint32_t Idx2 = (Key * V709::KEY_MUL_INNER + V709::KEY_ADD_INNER) & V709::KEY_MASK_INNER;
+                WBuf[2 * I + 1] ^= m_keyTableNewPatch[Idx2];
+
+                Key = Key * V709::KEY_MUL_ADVANCE + V709::KEY_ADD_ADVANCE;
+            }
+            if (Length & 1) {
+                uint32_t Idx = Key & V709::KEY_INDEX_MASK;
+                WBuf[Length - 1] ^= m_keyTableNewPatch[Idx];
+            }
+
+            std::string Out;
+            Out.reserve(Length);
+            for (int J = 0; J < Length; ++J) {
+                if (!WBuf[J]) break;
+                Out.push_back(static_cast<char>(WBuf[J] & 0xFFu));
+            }
+            return Out;
+        }
     }
 
     // CL-1201801 shard hash-table resolver. The binary's 3-function chain
@@ -1451,6 +1696,9 @@ public:
     //   because both compute byte[i] ^= keystream[(key+i)&0x3F] >> bitshift.
     std::string DecryptNameString(uint64_t NameEntryPtr) {
         if (!NameEntryPtr || !m_keyLoaded) return {};
+
+        if (m_newPatchActive)
+            return DecryptNameString_NewPatch(NameEntryPtr);
 
         if (m_ks707Loaded)
             return DecryptNameString_V707(NameEntryPtr);
@@ -2063,6 +2311,8 @@ private:
     bool           m_ks616Loaded = false;
     uint16_t       m_keyTable707[64];
     bool           m_ks707Loaded = false;
+    uint16_t       m_keyTableNewPatch[64];
+    bool           m_newPatchActive = false;
     __m128i        m_seedXor1 = {};
     __m128i        m_seedBlend = {};
     __m128i        m_seedBlendNot = {};

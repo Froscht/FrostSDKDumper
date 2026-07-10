@@ -156,7 +156,7 @@ public:
             hi = MODULE_BASE + 0xF0F5000ULL;
         }
         uint64_t fc0 = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::ClassPrivate);
-        if (fc0 >= lo && fc0 < hi) return fc0;
+        if (fc0 >= lo && fc0 < hi && (fc0 & 7) == 0) return fc0;
         return 0;
     }
 
@@ -854,7 +854,7 @@ public:
             for (uint64_t Fc : m_observed_fclass_ptrs) {
                 if (dumped++ >= 3) break;
                 std::printf("[fcname-cal] sample FFieldClass @ 0x%llX:\n", (unsigned long long)Fc);
-                for (int off = 0; off < 0xC0; off += 0x10) {
+                for (int off = 0; off < 0x100; off += 0x10) {
                     uint64_t a = 0, b = 0;
                     if (!m_reader.Read(Fc + off, &a, 8)) break;
                     m_reader.Read(Fc + off + 8, &b, 8);
@@ -875,7 +875,7 @@ public:
         struct Score { int32_t Off; int32_t Hits; std::string Best; };
         std::vector<Score> Scores;
 
-        for (int32_t Off = 0x10; Off <= 0x80; Off += 8) {
+        for (int32_t Off = 0x00; Off <= 0x100; Off += 8) {
             int32_t Hits = 0;
             std::string FirstHitName;
             for (uint64_t Fc : Sample) {
@@ -1234,7 +1234,7 @@ public:
         if (cached != m_fclass_name_cache.end())
             return cached->second;
         std::string name = m_fname.GetFFieldClassName(fclass_ptr);
-        if (name.empty())
+        if (name.empty() || !IsPlausibleUEName(name))
             name = "FProperty_Unknown";
         m_fclass_name_cache[fclass_ptr] = name;
         return name;
@@ -1327,10 +1327,10 @@ public:
     std::string GetNameTheia(uint64_t obj_ptr) {
         if (!obj_ptr || obj_ptr < 0x10000 || obj_ptr >= 0x7FFFFFFFFFFFULL) return {};
         std::string n = m_fname.GetName(obj_ptr);
-        if (!n.empty()) return n;
+        if (!n.empty() && IsPlausibleUEName(n)) return n;
         if (m_addr_to_name) {
             auto it = m_addr_to_name->find(obj_ptr);
-            if (it != m_addr_to_name->end()) return it->second;
+            if (it != m_addr_to_name->end() && IsPlausibleUEName(it->second)) return it->second;
         }
         return {};
     }
@@ -1365,13 +1365,22 @@ public:
         }
     }
 
+    static bool IsPlausibleUEName(const std::string& S) {
+        if (S.empty() || S.size() > 256) return false;
+        for (unsigned char C : S)
+            if (C < 0x20 || C > 0x7E) return false;
+        return true;
+    }
+
     void ResolveSubPropertyType(uint64_t ff, std::string& type_name) {
         if (type_name == "FStructProperty") {
             uint64_t sp = Read<uint64_t>(ff + ArcDecrypt::Offsets::FStructProperty::Struct);
             if (sp && sp > 0x10000 && sp < 0x7FFFFFFFFFFFULL) {
-                m_known_structs.insert(sp);
+                uint64_t svtbl = Read<uint64_t>(sp);
+                bool SVtOk = svtbl >= MODULE_BASE + 0x1000 && svtbl < MODULE_BASE + 0xE9D0000ULL;
+                if (SVtOk) m_known_structs.insert(sp);
                 std::string sn = GetNameTheia(sp);
-                if (!sn.empty()) { type_name = sn; m_resolveStructOk++; }
+                if (!sn.empty() && IsPlausibleUEName(sn)) { type_name = sn; m_resolveStructOk++; }
                 else { m_resolveStructFail++; if (m_unresolvedShadowSample.size() < 200) m_unresolvedShadowSample.insert(sp); }
             }
             if (type_name == "FStructProperty") {
@@ -1388,7 +1397,7 @@ public:
             uint64_t cp = Read<uint64_t>(ff + ArcDecrypt::Offsets::FObjectProperty::PropertyClass);
             if (cp && cp > 0x10000 && cp < 0x7FFFFFFFFFFFULL) {
                 std::string cn = GetNameTheia(cp);
-                if (!cn.empty()) { type_name = cn + "*"; m_resolveObjOk++; }
+                if (!cn.empty() && IsPlausibleUEName(cn)) { type_name = cn + "*"; m_resolveObjOk++; }
                 else { m_resolveObjFail++; if (m_unresolvedShadowSample.size() < 200) m_unresolvedShadowSample.insert(cp); }
             }
         }
@@ -1396,44 +1405,46 @@ public:
             uint64_t mc = Read<uint64_t>(ff + ArcDecrypt::Offsets::FObjectProperty::PropertyClass + 8);
             if (mc) {
                 std::string cn = GetNameTheia(mc);
-                if (!cn.empty()) { type_name = "TSubclassOf<" + cn + ">"; return; }
+                if (!cn.empty() && IsPlausibleUEName(cn)) { type_name = "TSubclassOf<" + cn + ">"; return; }
             }
             uint64_t cp = Read<uint64_t>(ff + ArcDecrypt::Offsets::FObjectProperty::PropertyClass);
-            if (cp) { std::string cn = GetNameTheia(cp); if (!cn.empty()) type_name = "TSubclassOf<" + cn + ">"; }
+            if (cp) { std::string cn = GetNameTheia(cp); if (!cn.empty() && IsPlausibleUEName(cn)) type_name = "TSubclassOf<" + cn + ">"; }
         }
         if (type_name == "FInterfaceProperty") {
             uint64_t ic = Read<uint64_t>(ff + ArcDecrypt::Offsets::FObjectProperty::PropertyClass);
-            if (ic) { std::string cn = GetNameTheia(ic); if (!cn.empty()) type_name = "TScriptInterface<" + cn + ">"; }
+            if (ic) { std::string cn = GetNameTheia(ic); if (!cn.empty() && IsPlausibleUEName(cn)) type_name = "TScriptInterface<" + cn + ">"; }
         }
         if (type_name == "FEnumProperty") {
             uint64_t ep = Read<uint64_t>(ff + ArcDecrypt::Offsets::FEnumProperty::Enum);
-            if (ep) {
-                if (ep > 0x10000 && ep < 0x7FFFFFFFFFFFULL) {
+            if (ep > 0x10000 && ep < 0x7FFFFFFFFFFFULL) {
+                uint64_t evtbl = Read<uint64_t>(ep);
+                bool VtOk = evtbl >= MODULE_BASE + 0x1000 && evtbl < MODULE_BASE + 0xE9D0000ULL;
+                if (VtOk) {
                     m_known_enums.insert(ep);
                     m_known_enums_hi.insert(ep);
                 }
                 std::string en = GetNameTheia(ep);
-                if (!en.empty()) type_name = en;
+                if (!en.empty() && IsPlausibleUEName(en)) type_name = en;
             }
         }
-        // FByteProperty: if it wraps a UEnum, emit the enum name; else fall
-        // through to primitive lowering (uint8_t).
         if (type_name == "FByteProperty") {
-            uint64_t en = Read<uint64_t>(ff + ArcDecrypt::Offsets::FEnumProperty::UnderlyingProp); // shares +0x108
+            uint64_t en = Read<uint64_t>(ff + ArcDecrypt::Offsets::FEnumProperty::UnderlyingProp);
             if (en > 0x10000 && en < 0x7FFFFFFFFFFFULL) {
-                m_known_enums.insert(en);
+                uint64_t evtbl = Read<uint64_t>(en);
+                bool VtOk = evtbl >= MODULE_BASE + 0x1000 && evtbl < MODULE_BASE + 0xE9D0000ULL;
+                if (VtOk) m_known_enums.insert(en);
                 std::string n = GetNameTheia(en);
-                if (!n.empty()) { type_name = n; return; }
+                if (!n.empty() && IsPlausibleUEName(n)) { type_name = n; return; }
             }
         }
         if (type_name == "FDelegateProperty" ||
             type_name == "FMulticastInlineDelegateProperty" ||
             type_name == "FMulticastSparseDelegateProperty" ||
             type_name == "FMulticastDelegateProperty") {
-            uint64_t sig = Read<uint64_t>(ff + 0x108);
+            uint64_t sig = Read<uint64_t>(ff + 0x158);
             if (sig > 0x10000 && sig < 0x7FFFFFFFFFFFULL) {
                 std::string n = GetNameTheia(sig);
-                if (!n.empty()) { type_name = "TDelegate<" + n + ">"; return; }
+                if (!n.empty() && IsPlausibleUEName(n)) { type_name = "TDelegate<" + n + ">"; return; }
             }
         }
         // FFieldPathProperty: PropertyClass-style pointer; the field-class
@@ -1613,7 +1624,7 @@ public:
                     const uint8_t k0 = static_cast<uint8_t>(sentinel & 0xFF);
                     const uint8_t k1 = static_cast<uint8_t>((sentinel >> 8) & 0xFF);
                     alignas(8) uint8_t probe[64] = {};
-                    if (m_reader.Read(ff + 0x60, probe, 64)) {
+                    if (m_reader.Read(ff + 0xC0, probe, 64)) {
                         for (int dx = 0; dx + 4 <= 64; ++dx) {
                             if (probe[dx]     != k0) continue;
                             if (probe[dx + 1] != k1) continue;
@@ -2750,7 +2761,7 @@ public:
             }
             std::unordered_map<uint64_t, int> cpScore;
             for (uint64_t ff : ffSamples) {
-                for (uint64_t off = 0x00; off <= 0xC0; off += 0x08) {
+                for (uint64_t off = 0x00; off <= 0x100; off += 0x08) {
                     uint64_t fc = Read<uint64_t>(ff + off);
                     if (fc < lo || fc >= hi) continue;
                     uint64_t castflags = Read<uint64_t>(fc + 0x10);
@@ -2776,11 +2787,14 @@ public:
         }
 
         // ── Brute-force FField::Next offset calibration ──────────────────
-        // Sample a handful of UClass objects, try every 8-aligned offset in
-        // FField in 0x00..0xE8, walk the chain, count valid FField hops.
-        // Whichever offset yields the longest aggregate chain across samples
-        // is the real Next pointer offset on this patch.
-        {
+        // SKIP when Phase 2c already extracted Next from binary code —
+        // the code-extracted value is authoritative and the brute-force
+        // probe can false-positive on UField chains at other offsets.
+        if (AutoDiscovery::g_DiscoveredFFieldLayout.Valid &&
+            AutoDiscovery::g_DiscoveredFFieldLayout.NextOff) {
+            std::printf("[autocal-next] skipped — Phase 2c discovered Next=+0x%X from binary code\n",
+                AutoDiscovery::g_DiscoveredFFieldLayout.NextOff);
+        } else {
             std::vector<uint64_t> classSamples;
             // Sample objects that LOOK like UStructs: heap address, vtable in
             // module range, ChildProperties at our configured offset pointing
@@ -2937,28 +2951,10 @@ public:
                     DynAdded, m_fclass_to_type.size());
             }
 
-            // Parallel path: probe FFieldClass NamePrivate slot directly. On
-            // builds where FFieldClass has an FName at a discoverable offset
-            // (verified 20260421), this resolves the type name without a
-            // typeidx lookup table — works even when the typeidx calibration
-            // fails (which happens when FFieldClass has no uint32 typeidx
-            // field, e.g. CL-1177146).
-            CalibrateFClassNameSlotOffset();
-            if (m_fclass_nameslot_offset < 0) {
-                m_fclass_nameslot_offset = static_cast<int32_t>(ArcDecrypt::v20260519::FFIELD_CLASS_NAME_OFF);
-                std::printf("[fcname-cal] calibration below threshold — pinning FFieldClass NamePrivate offset to compile-time 0x%X\n",
-                    m_fclass_nameslot_offset);
-            }
-            size_t NameAdded = SeedFClassMapByNameSlot();
-            if (NameAdded > 0) {
-                std::printf("[fcname-seed] FName-slot seeding produced %zu new FFieldClass mappings (total=%zu)\n",
-                    NameAdded, m_fclass_to_type.size());
-            }
-
-            // Phase 8 path: dereference each (target_rva, type_name) tuple
-            // extracted from FFieldClass init callers — direct map of static
-            // .data globals to type names. Bypasses FName decryption entirely.
-            // Runs FIRST so its mappings feed the CastFlags seeder below.
+            // Phase 8 FIRST — uses Phase 2f live map entries (correct names
+            // from ElementSize heuristic). Must run before FName-slot seeding
+            // because a failed calibration + fallback pin produces garbage
+            // names that would poison the map and block correct Phase 2f entries.
             size_t Phase8Added = SeedFClassMapFromGlobals();
             if (Phase8Added > 0) {
                 std::printf("[fcglob-seed] Phase 8 globals produced %zu new FFieldClass mappings (total=%zu)\n",
@@ -2968,9 +2964,7 @@ public:
             // Phase 7 path: if FFieldClass NamePrivate decode auto-discovered
             // its full pipeline (PSHUFLW + ROL32 + PSHUFLW + XOR + ROL64),
             // use m_fname.DecryptFFieldClassNameCI directly on every observed
-            // FFieldClass pointer. This bypasses the offset-only calibration
-            // above (which assumes the FField NamePrivate pipeline shape;
-            // FFieldClass uses a different shape).
+            // FFieldClass pointer.
             if (AutoDiscovery::g_DiscoveredFFieldClassName.Valid) {
                 size_t Phase7Added = SeedFClassMapViaPhase7();
                 if (Phase7Added > 0) {
@@ -2980,14 +2974,24 @@ public:
             }
 
             // CastFlags path: read FFieldClass+0x10 (uint64 CastFlags bitmask),
-            // build a (CastFlags → name) map from the now ~30-50 mapped
-            // FFieldClasses (after Phase 8), then resolve every unmapped
-            // observed FFieldClass by its CastFlags. Closes the bulk of the
-            // FFieldClass mapping gap on CL-1177146 (~700+ unmapped objs).
+            // build a (CastFlags → name) map from the now-seeded FFieldClasses,
+            // then resolve every unmapped observed FFieldClass by its CastFlags.
             size_t CfAdded = SeedFClassMapByCastFlags();
             if (CfAdded > 0) {
                 std::printf("[fcflags] CastFlags seeding produced %zu new FFieldClass mappings (total=%zu)\n",
                     CfAdded, m_fclass_to_type.size());
+            }
+
+            // FName-slot path LAST — only if calibration succeeds. Do NOT
+            // pin to a fallback offset on failure: a wrong offset produces
+            // garbage names that overwrite correct Phase 2f entries above.
+            CalibrateFClassNameSlotOffset();
+            if (m_fclass_nameslot_offset >= 0) {
+                size_t NameAdded = SeedFClassMapByNameSlot();
+                if (NameAdded > 0) {
+                    std::printf("[fcname-seed] FName-slot seeding produced %zu new FFieldClass mappings (total=%zu)\n",
+                        NameAdded, m_fclass_to_type.size());
+                }
             }
         }
 
@@ -3023,7 +3027,7 @@ public:
 
             auto fn_it = addr_to_name.find(obj_ptr);
             std::string short_name = (fn_it != addr_to_name.end()) ? fn_it->second : std::string();
-            // Skip packages (start with "/")
+            if (!short_name.empty() && !IsPlausibleUEName(short_name)) short_name.clear();
             if (!short_name.empty() && short_name[0] == '/') continue;
             if (func_obj_addrs.count(obj_ptr)) continue;
             // Skip CDOs — Default__X objects are class default *instances*,
@@ -3057,16 +3061,21 @@ public:
                 if (!class_cls && validClassTypes.count(cc)) class_cls = cc;
             }
             bool RefAsClass = allTypeAddrs.count(obj_ptr) > 0;
-            if (RefAsClass && class_cls) {
-                is_class_by_cls = true; cls = class_cls;
-            } else if (enum_cls && !RefAsClass) {
-                is_enum = true; cls = enum_cls;
+            if (ss_cls && class_cls) {
+                uint64_t Cp = m_fname.GetClassPrivate(obj_ptr);
+                if (Cp && ssAddrs.count(Cp)) {
+                    is_scriptstruct = true; cls = ss_cls;
+                } else {
+                    is_class_by_cls = true; cls = class_cls;
+                }
             } else if (ss_cls) {
                 is_scriptstruct = true; cls = ss_cls;
-            } else if (class_cls) {
-                is_class_by_cls = true; cls = class_cls;
             } else if (enum_cls) {
                 is_enum = true; cls = enum_cls;
+            } else if (class_cls) {
+                is_class_by_cls = true; cls = class_cls;
+            } else if (RefAsClass) {
+                is_class_by_cls = true;
             }
             if (!cls) cls = m_fname.GetClassPrivate(obj_ptr);  // fallback for legacy paths
 
@@ -3079,11 +3088,8 @@ public:
             // ScriptStructRVA is validated by Phase 1.6 oracle cross-check.
             // EnumRVA may be wrong (was UCameraShakePattern on CL-1233465), so
             // Path C below will still validate — false positives get filtered.
-            // Path V2: ONLY use vtable for UEnum (0xB462010 is unique).
-            // Class/ScriptStruct/Function share vtable 0xB447980 — can't distinguish.
-            // BPGC variants have unique vtables but are already handled by Path A.
             {
-                static uint32_t V2EnumCount = 0;
+                static uint32_t V2EnumCount = 0, V2StructCount = 0, V2ClassCount = 0, V2FuncCount = 0;
                 uint64_t obj_vt = Read<uint64_t>(obj_ptr);
                 if (obj_vt >= MODULE_BASE && obj_vt < MODULE_BASE + 0x10000000ULL) {
                     uint64_t obj_vt_rva = obj_vt - MODULE_BASE;
@@ -3091,7 +3097,52 @@ public:
                     if (Disc.EnumRVA && obj_vt_rva == Disc.EnumRVA) {
                         is_enum = true; is_class_by_cls = false; is_scriptstruct = false;
                         V2EnumCount++;
+                    } else if (Disc.ScriptStructRVA && Disc.ClassNativeRVA &&
+                               Disc.ScriptStructRVA != Disc.ClassNativeRVA &&
+                               obj_vt_rva == Disc.ScriptStructRVA) {
+                        is_scriptstruct = true; is_class_by_cls = false; is_enum = false;
+                        V2StructCount++;
+                    } else if (Disc.ClassNativeRVA && Disc.ScriptStructRVA &&
+                               Disc.ClassNativeRVA != Disc.ScriptStructRVA &&
+                               obj_vt_rva == Disc.ClassNativeRVA) {
+                        is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
+                        V2ClassCount++;
+                    } else if (Disc.BPGCRVA && obj_vt_rva == Disc.BPGCRVA) {
+                        is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
+                        V2ClassCount++;
+                    } else if (Disc.WBPGCRVA && obj_vt_rva == Disc.WBPGCRVA) {
+                        is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
+                        V2ClassCount++;
+                    } else if (Disc.SMBPGCRVA && obj_vt_rva == Disc.SMBPGCRVA) {
+                        is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
+                        V2ClassCount++;
+                    } else if (Disc.AnimBPGCRVA && obj_vt_rva == Disc.AnimBPGCRVA) {
+                        is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
+                        V2ClassCount++;
+                    } else if (Disc.ASClassRVA && obj_vt_rva == Disc.ASClassRVA) {
+                        is_class_by_cls = true; is_scriptstruct = false; is_enum = false;
+                        V2ClassCount++;
+                    } else if (Disc.ASStructRVA && obj_vt_rva == Disc.ASStructRVA) {
+                        is_scriptstruct = true; is_class_by_cls = false; is_enum = false;
+                        V2StructCount++;
+                    } else if (Disc.FunctionRVA && obj_vt_rva == Disc.FunctionRVA) {
+                        is_scriptstruct = false; is_class_by_cls = false; is_enum = false;
+                        V2FuncCount++;
+                    } else {
+                        for (uint64_t AsfRva : Disc.ASFunctionRVAs) {
+                            if (AsfRva && obj_vt_rva == AsfRva) {
+                                is_scriptstruct = false; is_class_by_cls = false; is_enum = false;
+                                V2FuncCount++;
+                                break;
+                            }
+                        }
                     }
+                }
+                static uint32_t V2Calls = 0;
+                ++V2Calls;
+                if (V2Calls % 50000 == 0) {
+                    std::printf("[sdk] V2 vtable classify @%u: %u enum, %u struct, %u class, %u func\n",
+                        V2Calls, V2EnumCount, V2StructCount, V2ClassCount, V2FuncCount);
                 }
             }
 
@@ -3369,8 +3420,12 @@ public:
             result.structs.push_back(std::move(rec));
         }
 
-        std::printf("[sdk] After main loop: m_known_structs=%zu m_known_enums=%zu\n",
-            m_known_structs.size(), m_known_enums.size());
+        {
+            size_t PreRcClass = 0, PreRcStruct = 0;
+            for (const auto& R : result.structs) { if (R.is_class) ++PreRcClass; else ++PreRcStruct; }
+            std::printf("[sdk] After main loop: %zu class, %zu struct, m_known_structs=%zu m_known_enums=%zu\n",
+                PreRcClass, PreRcStruct, m_known_structs.size(), m_known_enums.size());
+        }
 
         {
             int EnumPass2 = 0;
@@ -3380,7 +3435,7 @@ public:
                 if (processed_enums.count(obj_ptr)) continue;
                 auto fn_it = addr_to_name.find(obj_ptr);
                 std::string short_name = (fn_it != addr_to_name.end()) ? fn_it->second : std::string();
-                if (short_name.empty()) continue;
+                if (short_name.empty() || !IsPlausibleUEName(short_name)) continue;
                 EnumRecord erec{};
                 erec.addr    = obj_ptr;
                 erec.name    = short_name;
@@ -3405,14 +3460,13 @@ public:
 
             std::unordered_set<uint64_t> ConfirmedClass;
 
-            size_t Promoted = 0;
+            size_t DirectConfirmed = 0;
             for (auto& Rec : result.structs) {
                 bool Fmap = HasValidFuncMap(Rec.addr);
                 bool HasFuncs = m_owner_to_funcs.count(Rec.addr) > 0;
                 if (Fmap || HasFuncs) {
                     ConfirmedClass.insert(Rec.addr);
-                    if (!Rec.is_class) ++Promoted;
-                    Rec.is_class = true;
+                    ++DirectConfirmed;
                 }
             }
 
@@ -3421,32 +3475,29 @@ public:
                 if (Rec.super_addr)
                     ChildMap[Rec.super_addr].push_back(Rec.addr);
 
-            std::unordered_map<uint64_t, bool> AddrIsClass;
-            for (const auto& Rec : result.structs)
-                AddrIsClass[Rec.addr] = Rec.is_class;
-
-            std::function<void(uint64_t, bool)> PropagateDown = [&](uint64_t Addr, bool ParentIsClass) {
+            std::function<void(uint64_t)> PropagateDown = [&](uint64_t Addr) {
                 auto Cit = ChildMap.find(Addr);
                 if (Cit == ChildMap.end()) return;
                 for (uint64_t Child : Cit->second) {
-                    if (ParentIsClass && !ConfirmedClass.count(Child)) {
+                    if (ConfirmedClass.count(Addr) && !ConfirmedClass.count(Child)) {
                         ConfirmedClass.insert(Child);
-                        AddrIsClass[Child] = true;
                     }
-                    bool ChildIsClass = AddrIsClass.count(Child) ? AddrIsClass[Child] : false;
-                    PropagateDown(Child, ChildIsClass);
+                    PropagateDown(Child);
                 }
             };
             for (const auto& Rec : result.structs)
                 if (!Rec.super_addr)
-                    PropagateDown(Rec.addr, Rec.is_class);
+                    PropagateDown(Rec.addr);
 
-            size_t PropPromoted = 0;
+            size_t Promoted = 0, Demoted = 0;
             for (auto& Rec : result.structs) {
-                auto It = AddrIsClass.find(Rec.addr);
-                if (It != AddrIsClass.end() && It->second && !Rec.is_class) {
+                bool Confirmed = ConfirmedClass.count(Rec.addr) > 0;
+                if (Confirmed && !Rec.is_class) {
                     Rec.is_class = true;
-                    ++PropPromoted;
+                    ++Promoted;
+                } else if (!Confirmed && Rec.is_class) {
+                    Rec.is_class = false;
+                    ++Demoted;
                 }
             }
 
@@ -3455,9 +3506,9 @@ public:
                 if (Rec.is_class) ++FinalClasses;
                 else ++FinalStructs;
             }
-            std::printf("[sdk] Struct/Class reclassification: promoted=%zu propagated=%zu "
+            std::printf("[sdk] Struct/Class reclassification: confirmed=%zu promoted=%zu demoted=%zu "
                 "(final: %zu classes, %zu structs)\n",
-                Promoted, PropPromoted, FinalClasses, FinalStructs);
+                DirectConfirmed, Promoted, Demoted, FinalClasses, FinalStructs);
         }
 
         // ── Pass 7: post-reclassification FuncMap walk ──────────────────────
@@ -3551,7 +3602,7 @@ public:
                 int32_t Ci = m_fname.DecryptFFieldNameCI(sp - 8);
                 if (Ci > 1) name = m_fname.CompIndexToNameLenient(Ci);
             }
-            if (name.empty()) { ++diag_s_noname; continue; }
+            if (name.empty() || !IsPlausibleUEName(name)) { ++diag_s_noname; continue; }
             if (name[0] == '/') { ++diag_s_slash; continue; }
             size_t dot = name.rfind('.');
             if (dot != std::string::npos) name = name.substr(dot + 1);
@@ -3603,7 +3654,7 @@ public:
                 int32_t Ci = m_fname.DecryptFFieldNameCI(ep - 8);
                 if (Ci > 1) name = m_fname.CompIndexToNameLenient(Ci);
             }
-            if (name.empty() || name[0] == '/') continue;
+            if (name.empty() || !IsPlausibleUEName(name) || name[0] == '/') continue;
             size_t dot = name.rfind('.');
             if (dot != std::string::npos) name = name.substr(dot + 1);
             EnumRecord erec{};

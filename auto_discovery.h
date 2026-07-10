@@ -2338,63 +2338,100 @@ struct FNameResolverConsts {
 };
 
 inline FNameResolverConsts DiscoverFNameResolverConsts(
-    const SigScanV2::Scanner& scanner, uint64_t fname_func_rva)
+    const SigScanV2::Scanner& scanner, uint64_t fname_func_rva,
+    int max_depth = 4)
 {
     FNameResolverConsts out;
     if (!fname_func_rva) return out;
     out.FunctionStartRva = fname_func_rva;
 
-    auto insns = FuncAnalyze::DecodeFunctionAt(scanner, fname_func_rva, 0x2000);
-    if (insns.empty()) {
-        std::printf("[autodisc-fname] couldn't decode fn @ 0x%llX\n",
-            (unsigned long long)fname_func_rva);
-        return out;
-    }
-    std::printf("[autodisc-fname] decoded %zu insns at fn 0x%llX\n",
-        insns.size(), (unsigned long long)fname_func_rva);
+    std::unordered_set<uint64_t> Visited;
+    size_t TotalInsns = 0;
 
-    for (const auto& ins : insns) {
-        if (ins.type == INSN_MOV_REG && ins.imm64 != 0 && ins.length == 10) {
-            out.AllImm64.push_back(ins.imm64);
+    auto IsLoadBearing = [&](uint64_t FnRva) -> bool {
+        if (!scanner.IsTextRVA(FnRva)) return false;
+        const uint8_t* P = scanner.GetLocalPtr(FnRva);
+        if (!P) return false;
+        for (int I = 0; I < 0x40; ++I) {
+            if (P[I] == 0xCC) return false;
         }
-        if (ins.type == INSN_PSHUFLW && ins.hasImm8) {
-            out.AllPshuflwImm.push_back(ins.imm8);
+        return true;
+    };
+
+    std::function<void(uint64_t, int)> Walk = [&](uint64_t Rva, int Depth) {
+        if (Depth >= max_depth) return;
+        if (!Visited.insert(Rva).second) return;
+
+        auto Insns = FuncAnalyze::DecodeFunctionAt(scanner, Rva, 0x2000);
+        if (Insns.empty()) return;
+        TotalInsns += Insns.size();
+
+        for (const auto& Ins : Insns) {
+            if (Ins.type == INSN_MOV_REG && Ins.imm64 != 0 && Ins.length == 10) {
+                out.AllImm64.push_back(Ins.imm64);
+            }
+            if (Ins.type == INSN_PSHUFLW && Ins.hasImm8) {
+                out.AllPshuflwImm.push_back(Ins.imm8);
+            }
+            if (Ins.type == INSN_ROL && Ins.hasImm8 && Ins.hasREX_W) {
+                out.AllRolImm.push_back(Ins.imm8);
+            }
+            if (Ins.hasRipRel &&
+                (Ins.type == INSN_PSHUFB || Ins.type == INSN_PXOR ||
+                 Ins.type == INSN_XORPS  || Ins.type == INSN_LEA  ||
+                 Ins.type == INSN_MOVDQA || Ins.type == INSN_MOVQ ||
+                 Ins.type == INSN_LOADL_EPI64 || Ins.type == INSN_PAND ||
+                 Ins.type == INSN_PANDN  || Ins.type == INSN_POR ||
+                 Ins.type == INSN_MOVAPS))
+            {
+                uint64_t T = Ins.ResolveRipRVA();
+                if (scanner.IsRDataRVA(T)) out.AllRDataLeas.push_back(T);
+            }
         }
-        if (ins.type == INSN_ROL && ins.hasImm8 && ins.hasREX_W) {
-            out.AllRolImm.push_back(ins.imm8);
+
+        for (const auto& Ins : Insns) {
+            if (Ins.type != INSN_CALL_RIP) continue;
+            if (!Ins.hasImm32 || Ins.hasRipRel) continue;
+            int32_t Rel = (int32_t)Ins.imm32;
+            uint64_t Target = Ins.rva + Ins.length + (int64_t)Rel;
+            if (!scanner.IsTextRVA(Target)) continue;
+            if (!IsLoadBearing(Target)) continue;
+            if (Visited.count(Target)) continue;
+            Walk(Target, Depth + 1);
         }
-        if (ins.hasRipRel &&
-            (ins.type == INSN_PSHUFB || ins.type == INSN_PXOR ||
-             ins.type == INSN_XORPS  || ins.type == INSN_LEA  ||
-             ins.type == INSN_MOVDQA || ins.type == INSN_MOVQ ||
-             ins.type == INSN_LOADL_EPI64))
-        {
-            uint64_t t = ins.ResolveRipRVA();
-            if (scanner.IsRDataRVA(t)) out.AllRDataLeas.push_back(t);
-        }
-    }
+    };
+
+    Walk(fname_func_rva, 0);
+
     std::sort(out.AllRDataLeas.begin(), out.AllRDataLeas.end());
     out.AllRDataLeas.erase(std::unique(out.AllRDataLeas.begin(), out.AllRDataLeas.end()),
                            out.AllRDataLeas.end());
 
+    std::printf("[autodisc-fname] deep walk: %zu fns visited, %zu total insns\n",
+        Visited.size(), TotalInsns);
     std::printf("[autodisc-fname] extracted: %zu imm64, %zu pshuflw_imm, %zu rol_imm, %zu rdata_leas\n",
         out.AllImm64.size(), out.AllPshuflwImm.size(),
         out.AllRolImm.size(), out.AllRDataLeas.size());
 
     if (!out.AllImm64.empty()) {
         std::printf("[autodisc-fname]   imm64 candidates:\n");
-        size_t shown = 0;
-        for (uint64_t v : out.AllImm64) {
-            if (shown++ >= 8) break;
-            std::printf("[autodisc-fname]     0x%016llX\n", (unsigned long long)v);
+        size_t Shown = 0;
+        for (uint64_t V : out.AllImm64) {
+            if (Shown++ >= 12) break;
+            std::printf("[autodisc-fname]     0x%016llX\n", (unsigned long long)V);
         }
     }
     if (!out.AllRDataLeas.empty()) {
-        std::printf("[autodisc-fname]   .rdata table candidates:\n");
-        size_t shown = 0;
-        for (uint64_t v : out.AllRDataLeas) {
-            if (shown++ >= 8) break;
-            std::printf("[autodisc-fname]     0x%llX\n", (unsigned long long)v);
+        std::printf("[autodisc-fname]   .rdata table candidates (%zu total):\n",
+            out.AllRDataLeas.size());
+        size_t Shown = 0;
+        for (uint64_t V : out.AllRDataLeas) {
+            if (Shown++ >= 16) break;
+            std::printf("[autodisc-fname]     0x%llX\n", (unsigned long long)V);
+        }
+        if (out.AllRDataLeas.size() > 16) {
+            std::printf("[autodisc-fname]     ... and %zu more\n",
+                out.AllRDataLeas.size() - 16);
         }
     }
 
@@ -3542,9 +3579,685 @@ inline FFieldNameDecryptMasks DiscoverFFieldNameMasks(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Phase 2c: FField layout + NamePrivate decode from live binary code
+//
+// Theia randomizes FField/UStruct struct layout offsets per game session.
+// This phase sig-scans the .text section for the ChildProperties access
+// pattern and the surrounding SIMD FField NamePrivate decode, extracting:
+//   - UStruct::ChildProperties offset (from MOV RAX, [RAX+??] in the access pattern)
+//   - FField::NamePrivate offset (from MOVDQA XMM0, [RAX+??] in the SIMD decode)
+//   - FField::Next offset (from MOV RAX, [RAX+??] in the loop body)
+//   - XOR key and PSHUFB mask (from MOVQ XMM loads with RIP-relative addresses)
+//   - ROL16 and ROL64 amounts (from PSRLW/PSLLW and ROL immediates)
+// ─────────────────────────────────────────────────────────────────────────────
+struct FFieldLayoutFromCode {
+    uint32_t ChildPropsOff  = 0;
+    uint32_t NamePrivateOff = 0;
+    uint32_t NextOff        = 0;
+    uint32_t OwnerOff       = 0;
+    uint32_t ClassPrivateOff= 0;
+    uint64_t XorKey         = 0;
+    uint8_t  PshufbMask[8]  = {};
+    int      Rol16Amount    = 0;
+    int      Rol64Amount    = 0;
+    bool     Valid          = false;
+};
+
+inline FFieldLayoutFromCode DiscoverFFieldLayoutFromCode(
+    const SigScanV2::Scanner& Scanner,
+    IMemoryReader& Reader,
+    uint64_t ModuleBase)
+{
+    FFieldLayoutFromCode Out;
+
+    // Sig: MOV [RSP+0x50], RAX; MOV RAX, [RAX+??]; MOV [RSP+0x58], RAX
+    // Hex: 48 89 44 24 50 48 8B 80 ?? 00 00 00 48 89 44 24 58
+    auto Hits = ScanCodeSections(Scanner,
+        "48 89 44 24 50 48 8B 80 ?? 00 00 00 48 89 44 24 58");
+
+    if (Hits.empty()) {
+        std::printf("[autodisc-fflayout] ChildProperties sig not found\n");
+        return Out;
+    }
+
+    const uint8_t* Cache = Scanner.CacheData();
+    size_t CacheSize = Scanner.CacheSize();
+
+    for (uint64_t Rva : Hits) {
+        if (Rva + 256 >= CacheSize) continue;
+
+        uint8_t CpOff = Cache[Rva + 8];
+        if (CpOff < 0x20 || CpOff > 0xFF) continue;
+
+        std::printf("[autodisc-fflayout] ChildProperties sig @ RVA 0x%llX → offset=+0x%X\n",
+            (unsigned long long)Rva, CpOff);
+
+        Out.ChildPropsOff = CpOff;
+
+        const uint8_t* Buf = Cache + Rva;
+        size_t BufLen = std::min<size_t>(CacheSize - Rva, 256);
+
+        for (size_t I = 17; I + 8 < BufLen; ++I) {
+            if (Buf[I] == 0x66 && Buf[I+1] == 0x0F && Buf[I+2] == 0x6F &&
+                Buf[I+3] == 0x80 && Buf[I+5] == 0x00 && Buf[I+6] == 0x00 &&
+                Buf[I+7] == 0x00) {
+                Out.NamePrivateOff = Buf[I+4];
+                std::printf("[autodisc-fflayout]   NamePrivate = +0x%X (MOVDQA @ sig+0x%X)\n",
+                    Out.NamePrivateOff, (int)I);
+
+                // Two MOVQ loads before the MOVDQA: first=XOR key, second=PSHUFB mask.
+                // Search forward from start of function area to find them in order.
+                int MovqCount = 0;
+                for (int J = 0; J < (int)I && J + 8 < (int)BufLen; ++J) {
+                    if (Buf[J] == 0xF3 && Buf[J+1] == 0x0F && Buf[J+2] == 0x7E &&
+                        (Buf[J+3] & 0xC7) == 0x05) {
+                        int32_t Rel32 = 0;
+                        std::memcpy(&Rel32, &Buf[J+4], 4);
+                        uint64_t TargetRva = Rva + J + 8 + Rel32;
+                        if (TargetRva + 8 > CacheSize) { J += 7; continue; }
+
+                        if (MovqCount == 0) {
+                            std::memcpy(&Out.XorKey, Cache + TargetRva, 8);
+                            std::printf("[autodisc-fflayout]   XOR key = 0x%016llX (MOVQ #1 @ sig+0x%X, .rdata RVA 0x%llX)\n",
+                                (unsigned long long)Out.XorKey, J, (unsigned long long)TargetRva);
+                        } else if (MovqCount == 1) {
+                            std::memcpy(Out.PshufbMask, Cache + TargetRva, 8);
+                            std::printf("[autodisc-fflayout]   PSHUFB mask = [%02X %02X %02X %02X %02X %02X %02X %02X] (MOVQ #2 @ sig+0x%X, .rdata RVA 0x%llX)\n",
+                                Out.PshufbMask[0], Out.PshufbMask[1], Out.PshufbMask[2],
+                                Out.PshufbMask[3], Out.PshufbMask[4], Out.PshufbMask[5],
+                                Out.PshufbMask[6], Out.PshufbMask[7], J, (unsigned long long)TargetRva);
+                        }
+                        MovqCount++;
+                        J += 7;
+                        if (MovqCount >= 2) break;
+                    }
+                }
+
+                for (size_t K = I + 8; K + 5 < BufLen; ++K) {
+                    if (Buf[K] == 0x66 && Buf[K+1] == 0x0F && Buf[K+2] == 0x71 &&
+                        (Buf[K+3] & 0xF8) == 0xD0) {
+                        int ShiftR = Buf[K+4];
+                        Out.Rol16Amount = 16 - ShiftR;
+                        std::printf("[autodisc-fflayout]   ROL16 amount = %d (PSRLW %d @ sig+0x%X)\n",
+                            Out.Rol16Amount, ShiftR, (int)K);
+                    }
+                    if (Buf[K] == 0x48 && Buf[K+1] == 0xC1 && Buf[K+2] == 0xC1) {
+                        Out.Rol64Amount = Buf[K+3];
+                        std::printf("[autodisc-fflayout]   ROL64 amount = %d (@ sig+0x%X)\n",
+                            Out.Rol64Amount, (int)K);
+                    }
+                }
+
+                for (size_t K = I + 8; K + 6 < BufLen; ++K) {
+                    if (Buf[K] == 0x74 && K + 5 < BufLen &&
+                        Buf[K+2] == 0x48 && Buf[K+3] == 0x8B && Buf[K+4] == 0x40) {
+                        Out.NextOff = Buf[K+5];
+                        std::printf("[autodisc-fflayout]   Next = +0x%X (MOV RAX,[RAX+%X] @ sig+0x%X)\n",
+                            Out.NextOff, Out.NextOff, (int)(K+2));
+                        break;
+                    }
+                }
+
+                break;
+            }
+        }
+
+        if (Out.ChildPropsOff && Out.NamePrivateOff) {
+            Out.Valid = true;
+            std::printf("[autodisc-fflayout] SUCCESS: ChildProperties=+0x%X NamePrivate=+0x%X Next=+0x%X\n",
+                Out.ChildPropsOff, Out.NamePrivateOff, Out.NextOff);
+            std::printf("[autodisc-fflayout]   XOR=0x%016llX ROL16=%d ROL64=%d\n",
+                (unsigned long long)Out.XorKey, Out.Rol16Amount, Out.Rol64Amount);
+            break;
+        }
+    }
+
+    return Out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2d: FProperty layout offsets from live binary code
+//
+// Scans for the FProperty Offset_Internal encode pattern (xor eax,imm32;
+// bswap eax; mov [reg+off],eax) which yields:
+//   - PropertyOffsetXor (imm32 from XOR EAX)
+//   - Offset_Internal field offset (from MOV store destination)
+// Then walks nearby instructions for ElementSize and ArrayDim accesses.
+// ─────────────────────────────────────────────────────────────────────────────
+struct FPropertyLayoutFromCode {
+    uint32_t OffsetInternalOff  = 0;
+    uint32_t OffsetXorKey       = 0;
+    uint32_t ElementSizeOff     = 0;
+    uint32_t ArrayDimOff        = 0;
+    uint32_t SubPointerOff      = 0;
+    bool     Valid              = false;
+};
+
+inline FPropertyLayoutFromCode DiscoverFPropertyLayoutFromCode(
+    const SigScanV2::Scanner& Scanner,
+    IMemoryReader& Reader,
+    uint64_t ModuleBase)
+{
+    FPropertyLayoutFromCode Out;
+
+    // Pattern: XOR EAX, imm32; BSWAP EAX → 35 ?? ?? ?? ?? 0F C8
+    auto Hits = ScanCodeSections(Scanner, "35 ?? ?? ?? ?? 0F C8");
+
+    if (Hits.empty()) {
+        std::printf("[autodisc-fplayout] FProperty offset XOR sig not found\n");
+        return Out;
+    }
+
+    const uint8_t* Cache = Scanner.CacheData();
+    size_t CacheSize = Scanner.CacheSize();
+
+    for (uint64_t Rva : Hits) {
+        if (Rva < 16 || Rva + 48 >= CacheSize) continue;
+
+        uint32_t XorKey = 0;
+        std::memcpy(&XorKey, Cache + Rva + 1, 4);
+
+        uint32_t OffIntOff = 0;
+        const uint8_t* Post = Cache + Rva + 7;
+        size_t PostLen = std::min<size_t>(CacheSize - (Rva + 7), 32);
+        for (size_t I = 0; I + 6 < PostLen; ++I) {
+            if (Post[I] == 0x89 && Post[I+1] == 0x83) {
+                std::memcpy(&OffIntOff, &Post[I+2], 4);
+                break;
+            }
+            if (Post[I] == 0x89 && Post[I+1] == 0x43) {
+                OffIntOff = Post[I+2];
+                break;
+            }
+        }
+
+        if (!OffIntOff || OffIntOff > 0x200) continue;
+
+        Out.OffsetXorKey = XorKey;
+        Out.OffsetInternalOff = OffIntOff;
+        std::printf("[autodisc-fplayout] FProperty Offset_Internal @ RVA 0x%llX: +0x%X, XOR=0x%08X\n",
+            (unsigned long long)Rva, OffIntOff, XorKey);
+
+        if (Rva >= 32 && Rva + 224 < CacheSize) {
+            const uint8_t* Near = Cache + Rva - 32;
+            size_t NearLen = 256;
+            for (size_t I = 0; I + 7 < NearLen; ++I) {
+                if (!Out.ElementSizeOff && Near[I] == 0x8B && Near[I+1] == 0x8B) {
+                    uint32_t D = 0;
+                    std::memcpy(&D, &Near[I+2], 4);
+                    if (D > 0x40 && D < 0x200) {
+                        Out.ElementSizeOff = D;
+                        std::printf("[autodisc-fplayout]   ElementSize = +0x%X (MOV ECX @ off+0x%X)\n",
+                            D, (int)(I - 32));
+                    }
+                }
+                if (!Out.ArrayDimOff && Near[I] == 0x0F && Near[I+1] == 0xAF &&
+                    Near[I+2] == 0x8B) {
+                    uint32_t D = 0;
+                    std::memcpy(&D, &Near[I+3], 4);
+                    if (D > 0x40 && D < 0x200) {
+                        Out.ArrayDimOff = D;
+                        std::printf("[autodisc-fplayout]   ArrayDim = +0x%X (IMUL ECX @ off+0x%X)\n",
+                            D, (int)(I - 32));
+                    }
+                }
+            }
+        }
+
+        Out.Valid = true;
+        break;
+    }
+
+    // SubPointer discovery disabled — too many false positives from generic
+    // MOV [RBX+disp32],RSI patterns. Sub-pointer offsets (FStructProperty::Struct,
+    // FArrayProperty::Inner, etc.) are found by live probing in auto_offsets.h
+    // after ChildProperties is corrected.
+
+    if (Out.Valid) {
+        std::printf("[autodisc-fplayout] SUCCESS: Offset_Internal=+0x%X XOR=0x%08X ElementSize=+0x%X ArrayDim=+0x%X\n",
+            Out.OffsetInternalOff, Out.OffsetXorKey, Out.ElementSizeOff,
+            Out.ArrayDimOff);
+    }
+    return Out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2c.5: Live FField probing for Owner + ClassPrivate offsets
+//
+// Requires: ChildProperties and Next offsets already discovered.
+// Strategy: Walk a few FField chains from known UClass objects, scan each
+// FField's bytes for the Owner pointer (tagged with bit0, matches the UClass
+// address) and the ClassPrivate pointer (in .data section of the module).
+// ─────────────────────────────────────────────────────────────────────────────
+inline void ProbeFFieldOwnerAndClassPrivate(
+    FFieldLayoutFromCode& Layout,
+    IMemoryReader& Reader,
+    uint64_t ModuleBase,
+    const ModuleBounds& Bounds,
+    const std::vector<uint64_t>& SeedObjects,
+    const VTableMap& VTables)
+{
+    if (!Layout.Valid || !Layout.ChildPropsOff || !Layout.NextOff) return;
+
+    uint64_t ClassVt = VTables.ClassNativeRVA ? (ModuleBase + VTables.ClassNativeRVA) : 0;
+    if (!ClassVt) {
+        std::printf("[autodisc-fflayout] ClassPrivate probe — no Class vtable; skipping\n");
+        return;
+    }
+
+    uint64_t DataStart = ModuleBase + Bounds.DataRva;
+    uint64_t DataEnd   = ModuleBase + Bounds.DataRva + Bounds.DataSize;
+
+    std::unordered_map<uint32_t, int> OwnerHits;
+    std::unordered_map<uint32_t, int> ClassPrivateHits;
+    int TotalFields = 0;
+
+    for (uint64_t Obj : SeedObjects) {
+        if (TotalFields >= 200) break;
+        uint64_t Vt = 0;
+        if (!Reader.Read(Obj, &Vt, 8)) continue;
+        if (Vt != ClassVt) continue;
+
+        uint64_t FieldPtr = 0;
+        if (!Reader.Read(Obj + Layout.ChildPropsOff, &FieldPtr, 8)) continue;
+        if (!FieldPtr || FieldPtr < 0x10000) continue;
+
+        for (int Chain = 0; Chain < 10 && FieldPtr; ++Chain) {
+            uint8_t FieldBuf[256] = {};
+            if (!Reader.Read(FieldPtr, FieldBuf, 256)) break;
+
+            uint64_t OwnerTagged = Obj | 1;
+            for (uint32_t Off = 0x10; Off < 0xC0; Off += 8) {
+                uint64_t Val = 0;
+                std::memcpy(&Val, FieldBuf + Off, 8);
+                if (Val == OwnerTagged) OwnerHits[Off]++;
+                if (Val >= DataStart && Val < DataEnd) ClassPrivateHits[Off]++;
+            }
+            TotalFields++;
+
+            uint64_t NextVal = 0;
+            std::memcpy(&NextVal, FieldBuf + Layout.NextOff, 8);
+            FieldPtr = NextVal;
+        }
+    }
+
+    std::printf("[autodisc-fflayout] Probed %d FFields for Owner/ClassPrivate\n", TotalFields);
+
+    auto PickBest = [](const std::unordered_map<uint32_t, int>& Map) -> std::pair<uint32_t, int> {
+        uint32_t Best = 0;
+        int BestHits = 0;
+        for (auto& [Off, Hits] : Map) {
+            if (Hits > BestHits) { Best = Off; BestHits = Hits; }
+        }
+        return {Best, BestHits};
+    };
+
+    auto [OwBest, OwHits] = PickBest(OwnerHits);
+    if (OwHits >= 5) {
+        Layout.OwnerOff = OwBest;
+        std::printf("[autodisc-fflayout]   Owner = +0x%X (%d/%d hits)\n",
+            OwBest, OwHits, TotalFields);
+    }
+
+    auto [CpBest, CpHits] = PickBest(ClassPrivateHits);
+    if (CpHits >= 5 && CpBest != OwBest && CpBest != Layout.NextOff) {
+        Layout.ClassPrivateOff = CpBest;
+        std::printf("[autodisc-fflayout]   ClassPrivate = +0x%X (%d/%d hits)\n",
+            CpBest, CpHits, TotalFields);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2c.6: FProperty sub-pointer offset auto-discovery
+//
+// Finds the offset where FStructProperty::Struct / FObjectProperty::PropertyClass
+// / FArrayProperty::Inner live. Theia randomizes this per session.
+// Strategy: walk ChildProperties chains from UClass objects, scan each FProperty
+// for offsets 0xD0..0x200 where the value is a valid pointer whose vtable matches
+// a known engine type (UScriptStruct, UClass, UEnum). The offset with the most
+// hits wins.
+// ─────────────────────────────────────────────────────────────────────────────
+inline uint32_t DiscoverFPropertySubPointerOffset(
+    IMemoryReader& Reader,
+    uint64_t ModuleBase,
+    const ModuleBounds& Bounds,
+    const std::vector<uint64_t>& SeedObjects,
+    const VTableMap& VTables)
+{
+    uint64_t ClassVt = VTables.ClassNativeRVA ? (ModuleBase + VTables.ClassNativeRVA) : 0;
+    if (!ClassVt) {
+        std::printf("[autodisc-subptr] No Class vtable; skipping\n");
+        return 0;
+    }
+
+    uint64_t CpOff = ArcDecrypt::Offsets::UStruct::ChildProperties;
+    uint64_t NextOff = ArcDecrypt::Offsets::FField::Next;
+
+    std::unordered_set<uint64_t> KnownVtables;
+    if (VTables.ScriptStructRVA) KnownVtables.insert(ModuleBase + VTables.ScriptStructRVA);
+    if (VTables.ClassNativeRVA)  KnownVtables.insert(ModuleBase + VTables.ClassNativeRVA);
+    if (VTables.EnumRVA)         KnownVtables.insert(ModuleBase + VTables.EnumRVA);
+    if (VTables.BPGCRVA)         KnownVtables.insert(ModuleBase + VTables.BPGCRVA);
+    if (VTables.WBPGCRVA)        KnownVtables.insert(ModuleBase + VTables.WBPGCRVA);
+    if (VTables.SMBPGCRVA)       KnownVtables.insert(ModuleBase + VTables.SMBPGCRVA);
+    if (VTables.AnimBPGCRVA)     KnownVtables.insert(ModuleBase + VTables.AnimBPGCRVA);
+    if (VTables.ASClassRVA)      KnownVtables.insert(ModuleBase + VTables.ASClassRVA);
+    if (VTables.ASStructRVA)     KnownVtables.insert(ModuleBase + VTables.ASStructRVA);
+
+    if (KnownVtables.empty()) {
+        std::printf("[autodisc-subptr] No known vtables; skipping\n");
+        return 0;
+    }
+
+    uint64_t ModEnd = ModuleBase + Bounds.ImageSize;
+    std::unordered_map<uint32_t, int> HitsByOffset;
+    int TotalFields = 0;
+
+    for (uint64_t Obj : SeedObjects) {
+        if (TotalFields >= 500) break;
+        uint64_t Vt = 0;
+        if (!Reader.Read(Obj, &Vt, 8)) continue;
+        if (Vt != ClassVt) continue;
+
+        uint64_t FieldPtr = 0;
+        if (!Reader.Read(Obj + CpOff, &FieldPtr, 8)) continue;
+        if (!FieldPtr || FieldPtr < 0x10000) continue;
+
+        for (int Chain = 0; Chain < 30 && FieldPtr; ++Chain) {
+            uint8_t FieldBuf[0x210] = {};
+            if (!Reader.Read(FieldPtr, FieldBuf, sizeof(FieldBuf))) break;
+
+            for (uint32_t Off = 0xD0; Off <= 0x200; Off += 8) {
+                uint64_t Val = 0;
+                std::memcpy(&Val, FieldBuf + Off, 8);
+                if (Val < 0x10000) continue;
+                if (Val >= ModuleBase && Val < ModEnd) continue;
+
+                uint64_t TargetVt = 0;
+                if (!Reader.Read(Val, &TargetVt, 8)) continue;
+                if (KnownVtables.count(TargetVt)) {
+                    HitsByOffset[Off]++;
+                }
+            }
+
+            TotalFields++;
+            uint64_t NextVal = 0;
+            std::memcpy(&NextVal, FieldBuf + NextOff, 8);
+            FieldPtr = NextVal;
+        }
+    }
+
+    std::printf("[autodisc-subptr] Scanned %d FFields across offsets 0xD0..0x200\n", TotalFields);
+
+    uint32_t BestOff = 0;
+    int BestHits = 0;
+    for (auto& [Off, Hits] : HitsByOffset) {
+        std::printf("[autodisc-subptr]   offset +0x%X: %d vtable hits\n", Off, Hits);
+        if (Hits > BestHits) {
+            BestOff = Off;
+            BestHits = Hits;
+        }
+    }
+
+    if (BestHits >= 10) {
+        std::printf("[autodisc-subptr] SUCCESS: SubPointer offset = +0x%X (%d hits)\n",
+            BestOff, BestHits);
+        return BestOff;
+    }
+
+    std::printf("[autodisc-subptr] No clear winner (best: +0x%X with %d hits)\n",
+        BestOff, BestHits);
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2e: Apply discovered FField+FProperty layout to runtime offsets
+// ─────────────────────────────────────────────────────────────────────────────
+inline void ApplyDiscoveredLayouts(
+    const FFieldLayoutFromCode& FF,
+    const FPropertyLayoutFromCode& FP)
+{
+    namespace Off = ArcDecrypt::Offsets;
+
+    if (FF.Valid) {
+        auto Upd = [](const char* Name, uint64_t& Slot, uint64_t New) {
+            if (New && New != Slot) {
+                std::printf("[layout-apply] %s: 0x%llX → 0x%llX\n", Name,
+                    (unsigned long long)Slot, (unsigned long long)New);
+                Slot = New;
+            }
+        };
+        Upd("UStruct::ChildProperties",   Off::UStruct::ChildProperties, FF.ChildPropsOff);
+        Upd("UStruct::Children",          Off::UStruct::Children,        FF.ChildPropsOff);
+        Upd("FField::NamePrivate",        Off::FField::NamePrivate,      FF.NamePrivateOff);
+        Upd("FField::NameEncrypted",      Off::FField::NameEncrypted,    FF.NamePrivateOff);
+        Upd("FField::Next",              Off::FField::Next,              FF.NextOff);
+        if (FF.OwnerOff)
+            Upd("FField::Owner",          Off::FField::Owner,            FF.OwnerOff);
+        if (FF.ClassPrivateOff)
+            Upd("FField::ClassPrivate",   Off::FField::ClassPrivate,     FF.ClassPrivateOff);
+    }
+
+    if (FP.Valid) {
+        auto Upd = [](const char* Name, uint64_t& Slot, uint64_t New) {
+            if (New && New != Slot) {
+                std::printf("[layout-apply] %s: 0x%llX → 0x%llX\n", Name,
+                    (unsigned long long)Slot, (unsigned long long)New);
+                Slot = New;
+            }
+        };
+        auto Upd32 = [](const char* Name, uint32_t& Slot, uint32_t New) {
+            if (New && New != Slot) {
+                std::printf("[layout-apply] %s: 0x%08X → 0x%08X\n", Name, Slot, New);
+                Slot = New;
+            }
+        };
+        Upd("FProperty::Offset_Internal", Off::FProperty::Offset_Internal, FP.OffsetInternalOff);
+        Upd32("FProperty::Offset_XOR",    Off::FProperty::Offset_XOR,      FP.OffsetXorKey);
+        Upd("FProperty::ElementSize",     Off::FProperty::ElementSize,     FP.ElementSizeOff);
+        Upd("FProperty::ArrayDim",        Off::FProperty::ArrayDim,        FP.ArrayDimOff);
+
+        ArcDecrypt::Patch20260421::g_PropertyOffsetXor = FP.OffsetXorKey;
+
+        if (FP.SubPointerOff) {
+            Upd("FStructProperty::Struct",       Off::FStructProperty::Struct,           (uint64_t)FP.SubPointerOff);
+            Upd("FObjectProperty::PropertyClass", Off::FObjectProperty::PropertyClass,    (uint64_t)FP.SubPointerOff);
+            Upd("FArrayProperty::Inner",         Off::FArrayProperty::Inner,              (uint64_t)FP.SubPointerOff);
+            Upd("FBoolProperty::FieldSize",      Off::FBoolProperty::FieldSize,           (uint64_t)FP.SubPointerOff);
+            Upd("FBoolProperty::ByteOffset",     Off::FBoolProperty::ByteOffset,          (uint64_t)(FP.SubPointerOff + 1));
+            Upd("FBoolProperty::ByteMask",       Off::FBoolProperty::ByteMask,            (uint64_t)(FP.SubPointerOff + 2));
+            Upd("FBoolProperty::FieldMask",      Off::FBoolProperty::FieldMask,           (uint64_t)(FP.SubPointerOff + 3));
+            Upd("FEnumProperty::UnderlyingProp", Off::FEnumProperty::UnderlyingProp,      (uint64_t)FP.SubPointerOff);
+            Upd("FEnumProperty::Enum",           Off::FEnumProperty::Enum,                (uint64_t)(FP.SubPointerOff + 8));
+            Upd("FSetProperty::ElementProp",     Off::FSetProperty::ElementProp,          (uint64_t)FP.SubPointerOff);
+            Upd("FSoftObjectProperty::PropertyClass", Off::FSoftObjectProperty::PropertyClass, (uint64_t)FP.SubPointerOff);
+            Upd("FMapProperty::KeyProp",         Off::FMapProperty::KeyProp,              (uint64_t)FP.SubPointerOff);
+            Upd("FMapProperty::ValueProp",       Off::FMapProperty::ValueProp,            (uint64_t)(FP.SubPointerOff + 8));
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2f: Build live FFieldClass-to-type map from FField chains
+//
+// The hardcoded FFieldClass RVAs in SeedHardcodedFClassGlobals_CL1201801()
+// are from an old patch and don't match the current binary. This function
+// walks live FField chains from UClass objects, reads each FField's
+// ClassPrivate pointer and ElementSize, then infers the FProperty subclass
+// type from the ElementSize value. The resulting map lets Probe 10
+// (ProbeFPropertySubPointers) bucket FProperties by type.
+// ─────────────────────────────────────────────────────────────────────────────
+inline std::unordered_map<uint64_t, std::string> BuildLiveFFieldClassMap(
+    IMemoryReader& Reader,
+    uint64_t ModuleBase,
+    const ModuleBounds& Bounds,
+    const std::vector<uint64_t>& SeedObjects,
+    const VTableMap& VTables)
+{
+    std::unordered_map<uint64_t, std::string> Result;
+
+    namespace Off = ArcDecrypt::Offsets;
+
+    uint64_t ClassVt = VTables.ClassNativeRVA ? (ModuleBase + VTables.ClassNativeRVA) : 0;
+    std::vector<uint64_t> ClassVtCandidates;
+    if (ClassVt) ClassVtCandidates.push_back(ClassVt);
+    if (VTables.ASClassRVA)  ClassVtCandidates.push_back(ModuleBase + VTables.ASClassRVA);
+    if (VTables.BPGCRVA)     ClassVtCandidates.push_back(ModuleBase + VTables.BPGCRVA);
+    if (VTables.WBPGCRVA)    ClassVtCandidates.push_back(ModuleBase + VTables.WBPGCRVA);
+    if (VTables.AnimBPGCRVA) ClassVtCandidates.push_back(ModuleBase + VTables.AnimBPGCRVA);
+    if (VTables.SMBPGCRVA)   ClassVtCandidates.push_back(ModuleBase + VTables.SMBPGCRVA);
+    if (VTables.FunctionRVA) ClassVtCandidates.push_back(ModuleBase + VTables.FunctionRVA);
+
+    if (ClassVtCandidates.empty()) {
+        std::printf("[live-fclass] No class vtable candidates — cannot build live map\n");
+        return Result;
+    }
+
+    std::unordered_set<uint64_t> ClassVtSet(ClassVtCandidates.begin(), ClassVtCandidates.end());
+
+    uint64_t DataStart = ModuleBase + Bounds.DataRva;
+    uint64_t DataEnd   = ModuleBase + Bounds.DataRva + Bounds.DataSize;
+    uint64_t ModEnd    = ModuleBase + Bounds.ImageSize;
+    uint64_t CpOff     = Off::UStruct::ChildProperties;
+    uint64_t NextOff   = Off::FField::Next;
+    uint64_t CprvOff   = Off::FField::ClassPrivate;
+    uint64_t EsOff     = Off::FProperty::ElementSize;
+    uint64_t BoolFsOff = Off::FBoolProperty::FieldSize;
+    uint64_t SubPtrOff = Off::FStructProperty::Struct;
+
+    struct ClassInfo {
+        std::unordered_map<int32_t, int> ElemSizeCounts;
+        int TotalSamples = 0;
+        bool HasSubPointerToObject = false;
+        bool HasBoolPattern = false;
+    };
+    std::unordered_map<uint64_t, ClassInfo> ClassMap;
+
+    int TotalFields = 0;
+    int TotalUStructs = 0;
+
+    for (uint64_t Obj : SeedObjects) {
+        if (TotalFields >= 2000) break;
+        uint64_t Vt = 0;
+        if (!Reader.Read(Obj, &Vt, 8)) continue;
+        if (!ClassVtSet.count(Vt)) continue;
+        TotalUStructs++;
+
+        uint64_t FieldPtr = 0;
+        if (!Reader.Read(Obj + CpOff, &FieldPtr, 8)) continue;
+        if (!FieldPtr || FieldPtr < 0x10000) continue;
+        if (FieldPtr >= ModuleBase && FieldPtr < ModEnd) continue;
+
+        std::unordered_set<uint64_t> Seen;
+        for (int Chain = 0; Chain < 64 && FieldPtr && TotalFields < 2000; ++Chain) {
+            if (!Seen.insert(FieldPtr).second) break;
+
+            uint64_t FFieldVt = 0;
+            if (!Reader.Read(FieldPtr, &FFieldVt, 8)) break;
+            if (FFieldVt < ModuleBase || FFieldVt >= ModEnd) break;
+
+            uint64_t ClassPrivateVal = 0;
+            if (!Reader.Read(FieldPtr + CprvOff, &ClassPrivateVal, 8)) break;
+
+            if (ClassPrivateVal >= DataStart && ClassPrivateVal < DataEnd) {
+                int32_t ElemSize = 0;
+                Reader.Read(FieldPtr + EsOff, &ElemSize, 4);
+
+                auto& Info = ClassMap[ClassPrivateVal];
+                Info.ElemSizeCounts[ElemSize]++;
+                Info.TotalSamples++;
+
+                if (ElemSize >= 1 && ElemSize <= 8) {
+                    uint8_t FieldSizeByte = 0;
+                    Reader.Read(FieldPtr + BoolFsOff, &FieldSizeByte, 1);
+                    uint8_t ByteMask = 0;
+                    Reader.Read(FieldPtr + BoolFsOff + 2, &ByteMask, 1);
+                    if ((FieldSizeByte == 1 || FieldSizeByte == 2 || FieldSizeByte == 4 || FieldSizeByte == 8) &&
+                        (ByteMask & (ByteMask - 1)) == 0 && ByteMask != 0) {
+                        Info.HasBoolPattern = true;
+                    }
+                }
+
+                if (ElemSize == 8) {
+                    uint64_t SubPtr = 0;
+                    if (Reader.Read(FieldPtr + SubPtrOff, &SubPtr, 8) && SubPtr > 0x10000 && SubPtr < 0x800000000000ULL) {
+                        uint64_t SubVt = 0;
+                        if (Reader.Read(SubPtr, &SubVt, 8) && SubVt >= ModuleBase && SubVt < ModEnd) {
+                            Info.HasSubPointerToObject = true;
+                        }
+                    }
+                }
+
+                TotalFields++;
+            }
+
+            uint64_t NextVal = 0;
+            if (!Reader.Read(FieldPtr + NextOff, &NextVal, 8)) break;
+            FieldPtr = NextVal;
+        }
+    }
+
+    std::printf("[live-fclass] Walked %d FFields from %d UStructs, found %zu unique ClassPrivate addresses\n",
+        TotalFields, TotalUStructs, ClassMap.size());
+
+    for (auto& [ClassAddr, Info] : ClassMap) {
+        int32_t DominantSize = 0;
+        int DominantCount = 0;
+        for (auto& [Sz, Cnt] : Info.ElemSizeCounts) {
+            if (Cnt > DominantCount) {
+                DominantCount = Cnt;
+                DominantSize = Sz;
+            }
+        }
+
+        std::string TypeName;
+        switch (DominantSize) {
+            case 0:  TypeName = "FBoolProperty"; break;
+            case 1:
+                if (Info.HasBoolPattern)
+                    TypeName = "FBoolProperty";
+                else
+                    TypeName = "FByteProperty";
+                break;
+            case 2:  TypeName = "FUInt16Property"; break;
+            case 4:  TypeName = "FIntProperty"; break;
+            case 8:
+                if (Info.HasSubPointerToObject)
+                    TypeName = "FObjectProperty";
+                else
+                    TypeName = "FNameProperty";
+                break;
+            case 16: TypeName = "FStrProperty"; break;
+            case 24: TypeName = "FTextProperty"; break;
+            case 32: TypeName = "FDelegateProperty"; break;
+            case 40: TypeName = "FSoftObjectProperty"; break;
+            case 48: TypeName = "FMulticastInlineDelegateProperty"; break;
+            case 80: TypeName = "FMapProperty"; break;
+            default:
+                if (DominantSize > 0 && DominantSize <= 0x400)
+                    TypeName = "FStructProperty";
+                break;
+        }
+
+        if (!TypeName.empty()) {
+            Result[ClassAddr] = TypeName;
+            std::printf("[live-fclass]   0x%llX → %s (elem_size=%d, samples=%d)\n",
+                (unsigned long long)ClassAddr, TypeName.c_str(), DominantSize, Info.TotalSamples);
+        }
+    }
+
+    std::printf("[live-fclass] Built live map: %zu type entries\n", Result.size());
+    return Result;
+}
+
+inline std::unordered_map<uint64_t, std::string> g_LiveFClassMap;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Globals — populated by main.cpp::Init() during the discovery phase, read
 // at decrypt sites (gobjects.h, fname_decrypt.h, arc_decrypt.h).
 // ─────────────────────────────────────────────────────────────────────────────
+inline FFieldLayoutFromCode      g_DiscoveredFFieldLayout;
+inline FPropertyLayoutFromCode   g_DiscoveredFPropertyLayout;
 inline VTableMap                 g_DiscoveredVTables;
 inline ModuleBounds              g_DiscoveredBounds;
 inline WorldDiscovery            g_DiscoveredWorld;
@@ -3554,6 +4267,7 @@ inline FFieldNameDecryptMasks    g_DiscoveredFFieldMasks;
 inline FPropertyDecryptParams    g_DiscoveredFProperty;
 inline UObjSlotDecryptParams     g_DiscoveredUObjSlot;
 inline bool                      g_UseV707SlotHash = false;
+inline bool                      g_UseV709SlotHash = false;
 inline FNameResolverConsts       g_DiscoveredFName;
 inline GNamesDiscovery           g_DiscoveredGNames;
 inline FNameKeystreamDiscovery   g_DiscoveredFNameKey;

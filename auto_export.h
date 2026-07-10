@@ -213,14 +213,32 @@ inline void EmitModuleBlock(JsonWriter& W, uint64_t ModuleBase) {
 inline void EmitAnchors(JsonWriter& W) {
     W.OpenObj("anchors");
     W.KU64("rva_gworld",              ArcDecrypt::RVA_GWORLD);
-    W.KU64("rva_gnames_base",         ArcDecrypt::RVA_GNAMES_BASE);
-    W.KU64("rva_fname_key_table",     ArcDecrypt::RVA_FNAME_KEY_TABLE);
+
+    uint64_t GnamesRva = ArcDecrypt::RVA_GNAMES_BASE;
+    if (AutoDiscovery::g_DiscoveredGNames.Valid && AutoDiscovery::g_DiscoveredGNames.GNamesRva)
+        GnamesRva = AutoDiscovery::g_DiscoveredGNames.GNamesRva;
+    W.KU64("rva_gnames_base", GnamesRva);
+
+    uint64_t KeyTblRva = ArcDecrypt::RVA_FNAME_KEY_TABLE;
+    if (AutoDiscovery::g_DiscoveredFNameKey.Valid && AutoDiscovery::g_DiscoveredFNameKey.KeystreamRva)
+        KeyTblRva = AutoDiscovery::g_DiscoveredFNameKey.KeystreamRva;
+    W.KU64("rva_fname_key_table", KeyTblRva);
+
     W.KU64("rva_gobject_array_base",  ArcDecrypt::RVA_GOBJECT_ARRAY_BASE);
     W.KU64("rva_simd_objarray_xor",   ArcDecrypt::RVA_SIMD_OBJARRAY_XOR);
     W.KU64("rva_elem_mask_a",         ArcDecrypt::RVA_ELEM_MASK_A);
     W.KU64("rva_elem_mask_b",         ArcDecrypt::RVA_ELEM_MASK_B);
     W.KU64("rva_elem_xor_key",        ArcDecrypt::RVA_ELEM_XOR_KEY);
     W.KU64("rva_cidx_xor1",           ArcDecrypt::RVA_CIDX_XOR1);
+    W.KU64("rva_v707_gnamepool",       ArcDecrypt::v20260707::RVA_GNAMEPOOL);
+    W.KU64("rva_v707_keytable",        ArcDecrypt::v20260707::RVA_KEYTABLE);
+    W.KU64("rva_v707_seed_xor1",       ArcDecrypt::v20260707::RVA_SEED_XOR1);
+    W.KU64("rva_v707_seed_blend",      ArcDecrypt::v20260707::RVA_SEED_BLEND);
+    W.KU64("rva_v707_seed_blend_not",  ArcDecrypt::v20260707::RVA_SEED_BLEND_NOT);
+    W.KU64("rva_v707_seed_xor2",       ArcDecrypt::v20260707::RVA_SEED_XOR2);
+    W.KU64("rva_v707_seed_xor3",       ArcDecrypt::v20260707::RVA_SEED_XOR3);
+    W.KU64("rva_v707_seed_xor4",       ArcDecrypt::v20260707::RVA_SEED_XOR4);
+    W.KU64("rva_v707_chunk_xor",       ArcDecrypt::v20260707::RVA_CHUNK_XOR);
     W.CloseObj();
 }
 
@@ -417,6 +435,10 @@ inline void EmitAutoDiscovery(JsonWriter& W) {
         W.KU64("xor_const",     F.XorConst);
         W.KI64("rol32_amount",  F.Rol32Amount);
         W.KI64("rol64_amount",  F.Rol64Amount);
+        W.KBool("two_shuffle",  F.TwoShuffle);
+        W.KI64("shuf_imm1",    F.ShufImm1);
+        W.KI64("shuf_imm2",    F.ShufImm2);
+        W.KI64("ts_rol64",     F.TsRol64);
     }
     W.CloseObj();
 
@@ -536,7 +558,12 @@ inline bool WriteAll(const char* Path, uint64_t ModuleBase) {
     W.OpenObj();
     W.KStr("schema",     "frostsdk.decrypt-export/v1");
     W.KStr("timestamp",  IsoTimestamp());
-    W.KStr("patch",      "CL-1177678");
+    {
+        char PatchBuf[64];
+        std::snprintf(PatchBuf, sizeof(PatchBuf), "imgsize-0x%llX",
+            (unsigned long long)AutoDiscovery::g_DiscoveredBounds.ImageSize);
+        W.KStr("patch", PatchBuf);
+    }
 
     EmitModuleBlock(W, ModuleBase);
     EmitAnchors(W);

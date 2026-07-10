@@ -514,8 +514,13 @@ inline void LoadAutoDiscoveryFFieldNameDecrypt(const JsonValue& Root) {
     Ff.Rol64Amount = static_cast<int>(F["rol64_amount"].Int());
     Ff.Valid        = true;
 
-    std::printf("[config] loaded FField name decrypt: xor=0x%016llX rol32=%d rol64=%d\n",
-        (unsigned long long)Ff.XorConst, Ff.Rol32Amount, Ff.Rol64Amount);
+    if (!F["two_shuffle"].IsNull()) Ff.TwoShuffle = F["two_shuffle"].Bool();
+    if (!F["shuf_imm1"].IsNull())   Ff.ShufImm1   = static_cast<uint8_t>(F["shuf_imm1"].Int());
+    if (!F["shuf_imm2"].IsNull())   Ff.ShufImm2   = static_cast<uint8_t>(F["shuf_imm2"].Int());
+    if (!F["ts_rol64"].IsNull())    Ff.TsRol64    = static_cast<int>(F["ts_rol64"].Int());
+
+    std::printf("[config] loaded FField name decrypt: xor=0x%016llX rol32=%d shuf=0x%02X rol64=%d two_shuf=%d\n",
+        (unsigned long long)Ff.XorConst, Ff.Rol32Amount, Ff.ShufImm1, Ff.Rol64Amount, Ff.TwoShuffle);
 }
 
 inline void LoadAutoDiscoveryFNameKeystream(const JsonValue& Root) {
@@ -611,6 +616,7 @@ inline void LoadAutoDiscoveryWorld(const JsonValue& Root) {
 struct LoadResult {
     bool Loaded = false;
     std::string Patch;
+    uint64_t ConfigImageSize = 0;
     int SectionsLoaded = 0;
 };
 
@@ -650,8 +656,24 @@ inline LoadResult LoadDiscoveryConfig(const char* Path) {
         Path, Result.Patch.c_str(),
         Root["timestamp"].IsStr() ? Root["timestamp"].StrVal.c_str() : "?");
 
+    const auto& ModBlock = Root["module"];
+    if (ModBlock.IsObj())
+        Result.ConfigImageSize = ModBlock["image_size"].Hex64();
+
     LoadAnchors(Root);            Result.SectionsLoaded++;
+
+    if (Result.ConfigImageSize > 0 &&
+        Result.ConfigImageSize == AutoDiscovery::g_DiscoveredBounds.ImageSize) {
+        LoadOffsets(Root);
+        std::printf("[config] offsets loaded (image_size 0x%llX matches)\n",
+            (unsigned long long)Result.ConfigImageSize);
+    } else if (Result.ConfigImageSize > 0) {
+        std::printf("[config] skipping offsets (image_size mismatch: config=0x%llX live=0x%llX)\n",
+            (unsigned long long)Result.ConfigImageSize,
+            (unsigned long long)AutoDiscovery::g_DiscoveredBounds.ImageSize);
+    }
     Result.SectionsLoaded++;
+
     LoadPatchConstants(Root);     Result.SectionsLoaded++;
 
     LoadAutoDiscoveryVTables(Root);          Result.SectionsLoaded++;

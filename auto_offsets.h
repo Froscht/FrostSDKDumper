@@ -60,6 +60,9 @@ inline bool IsTextPtr(uint64_t p, uint64_t base, const AutoDiscovery::ModuleBoun
 inline bool IsHeapNonModule(uint64_t p, uint64_t base, uint64_t size) {
     return IsHeapPtr(p) && !IsModulePtr(p, base, size);
 }
+inline bool IsDataSectionPtr(uint64_t p, uint64_t base, const AutoDiscovery::ModuleBounds& b) {
+    return b.DataRva && p >= base + b.DataRva && p < base + b.DataRva + b.DataSize;
+}
 
 template <typename T>
 inline bool R(IMemoryReader& reader, uint64_t addr, T& out) {
@@ -178,13 +181,21 @@ inline void BuildFClassTypeMap(Context& ctx) {
 //
 // Returns the offset where the FFieldClass match was found (-1 if none).
 inline int FindFClassPointerOffset(uint64_t addr, Context& ctx) {
-    if (ctx.fclass_to_type.empty()) return -1;
     uint8_t buf[0x180] = {};
     if (!ctx.reader->Read(addr, buf, sizeof(buf))) return -1;
-    for (size_t off = 0; off + 8 <= sizeof(buf); off += 8) {
-        uint64_t v = 0;
-        std::memcpy(&v, buf + off, 8);
-        if (ctx.fclass_to_type.count(v)) return (int)off;
+    if (!ctx.fclass_to_type.empty()) {
+        for (size_t off = 0; off + 8 <= sizeof(buf); off += 8) {
+            uint64_t v = 0;
+            std::memcpy(&v, buf + off, 8);
+            if (ctx.fclass_to_type.count(v)) return (int)off;
+        }
+    }
+    if (ctx.bounds.DataRva) {
+        for (size_t off = 0; off + 8 <= sizeof(buf); off += 8) {
+            uint64_t v = 0;
+            std::memcpy(&v, buf + off, 8);
+            if (IsDataSectionPtr(v, ctx.module_base, ctx.bounds)) return (int)off;
+        }
     }
     return -1;
 }
@@ -248,10 +259,6 @@ inline void ProbeChildPropertiesAndClassPrivate(Context& ctx,
         std::printf("[autoff] UStruct::ChildProperties — no samples\n");
         return;
     }
-    if (ctx.fclass_to_type.empty()) {
-        std::printf("[autoff] UStruct::ChildProperties — no FFieldClass map; can't validate FFields\n");
-        return;
-    }
     std::unordered_map<uint64_t, int> cp_counts;
     std::unordered_map<uint64_t, int> cpriv_counts;
     int joint_hits = 0;
@@ -293,7 +300,7 @@ inline void ProbeChildPropertiesAndClassPrivate(Context& ctx,
 // module-vtable would form a fake "chain" through unrelated UObjects.
 // ─────────────────────────────────────────────────────────────────
 inline void ProbeFFieldNext(Context& ctx, const std::vector<uint64_t>& ustructs) {
-    if (ustructs.empty() || ctx.fclass_to_type.empty()) return;
+    if (ustructs.empty()) return;
     const uint64_t slot_off = ArcDecrypt::Offsets::FField::Next;
     std::unordered_map<uint64_t, int> chain_total;
     for (uint64_t uss : ustructs) {
@@ -711,14 +718,12 @@ inline void ProbeUFunctionInternals(Context& ctx, const std::vector<uint64_t>& f
 //   FMapProperty::KeyProp/ValueProp→ two consecutive FField ptrs
 // ─────────────────────────────────────────────────────────────────
 inline void ProbeFPropertySubPointers(Context& ctx, const std::vector<uint64_t>& ustructs) {
-    if (ctx.fclass_to_type.empty()) {
-        std::printf("[autoff] FProperty sub-pointers — no FFieldClass type map; skipping\n");
+    auto ffields = CollectFFields(ctx, ustructs, 800);
+    if (ffields.empty()) {
+        std::printf("[autoff] FProperty sub-pointers — no FFields collected; skipping\n");
         return;
     }
-    auto ffields = CollectFFields(ctx, ustructs, 800);
-    if (ffields.empty()) return;
 
-    // Bucket by FProperty subclass type
     std::unordered_map<std::string, std::vector<uint64_t>> by_type;
     for (uint64_t ff : ffields) {
         uint64_t fc = 0;
@@ -726,9 +731,14 @@ inline void ProbeFPropertySubPointers(Context& ctx, const std::vector<uint64_t>&
         auto it = ctx.fclass_to_type.find(fc);
         if (it != ctx.fclass_to_type.end()) by_type[it->second].push_back(ff);
     }
-    std::printf("[autoff] FProperty sub-pointer buckets:");
-    for (const auto& [t, v] : by_type) std::printf(" %s=%zu", t.c_str(), v.size());
-    std::printf("\n");
+    bool Unbucketed = by_type.empty();
+    if (!Unbucketed) {
+        std::printf("[autoff] FProperty sub-pointer buckets:");
+        for (const auto& [t, v] : by_type) std::printf(" %s=%zu", t.c_str(), v.size());
+        std::printf("\n");
+    } else {
+        std::printf("[autoff] FProperty sub-pointers — no type buckets; using unbucketed probe on %zu FFields\n", ffields.size());
+    }
 
     auto probe_to_vtable = [&](uint64_t want_vt_va, const std::vector<uint64_t>& ffs,
                                uint64_t& slot, const char* label, int min_hits)
@@ -739,7 +749,7 @@ inline void ProbeFPropertySubPointers(Context& ctx, const std::vector<uint64_t>&
         }
         std::unordered_map<uint64_t, int> counts;
         for (uint64_t ff : ffs) {
-            for (uint64_t off = 0xD0; off <= 0x180; off += 8) {
+            for (uint64_t off = 0xD0; off <= 0x200; off += 8) {
                 uint64_t p = 0;
                 if (!R(*ctx.reader, ff + off, p)) continue;
                 if (!IsHeapNonModule(p, ctx.module_base, ctx.bounds.ImageSize)) continue;
@@ -763,7 +773,7 @@ inline void ProbeFPropertySubPointers(Context& ctx, const std::vector<uint64_t>&
         }
         std::unordered_map<uint64_t, int> counts;
         for (uint64_t ff : ffs) {
-            for (uint64_t off = 0xD0; off <= 0x180; off += 8) {
+            for (uint64_t off = 0xD0; off <= 0x200; off += 8) {
                 uint64_t p = 0;
                 if (!R(*ctx.reader, ff + off, p)) continue;
                 if (!IsHeapNonModule(p, ctx.module_base, ctx.bounds.ImageSize)) continue;
@@ -782,26 +792,38 @@ inline void ProbeFPropertySubPointers(Context& ctx, const std::vector<uint64_t>&
     uint64_t class_vt  = ctx.vtables.ClassNativeRVA  ? (ctx.module_base + ctx.vtables.ClassNativeRVA)  : 0;
     uint64_t enum_vt   = ctx.vtables.EnumRVA         ? (ctx.module_base + ctx.vtables.EnumRVA)         : 0;
 
-    probe_to_vtable(struct_vt, by_type["FStructProperty"],
-        ArcDecrypt::Offsets::FStructProperty::Struct, "FStructProperty::Struct", 3);
-    probe_to_vtable(class_vt,  by_type["FObjectProperty"],
-        ArcDecrypt::Offsets::FObjectProperty::PropertyClass, "FObjectProperty::PropertyClass", 3);
-    probe_to_vtable(class_vt,  by_type["FObjectPtrProperty"],
-        ArcDecrypt::Offsets::FObjectProperty::PropertyClass, "FObjectPtrProperty::PropertyClass", 2);
-    probe_to_vtable(class_vt,  by_type["FSoftObjectProperty"],
-        ArcDecrypt::Offsets::FSoftObjectProperty::PropertyClass, "FSoftObjectProperty::PropertyClass", 2);
-    probe_to_vtable(enum_vt,   by_type["FEnumProperty"],
-        ArcDecrypt::Offsets::FEnumProperty::Enum, "FEnumProperty::Enum", 2);
-    probe_to_ffield(by_type["FArrayProperty"],
-        ArcDecrypt::Offsets::FArrayProperty::Inner, "FArrayProperty::Inner", 2);
-    probe_to_ffield(by_type["FSetProperty"],
-        ArcDecrypt::Offsets::FSetProperty::ElementProp, "FSetProperty::ElementProp", 2);
+    if (Unbucketed) {
+        probe_to_vtable(struct_vt, ffields,
+            ArcDecrypt::Offsets::FStructProperty::Struct, "FStructProperty::Struct (unbucketed)", 3);
+        probe_to_vtable(class_vt, ffields,
+            ArcDecrypt::Offsets::FObjectProperty::PropertyClass, "FObjectProperty::PropertyClass (unbucketed)", 3);
+        probe_to_vtable(enum_vt, ffields,
+            ArcDecrypt::Offsets::FEnumProperty::Enum, "FEnumProperty::Enum (unbucketed)", 2);
+        probe_to_ffield(ffields,
+            ArcDecrypt::Offsets::FArrayProperty::Inner, "FArrayProperty::Inner (unbucketed)", 2);
+    } else {
+        probe_to_vtable(struct_vt, by_type["FStructProperty"],
+            ArcDecrypt::Offsets::FStructProperty::Struct, "FStructProperty::Struct", 3);
+        probe_to_vtable(class_vt,  by_type["FObjectProperty"],
+            ArcDecrypt::Offsets::FObjectProperty::PropertyClass, "FObjectProperty::PropertyClass", 3);
+        probe_to_vtable(class_vt,  by_type["FObjectPtrProperty"],
+            ArcDecrypt::Offsets::FObjectProperty::PropertyClass, "FObjectPtrProperty::PropertyClass", 2);
+        probe_to_vtable(class_vt,  by_type["FSoftObjectProperty"],
+            ArcDecrypt::Offsets::FSoftObjectProperty::PropertyClass, "FSoftObjectProperty::PropertyClass", 2);
+        probe_to_vtable(enum_vt,   by_type["FEnumProperty"],
+            ArcDecrypt::Offsets::FEnumProperty::Enum, "FEnumProperty::Enum", 2);
+        probe_to_ffield(by_type["FArrayProperty"],
+            ArcDecrypt::Offsets::FArrayProperty::Inner, "FArrayProperty::Inner", 2);
+        probe_to_ffield(by_type["FSetProperty"],
+            ArcDecrypt::Offsets::FSetProperty::ElementProp, "FSetProperty::ElementProp", 2);
+    }
 
     // FMapProperty: two consecutive FField ptrs.
-    if (auto& maps = by_type["FMapProperty"]; !maps.empty()) {
+    auto& maps = Unbucketed ? ffields : by_type["FMapProperty"];
+    if (!maps.empty()) {
         std::unordered_map<uint64_t, int> counts;
         for (uint64_t ff : maps) {
-            for (uint64_t off = 0xD0; off <= 0x178; off += 8) {
+            for (uint64_t off = 0xD0; off <= 0x200; off += 8) {
                 uint64_t k = 0, v = 0;
                 if (!R(*ctx.reader, ff + off,     k)) continue;
                 if (!R(*ctx.reader, ff + off + 8, v)) continue;
@@ -829,7 +851,7 @@ inline void ProbeFPropertySubPointers(Context& ctx, const std::vector<uint64_t>&
     }
 
     // FEnumProperty::UnderlyingProp — sits 8 bytes BEFORE Enum on UE5.
-    if (!by_type["FEnumProperty"].empty() && ArcDecrypt::Offsets::FEnumProperty::Enum >= 8) {
+    if (ArcDecrypt::Offsets::FEnumProperty::Enum >= 8) {
         ArcDecrypt::Offsets::FEnumProperty::UnderlyingProp =
             ArcDecrypt::Offsets::FEnumProperty::Enum - 8;
         std::printf("[autoff] FEnumProperty::UnderlyingProp set to +0x%llX (= Enum - 8)\n",
@@ -936,6 +958,12 @@ inline void DiscoverAll(IMemoryReader& reader, uint64_t module_base,
     }
 
     BuildFClassTypeMap(ctx);
+    if (!AutoDiscovery::g_LiveFClassMap.empty()) {
+        for (const auto& [Addr, TypeName] : AutoDiscovery::g_LiveFClassMap) {
+            if (!ctx.fclass_to_type.count(Addr))
+                ctx.fclass_to_type[Addr] = TypeName;
+        }
+    }
     std::printf("[autoff] FFieldClass→type live map: %zu entries\n", ctx.fclass_to_type.size());
 
     auto u_classes = FilterByVtable(objects, reader,
@@ -985,9 +1013,12 @@ inline void DiscoverAll(IMemoryReader& reader, uint64_t module_base,
         return;
     }
 
-    ProbeChildPropertiesAndClassPrivate(ctx, ustructs_all);
-    ProbeFFieldNext(ctx, ustructs_all);
-    ProbeFFieldNamePrivate(ctx, ustructs_all);
+    if (!AutoDiscovery::g_DiscoveredFFieldLayout.Valid || !AutoDiscovery::g_DiscoveredFFieldLayout.ChildPropsOff)
+        ProbeChildPropertiesAndClassPrivate(ctx, ustructs_all);
+    if (!AutoDiscovery::g_DiscoveredFFieldLayout.Valid || !AutoDiscovery::g_DiscoveredFFieldLayout.NextOff)
+        ProbeFFieldNext(ctx, ustructs_all);
+    if (!AutoDiscovery::g_DiscoveredFFieldLayout.Valid || !AutoDiscovery::g_DiscoveredFFieldLayout.NamePrivateOff)
+        ProbeFFieldNamePrivate(ctx, ustructs_all);
     ProbeUStructSuperStruct(ctx, u_classes);
     ProbeUStructPropertiesSize(ctx, ustructs_all);
     ProbeUEnumNames(ctx, u_enums);
