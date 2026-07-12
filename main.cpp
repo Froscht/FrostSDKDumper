@@ -780,9 +780,35 @@ public:
             AutoDiscovery::NameResolver Resolver = [this](uint64_t Obj) -> std::string {
                 return m_fname.GetName(Obj);
             };
+            auto ConfigVT = AutoDiscovery::g_DiscoveredVTables;
             AutoDiscovery::g_DiscoveredVTables = AutoDiscovery::DiscoverEngineVTables(
                 m_gobj.GetSeedObjects(), Resolver, m_reader, MODULE_BASE,
                 AutoDiscovery::g_DiscoveredBounds);
+            {
+                auto& VT = AutoDiscovery::g_DiscoveredVTables;
+                auto Merge = [](uint64_t& Live, uint64_t Cfg, const char* Name) {
+                    if (Cfg && Cfg != Live) {
+                        std::printf("[autodisc] Phase 1 merge: %s config=0x%llX live=0x%llX → keeping config\n",
+                            Name, (unsigned long long)Cfg, (unsigned long long)Live);
+                        Live = Cfg;
+                    }
+                };
+                Merge(VT.ScriptStructRVA, ConfigVT.ScriptStructRVA, "ScriptStruct");
+                Merge(VT.ClassNativeRVA,  ConfigVT.ClassNativeRVA,  "Class");
+                Merge(VT.FunctionRVA,     ConfigVT.FunctionRVA,     "Function");
+                Merge(VT.EnumRVA,         ConfigVT.EnumRVA,         "Enum");
+                Merge(VT.PackageRVA,      ConfigVT.PackageRVA,      "Package");
+                Merge(VT.BPGCRVA,         ConfigVT.BPGCRVA,         "BPGC");
+                Merge(VT.WBPGCRVA,        ConfigVT.WBPGCRVA,        "WBPGC");
+                Merge(VT.SMBPGCRVA,       ConfigVT.SMBPGCRVA,       "SMBPGC");
+                Merge(VT.AnimBPGCRVA,     ConfigVT.AnimBPGCRVA,     "AnimBPGC");
+                if (ConfigVT.ASClassRVA && ConfigVT.ASClassRVA != VT.ASClassRVA)
+                    std::printf("[autodisc] Phase 1 merge: ASClass config=0x%llX live=0x%llX → keeping LIVE (session-specific)\n",
+                        (unsigned long long)ConfigVT.ASClassRVA, (unsigned long long)VT.ASClassRVA);
+                if (ConfigVT.ASStructRVA && ConfigVT.ASStructRVA != VT.ASStructRVA)
+                    std::printf("[autodisc] Phase 1 merge: ASStruct config=0x%llX live=0x%llX → keeping LIVE (session-specific)\n",
+                        (unsigned long long)ConfigVT.ASStructRVA, (unsigned long long)VT.ASStructRVA);
+            }
 
             // ── Phase 1.5: wide-string anchor fallback ─────────────────────
             // Phase 1 needs FName resolution AND enough sampled instances to

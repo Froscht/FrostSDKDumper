@@ -3113,6 +3113,41 @@ public:
                 std::printf("\n");
             }
 
+            for (size_t i = 0; i < VtTop.size() && i < 30; ++i) {
+                uint64_t Rva2 = VtTop[i].second;
+                bool Known = (Rva2 == Disc.ScriptStructRVA || Rva2 == Disc.ClassNativeRVA ||
+                              Rva2 == Disc.EnumRVA || Rva2 == Disc.FunctionRVA ||
+                              Rva2 == Disc.BPGCRVA || Rva2 == Disc.PackageRVA ||
+                              Rva2 == Disc.ASStructRVA || Rva2 == Disc.WBPGCRVA ||
+                              Rva2 == Disc.SMBPGCRVA || Rva2 == Disc.AnimBPGCRVA);
+                if (Known) continue;
+                if (VtTop[i].first < 100) continue;
+                auto It2 = VtToAddrs.find(Rva2);
+                if (It2 == VtToAddrs.end() || It2->second.empty()) continue;
+                auto NIt2 = addr_to_name.find(It2->second[0]);
+                if (NIt2 == addr_to_name.end()) continue;
+                const std::string& FirstName = NIt2->second;
+                if (FirstName == "Default__ASStruct") {
+                    for (const auto& [idx3, op3] : object_ptrs) {
+                        if (!op3) continue;
+                        uint64_t Vt3 = Read<uint64_t>(op3);
+                        if (Vt3 >= MODULE_BASE && (Vt3 - MODULE_BASE) == Rva2)
+                            VtStructAddrs.insert(op3);
+                    }
+                    std::printf("[vtpre] Auto-classified vtable 0x%llX as ASStruct (%u objs)\n",
+                        (unsigned long long)Rva2, VtTop[i].first);
+                } else if (FirstName == "Default__ASClass") {
+                    for (const auto& [idx3, op3] : object_ptrs) {
+                        if (!op3) continue;
+                        uint64_t Vt3 = Read<uint64_t>(op3);
+                        if (Vt3 >= MODULE_BASE && (Vt3 - MODULE_BASE) == Rva2)
+                            VtClassAddrs.insert(op3);
+                    }
+                    std::printf("[vtpre] Auto-classified vtable 0x%llX as ASClass (%u objs)\n",
+                        (unsigned long long)Rva2, VtTop[i].first);
+                }
+            }
+
             size_t VtSeeded = 0;
             for (uint64_t A : VtStructAddrs) { if (allTypeAddrs.insert(A).second) ++VtSeeded; }
             for (uint64_t A : VtClassAddrs)  { if (allTypeAddrs.insert(A).second) ++VtSeeded; }
@@ -3351,7 +3386,7 @@ public:
                     // 1-entry pseudo-enums are nearly all misclassifications
                     // (UClass +0xB0 = SuperStruct ptr happens to point at a
                     // heap region with one resolvable FName slot by chance).
-                    if (shape_ok && names_cnt < 2) {
+                    if (shape_ok && names_cnt < 1) {
                         shape_ok = false;
                     }
                 }
@@ -3574,40 +3609,11 @@ public:
                 return Validated >= 1;
             };
 
-            std::unordered_map<uint64_t, StructRecord*> AddrToRec;
-            for (auto& Rec : result.structs)
-                AddrToRec[Rec.addr] = &Rec;
-
-            std::unordered_map<uint64_t, int> SuperChain;
-            std::function<int(uint64_t)> ClassifyBySuper = [&](uint64_t Addr) -> int {
-                auto It = SuperChain.find(Addr);
-                if (It != SuperChain.end()) return It->second;
-                SuperChain[Addr] = 0;
-                if (VtClassAddrs.count(Addr)) { SuperChain[Addr] = 1; return 1; }
-                if (VtStructAddrs.count(Addr)) { SuperChain[Addr] = 2; return 2; }
-                if (VtEnumAddrs.count(Addr)) { SuperChain[Addr] = 3; return 3; }
-                auto Rit = AddrToRec.find(Addr);
-                if (Rit == AddrToRec.end() || Rit->second->super_addr == 0)
-                    return 0;
-                int Parent = ClassifyBySuper(Rit->second->super_addr);
-                SuperChain[Addr] = Parent;
-                return Parent;
-            };
-            for (auto& Rec : result.structs)
-                ClassifyBySuper(Rec.addr);
-
             std::unordered_set<uint64_t> ConfirmedClass;
+
             size_t DirectConfirmed = 0, ConfByFuncs = 0, ConfByFmap = 0;
-            size_t ConfByChain = 0, OverriddenByChain = 0;
             for (auto& Rec : result.structs) {
-                int Chain = SuperChain.count(Rec.addr) ? SuperChain[Rec.addr] : 0;
-                if (Chain == 2) continue;
-                if (Chain == 1) {
-                    ConfirmedClass.insert(Rec.addr);
-                    ++DirectConfirmed;
-                    ++ConfByChain;
-                    continue;
-                }
+                if (VtStructAddrs.count(Rec.addr)) continue;
                 bool HasFuncs = m_owner_to_funcs.count(Rec.addr) > 0;
                 if (HasFuncs) {
                     ConfirmedClass.insert(Rec.addr);
@@ -3622,15 +3628,29 @@ public:
                     ++ConfByFmap;
                 }
             }
-            for (auto& Rec : result.structs) {
-                int Chain = SuperChain.count(Rec.addr) ? SuperChain[Rec.addr] : 0;
-                if (Chain == 2 && m_owner_to_funcs.count(Rec.addr))
-                    ++OverriddenByChain;
-            }
-            std::printf("[sdk] Class confirmation: %zu total (%zu by chain, %zu by funcs, %zu by fmap, %zu funcs-overridden-by-struct-chain)\n",
-                DirectConfirmed, ConfByChain, ConfByFuncs, ConfByFmap, OverriddenByChain);
+            std::printf("[sdk] Class confirmation: %zu total (%zu by funcs, %zu by validated-fmap)\n",
+                DirectConfirmed, ConfByFuncs, ConfByFmap);
 
-            size_t Promoted = 0, Demoted = 0, VtLocked = 0, ChainLocked = 0;
+            std::unordered_map<uint64_t, std::vector<uint64_t>> ChildMap;
+            for (const auto& Rec : result.structs)
+                if (Rec.super_addr)
+                    ChildMap[Rec.super_addr].push_back(Rec.addr);
+
+            std::function<void(uint64_t)> PropagateDown = [&](uint64_t Addr) {
+                auto Cit = ChildMap.find(Addr);
+                if (Cit == ChildMap.end()) return;
+                for (uint64_t Child : Cit->second) {
+                    if (ConfirmedClass.count(Addr) && !ConfirmedClass.count(Child)) {
+                        ConfirmedClass.insert(Child);
+                    }
+                    PropagateDown(Child);
+                }
+            };
+            for (const auto& Rec : result.structs)
+                if (!Rec.super_addr)
+                    PropagateDown(Rec.addr);
+
+            size_t Promoted = 0, Demoted = 0, VtLocked = 0;
             for (auto& Rec : result.structs) {
                 if (VtStructAddrs.count(Rec.addr)) {
                     if (Rec.is_class) ++Demoted;
@@ -3642,19 +3662,6 @@ public:
                     if (!Rec.is_class) ++Promoted;
                     Rec.is_class = true;
                     ++VtLocked;
-                    continue;
-                }
-                int Chain = SuperChain.count(Rec.addr) ? SuperChain[Rec.addr] : 0;
-                if (Chain == 2) {
-                    if (Rec.is_class) ++Demoted;
-                    Rec.is_class = false;
-                    ++ChainLocked;
-                    continue;
-                }
-                if (Chain == 1) {
-                    if (!Rec.is_class) ++Promoted;
-                    Rec.is_class = true;
-                    ++ChainLocked;
                     continue;
                 }
                 bool Confirmed = ConfirmedClass.count(Rec.addr) > 0;
@@ -3672,9 +3679,9 @@ public:
                 if (Rec.is_class) ++FinalClasses;
                 else ++FinalStructs;
             }
-            std::printf("[sdk] Struct/Class reclassification: confirmed=%zu promoted=%zu demoted=%zu vtlocked=%zu chainlocked=%zu "
+            std::printf("[sdk] Struct/Class reclassification: confirmed=%zu promoted=%zu demoted=%zu vtlocked=%zu "
                 "(final: %zu classes, %zu structs)\n",
-                DirectConfirmed, Promoted, Demoted, VtLocked, ChainLocked, FinalClasses, FinalStructs);
+                DirectConfirmed, Promoted, Demoted, VtLocked, FinalClasses, FinalStructs);
         }
 
         // ── Pass 7: post-reclassification FuncMap walk ──────────────────────
@@ -3903,6 +3910,7 @@ public:
         // had size=0, no properties, no super_addr — i.e. zero reflection
         // content. They inflated the output 1.8x with no information value.
         auto struct_is_empty = [](const StructRecord& r) -> bool {
+            if (!r.is_class) return false;
             if (r.props_size != 0) return false;
             if (!r.functions.empty()) return false;
             if (r.super_addr != 0) return false;
