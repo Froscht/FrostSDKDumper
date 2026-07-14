@@ -1015,6 +1015,7 @@ namespace v20260707 {
     constexpr int      SHARD_HASH_ROL_B       = 19;
     constexpr int      SHARD_HASH_ROL_C       = 24;
     constexpr int      SHARD_HASH_SHIFT       = 13;
+    constexpr int      SHARD_SLOT_SELECT_ADD  = 166;
 
     constexpr int      BLOCK_PSHUFLW          = 0x1B;
     constexpr int      BLOCK_ROL64            = 10;
@@ -1052,6 +1053,7 @@ namespace v20260709 {
     constexpr uint64_t SHARD_BLOCK_BASE_OFF  = 0x2FA0ULL;
     constexpr int      SHARD_HASH_ROL_A      = 17;
     constexpr int      SHARD_HASH_ROL_B      = 13;
+    constexpr int      SHARD_SLOT_SELECT_ADD = 82;
 
     constexpr int      BLOCK_ROL64           = 13;
     constexpr int      BLOCK_PSHUFLW         = 0x93;

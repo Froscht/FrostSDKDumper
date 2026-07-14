@@ -2175,6 +2175,7 @@ struct UObjSlotDecryptParams {
     uint64_t XorScalar   = 0;     // lo64 of the XOR const (read live)
     int      Rol64Amount = 32;    // post-XOR ROL64
     uint8_t  ShufMaskBytes[8] = {};  // copy of the 8-byte mask, for fast access
+    uint64_t FirstSiteRva = 0;    // RVA of first code site (for slot hash backward walk)
     bool     Valid       = false;
 };
 
@@ -2301,12 +2302,13 @@ inline UObjSlotDecryptParams DiscoverUObjSlotDecrypt(
         return out;
     }
 
-    out.ShufMaskRVA = shufRva;
-    out.XorConstRVA = xorRva;
-    out.XorScalar   = xor_lo64;
-    out.Rol64Amount = bestInfo.rol64Amt;
+    out.ShufMaskRVA  = shufRva;
+    out.XorConstRVA  = xorRva;
+    out.XorScalar    = xor_lo64;
+    out.Rol64Amount  = bestInfo.rol64Amt;
+    out.FirstSiteRva = bestInfo.firstRva;
     std::memcpy(out.ShufMaskBytes, shufBytes, 8);
-    out.Valid       = true;
+    out.Valid        = true;
     std::printf("[autodisc-uobj] slot decrypt: %d sites agree on shuf=0x%llX xor=0x%llX (lo64=0x%016llX)  rol64=%d (first @ 0x%llX)\n",
         bestInfo.count, (unsigned long long)shufRva, (unsigned long long)xorRva,
         (unsigned long long)xor_lo64, out.Rol64Amount,
@@ -2437,6 +2439,698 @@ inline FNameResolverConsts DiscoverFNameResolverConsts(
 
     out.Valid = !out.AllImm64.empty() || !out.AllRDataLeas.empty();
     return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5.5: Structured FName pipeline constant extraction
+//
+// Walks each sub-function in the FName resolver call tree INDIVIDUALLY and
+// uses structural instruction patterns to extract pipeline constants:
+//   A. Shard hash (FNV32): SHARD_HASH_ADD, ROL amounts, final SHR/ROL
+//   B. Block decrypt:      BLOCK_PSHUFLW, BLOCK_ROL64, BLOCK_FNV_XOR
+//   C. FNV64 fold:         FNV_ADD, FNV_ROL1, FNV_ROL2
+//   D. Pointer fixup:      PTR_XOR chain (bswap-bracketed imm64s)
+//
+// Shard hash fingerprint: ≥3 IMUL(0x01000193) without REX.W in one function.
+// Block decrypt: PSHUFLW + nearby PSLLQ/PSRLQ pair (ROL64).
+// FNV fold: MOV r64, 0x100000001B3 (FNV prime).
+// ─────────────────────────────────────────────────────────────────────────────
+struct FNamePipelineDiscovery {
+    uint32_t ShardHashAdd       = 0;
+    int      ShardHashRols[4]   = {};
+    int      ShardHashRolCount  = 0;
+    int      ShardHashFinalShift = 0;
+    uint64_t ShardSeedOff       = 0;
+    uint64_t ShardBlockBaseOff  = 0;
+
+    uint8_t  BlockPshuflw       = 0;
+    int      BlockRol64         = 0;
+    uint64_t BlockFnvXor        = 0;
+
+    uint64_t FnvAdd             = 0;
+    int      FnvRol1            = 0;
+    int      FnvRol2            = 0;
+
+    int      SlotSelectMul       = 0;
+    int      SlotSelectAdd       = 0;
+    bool     SlotSelectValid     = false;
+
+    uint64_t PtrXor[3]          = {};
+    int      PtrXorCount        = 0;
+
+    bool     ShardHashValid     = false;
+    bool     BlockDecryptValid  = false;
+    bool     FnvFoldValid       = false;
+    bool     Valid              = false;
+};
+
+struct SlotHashDiscovery {
+    uint32_t SlotHashAdd = 0;
+    struct Op {
+        int Amount = 0;
+        bool IsShr = false;
+    };
+    Op Ops[8] = {};
+    int OpCount = 0;
+    bool Valid = false;
+};
+
+inline FNamePipelineDiscovery DiscoverFNamePipeline(
+    const SigScanV2::Scanner& Scanner, uint64_t FNameFuncRva)
+{
+    FNamePipelineDiscovery Out;
+    if (!FNameFuncRva) return Out;
+
+    struct FuncBody {
+        uint64_t StartRva;
+        std::vector<DecodedInsn> Insns;
+    };
+    std::vector<FuncBody> Bodies;
+    std::unordered_set<uint64_t> Visited;
+
+    auto IsLoadBearing = [&](uint64_t FnRva) -> bool {
+        if (!Scanner.IsTextRVA(FnRva)) return false;
+        const uint8_t* P = Scanner.GetLocalPtr(FnRva);
+        if (!P) return false;
+        for (int I = 0; I < 0x40; ++I)
+            if (P[I] == 0xCC) return false;
+        return true;
+    };
+
+    std::function<void(uint64_t, int)> Walk = [&](uint64_t Rva, int Depth) {
+        if (Depth >= 4 || !Visited.insert(Rva).second) return;
+        auto Insns = FuncAnalyze::DecodeFunctionAt(Scanner, Rva, 0x2000);
+        if (Insns.empty()) return;
+        for (size_t I = 0; I < Insns.size(); ++I) {
+            if (Insns[I].type == INSN_INT3) { Insns.resize(I); break; }
+        }
+
+        for (const auto& Ins : Insns) {
+            if (Ins.type != INSN_CALL_RIP || !Ins.hasImm32 || Ins.hasRipRel) continue;
+            uint64_t Target = Ins.rva + Ins.length + (int64_t)(int32_t)Ins.imm32;
+            if (!Scanner.IsTextRVA(Target) || Visited.count(Target)) continue;
+            if (!IsLoadBearing(Target)) continue;
+            Walk(Target, Depth + 1);
+        }
+
+        Bodies.push_back({Rva, std::move(Insns)});
+    };
+    Walk(FNameFuncRva, 0);
+
+    std::printf("[pipeline-disc] walked %zu functions in FName call tree\n", Bodies.size());
+
+    // ── Chain tracing from entry point ────────────────────────────────────
+    // Theia duplicates pipeline functions with different constants. Trace the
+    // actual call chain from the known entry to find the right pipeline copy.
+    int CoreIdx = -1, MiddleIdx = -1, OuterIdx = -1;
+    std::unordered_map<uint64_t, int> RvaToIdx;
+    for (int I = 0; I < (int)Bodies.size(); ++I) RvaToIdx[Bodies[I].StartRva] = I;
+    for (int BI = 0; BI < (int)Bodies.size(); ++BI)
+        if (Bodies[BI].StartRva == FNameFuncRva) { OuterIdx = BI; break; }
+    auto PipelineScore = [&](int BI) -> int {
+        int S = 0;
+        for (const auto& Ins : Bodies[BI].Insns) {
+            if (Ins.type == INSN_IMUL && Ins.hasImm32 && Ins.imm32 == 0x01000193u && !Ins.hasREX_W) S += 3;
+            if (Ins.type == INSN_PSHUFLW) S += 2;
+            if (Ins.type == INSN_MOV_REG && Ins.imm64 == 0x100000001B3ULL && Ins.length == 10) S += 5;
+            if (Ins.type == INSN_PSLLQ || Ins.type == INSN_PSRLQ) S += 1;
+        }
+        return S;
+    };
+    auto FindCalleeIdxs = [&](int BI) -> std::vector<int> {
+        std::vector<int> Result; std::unordered_set<uint64_t> Seen;
+        for (const auto& Ins : Bodies[BI].Insns) {
+            if (Ins.type != INSN_CALL_RIP || !Ins.hasImm32 || Ins.hasRipRel) continue;
+            uint64_t Target = Ins.rva + Ins.length + (int64_t)(int32_t)Ins.imm32;
+            if (!Seen.insert(Target).second) continue;
+            auto It = RvaToIdx.find(Target);
+            if (It != RvaToIdx.end()) Result.push_back(It->second);
+        }
+        return Result;
+    };
+    if (OuterIdx >= 0) {
+        auto L1 = FindCalleeIdxs(OuterIdx);
+        int L1Best = -1, L1Score = 0;
+        for (int C : L1) { int S = PipelineScore(C); if (S > L1Score) { L1Score = S; L1Best = C; } }
+        if (L1Best >= 0 && L1Score >= 5) {
+            auto L2 = FindCalleeIdxs(L1Best);
+            int L2Best = -1, L2Score = 0;
+            for (int C : L2) { int S = PipelineScore(C); if (S > L2Score) { L2Score = S; L2Best = C; } }
+            if (L2Best >= 0 && L2Score >= 10) { MiddleIdx = L1Best; CoreIdx = L2Best; }
+            else CoreIdx = L1Best;
+        }
+        std::printf("[pipeline-disc] chain: core=0x%llX middle=0x%llX outer=0x%llX\n",
+            CoreIdx >= 0 ? (unsigned long long)Bodies[CoreIdx].StartRva : 0ULL,
+            MiddleIdx >= 0 ? (unsigned long long)Bodies[MiddleIdx].StartRva : 0ULL,
+            (unsigned long long)Bodies[OuterIdx].StartRva);
+    }
+
+    // ── A: Shard hash extraction ──────────────────────────────────────────
+    // If chain tracing found the core, check it first. Fallback: scan all.
+    std::vector<int> ASearchOrder;
+    if (CoreIdx >= 0) ASearchOrder.push_back(CoreIdx);
+    for (int I = 0; I < (int)Bodies.size(); ++I) if (I != CoreIdx) ASearchOrder.push_back(I);
+    for (int BI : ASearchOrder) {
+        auto& Body = Bodies[BI];
+        std::vector<int> ImulPos;
+        for (int I = 0; I < (int)Body.Insns.size(); ++I) {
+            const auto& Ins = Body.Insns[I];
+            if (Ins.type == INSN_IMUL && Ins.hasImm32 &&
+                Ins.imm32 == 0x01000193u && !Ins.hasREX_W)
+                ImulPos.push_back(I);
+        }
+        if (ImulPos.size() < 3) continue;
+
+        bool HasPshuflw = false, HasFnvPrime = false;
+        for (const auto& Ins : Body.Insns) {
+            if (Ins.type == INSN_PSHUFLW) HasPshuflw = true;
+            if (Ins.type == INSN_MOV_REG && Ins.imm64 == 0x100000001B3ULL && Ins.length == 10)
+                HasFnvPrime = true;
+        }
+        if (!HasPshuflw || !HasFnvPrime) continue;
+
+        std::unordered_map<uint32_t, int> AddCounts;
+        for (int Pos : ImulPos) {
+            for (int J = Pos + 1; J < std::min((int)Body.Insns.size(), Pos + 6); ++J) {
+                if (Body.Insns[J].type == INSN_ADD_IMM && Body.Insns[J].hasImm32 &&
+                    Body.Insns[J].imm32 > 0x10000u) {
+                    AddCounts[Body.Insns[J].imm32]++;
+                    break;
+                }
+                if (Body.Insns[J].type == INSN_LEA && !Body.Insns[J].hasRipRel &&
+                    Body.Insns[J].hasImm32 && Body.Insns[J].imm32 > 0x10000u) {
+                    AddCounts[Body.Insns[J].imm32]++;
+                    break;
+                }
+            }
+        }
+        uint32_t BestAdd = 0; int BestAddCnt = 0;
+        for (auto& [V, C] : AddCounts) {
+            if (C > BestAddCnt) { BestAdd = V; BestAddCnt = C; }
+        }
+        if (!BestAdd) continue;
+
+        Out.ShardHashAdd = BestAdd;
+
+        for (int Pos : ImulPos) {
+            for (int J = Pos - 1; J >= std::max(0, Pos - 8); --J) {
+                if (Body.Insns[J].type == INSN_ROL && Body.Insns[J].hasImm8 &&
+                    !Body.Insns[J].hasREX_W) {
+                    if (Out.ShardHashRolCount < 4)
+                        Out.ShardHashRols[Out.ShardHashRolCount++] = Body.Insns[J].imm8;
+                    break;
+                }
+                if (Body.Insns[J].type == INSN_SHR && Body.Insns[J].hasImm8 &&
+                    !Body.Insns[J].hasREX_W) {
+                    Out.ShardHashFinalShift = Body.Insns[J].imm8;
+                    break;
+                }
+            }
+        }
+
+        Out.ShardHashValid = true;
+        CoreIdx = BI;
+        std::printf("[pipeline-disc] SHARD_HASH_ADD = 0x%08X (%d votes from %zu IMUL sites)\n",
+            BestAdd, BestAddCnt, ImulPos.size());
+        std::printf("[pipeline-disc] shard ROLs:");
+        for (int I = 0; I < Out.ShardHashRolCount; ++I)
+            std::printf(" %d", Out.ShardHashRols[I]);
+        if (Out.ShardHashFinalShift)
+            std::printf(" | final SHR=%d", Out.ShardHashFinalShift);
+        std::printf("\n");
+
+        std::unordered_map<uint32_t, int> OffCands;
+        int SearchStart = std::max(0, ImulPos[0] - 50);
+        int SearchEnd   = std::min((int)Body.Insns.size(), ImulPos.back() + 30);
+        for (int I2 = SearchStart; I2 < SearchEnd; ++I2) {
+            const auto& Ins = Body.Insns[I2];
+            uint32_t V = 0;
+            if (Ins.type == INSN_ADD_IMM && Ins.hasImm32 &&
+                Ins.imm32 >= 0x40u && Ins.imm32 <= 0x100000u &&
+                Ins.imm32 != BestAdd)
+                V = Ins.imm32;
+            else if (Ins.type == INSN_LEA && !Ins.hasRipRel && Ins.hasImm32 &&
+                     Ins.imm32 >= 0x40u && Ins.imm32 <= 0x100000u)
+                V = Ins.imm32;
+            if (V) OffCands[V]++;
+        }
+        for (auto& [V1, C1] : OffCands) {
+            if (OffCands.count(V1 + 0x10)) {
+                Out.ShardSeedOff     = V1;
+                Out.ShardBlockBaseOff = V1 + 0x10;
+                std::printf("[pipeline-disc] SHARD_SEED_OFF = 0x%llX, BLOCK_BASE_OFF = 0x%llX (pair)\n",
+                    (unsigned long long)Out.ShardSeedOff, (unsigned long long)Out.ShardBlockBaseOff);
+                break;
+            }
+        }
+        if (!Out.ShardSeedOff && OffCands.size() == 1) {
+            auto V = OffCands.begin()->first;
+            if (V >= 0x400 && V <= 0xFFFF0) {
+                Out.ShardSeedOff     = V;
+                Out.ShardBlockBaseOff = V + 0x10;
+                std::printf("[pipeline-disc] SHARD_SEED_OFF = 0x%llX, BLOCK_BASE_OFF = 0x%llX (inferred +0x10)\n",
+                    (unsigned long long)Out.ShardSeedOff, (unsigned long long)Out.ShardBlockBaseOff);
+            }
+        }
+
+        for (int I = 0; I < (int)Body.Insns.size(); ++I) {
+            const auto& Ins = Body.Insns[I];
+            if (Ins.type != INSN_IMUL || !Ins.hasImm32) continue;
+            int32_t SignedImm = static_cast<int32_t>(Ins.imm32);
+            if (SignedImm != -109) continue;
+            Out.SlotSelectMul = -109;
+            for (int J = I + 1; J < std::min((int)Body.Insns.size(), I + 6); ++J) {
+                if (Body.Insns[J].type == INSN_ADD_IMM && Body.Insns[J].hasImm32) {
+                    Out.SlotSelectAdd = static_cast<int32_t>(Body.Insns[J].imm32);
+                    break;
+                }
+                if (Body.Insns[J].type == INSN_LEA && !Body.Insns[J].hasRipRel && Body.Insns[J].hasImm32) {
+                    Out.SlotSelectAdd = static_cast<int32_t>(Body.Insns[J].imm32);
+                    break;
+                }
+                if (Body.Insns[J].type == INSN_SUB_IMM && Body.Insns[J].hasImm32) {
+                    Out.SlotSelectAdd = -static_cast<int32_t>(Body.Insns[J].imm32);
+                    break;
+                }
+            }
+            Out.SlotSelectValid = true;
+            std::printf("[pipeline-disc] SLOT_SELECT: %d*T + %d (imul @ insn %d)\n",
+                Out.SlotSelectMul, Out.SlotSelectAdd, I);
+            break;
+        }
+
+        break;
+    }
+
+    // Resolve middle (fallback if chain tracing didn't find it)
+    if (CoreIdx >= 0 && MiddleIdx < 0) {
+        uint64_t CoreRva = Bodies[CoreIdx].StartRva;
+        for (int BI = 0; BI < (int)Bodies.size(); ++BI) {
+            if (BI == CoreIdx) continue;
+            for (const auto& Ins : Bodies[BI].Insns) {
+                if (Ins.type != INSN_CALL_RIP || !Ins.hasImm32 || Ins.hasRipRel) continue;
+                uint64_t Target = Ins.rva + Ins.length + (int64_t)(int32_t)Ins.imm32;
+                if (Target == CoreRva) { MiddleIdx = BI; break; }
+            }
+            if (MiddleIdx >= 0) break;
+        }
+    }
+
+    // ── B: Block decrypt extraction ───────────────────────────────────────
+    // PSHUFLW + PSLLQ/PSRLQ (ROL64) in the same ±15 insn window.
+    // Also require MOVQ with rip-rel nearby (loads BLOCK_FNV_XOR from .rdata).
+    int BlockBodyIdx = -1;
+    std::vector<int> BSearchOrder;
+    if (CoreIdx >= 0) BSearchOrder.push_back(CoreIdx);
+    for (int I = 0; I < (int)Bodies.size(); ++I) if (I != CoreIdx) BSearchOrder.push_back(I);
+    for (int BI : BSearchOrder) {
+        auto& Body = Bodies[BI];
+        for (int I = 0; I < (int)Body.Insns.size(); ++I) {
+            if (Body.Insns[I].type != INSN_PSHUFLW || !Body.Insns[I].hasImm8) continue;
+            int Window = std::max(0, I - 15);
+            int Rol = FuncAnalyze::FindRol64Pair(Body.Insns, Window, 30);
+            if (!Rol) continue;
+            bool HasMovqRipRel = false;
+            for (int J = std::max(0, I - 20); J < std::min((int)Body.Insns.size(), I + 20); ++J)
+                if (Body.Insns[J].type == INSN_MOVQ && Body.Insns[J].hasRipRel) { HasMovqRipRel = true; break; }
+            if (!HasMovqRipRel) continue;
+            Out.BlockPshuflw = Body.Insns[I].imm8;
+            Out.BlockRol64 = Rol;
+            Out.BlockDecryptValid = true;
+            BlockBodyIdx = BI;
+            std::printf("[pipeline-disc] BLOCK_PSHUFLW = 0x%02X, BLOCK_ROL64 = %d (fn 0x%llX)\n",
+                Out.BlockPshuflw, Out.BlockRol64, (unsigned long long)Body.StartRva);
+            break;
+        }
+        if (Out.BlockDecryptValid) break;
+    }
+
+    // ── C: FNV64 fold extraction ──────────────────────────────────────────
+    // MOV r64, 0x100000001B3 anchors the FNV section. The real FNV function
+    // also has ≥2 REX.W ROL instructions nearby; skip bodies that don't
+    // (utility functions may coincidentally reference the prime).
+    // FNV_ADD is the non-prime MOV r64, imm64 in the same window.
+    // BLOCK_FNV_XOR is loaded from .rdata via PXOR (handled below in fallback).
+    std::vector<int> CSearchOrder;
+    if (CoreIdx >= 0) CSearchOrder.push_back(CoreIdx);
+    for (int I = 0; I < (int)Bodies.size(); ++I) if (I != CoreIdx) CSearchOrder.push_back(I);
+    for (int CBI : CSearchOrder) {
+        auto& Body = Bodies[CBI];
+        int PrimeIdx = -1;
+        for (int I = 0; I < (int)Body.Insns.size(); ++I) {
+            if (Body.Insns[I].type == INSN_MOV_REG &&
+                Body.Insns[I].imm64 == 0x100000001B3ULL && Body.Insns[I].length == 10)
+            { PrimeIdx = I; break; }
+        }
+        if (PrimeIdx < 0) continue;
+
+        std::vector<int> FnvRols;
+        for (int J = std::max(0, PrimeIdx - 10);
+             J < std::min((int)Body.Insns.size(), PrimeIdx + 35); ++J)
+        {
+            if (Body.Insns[J].type == INSN_ROL && Body.Insns[J].hasImm8 &&
+                Body.Insns[J].hasREX_W)
+                FnvRols.push_back(Body.Insns[J].imm8);
+        }
+        if (FnvRols.size() < 2) continue;
+
+        Out.FnvRol1 = FnvRols[0];
+        Out.FnvRol2 = FnvRols[1];
+
+        for (int J = std::max(0, PrimeIdx - 25);
+             J < std::min((int)Body.Insns.size(), PrimeIdx + 25); ++J)
+        {
+            if (J == PrimeIdx) continue;
+            if (Body.Insns[J].type != INSN_MOV_REG || Body.Insns[J].length != 10) continue;
+            uint64_t V = Body.Insns[J].imm64;
+            if (!V || V == 0x100000001B3ULL) continue;
+            Out.FnvAdd = V;
+            break;
+        }
+
+        Out.FnvFoldValid = (Out.FnvAdd != 0 && Out.FnvRol1 != 0);
+        if (Out.FnvFoldValid) {
+            std::printf("[pipeline-disc] FNV_ADD = 0x%016llX, FNV_ROL1 = %d, FNV_ROL2 = %d\n",
+                (unsigned long long)Out.FnvAdd, Out.FnvRol1, Out.FnvRol2);
+        }
+        break;
+    }
+
+    // If BLOCK_FNV_XOR not found via imm64, try .rdata references in the
+    // block decode function: direct PXOR [rip+disp] or MOVQ [rip+disp] → PXOR.
+    int BfxBodyIdx = CoreIdx >= 0 ? CoreIdx : BlockBodyIdx;
+    if (!Out.BlockFnvXor && BfxBodyIdx >= 0) {
+        auto& Body = Bodies[BfxBodyIdx];
+        {
+            for (int I = 0; I < (int)Body.Insns.size(); ++I) {
+                const auto& Ins = Body.Insns[I];
+                bool IsCandidate = false;
+                if ((Ins.type == INSN_PXOR || Ins.type == INSN_XORPS) && Ins.hasRipRel)
+                    IsCandidate = true;
+                if (Ins.type == INSN_MOVQ && Ins.hasRipRel) {
+                    for (int J = I + 1; J < std::min((int)Body.Insns.size(), I + 4); ++J) {
+                        if (Body.Insns[J].type == INSN_PXOR) { IsCandidate = true; break; }
+                    }
+                }
+                if (!IsCandidate) continue;
+                uint64_t Rva = Ins.ResolveRipRVA();
+                if (!Scanner.IsRDataRVA(Rva)) continue;
+                const uint8_t* P = Scanner.GetLocalPtr(Rva);
+                if (!P) continue;
+                uint64_t Lo = 0;
+                std::memcpy(&Lo, P, 8);
+                if (Lo > 0x100000ULL) {
+                    Out.BlockFnvXor = Lo;
+                    std::printf("[pipeline-disc] BLOCK_FNV_XOR = 0x%016llX (from .rdata 0x%llX)\n",
+                        (unsigned long long)Lo, (unsigned long long)Rva);
+                    break;
+                }
+            }
+        }
+    }
+
+    // ── D: Pointer XOR chain ─────────────────────────────────────────────
+    // Three XOR stages in the direct chain (core → middle → outer):
+    //   PTR_XOR1 (32-bit): XOR RAX, imm32 before BSWAP in core
+    //   PTR_XOR2 (64-bit): MOV r64, imm64 + XOR in middle
+    //   PTR_XOR3 (64-bit): MOV r64, imm64 + XOR in outer
+    // Search only the three chain functions, not all 160+ walked bodies.
+
+    int ChainIdxs[3] = { CoreIdx, MiddleIdx, OuterIdx };
+    for (int CI = 0; CI < 3; ++CI) {
+        if (ChainIdxs[CI] < 0) continue;
+        auto& Body = Bodies[ChainIdxs[CI]];
+        for (int I = 0; I < (int)Body.Insns.size(); ++I) {
+            if (Body.Insns[I].type != INSN_BSWAP || !Body.Insns[I].hasREX_W) continue;
+            for (int J = std::max(0, I - 6); J < I; ++J) {
+                if (Body.Insns[J].type == INSN_XOR_EAX && Body.Insns[J].hasImm32 &&
+                    Body.Insns[J].hasREX_W && Body.Insns[J].imm32 > 0x1000u) {
+                    if (!Out.PtrXor[0]) {
+                        Out.PtrXor[0] = Body.Insns[J].imm32;
+                        Out.PtrXorCount = std::max(Out.PtrXorCount, 1);
+                        std::printf("[pipeline-disc] PTR_XOR1 = 0x%08X (xor+bswap @ fn 0x%llX)\n",
+                            Body.Insns[J].imm32, (unsigned long long)Body.StartRva);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    int PtrXor64Idxs[2] = { MiddleIdx, OuterIdx };
+    for (int CI = 0; CI < 2; ++CI) {
+        if (PtrXor64Idxs[CI] < 0) continue;
+        auto& Body = Bodies[PtrXor64Idxs[CI]];
+        for (int I = 0; I < (int)Body.Insns.size(); ++I) {
+            if (Body.Insns[I].type != INSN_MOV_REG || Body.Insns[I].length != 10) continue;
+            uint64_t V = Body.Insns[I].imm64;
+            if (!V || V == 0x100000001B3ULL || V == Out.FnvAdd || V == Out.BlockFnvXor) continue;
+            if ((V & 0xFFFFFFFFULL) != 0) continue;
+            bool NearXor = false;
+            for (int J = I + 1; J < std::min((int)Body.Insns.size(), I + 6); ++J) {
+                if (Body.Insns[J].type == INSN_XOR_REG || Body.Insns[J].type == INSN_XOR_EAX) {
+                    NearXor = true;
+                    break;
+                }
+            }
+            if (!NearXor) continue;
+            if (Out.PtrXorCount < 3 && V != Out.PtrXor[0]) {
+                Out.PtrXor[Out.PtrXorCount++] = V;
+                std::printf("[pipeline-disc] PTR_XOR%d = 0x%016llX (mov+xor @ fn 0x%llX)\n",
+                    Out.PtrXorCount, (unsigned long long)V, (unsigned long long)Body.StartRva);
+            }
+        }
+    }
+
+    Out.Valid = Out.ShardHashValid || Out.BlockDecryptValid || Out.FnvFoldValid;
+    return Out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 4.5: UObject slot hash constant extraction
+//
+// Backward-walks from Phase 4's PSHUFB+PXOR consensus site to find the
+// enclosing UObject accessor function, then extracts the FNV32 hash constants
+// (SLOT_HASH_ADD, HASH_ROL1..4) used to pick which slot holds Name/Class/Outer.
+//
+// Fingerprint: IMUL(0x01000193) without REX.W + ADD_IMM (hash add) +
+//              AND(3) or (slot_byte & 3) ^ 2 formula.
+// ─────────────────────────────────────────────────────────────────────────────
+inline SlotHashDiscovery DiscoverSlotHashConsts(
+    const SigScanV2::Scanner& Scanner, uint64_t SlotDecryptSiteRva)
+{
+    SlotHashDiscovery Out;
+    if (!SlotDecryptSiteRva) return Out;
+
+    auto Insns = FuncAnalyze::DecodeFunctionAt(Scanner, SlotDecryptSiteRva, 0x4000);
+    if (Insns.empty()) return Out;
+
+    std::printf("[slot-hash-disc] decoding function around PSHUFB site 0x%llX: %zu insns\n",
+        (unsigned long long)SlotDecryptSiteRva, Insns.size());
+
+    std::vector<int> ImulPos;
+    for (int I = 0; I < (int)Insns.size(); ++I) {
+        if (Insns[I].type == INSN_IMUL && Insns[I].hasImm32 &&
+            Insns[I].imm32 == 0x01000193u && !Insns[I].hasREX_W)
+            ImulPos.push_back(I);
+    }
+
+    if (ImulPos.size() < 3) {
+        std::printf("[slot-hash-disc] only %zu IMUL(0x01000193) found — insufficient\n", ImulPos.size());
+        return Out;
+    }
+
+    std::unordered_map<uint32_t, int> AddCounts;
+    for (int Pos : ImulPos) {
+        for (int J = Pos + 1; J < std::min((int)Insns.size(), Pos + 6); ++J) {
+            if (Insns[J].type == INSN_ADD_IMM && Insns[J].hasImm32 &&
+                Insns[J].imm32 > 0x10000u) {
+                AddCounts[Insns[J].imm32]++;
+                break;
+            }
+        }
+    }
+    uint32_t BestAdd = 0; int BestAddCnt = 0;
+    for (auto& [V, C] : AddCounts) {
+        if (C > BestAddCnt) { BestAdd = V; BestAddCnt = C; }
+    }
+    if (!BestAdd) {
+        std::printf("[slot-hash-disc] no ADD_IMM consensus near IMUL sites\n");
+        return Out;
+    }
+
+    Out.SlotHashAdd = BestAdd;
+
+    for (int Pos : ImulPos) {
+        if (Out.OpCount >= 8) break;
+        for (int J = Pos - 1; J >= std::max(0, Pos - 8); --J) {
+            if (Insns[J].type == INSN_ROL && Insns[J].hasImm8 && !Insns[J].hasREX_W) {
+                Out.Ops[Out.OpCount++] = {Insns[J].imm8, false};
+                break;
+            }
+            if (Insns[J].type == INSN_SHR && Insns[J].hasImm8 && !Insns[J].hasREX_W) {
+                Out.Ops[Out.OpCount++] = {Insns[J].imm8, true};
+                break;
+            }
+        }
+    }
+
+    Out.Valid = (Out.OpCount >= 4);
+    std::printf("[slot-hash-disc] SLOT_HASH_ADD = 0x%08X (%d votes from %zu IMUL sites)\n",
+        BestAdd, BestAddCnt, ImulPos.size());
+    std::printf("[slot-hash-disc] ops(%d):", Out.OpCount);
+    for (int I = 0; I < Out.OpCount; ++I)
+        std::printf(" %s(%d)", Out.Ops[I].IsShr ? "SHR" : "ROL", Out.Ops[I].Amount);
+    std::printf("\n");
+    return Out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5.7: FName string decrypt parameter extraction
+//
+// Walks the string decrypt function (a callee of the FName resolver, identified
+// by the presence of header-extraction bitops) to extract:
+//   - HDR_IS_WIDE_BIT: the TEST/AND mask that checks wide-string flag
+//   - HDR_LENGTH_SHIFT: the SHR amount for length extraction
+//   - KEY_INIT_ADD: the ADD/SUB imm32 for keystream seed initialization
+//   - KEY_INDEX_MASK: the AND mask (0x3F or 0x3D) for keystream table index
+//   - KEY_MUL_INNER, KEY_ADD_INNER: LCG step multiplier/addend (if present)
+//   - KEY_MUL_ADVANCE, KEY_ADD_ADVANCE: inter-pair LCG step (if present)
+// ─────────────────────────────────────────────────────────────────────────────
+struct StringDecryptDiscovery {
+    uint16_t HdrIsWideBit     = 0;
+    int      HdrLengthShift   = 0;
+    uint32_t KeyInitAdd       = 0;
+    uint8_t  KeyIndexMask     = 0;
+    uint32_t KeyMulInner      = 0;
+    uint32_t KeyAddInner      = 0;
+    uint32_t KeyMulAdvance    = 0;
+    uint32_t KeyAddAdvance    = 0;
+    uint32_t KeyPairStep      = 0;
+    bool     Valid            = false;
+};
+
+inline StringDecryptDiscovery DiscoverStringDecryptParams(
+    const SigScanV2::Scanner& Scanner, uint64_t FNameFuncRva)
+{
+    StringDecryptDiscovery Out;
+    if (!FNameFuncRva) return Out;
+
+    std::unordered_set<uint64_t> Visited;
+    struct FuncBody {
+        uint64_t StartRva;
+        std::vector<DecodedInsn> Insns;
+    };
+    std::vector<FuncBody> Bodies;
+
+    auto IsLoadBearing = [&](uint64_t FnRva) -> bool {
+        if (!Scanner.IsTextRVA(FnRva)) return false;
+        const uint8_t* P = Scanner.GetLocalPtr(FnRva);
+        if (!P) return false;
+        for (int I = 0; I < 0x40; ++I)
+            if (P[I] == 0xCC) return false;
+        return true;
+    };
+
+    std::function<void(uint64_t, int)> Walk = [&](uint64_t Rva, int Depth) {
+        if (Depth >= 5 || !Visited.insert(Rva).second) return;
+        auto Insns = FuncAnalyze::DecodeFunctionAt(Scanner, Rva, 0x2000);
+        if (Insns.empty()) return;
+
+        for (const auto& Ins : Insns) {
+            if (Ins.type != INSN_CALL_RIP || !Ins.hasImm32 || Ins.hasRipRel) continue;
+            uint64_t Target = Ins.rva + Ins.length + (int64_t)(int32_t)Ins.imm32;
+            if (!Scanner.IsTextRVA(Target) || Visited.count(Target)) continue;
+            if (!IsLoadBearing(Target)) continue;
+            Walk(Target, Depth + 1);
+        }
+        Bodies.push_back({Rva, std::move(Insns)});
+    };
+    Walk(FNameFuncRva, 0);
+
+    for (auto& Body : Bodies) {
+        int ShrCount = 0;
+        int AndSmallCount = 0;
+        bool HasImul32 = false;
+        for (const auto& Ins : Body.Insns) {
+            if (Ins.type == INSN_SHR && Ins.hasImm8 && !Ins.hasREX_W &&
+                Ins.imm8 >= 2 && Ins.imm8 <= 15) ShrCount++;
+            if (Ins.type == INSN_AND_IMM && Ins.hasImm32 &&
+                (Ins.imm32 == 0x3Fu || Ins.imm32 == 0x3Du)) AndSmallCount++;
+            if (Ins.type == INSN_IMUL && Ins.hasImm32 && Ins.imm32 > 0x1000u &&
+                Ins.imm32 != 0x01000193u) HasImul32 = true;
+        }
+        if (ShrCount < 1 || AndSmallCount < 1) continue;
+
+        for (int I = 0; I < (int)Body.Insns.size(); ++I) {
+            const auto& Ins = Body.Insns[I];
+
+            if (Ins.type == INSN_SHR && Ins.hasImm8 && !Ins.hasREX_W &&
+                Ins.imm8 >= 2 && Ins.imm8 <= 15 && !Out.HdrLengthShift) {
+                Out.HdrLengthShift = Ins.imm8;
+            }
+
+            if (Ins.type == INSN_AND_IMM && Ins.hasImm32) {
+                uint32_t V = Ins.imm32;
+                if (V == 0x3Fu || V == 0x3Du)
+                    Out.KeyIndexMask = static_cast<uint8_t>(V);
+                if (V == 0x8000u || V == 0x20u || V == 0x100u || V == 0x40u)
+                    Out.HdrIsWideBit = static_cast<uint16_t>(V);
+            }
+
+            if (Ins.type == INSN_ADD_IMM && Ins.hasImm32 && !Ins.hasREX_W) {
+                uint32_t V = Ins.imm32;
+                if (V > 0x1000u && V < 0x10000u && !Out.KeyInitAdd)
+                    Out.KeyInitAdd = V;
+                if (V > 0x100u && V < 0x1000u && !Out.KeyPairStep)
+                    Out.KeyPairStep = V;
+            }
+        }
+
+        if (HasImul32) {
+            std::vector<uint32_t> ImulImms;
+            std::vector<uint32_t> FollowingAdds;
+            for (int I = 0; I < (int)Body.Insns.size(); ++I) {
+                const auto& Ins = Body.Insns[I];
+                if (Ins.type == INSN_IMUL && Ins.hasImm32 && Ins.imm32 != 0x01000193u) {
+                    ImulImms.push_back(Ins.imm32);
+                    for (int J = I + 1; J < std::min((int)Body.Insns.size(), I + 4); ++J) {
+                        if (Body.Insns[J].type == INSN_ADD_IMM && Body.Insns[J].hasImm32) {
+                            FollowingAdds.push_back(Body.Insns[J].imm32);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (ImulImms.size() >= 2) {
+                Out.KeyMulInner   = ImulImms[0];
+                Out.KeyMulAdvance = ImulImms[1];
+            } else if (ImulImms.size() == 1) {
+                Out.KeyMulInner = ImulImms[0];
+            }
+            if (FollowingAdds.size() >= 2) {
+                Out.KeyAddInner   = FollowingAdds[0];
+                Out.KeyAddAdvance = FollowingAdds[1];
+            } else if (FollowingAdds.size() == 1) {
+                Out.KeyAddInner = FollowingAdds[0];
+            }
+        }
+
+        Out.Valid = (Out.KeyIndexMask != 0 && Out.HdrLengthShift != 0);
+        if (Out.Valid) {
+            std::printf("[str-decrypt-disc] HDR_SHIFT=%d, WIDE_BIT=0x%X, KEY_MASK=0x%02X\n",
+                Out.HdrLengthShift, Out.HdrIsWideBit, Out.KeyIndexMask);
+            if (Out.KeyInitAdd)
+                std::printf("[str-decrypt-disc] KEY_INIT_ADD=0x%X, KEY_PAIR_STEP=0x%X\n",
+                    Out.KeyInitAdd, Out.KeyPairStep);
+            if (Out.KeyMulInner)
+                std::printf("[str-decrypt-disc] KEY_MUL_INNER=0x%X, KEY_ADD_INNER=0x%X, "
+                    "KEY_MUL_ADVANCE=0x%X, KEY_ADD_ADVANCE=0x%X\n",
+                    Out.KeyMulInner, Out.KeyAddInner, Out.KeyMulAdvance, Out.KeyAddAdvance);
+            break;
+        }
+    }
+
+    return Out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4274,6 +4968,9 @@ inline FNameKeystreamDiscovery   g_DiscoveredFNameKey;
 inline FFieldClassNameParams     g_DiscoveredFFieldClassName;
 inline std::vector<FFieldClassGlobal> g_DiscoveredFClassGlobals;
 inline GUObjectArrayLayout       g_DiscoveredGObjLayout;
+inline FNamePipelineDiscovery    g_DiscoveredFNamePipeline;
+inline SlotHashDiscovery         g_DiscoveredSlotHash;
+inline StringDecryptDiscovery    g_DiscoveredStringDecrypt;
 
 // Seed g_DiscoveredFClassGlobals with hardcoded CL-1201801 FFieldClass RVAs so
 // AutoOffsets::DiscoverAll (Probe 10) has a populated fclass_to_type map even

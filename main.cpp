@@ -1447,6 +1447,37 @@ public:
                     }
                 }
             }
+
+            // ── Phase 5.5: Structured FName pipeline extraction ──────────
+            if (!AutoDiscovery::g_DiscoveredFNamePipeline.Valid) {
+                std::printf("\n=== Phase 5.5: FName pipeline structured extraction ===\n");
+                AutoDiscovery::g_DiscoveredFNamePipeline =
+                    AutoDiscovery::DiscoverFNamePipeline(m_sigScanner, fname_rva);
+                const auto& Pipe = AutoDiscovery::g_DiscoveredFNamePipeline;
+                if (Pipe.Valid) {
+                    std::printf("[Phase 5.5] FName pipeline discovery: shard=%d block=%d fnv=%d ptrXor=%d seedOff=0x%llX\n",
+                        Pipe.ShardHashValid, Pipe.BlockDecryptValid, Pipe.FnvFoldValid,
+                        Pipe.PtrXorCount, (unsigned long long)Pipe.ShardSeedOff);
+                }
+            }
+
+            // ── Phase 4.5: Slot hash constant extraction ─────────────────
+            if (!AutoDiscovery::g_DiscoveredSlotHash.Valid &&
+                AutoDiscovery::g_DiscoveredUObjSlot.Valid &&
+                AutoDiscovery::g_DiscoveredUObjSlot.FirstSiteRva)
+            {
+                std::printf("\n=== Phase 4.5: UObject slot hash extraction ===\n");
+                AutoDiscovery::g_DiscoveredSlotHash =
+                    AutoDiscovery::DiscoverSlotHashConsts(
+                        m_sigScanner, AutoDiscovery::g_DiscoveredUObjSlot.FirstSiteRva);
+            }
+
+            // ── Phase 5.7: String decrypt parameter extraction ───────────
+            if (!AutoDiscovery::g_DiscoveredStringDecrypt.Valid) {
+                std::printf("\n=== Phase 5.7: String decrypt parameter extraction ===\n");
+                AutoDiscovery::g_DiscoveredStringDecrypt =
+                    AutoDiscovery::DiscoverStringDecryptParams(m_sigScanner, fname_rva);
+            }
         }
 
     }

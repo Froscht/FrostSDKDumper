@@ -48,6 +48,18 @@ namespace FName {
 static inline uint32_t fn_rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
 static inline uint64_t fn_rotl64(uint64_t x, int n) { return (x << n) | (x >> (64 - n)); }
 
+static inline uint64_t SoftPshuflw(uint64_t Val, int Imm8) {
+    uint16_t W[4];
+    std::memcpy(W, &Val, 8);
+    uint16_t R[4] = {
+        W[(Imm8 >> 0) & 3], W[(Imm8 >> 2) & 3],
+        W[(Imm8 >> 4) & 3], W[(Imm8 >> 6) & 3]
+    };
+    uint64_t Out;
+    std::memcpy(&Out, R, 8);
+    return Out;
+}
+
 static inline uint64_t u64_lo_xmm(__m128i v) {
     uint64_t arr[2];
     _mm_storeu_si128(reinterpret_cast<__m128i*>(arr), v);
@@ -340,55 +352,70 @@ public:
     //   OUTER = (slot_byte + 1) & 3
     //   CLASS =  slot_byte & 3
     static uint8_t Build20260519_ObjSlotMixByte(uint64_t obj_ptr) {
+        constexpr uint32_t P = 0x01000193u;
+        uint64_t Addr = obj_ptr + 0x10;
+        uint32_t Lo = static_cast<uint32_t>(Addr);
+        uint32_t Hi = static_cast<uint32_t>(Addr >> 32);
+
+        const auto& Sh = AutoDiscovery::g_DiscoveredSlotHash;
+        if (Sh.Valid && Sh.OpCount >= 4) {
+            auto Apply = [](uint32_t V, const AutoDiscovery::SlotHashDiscovery::Op& O) -> uint32_t {
+                return O.IsShr ? (V >> O.Amount) : fn_rotl32(V, O.Amount);
+            };
+            uint32_t H = Apply(Lo, Sh.Ops[0]);
+            H = P * H + Sh.SlotHashAdd;
+            H = Apply(H, Sh.Ops[1]);
+            H = P * H + Hi + Sh.SlotHashAdd;
+            H = Apply(H, Sh.Ops[2]);
+            H = P * H + Sh.SlotHashAdd;
+            H = Apply(H, Sh.Ops[3]);
+            uint32_t V12 = P * H + Sh.SlotHashAdd;
+            return static_cast<uint8_t>(V12) ^ static_cast<uint8_t>(V12 >> 16);
+        }
+
         const bool Is709 = AutoDiscovery::g_UseV709SlotHash;
         const bool Is707 = !Is709 && AutoDiscovery::g_UseV707SlotHash;
         const bool Is616 = !Is709 && !Is707 && AutoDiscovery::g_DiscoveredUObjSlot.Valid;
-        const uint32_t P   = 0x01000193u;
         const uint32_t ADD = Is709 ? ArcDecrypt::v20260709::SLOT_HASH_ADD
                            : Is707 ? ArcDecrypt::v20260707::SLOT_HASH_ADD
                            : Is616 ? ArcDecrypt::v20260616::SLOT_HASH_ADD
                                    : ArcDecrypt::v20260519::SLOT_HASH_ADD;
-        uint64_t p = obj_ptr + 0x10;
-        uint32_t lo32 = static_cast<uint32_t>(p);
-        uint32_t hi32 = static_cast<uint32_t>(p >> 32);
-
-        uint32_t h;
+        uint32_t H;
         if (Is709) {
-            h = fn_rotl32(lo32, ArcDecrypt::v20260709::SLOT_HASH_ROL1);
-            h = P * h + ADD;
-            h = fn_rotl32(h, ArcDecrypt::v20260709::SLOT_HASH_ROL2);
-            h = P * h + hi32 + ADD;
-            h = fn_rotl32(h, ArcDecrypt::v20260709::SLOT_HASH_ROL3);
-            h = P * h + ADD;
-            h = fn_rotl32(h, ArcDecrypt::v20260709::SLOT_HASH_ROL4);
+            H = fn_rotl32(Lo, ArcDecrypt::v20260709::SLOT_HASH_ROL1);
+            H = P * H + ADD;
+            H = fn_rotl32(H, ArcDecrypt::v20260709::SLOT_HASH_ROL2);
+            H = P * H + Hi + ADD;
+            H = fn_rotl32(H, ArcDecrypt::v20260709::SLOT_HASH_ROL3);
+            H = P * H + ADD;
+            H = fn_rotl32(H, ArcDecrypt::v20260709::SLOT_HASH_ROL4);
         } else if (Is707) {
-            h = fn_rotl32(lo32, ArcDecrypt::v20260707::HASH_ROL1);
-            h = P * h + ADD;
-            h = fn_rotl32(h, ArcDecrypt::v20260707::HASH_ROL2);
-            h = P * h + hi32 + ADD;
-            h = fn_rotl32(h, ArcDecrypt::v20260707::HASH_ROL3);
-            h = P * h + ADD;
-            h = fn_rotl32(h, ArcDecrypt::v20260707::HASH_ROL4);
+            H = fn_rotl32(Lo, ArcDecrypt::v20260707::HASH_ROL1);
+            H = P * H + ADD;
+            H = fn_rotl32(H, ArcDecrypt::v20260707::HASH_ROL2);
+            H = P * H + Hi + ADD;
+            H = fn_rotl32(H, ArcDecrypt::v20260707::HASH_ROL3);
+            H = P * H + ADD;
+            H = fn_rotl32(H, ArcDecrypt::v20260707::HASH_ROL4);
         } else if (Is616) {
-            h = fn_rotl32(lo32, 26);
-            h = P * h + ADD;
-            h = fn_rotl32(h, 27);
-            h = P * h + hi32 + ADD;
-            h >>= 6;
-            h = P * h + ADD;
-            h >>= 5;
+            H = fn_rotl32(Lo, 26);
+            H = P * H + ADD;
+            H = fn_rotl32(H, 27);
+            H = P * H + Hi + ADD;
+            H >>= 6;
+            H = P * H + ADD;
+            H >>= 5;
         } else {
-            h = fn_rotl32(lo32, 17);
-            h = P * h + ADD;
-            h = fn_rotl32(h, 19);
-            h = P * h + hi32 + ADD;
-            h = fn_rotl32(h, 17);
-            h = P * h + ADD;
-            h >>= 13;
+            H = fn_rotl32(Lo, 17);
+            H = P * H + ADD;
+            H = fn_rotl32(H, 19);
+            H = P * H + Hi + ADD;
+            H = fn_rotl32(H, 17);
+            H = P * H + ADD;
+            H >>= 13;
         }
-        uint32_t v12 = P * h + ADD;
-
-        return static_cast<uint8_t>(v12) ^ static_cast<uint8_t>(v12 >> 16);
+        uint32_t V12 = P * H + ADD;
+        return static_cast<uint8_t>(V12) ^ static_cast<uint8_t>(V12 >> 16);
     }
     static uint32_t Build20260519_ObjNameSlot(uint64_t obj_ptr) {
         return ((uint32_t)Build20260519_ObjSlotMixByte(obj_ptr) & 3u) ^ 2u;
@@ -1342,6 +1369,9 @@ public:
         namespace V707 = ArcDecrypt::v20260707;
         if (CompIndex <= 0 || !m_ks707Loaded || !m_seedLoaded) return 0;
 
+        const auto& Pipe = AutoDiscovery::g_DiscoveredFNamePipeline;
+        const bool UsePipe = Pipe.ShardHashValid;
+
         __m128i Seed = ComputeNameSeed(CompIndex);
         uint64_t SeedLo;
         _mm_storel_epi64(reinterpret_cast<__m128i*>(&SeedLo), Seed);
@@ -1358,44 +1388,72 @@ public:
         uint64_t ChunkAddr = m_base + GnpRva707 +
                              (static_cast<uint64_t>(V5 >> 8) & 0xFFFF00ULL);
 
-        uint64_t HashAddr = ChunkAddr + V707::SHARD_HASH_SEED_OFF;
+        const uint64_t SeedOff  = (UsePipe && Pipe.ShardSeedOff)  ? Pipe.ShardSeedOff  : V707::SHARD_HASH_SEED_OFF;
+        const uint64_t BlockOff = (UsePipe && Pipe.ShardBlockBaseOff) ? Pipe.ShardBlockBaseOff : V707::SHARD_BLOCK_BASE_OFF;
+        const uint32_t ShardAdd = UsePipe ? Pipe.ShardHashAdd : V707::SHARD_HASH_ADD;
+        constexpr uint32_t HP   = V707::HASH_PRIME;
+
+        uint64_t HashAddr = ChunkAddr + SeedOff;
         uint32_t HLo = static_cast<uint32_t>(HashAddr);
         uint32_t HHi = static_cast<uint32_t>(HashAddr >> 32);
 
-        uint32_t H = fn_rotl32(HLo, V707::SHARD_HASH_ROL_A);
-        H = V707::HASH_PRIME * H + V707::SHARD_HASH_ADD;
-        H = fn_rotl32(H, V707::SHARD_HASH_ROL_B);
-        H = V707::HASH_PRIME * H + HHi + V707::SHARD_HASH_ADD;
-        H = fn_rotl32(H, V707::SHARD_HASH_ROL_C);
-        H = V707::HASH_PRIME * H + V707::SHARD_HASH_ADD;
-        uint32_t V9H = V707::HASH_PRIME * (H >> V707::SHARD_HASH_SHIFT) + V707::SHARD_HASH_ADD;
-        uint32_t Mix = V9H ^ (V9H >> 16);
+        uint32_t H;
+        if (UsePipe && Pipe.ShardHashRolCount >= 3) {
+            H = fn_rotl32(HLo, Pipe.ShardHashRols[0]);
+            H = HP * H + ShardAdd;
+            H = fn_rotl32(H, Pipe.ShardHashRols[1]);
+            H = HP * H + HHi + ShardAdd;
+            H = fn_rotl32(H, Pipe.ShardHashRols[2]);
+            H = HP * H + ShardAdd;
+        } else {
+            H = fn_rotl32(HLo, V707::SHARD_HASH_ROL_A);
+            H = HP * H + ShardAdd;
+            H = fn_rotl32(H, V707::SHARD_HASH_ROL_B);
+            H = HP * H + HHi + ShardAdd;
+            H = fn_rotl32(H, V707::SHARD_HASH_ROL_C);
+            H = HP * H + ShardAdd;
+        }
 
-        uint32_t Bidx1 = Mix & 7u;
-        uint32_t Bidx2 = (Mix + 1u) & 7u;
+        uint32_t T;
+        if (UsePipe && Pipe.ShardHashFinalShift > 0)
+            T = H >> Pipe.ShardHashFinalShift;
+        else if (UsePipe && Pipe.ShardHashRolCount >= 4)
+            T = fn_rotl32(H, Pipe.ShardHashRols[3]);
+        else
+            T = H >> V707::SHARD_HASH_SHIFT;
 
-        uint64_t BlockBase = ChunkAddr + V707::SHARD_BLOCK_BASE_OFF;
+        int SlotAdd = (UsePipe && Pipe.SlotSelectValid)
+                    ? Pipe.SlotSelectAdd : V707::SHARD_SLOT_SELECT_ADD;
+        uint8_t Pa = static_cast<uint8_t>(-109 * static_cast<int>(T) + SlotAdd);
+        uint8_t Pb = static_cast<uint8_t>((HP * T + ShardAdd) >> 16);
+        uint32_t Bidx1 = (Pa ^ Pb) & 7u;
+        uint32_t Bidx2 = (Bidx1 + 1u) & 7u;
+
+        uint64_t BlockBase = ChunkAddr + BlockOff;
         uint64_t Raw1 = 0, Raw2 = 0;
         if (!m_reader.Read(BlockBase + 32ULL * Bidx1, &Raw1, 8)) return 0;
         if (!m_reader.Read(BlockBase + 32ULL * Bidx2, &Raw2, 8)) return 0;
         if (!Raw1 && !Raw2) return 0;
 
-        auto DecBlock = [](uint64_t Raw) -> uint64_t {
-            uint64_t Rotated = fn_rotl64(Raw, V707::BLOCK_ROL64);
-            __m128i V = _mm_set_epi64x(0, static_cast<int64_t>(Rotated));
-            V = _mm_shufflelo_epi16(V, V707::BLOCK_PSHUFLW);
-            uint64_t Lo;
-            _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
-            return Lo;
+        const int  BRol = (UsePipe && Pipe.BlockDecryptValid) ? Pipe.BlockRol64    : V707::BLOCK_ROL64;
+        const int  BShf = (UsePipe && Pipe.BlockDecryptValid) ? Pipe.BlockPshuflw  : V707::BLOCK_PSHUFLW;
+        const uint64_t BFnvXor = (UsePipe && Pipe.BlockDecryptValid && Pipe.BlockFnvXor) ? Pipe.BlockFnvXor : V707::BLOCK_FNV_XOR;
+
+        auto DecBlock = [BRol, BShf](uint64_t Raw) -> uint64_t {
+            return SoftPshuflw(fn_rotl64(Raw, BRol), BShf);
         };
 
-        uint64_t V13 = DecBlock(Raw1) ^ V707::BLOCK_FNV_XOR;
+        uint64_t V13 = DecBlock(Raw1) ^ BFnvXor;
         uint64_t V15 = DecBlock(Raw2);
 
-        uint64_t Fv1 = V707::FNV_PRIME * fn_rotl64(V13, V707::FNV_ROL1) + V707::FNV_ADD;
-        uint64_t Fv2 = V707::FNV_PRIME * fn_rotl64(Fv1, V707::FNV_ROL2) + V707::FNV_ADD;
+        const int FR1 = (UsePipe && Pipe.FnvFoldValid) ? Pipe.FnvRol1 : V707::FNV_ROL1;
+        const int FR2 = (UsePipe && Pipe.FnvFoldValid) ? Pipe.FnvRol2 : V707::FNV_ROL2;
+        const uint64_t FA = (UsePipe && Pipe.FnvFoldValid) ? Pipe.FnvAdd : V707::FNV_ADD;
 
-        uint64_t EntryPtr = (Fv2 ^ V707::BLOCK_FNV_XOR ^ V15) + V13 + 2ULL * NameOff;
+        uint64_t Fv1 = V707::FNV_PRIME * fn_rotl64(V13, FR1) + FA;
+        uint64_t Fv2 = V707::FNV_PRIME * fn_rotl64(Fv1, FR2) + FA;
+
+        uint64_t EntryPtr = (Fv2 ^ BFnvXor ^ V15) + V13 + 2ULL * NameOff;
         if (EntryPtr < 0x10000ULL || EntryPtr >= 0x800000000000ULL) return 0;
         return EntryPtr;
     }
@@ -1403,6 +1461,9 @@ public:
     uint64_t ResolveNamePtr_NewPatch(int32_t CompIndex) {
         namespace V709 = ArcDecrypt::v20260709;
         if (CompIndex <= 0) return 0;
+
+        const auto& Pipe = AutoDiscovery::g_DiscoveredFNamePipeline;
+        const bool UsePipe = Pipe.ShardHashValid;
 
         uint32_t Ci = static_cast<uint32_t>(CompIndex);
         uint16_t WordOff = static_cast<uint16_t>(Ci & 0xFFFFu);
@@ -1413,42 +1474,67 @@ public:
                          : ArcDecrypt::v20260707::RVA_GNAMEPOOL;
         uint64_t ChunkAddr = m_base + GnpRva + ChunkOff;
 
-        uint64_t SeedAddr = ChunkAddr + V709::SHARD_HASH_SEED_OFF;
+        const uint64_t SeedOff  = (UsePipe && Pipe.ShardSeedOff) ? Pipe.ShardSeedOff : V709::SHARD_HASH_SEED_OFF;
+        const uint64_t BlockOff = (UsePipe && Pipe.ShardBlockBaseOff) ? Pipe.ShardBlockBaseOff : V709::SHARD_BLOCK_BASE_OFF;
+        const uint32_t ShardAdd = UsePipe ? Pipe.ShardHashAdd : V709::SHARD_HASH_ADD;
+        constexpr uint32_t HP   = V709::HASH_PRIME;
+
+        uint64_t SeedAddr = ChunkAddr + SeedOff;
         uint32_t Lo = static_cast<uint32_t>(SeedAddr);
         uint32_t Hi = static_cast<uint32_t>(SeedAddr >> 32);
 
-        uint32_t H = V709::HASH_PRIME * fn_rotl32(Lo, V709::SHARD_HASH_ROL_A) + V709::SHARD_HASH_ADD;
-        H = V709::HASH_PRIME * fn_rotl32(H, V709::SHARD_HASH_ROL_B) + Hi + V709::SHARD_HASH_ADD;
-        H = V709::HASH_PRIME * fn_rotl32(H, V709::SHARD_HASH_ROL_A) + V709::SHARD_HASH_ADD;
-        uint32_t V8 = fn_rotl32(H, V709::SHARD_HASH_ROL_B);
+        uint32_t H;
+        if (UsePipe && Pipe.ShardHashRolCount >= 3) {
+            H = HP * fn_rotl32(Lo, Pipe.ShardHashRols[0]) + ShardAdd;
+            H = HP * fn_rotl32(H, Pipe.ShardHashRols[1]) + Hi + ShardAdd;
+            H = HP * fn_rotl32(H, Pipe.ShardHashRols[2]) + ShardAdd;
+        } else {
+            H = HP * fn_rotl32(Lo, V709::SHARD_HASH_ROL_A) + ShardAdd;
+            H = HP * fn_rotl32(H, V709::SHARD_HASH_ROL_B) + Hi + ShardAdd;
+            H = HP * fn_rotl32(H, V709::SHARD_HASH_ROL_A) + ShardAdd;
+        }
+        int SlotRol = (UsePipe && Pipe.ShardHashRolCount >= 4) ? Pipe.ShardHashRols[3] : V709::SHARD_HASH_ROL_B;
+        uint32_t T = fn_rotl32(H, SlotRol);
+        int SlotAdd709 = (UsePipe && Pipe.SlotSelectValid)
+                       ? Pipe.SlotSelectAdd : V709::SHARD_SLOT_SELECT_ADD;
+        uint8_t Pa = static_cast<uint8_t>(-109 * static_cast<int>(T) + SlotAdd709);
+        uint8_t Pb = static_cast<uint8_t>((HP * T + ShardAdd) >> 16);
+        uint32_t Bidx1 = (Pa ^ Pb) & 7u;
+        uint32_t Bidx2 = (Bidx1 + 1u) & 7u;
 
-        uint32_t Final = V709::HASH_PRIME * V8 + V709::SHARD_HASH_ADD;
-        uint32_t Mix = Final ^ (Final >> 16);
-        uint32_t Bidx1 = Mix & 7u;
-        uint32_t Bidx2 = (Mix + 1u) & 7u;
-
-        uint64_t BlockBase = ChunkAddr + V709::SHARD_BLOCK_BASE_OFF;
+        uint64_t BlockBase = ChunkAddr + BlockOff;
         uint64_t Raw1 = 0, Raw2 = 0;
         if (!m_reader.Read(BlockBase + 32ULL * Bidx1, &Raw1, 8)) return 0;
         if (!m_reader.Read(BlockBase + 32ULL * Bidx2, &Raw2, 8)) return 0;
         if (!Raw1 && !Raw2) return 0;
 
-        auto DecBlock = [](uint64_t Raw) -> uint64_t {
-            uint64_t Rotated = fn_rotl64(Raw, V709::BLOCK_ROL64);
-            __m128i V = _mm_set_epi64x(0, static_cast<int64_t>(Rotated));
-            V = _mm_shufflelo_epi16(V, V709::BLOCK_PSHUFLW);
-            uint64_t R;
-            _mm_storel_epi64(reinterpret_cast<__m128i*>(&R), V);
-            return R ^ V709::BLOCK_FNV_XOR;
+        const int BRol  = (UsePipe && Pipe.BlockDecryptValid) ? Pipe.BlockRol64   : V709::BLOCK_ROL64;
+        const int BShf  = (UsePipe && Pipe.BlockDecryptValid) ? Pipe.BlockPshuflw : V709::BLOCK_PSHUFLW;
+        const uint64_t BFnvXor = (UsePipe && Pipe.BlockDecryptValid && Pipe.BlockFnvXor) ? Pipe.BlockFnvXor : V709::BLOCK_FNV_XOR;
+
+        auto DecBlock = [BRol, BShf, BFnvXor](uint64_t Raw) -> uint64_t {
+            return SoftPshuflw(fn_rotl64(Raw, BRol), BShf) ^ BFnvXor;
         };
 
         uint64_t V13 = DecBlock(Raw1);
         uint64_t V15 = DecBlock(Raw2);
 
-        uint64_t Fv1 = V709::FNV_PRIME * fn_rotl64(V13, V709::FNV_ROL1) + V709::FNV_ADD;
-        uint64_t Fv2 = V709::FNV_PRIME * fn_rotl64(Fv1, V709::FNV_ROL2) + V709::FNV_ADD;
+        const int FR1 = (UsePipe && Pipe.FnvFoldValid) ? Pipe.FnvRol1 : V709::FNV_ROL1;
+        const int FR2 = (UsePipe && Pipe.FnvFoldValid) ? Pipe.FnvRol2 : V709::FNV_ROL2;
+        const uint64_t FA = (UsePipe && Pipe.FnvFoldValid) ? Pipe.FnvAdd : V709::FNV_ADD;
+
+        uint64_t Fv1 = V709::FNV_PRIME * fn_rotl64(V13, FR1) + FA;
+        uint64_t Fv2 = V709::FNV_PRIME * fn_rotl64(Fv1, FR2) + FA;
 
         uint64_t RawPtr = V13 + (V15 ^ Fv2) + 2ULL * WordOff;
+
+        if (UsePipe && Pipe.PtrXorCount >= 3) {
+            uint64_t Step1 = __builtin_bswap64(RawPtr ^ Pipe.PtrXor[0]);
+            uint64_t Step2 = Step1 ^ Pipe.PtrXor[1];
+            uint64_t EntryPtr = __builtin_bswap64(Step2 ^ Pipe.PtrXor[2]);
+            if (EntryPtr < 0x10000ULL || EntryPtr >= 0x800000000000ULL) return 0;
+            return EntryPtr;
+        }
         uint64_t Step1 = __builtin_bswap64(RawPtr ^ V709::FNAME_PTR_XOR1);
         uint64_t Step2 = Step1 ^ V709::FNAME_PTR_XOR2;
         uint64_t EntryPtr = __builtin_bswap64(Step2 ^ V709::FNAME_PTR_XOR3);
@@ -1460,11 +1546,24 @@ public:
         namespace V709 = ArcDecrypt::v20260709;
         if (!NameEntryPtr) return {};
 
+        const auto& Sd = AutoDiscovery::g_DiscoveredStringDecrypt;
+        const bool UseSd = false;
+
+        const uint16_t WideBit  = UseSd ? Sd.HdrIsWideBit    : V709::HDR_IS_WIDE_BIT;
+        const int      LenShift = UseSd ? Sd.HdrLengthShift  : V709::HDR_LENGTH_SHIFT;
+        const uint32_t KInit    = (UseSd && Sd.KeyInitAdd)    ? Sd.KeyInitAdd     : V709::KEY_INIT_ADD;
+        const uint8_t  KMask    = (UseSd && Sd.KeyIndexMask)  ? Sd.KeyIndexMask   : V709::KEY_INDEX_MASK;
+        const uint32_t KMulIn   = (UseSd && Sd.KeyMulInner)   ? Sd.KeyMulInner    : V709::KEY_MUL_INNER;
+        const uint32_t KAddIn   = (UseSd && Sd.KeyAddInner)   ? Sd.KeyAddInner    : V709::KEY_ADD_INNER;
+        const uint32_t KMaskIn  = (UseSd && Sd.KeyMulInner)   ? static_cast<uint32_t>(KMask) : V709::KEY_MASK_INNER;
+        const uint32_t KMulAdv  = (UseSd && Sd.KeyMulAdvance) ? Sd.KeyMulAdvance  : V709::KEY_MUL_ADVANCE;
+        const uint32_t KAddAdv  = (UseSd && Sd.KeyAddAdvance) ? Sd.KeyAddAdvance  : V709::KEY_ADD_ADVANCE;
+
         uint16_t Header = 0;
         if (!m_reader.Read(NameEntryPtr, &Header, 2) || !Header) return {};
 
-        bool IsWide = (Header & V709::HDR_IS_WIDE_BIT) != 0;
-        int Length = static_cast<int>(Header >> V709::HDR_LENGTH_SHIFT);
+        bool IsWide = (Header & WideBit) != 0;
+        int Length = static_cast<int>(Header >> LenShift);
         if (Length <= 0 || Length > 1023) return {};
 
         int ByteCount = IsWide ? Length * 2 : Length;
@@ -1473,21 +1572,21 @@ public:
         std::vector<uint8_t> Buf(ByteCount, 0);
         if (!m_reader.Read(NameEntryPtr + 2, Buf.data(), ByteCount)) return {};
 
-        uint32_t Key = static_cast<uint32_t>(Length) + V709::KEY_INIT_ADD;
+        uint32_t Key = static_cast<uint32_t>(Length) + KInit;
 
         if (!IsWide) {
             int PairCount = Length / 2;
             for (int I = 0; I < PairCount; ++I) {
-                uint32_t Idx1 = Key & V709::KEY_INDEX_MASK;
+                uint32_t Idx1 = Key & KMask;
                 Buf[2 * I] ^= static_cast<uint8_t>(m_keyTableNewPatch[Idx1] >> 3);
 
-                uint32_t Idx2 = (Key * V709::KEY_MUL_INNER + V709::KEY_ADD_INNER) & V709::KEY_MASK_INNER;
+                uint32_t Idx2 = (Key * KMulIn + KAddIn) & KMaskIn;
                 Buf[2 * I + 1] ^= static_cast<uint8_t>(m_keyTableNewPatch[Idx2] >> 3);
 
-                Key = Key * V709::KEY_MUL_ADVANCE + V709::KEY_ADD_ADVANCE;
+                Key = Key * KMulAdv + KAddAdv;
             }
             if (Length & 1) {
-                uint32_t Idx = Key & V709::KEY_INDEX_MASK;
+                uint32_t Idx = Key & KMask;
                 Buf[Length - 1] ^= static_cast<uint8_t>(m_keyTableNewPatch[Idx] >> 3);
             }
 
@@ -1502,16 +1601,16 @@ public:
             auto* WBuf = reinterpret_cast<uint16_t*>(Buf.data());
             int PairCount = Length / 2;
             for (int I = 0; I < PairCount; ++I) {
-                uint32_t Idx1 = Key & V709::KEY_INDEX_MASK;
+                uint32_t Idx1 = Key & KMask;
                 WBuf[2 * I] ^= m_keyTableNewPatch[Idx1];
 
-                uint32_t Idx2 = (Key * V709::KEY_MUL_INNER + V709::KEY_ADD_INNER) & V709::KEY_MASK_INNER;
+                uint32_t Idx2 = (Key * KMulIn + KAddIn) & KMaskIn;
                 WBuf[2 * I + 1] ^= m_keyTableNewPatch[Idx2];
 
-                Key = Key * V709::KEY_MUL_ADVANCE + V709::KEY_ADD_ADVANCE;
+                Key = Key * KMulAdv + KAddAdv;
             }
             if (Length & 1) {
-                uint32_t Idx = Key & V709::KEY_INDEX_MASK;
+                uint32_t Idx = Key & KMask;
                 WBuf[Length - 1] ^= m_keyTableNewPatch[Idx];
             }
 

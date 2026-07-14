@@ -6,12 +6,16 @@ External SDK dumper for ARC Raiders (Unreal Engine 5, Theia-obfuscated). Reads g
 Build: `g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 -I KernelDriver/include -o FrostDumper main.cpp build/Zydis.o -lcapstone -lunicorn -lm`
 Run: `sudo ./build_and_run.sh [PID]`
 
-## Current Patch: CL-1299607 (2026-07-07)
-Live-verified 2026-07-08 against PID 10696.
-UObject slot decode: ROL32(13) → lo64 → XOR(0x9A492C85DDF6F193) → ROL64(7) → CI in lo32 (equivalently ROL64(39) → CI in hi32).
-FField NamePrivate: PSHUFB([01,03,00,02,05,04,06,07]) → XOR(0x2BC795817F5A4D23) → ROL64(32).
-PropertyOffsetXor: 0x057F15E5. Most field offsets shifted -0x50 from CL-1233465.
-FName pipeline constants changed from v20260519 — see "CL-1299607 FName Pipeline" below.
+## Current Patch: CL-1315578 (2026-07-09)
+Live-verified 2026-07-14 against PID 8082. Image size 0x117E1000.
+UObject slot decode: ROL64(29) → PSHUFLW(0x39) → ROL32(5) → lo64, CI in hi32.
+FField NamePrivate: XOR(0x8FFAB191C340B792) → ROL16(12) → PSHUFB([07,06,04,05,02,03,00,01]) → ROL64(32).
+PropertyOffsetXor: 0xA271DBC5. Field offsets shifted +0x50 from CL-1299607.
+FName shard hash uses `-109*T+82` slot-select formula (NOT `H^(H>>16)` like CL-1299607).
+
+SDK stats (2026-07-14): 27602 classes, 14450 structs, 2930 enums, 40124 functions, 286137 properties (285140 named), 0% FProperty_Unknown.
+
+Previous patch (CL-1299607, 2026-07-07): FField NamePrivate: PSHUFB→XOR→ROL64. Shard hash: -109*T+166 slot-select. PropertyOffsetXor: 0x057F15E5.
 
 Previous patch (CL-1233465, 2026-06-18): 0% FProperty_Unknown, 283196 properties, 9138 classes.
 
@@ -66,28 +70,55 @@ Previous patch (CL-1201801): 99.85% naming, ~298K properties, 33200 classes, 111
 - Engine vtable RVAs (UClass, UScriptStruct, UFunction, UEnum, UPackage, BPGC)
 - chunks_manager via Unicorn emulation of vtable[7]
 
-**Hardcoded fallbacks (arc_decrypt.h, manual update if drift):**
-- UObject/UStruct/FField/FProperty field offsets (layout shifts per patch)
-- FName entry header bitmasks (HDR_LENGTH_LO_MASK, HDR_IS_WIDE_BIT, etc.)
-- SHARD_HASH_ADD, FNV_ADD, SLOT_HASH_ADD constants
-- FField NamePrivate SIMD pipeline (KEY1/KEY2/SHUF/ROL values)
-- GUObjectArray NumElements offset (+0x30 or +0xFC depending on patch)
+**Auto-discovers (Phase 2c/2d, new):**
+- FField layout: NamePrivate, Next, ChildProperties offsets + decrypt constants (XOR, PSHUFB, ROL16, ROL64)
+- FProperty layout: Offset_Internal, ElementSize, ArrayDim offsets + XOR key
 
-## Key Constants (CL-1299607 / v20260707)
+**Hardcoded fallbacks (arc_decrypt.h, manual update if drift):**
+- UStruct/FField::Owner/ClassPrivate offsets (not yet auto-discovered)
+- FName entry header bitmasks (HDR_LENGTH_SHIFT, HDR_IS_WIDE_BIT)
+- SHARD_HASH_ADD, FNV_ADD, BLOCK_FNV_XOR, block ROL/PSHUFLW constants
+- FField NamePrivate decode (now auto-discovered by Phase 2c — fallback still exists)
+- GUObjectArray NumElements offset (+0x5C on CL-1315578)
+
+## Key Constants (CL-1315578 / v20260709)
 
 ### Decrypt Constants
 | Constant | Value | Used For |
 |----------|-------|----------|
-| UOBJ_SLOT_XOR_64 | 0x9A492C85DDF6F193 | UObject slot XOR (after ROL32) |
-| UOBJ_SLOT_ROL32 | 13 | UObject slot ROL32 (replaces PSHUFB) |
-| UOBJ_SLOT_FINAL_ROL | 7 (lo32=CI) or 39 (hi32=CI) | UObject slot final ROL64 (equivalent) |
-| SLOT_HASH_ADD | 0x5A5A703F | FNV32 slot selector hash seed |
-| SHARD_HASH_ADD | 0x282106A6 | FNamePool shard hash (live-verified; arc_decrypt.h V707 value 0x22C9D9D4 is WRONG) |
-| FNV_ADD | 0xEB1E82D44384D6E6 | FName entry FNV hash offset (live-verified; arc_decrypt.h V707 value 0x43335C86AF304554 is WRONG) |
-| FFIELD_NAME_PSHUFB | [01,03,00,02,05,04,06,07] | FField NamePrivate PSHUFB mask |
-| FFIELD_NAME_XOR_KEY | 0x2BC795817F5A4D23 | FField NamePrivate XOR |
+| UOBJ_SLOT_ROL64_FIRST | 29 | UObject slot ROL64 (first step) |
+| UOBJ_SLOT_PSHUFLW | 0x39 | UObject slot PSHUFLW (second step) |
+| UOBJ_SLOT_ROL32_PER | 5 | UObject slot ROL32 (per-dword, third step) |
+| SLOT_HASH_ADD | 0xF3D8DA36 | FNV32 slot selector hash seed |
+| SHARD_HASH_ADD | 0xD5AF8E52 | FNamePool shard hash |
+| SHARD_HASH_ROL_A | 17 | Shard hash ROL step A |
+| SHARD_HASH_ROL_B | 13 | Shard hash ROL step B |
+| BLOCK_ROL64 | 13 | Block decrypt ROL64 |
+| BLOCK_PSHUFLW | 0x93 | Block decrypt PSHUFLW |
+| BLOCK_FNV_XOR | 0x19EA7DF486E7194E | Block decrypt XOR (loaded from RVA 0xB523C50) |
+| FNV_ADD | 0x10F3A73711CE0312 | FName entry FNV hash offset |
+| FNV_ROL1 | 37 | FNV fold ROL64 step 1 |
+| FNV_ROL2 | 40 | FNV fold ROL64 step 2 |
+| FNAME_PTR_XOR1 | 0x14329DBF | bswap64(RawPtr ^ XOR1) |
+| FNAME_PTR_XOR2 | 0x2E3400000000 | Step1 ^ XOR2 |
+| FNAME_PTR_XOR3 | 0xBF9D1C2000000000 | bswap64(Step2 ^ XOR3) = EntryPtr |
+| FFIELD_NAME_XOR_KEY | 0x8FFAB191C340B792 | FField NamePrivate XOR |
+| FFIELD_NAME_PSHUFB | [07,06,04,05,02,03,00,01] | FField NamePrivate PSHUFB mask |
+| FFIELD_NAME_ROL16 | 12 | FField NamePrivate ROL16 (new step) |
 | FFIELD_NAME_ROL64 | 32 | FField NamePrivate final ROL64 |
-| PropertyOffsetXor | 0x057F15E5 | bswap32(stored ^ key) = real offset |
+| PropertyOffsetXor | 0xA271DBC5 | bswap32(stored ^ key) = real offset |
+| HDR_LENGTH_SHIFT | 6 | FNameEntry header >> 6 = length |
+| HDR_IS_WIDE_BIT | 0x20 | FNameEntry wide-string flag |
+
+### CL-1299607 Constants (previous patch, for reference)
+| Constant | Value |
+|----------|-------|
+| UOBJ_SLOT_XOR_64 | 0x9A492C85DDF6F193 |
+| SHARD_HASH_ADD | 0x282106A6 |
+| FNV_ADD | 0xEB1E82D44384D6E6 |
+| FFIELD_NAME_PSHUFB | [01,03,00,02,05,04,06,07] |
+| FFIELD_NAME_XOR_KEY | 0x2BC795817F5A4D23 |
+| PropertyOffsetXor | 0x057F15E5 |
 
 ### CL-1233465 Constants (previous patch, for reference)
 | Constant | Value |
@@ -113,44 +144,57 @@ Slot selector: FNV32(prime=0x01000193, add=0x5A5A703F)
 Base: obj + 0x20, stride 0x20 (4 slots)
 ```
 
-### CL-1299607 FName Pipeline (live-verified 2026-07-08)
+### CL-1315578 FName Pipeline (live-verified 2026-07-14)
 ```
-CI → chunk: identity (SIMD pipeline cancels algebraically)
+CI → chunk: identity (SIMD pipeline cancels algebraically — confirmed for CL-1315578)
   NameOff = CI & 0xFFFF, ChunkOff = (CI >> 8) & 0xFFFF00
-  ChunkAddr = GNamePool(0xE4A3A00) + ChunkOff
+  ChunkAddr = GNamePool(0xE4F2A00) + ChunkOff
 
-Shard Hash (FNV32, 4-step):
-  SeedAddr = ChunkAddr + 0x6FD0
-  Lo = ROL32(lo32(SeedAddr), 24)
-  H = P * Lo + 0x282106A6
-  H = ROL32(H, 19)
-  H = P * H + hi32(SeedAddr) + 0x282106A6
-  H = ROL32(H, 24)
-  H = P * (P * H + 0x282106A6 >> 13) + 0x282106A6
-  mix = H ^ (H >> 16)
-  bidx1 = mix & 7, bidx2 = (mix+1) & 7
+Shard Hash (FNV32, 3-step + slot-select):
+  SeedAddr = ChunkAddr + 0x2F90
+  Lo = lo32(SeedAddr), Hi = hi32(SeedAddr)
+  H = P * ROL32(Lo, 17) + 0xD5AF8E52
+  H = P * ROL32(H, 13) + Hi + 0xD5AF8E52
+  H = P * ROL32(H, 17) + 0xD5AF8E52
+  T = ROL32(H, 13)
+  Pa = (uint8)(-109*T + 82)
+  Pb = (uint8)((P*T + 0xD5AF8E52) >> 16)
+  Bidx1 = (Pa ^ Pb) & 7, Bidx2 = (Bidx1 + 1) & 7
 
-Block Decode (8 blocks at ChunkAddr + 0x6FE0, stride 32):
-  Block = PSHUFLW(ROL64(raw, 10), 0x1B)  (per block, lo64 only)
-  v13 = Block1 ^ 0x1BC3B58FFB88504C (FnvXor)
-  v15 = Block2 (no XOR)
+Block Decode (8 blocks at ChunkAddr + 0x2FA0, stride 32):
+  Block = PSHUFLW(ROL64(raw, 13), 0x93) ^ 0x19EA7DF486E7194E (FnvXor from RVA 0xB523C50)
+  V13 = DecBlock(Block1), V15 = DecBlock(Block2)
 
 FNV64 Chain:
-  fv1 = 0x100000001B3 * ROL64(v13, 51) + 0xEB1E82D44384D6E6
-  fv2 = 0x100000001B3 * ROL64(fv1, 39) + 0xEB1E82D44384D6E6
-  EntryPtr = (fv2 ^ FnvXor ^ v15) + v13 + 2*NameOff
+  Fv1 = 0x100000001B3 * ROL64(V13, 37) + 0x10F3A73711CE0312
+  Fv2 = 0x100000001B3 * ROL64(Fv1, 40) + 0x10F3A73711CE0312
+  RawPtr = V13 + (V15 ^ Fv2) + 2*NameOff
+
+Pointer XOR Chain:
+  Step1 = bswap64(RawPtr ^ 0x14329DBF)
+  Step2 = Step1 ^ 0x2E3400000000
+  EntryPtr = bswap64(Step2 ^ 0xBF9D1C2000000000)
 
 String Header (16-bit):
-  length = (hdr >> 12) | ((hdr >> 2) & 0x3F8)   (10-bit)
-  isWide = (hdr & 0x8000) != 0
+  length = hdr >> 6
+  isWide = (hdr & 0x20) != 0
 
 String Decrypt:
-  KeyTable: ushort[64] at RVA 0xE3E28E4
-  Narrow (paired): eax = length + 0xFFFF9D4E
-    byte[2k]   ^= (KeyTable[(eax-0xE) & 0x3F] >> 3)
-    byte[2k+1] ^= (KeyTable[eax & 0x3F] >> 3)
-    eax += 0x29C per pair
-  Wide (paired): same indices, XOR full u16 (no >>3)
+  KeyTable: ushort[64] at RVA 0xE4318DC (offset +0xE8 from SIMD block)
+  Key = length + 0xA7B4
+  Narrow (paired): byte[2k] ^= (KeyTable[Key & 0x3F] >> 3)
+    Idx2 = (Key * 0xFFFF584C + 0xF629) & 0x3D
+    byte[2k+1] ^= (KeyTable[Idx2] >> 3)
+    Key = Key * 0x6DDC5690 + 0x5EBF2255
+```
+
+### CL-1299607 FName Pipeline (for reference)
+```
+GNamePool @ 0xE4A3A00. SeedOff=0x6FD0. BlockOff=0x6FE0.
+Shard hash: 3-step FNV32 with ROLs 24,19,24. T=H>>13. Slot: (-109*T+166) ^ ((P*T+ADD)>>16) & 7.
+Block: ROL64(10), PSHUFLW(0x1B), XOR 0x1BC3B58FFB88504C.
+FNV: ROL(51)+0xEB1E82D44384D6E6, ROL(39).
+Header: length=(hdr>>12)|((hdr>>2)&0x3F8). Key=length+0xFFFF9D4E.
 ```
 
 ### GNamePool Static Resolve Pipeline (CL-1233465, sub_2404F0)
@@ -186,46 +230,45 @@ String Decrypt (sub_234CE0):
   Keystream: uint16_t[160] at RVA 0xE2B57F4, decrypt entries at index +96
 ```
 
-### FField NamePrivate Decode (CL-1299607)
+### FField NamePrivate Decode (CL-1315578)
 ```
-PSHUFB([01,03,00,02,05,04,06,07]) → XOR(0x2BC795817F5A4D23) → ROL64(32)
+XOR(0x8FFAB191C340B792) → ROL16(12) → PSHUFB([07,06,04,05,02,03,00,01]) → ROL64(32)
 ```
 
-### FField/FProperty Layout (CL-1299607)
+### FField/FProperty Layout (CL-1315578)
 | Field | Offset | Notes |
 |-------|--------|-------|
 | FField::VTable | +0x00 | vtable pointer (ALL FProperty subclasses share one vtable!) |
-| FField::NamePrivate | +0x40 | Encrypted FName CI |
-| FField::Owner | +0x58 | Owner UStruct (tagged: bit0=1 if UObject) |
-| FField::Next | +0x60 | Next FField in chain |
-| FField::SaltSentinel | +0x68 | Session salt |
-| FField::ClassPrivate | +0x70 | FFieldClass pointer |
-| FProperty::ElementSize | +0x7C | int32 |
-| FProperty::PropertyFlags | +0x80 | uint64 flags |
-| FProperty::Offset_Internal | +0x94 | bswap(real ^ 0x057F15E5) |
-| FProperty::ArrayDim | +0xC0 | int32 |
-| FStructProperty::Struct | +0xE8 | UScriptStruct* |
-| FObjectProperty::PropertyClass | +0xE8 | UClass* |
-| FEnumProperty::UnderlyingProp | +0xE8 | FProperty* (numeric) |
-| FEnumProperty::Enum | +0xF0 | UEnum* |
-| FMapProperty::KeyProp | +0xE8 | FProperty* |
-| FMapProperty::ValueProp | +0xF0 | FProperty* |
-| FBoolProperty::FieldSize | +0xE8 | byte (1/2/4/8) |
-| FBoolProperty::ByteOffset | +0xE9 | byte index |
-| FBoolProperty::ByteMask | +0xEA | 1-bit mask (0x01..0x80) |
-| FBoolProperty::FieldMask | +0xEB | all-bools-in-byte mask |
-| FArrayProperty::Inner | +0xE8 | FProperty* |
+| FField::Owner | +0x80 | Owner UStruct (tagged: bit0=1 if UObject) |
+| FField::NamePrivate | +0xA0 | Encrypted FName CI |
+| FField::SaltSentinel | +0xB0 | Session salt |
+| FField::ClassPrivate | +0xB8 | FFieldClass pointer |
+| FField::Next | +0x78 | Next FField in chain |
+| FProperty::ElementSize | +0xD0 | int32 |
+| FProperty::Offset_Internal | +0xE4 | bswap(real ^ 0xA271DBC5) |
+| FProperty::ArrayDim | +0x110 | int32 |
+| FStructProperty::Struct | +0x138 | UScriptStruct* |
+| FObjectProperty::PropertyClass | +0x138 | UClass* |
+| FEnumProperty::UnderlyingProp | +0x138 | FProperty* (numeric) |
+| FEnumProperty::Enum | +0x140 | UEnum* |
+| FMapProperty::KeyProp | +0x138 | FProperty* |
+| FMapProperty::ValueProp | +0x140 | FProperty* |
+| FBoolProperty::FieldSize | +0x138 | byte (1/2/4/8) |
+| FBoolProperty::ByteOffset | +0x139 | byte index |
+| FBoolProperty::ByteMask | +0x13A | 1-bit mask (0x01..0x80) |
+| FBoolProperty::FieldMask | +0x13B | all-bools-in-byte mask |
+| FArrayProperty::Inner | +0x138 | FProperty* |
 
-### UStruct/UClass/UEnum Layout (CL-1299607)
+### UStruct/UClass/UEnum Layout (CL-1315578)
 | Field | Offset | Notes |
 |-------|--------|-------|
-| UStruct::SuperStruct | +0x60 | UStruct* parent |
-| UStruct::ChildProperties | +0xC8 | FField* head (NULL for UScriptStruct — Theia strips it) |
-| UStruct::PropertiesSize | +0x90 | int32 total struct size |
-| UFunction::NativeFunc | +0x128 | void* native function pointer |
-| UEnum::Names | +0x60 | TArray<TPair<FName,int64>> (stripped by Theia — always empty) |
+| UStruct::SuperStruct | +0xB0 | UStruct* parent |
+| UStruct::ChildProperties | +0xF0 | FField* head (auto-discovered from binary) |
+| UStruct::PropertiesSize | +0xD0 | int32 total struct size |
+| UFunction::NativeFunc | +0x150 | void* native function pointer |
+| UEnum::Names | +0xB0 | TArray<TPair<FName,int64>> (stripped by Theia — always empty) |
 
-### Property Type Detection (CL-1299607)
+### Property Type Detection (CL-1315578)
 All FProperty subclasses share the same vtable on CL-1299607 (Theia virtualizes them).
 Type detection uses ProbePropertyTypeStructural() which checks:
 1. elem_size == 80 → MapProperty/SetProperty (check sub-FField at +0xE8/+0xF0)
@@ -287,21 +330,21 @@ Bool-specific field init. FieldSize/ByteOffset/ByteMask/FieldMask setup.
 7. **If GObjectArray count wrong**: NumElements offset moved (+0x30 vs +0xFC); probed as u32, range [10000,2M]
 
 ### Offset drift history
-| Field | CL-1177146 | CL-1177678 | CL-1201801 | CL-1233465 | CL-1299607 |
-|-------|-----------|-----------|-----------|-----------|-----------|
-| FField::NamePrivate | +0x70 | +0x30 | +0x40 | +0x90 | +0x40 |
-| FField::Next | +0x80 | +0x48 | +0x50 | +0xB0 | +0x60 |
-| FField::ClassPrivate | +0x90 | +0x50 | +0x60 | +0xC0 | +0x70 |
-| FField::Owner | +0x10 | +0x10 | +0x70 | +0xA8 | +0x58 |
-| FProperty::Offset_Internal | +0xC4 | +0x88 | +0x94 | +0xE4 | +0x94 |
-| FProperty::ElementSize | — | — | +0xC8 | +0x118 | +0x7C |
-| FProperty::ArrayDim | — | — | +0xC0 | +0x110 | +0xC0 |
-| FStructProperty::Struct | +0x108 | +0xC8 | +0xE8 | +0x130 | +0xE8 |
-| FArrayProperty::Inner | +0xF0 | +0xC8 | +0xF8 | +0x140 | +0xE8 |
-| FBoolProperty::FieldSize | — | — | +0xF0 | +0x138 | +0xE8 |
-| UStruct::ChildProperties | +0x168 | +0xB0 | +0x108 | +0x118 | +0xC8 |
-| UStruct::PropertiesSize | — | — | +0x110 | +0xE0 | +0x90 |
-| PropertyOffsetXor | — | — | 0xBAB939DB | 0xEAABEC11 | 0x057F15E5 |
+| Field | CL-1177146 | CL-1177678 | CL-1201801 | CL-1233465 | CL-1299607 | CL-1315578 |
+|-------|-----------|-----------|-----------|-----------|-----------|-----------|
+| FField::NamePrivate | +0x70 | +0x30 | +0x40 | +0x90 | +0x40 | +0xA0 |
+| FField::Next | +0x80 | +0x48 | +0x50 | +0xB0 | +0x60 | +0x78 |
+| FField::ClassPrivate | +0x90 | +0x50 | +0x60 | +0xC0 | +0x70 | +0xB8 |
+| FField::Owner | +0x10 | +0x10 | +0x70 | +0xA8 | +0x58 | +0x80 |
+| FProperty::Offset_Internal | +0xC4 | +0x88 | +0x94 | +0xE4 | +0x94 | +0xE4 |
+| FProperty::ElementSize | — | — | +0xC8 | +0x118 | +0x7C | +0xD0 |
+| FProperty::ArrayDim | — | — | +0xC0 | +0x110 | +0xC0 | +0x110 |
+| FStructProperty::Struct | +0x108 | +0xC8 | +0xE8 | +0x130 | +0xE8 | +0x138 |
+| FArrayProperty::Inner | +0xF0 | +0xC8 | +0xF8 | +0x140 | +0xE8 | +0x138 |
+| FBoolProperty::FieldSize | — | — | +0xF0 | +0x138 | +0xE8 | +0x138 |
+| UStruct::ChildProperties | +0x168 | +0xB0 | +0x108 | +0x118 | +0xC8 | +0xF0 |
+| UStruct::PropertiesSize | — | — | +0x110 | +0xE0 | +0x90 | +0xD0 |
+| PropertyOffsetXor | — | — | 0xBAB939DB | 0xEAABEC11 | 0x057F15E5 | 0xA271DBC5 |
 
 ## Critical Rules (Learned from Past Bugs)
 

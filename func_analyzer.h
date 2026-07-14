@@ -211,6 +211,13 @@ inline int FindRol64Pair(const std::vector<DecodedInsn>& insns, int startIdx,
                     shl + insns[j].imm8 == 64) return shl;
             }
         }
+        if (insns[i].type == INSN_PSRLQ && insns[i].hasImm8) {
+            int shr = insns[i].imm8;
+            for (int j = i + 1; j < std::min((int)insns.size(), i + 4); ++j) {
+                if (insns[j].type == INSN_PSLLQ && insns[j].hasImm8 &&
+                    shr + insns[j].imm8 == 64) return insns[j].imm8;
+            }
+        }
     }
     return 0;
 }
