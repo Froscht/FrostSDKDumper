@@ -4284,6 +4284,15 @@ inline FFieldNameDecryptMasks DiscoverFFieldNameMasks(
 //   - XOR key and PSHUFB mask (from MOVQ XMM loads with RIP-relative addresses)
 //   - ROL16 and ROL64 amounts (from PSRLW/PSLLW and ROL immediates)
 // ─────────────────────────────────────────────────────────────────────────────
+enum FFieldPipelineOp : uint8_t {
+    FFOP_XOR64,
+    FFOP_PSHUFB,
+    FFOP_ROL16,
+    FFOP_PSHUFLW,
+    FFOP_ROL32,
+    FFOP_ROL64,
+};
+
 struct FFieldLayoutFromCode {
     uint32_t ChildPropsOff  = 0;
     uint32_t NamePrivateOff = 0;
@@ -4293,8 +4302,14 @@ struct FFieldLayoutFromCode {
     uint64_t XorKey         = 0;
     uint8_t  PshufbMask[8]  = {};
     int      Rol16Amount    = 0;
+    int      Rol32Amount    = 0;
     int      Rol64Amount    = 0;
+    uint8_t  PshuflwImm     = 0;
     bool     Valid          = false;
+
+    FFieldPipelineOp Pipeline[8] = {};
+    int              PipelineLen = 0;
+    bool             PipelineValid = false;
 };
 
 inline FFieldLayoutFromCode DiscoverFFieldLayoutFromCode(
@@ -4398,10 +4413,72 @@ inline FFieldLayoutFromCode DiscoverFFieldLayoutFromCode(
 
         if (Out.ChildPropsOff && Out.NamePrivateOff) {
             Out.Valid = true;
+
+            size_t MovdqaPos = 0;
+            for (size_t Sc = 17; Sc + 8 < BufLen; ++Sc) {
+                if (Buf[Sc] == 0x66 && Buf[Sc+1] == 0x0F && Buf[Sc+2] == 0x6F &&
+                    Buf[Sc+3] == 0x80 && Buf[Sc+4] == Out.NamePrivateOff) {
+                    MovdqaPos = Sc;
+                    break;
+                }
+            }
+            size_t Rol64Pos = 0;
+            for (size_t Sc = MovdqaPos + 8; Sc + 4 < BufLen; ++Sc) {
+                if (Buf[Sc] == 0x48 && Buf[Sc+1] == 0xC1 &&
+                    (Buf[Sc+2] == 0xC1 || Buf[Sc+2] == 0xC0)) {
+                    Rol64Pos = Sc;
+                    break;
+                }
+            }
+
+            if (MovdqaPos && Rol64Pos && Rol64Pos > MovdqaPos) {
+                size_t DecStart = MovdqaPos + 8;
+                size_t DecLen = Rol64Pos - DecStart;
+                if (DecLen > 0 && DecLen < 200) {
+                    InsnDecoder PipeDec;
+                    auto PipeInsns = PipeDec.Decode(Buf + DecStart, DecLen, Rva + DecStart);
+                    bool Rol16Seen = false, Rol32Seen = false;
+                    for (const auto& Ins : PipeInsns) {
+                        if (Out.PipelineLen >= 7) break;
+                        if (Ins.type == INSN_PXOR || Ins.type == INSN_XORPS) {
+                            Out.Pipeline[Out.PipelineLen++] = FFOP_XOR64;
+                        } else if (Ins.type == INSN_PSHUFB) {
+                            Out.Pipeline[Out.PipelineLen++] = FFOP_PSHUFB;
+                        } else if ((Ins.type == INSN_PSLLW || Ins.type == INSN_PSRLW) && !Rol16Seen) {
+                            Rol16Seen = true;
+                            if (Ins.type == INSN_PSLLW && Ins.hasImm8 && !Out.Rol16Amount)
+                                Out.Rol16Amount = Ins.imm8;
+                            Out.Pipeline[Out.PipelineLen++] = FFOP_ROL16;
+                        } else if (Ins.type == INSN_PSHUFLW && Ins.hasImm8) {
+                            Out.PshuflwImm = Ins.imm8;
+                            Out.Pipeline[Out.PipelineLen++] = FFOP_PSHUFLW;
+                        } else if ((Ins.type == INSN_PSLLD || Ins.type == INSN_PSRLD ||
+                                   (Ins.type == INSN_PADDD && Ins.reg1 == Ins.reg2)) && !Rol32Seen) {
+                            Rol32Seen = true;
+                            if (Ins.type == INSN_PSLLD && Ins.hasImm8)
+                                Out.Rol32Amount = Ins.imm8;
+                            else if (Ins.type == INSN_PADDD)
+                                Out.Rol32Amount = 1;
+                            Out.Pipeline[Out.PipelineLen++] = FFOP_ROL32;
+                        }
+                    }
+                    Out.Pipeline[Out.PipelineLen++] = FFOP_ROL64;
+                    Out.PipelineValid = (Out.PipelineLen >= 2);
+                }
+            }
+
             std::printf("[autodisc-fflayout] SUCCESS: ChildProperties=+0x%X NamePrivate=+0x%X Next=+0x%X\n",
                 Out.ChildPropsOff, Out.NamePrivateOff, Out.NextOff);
             std::printf("[autodisc-fflayout]   XOR=0x%016llX ROL16=%d ROL64=%d\n",
                 (unsigned long long)Out.XorKey, Out.Rol16Amount, Out.Rol64Amount);
+            if (Out.PipelineValid) {
+                std::printf("[autodisc-fflayout]   Pipeline(%d ops):", Out.PipelineLen);
+                for (int Pi = 0; Pi < Out.PipelineLen; ++Pi) {
+                    const char* Names[] = {"XOR64","PSHUFB","ROL16","PSHUFLW","ROL32","ROL64"};
+                    std::printf(" %s", Names[Out.Pipeline[Pi]]);
+                }
+                std::printf("\n");
+            }
             break;
         }
     }

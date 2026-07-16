@@ -60,6 +60,13 @@ static inline uint64_t SoftPshuflw(uint64_t Val, int Imm8) {
     return Out;
 }
 
+static inline __m128i SoftPshuflwXmm(__m128i V, uint8_t Imm) {
+    uint64_t Lo;
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+    Lo = SoftPshuflw(Lo, Imm);
+    return _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&Lo));
+}
+
 static inline uint64_t u64_lo_xmm(__m128i v) {
     uint64_t arr[2];
     _mm_storeu_si128(reinterpret_cast<__m128i*>(arr), v);
@@ -610,27 +617,54 @@ public:
     static constexpr uint64_t FFIELD_NAME_XOR_CL1177146 = 0x9A492C85DDF6F193ULL;
     uint64_t DecryptFFieldNameSlot(const uint8_t enc[16]) const {
         auto ApplyShuf = [](__m128i V, uint8_t Imm) -> __m128i {
-            switch (Imm) {
-                case 0x1E: return _mm_shufflelo_epi16(V, 0x1E);
-                case 0x72: return _mm_shufflelo_epi16(V, 0x72);
-                case 0x4B: return _mm_shufflelo_epi16(V, 0x4B);
-                case 0x39: return _mm_shufflelo_epi16(V, 0x39);
-                case 0x93: return _mm_shufflelo_epi16(V, 0x93);
-                case 0xB1: return _mm_shufflelo_epi16(V, 0xB1);
-                case 0x2E: return _mm_shufflelo_epi16(V, 0x2E);
-                case 0x1B: return _mm_shufflelo_epi16(V, 0x1B);
-                case 0x4E: return _mm_shufflelo_epi16(V, 0x4E);
-                case 0x8D: return _mm_shufflelo_epi16(V, 0x8D);
-                case 0xD8: return _mm_shufflelo_epi16(V, 0xD8);
-                case 0xE1: return _mm_shufflelo_epi16(V, 0xE1);
-                case 0x8C: return _mm_shufflelo_epi16(V, 0x8C);
-                default:   return V;
-            }
+            return SoftPshuflwXmm(V, Imm);
         };
 
         {
             const auto& Lay = AutoDiscovery::g_DiscoveredFFieldLayout;
-            if (Lay.Valid && Lay.XorKey != 0) {
+            if (Lay.PipelineValid && Lay.PipelineLen >= 2) {
+                __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
+                for (int Pi = 0; Pi < Lay.PipelineLen; ++Pi) {
+                    switch (Lay.Pipeline[Pi]) {
+                    case AutoDiscovery::FFOP_XOR64:
+                        V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(Lay.XorKey)));
+                        break;
+                    case AutoDiscovery::FFOP_PSHUFB: {
+                        alignas(16) uint8_t M[16] = {};
+                        std::memcpy(M, Lay.PshufbMask, 8);
+                        V = _mm_shuffle_epi8(V, _mm_load_si128(reinterpret_cast<const __m128i*>(M)));
+                        break;
+                    }
+                    case AutoDiscovery::FFOP_ROL16:
+                        if (Lay.Rol16Amount > 0 && Lay.Rol16Amount < 16)
+                            V = _mm_or_si128(_mm_slli_epi16(V, Lay.Rol16Amount),
+                                             _mm_srli_epi16(V, 16 - Lay.Rol16Amount));
+                        break;
+                    case AutoDiscovery::FFOP_PSHUFLW:
+                        V = SoftPshuflwXmm(V, Lay.PshuflwImm);
+                        break;
+                    case AutoDiscovery::FFOP_ROL32:
+                        if (Lay.Rol32Amount > 0 && Lay.Rol32Amount < 32)
+                            V = _mm_or_si128(_mm_slli_epi32(V, Lay.Rol32Amount),
+                                             _mm_srli_epi32(V, 32 - Lay.Rol32Amount));
+                        break;
+                    case AutoDiscovery::FFOP_ROL64: {
+                        uint64_t Lo;
+                        _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), V);
+                        if (Lay.Rol64Amount > 0 && Lay.Rol64Amount < 64)
+                            Lo = (Lo << Lay.Rol64Amount) | (Lo >> (64 - Lay.Rol64Amount));
+                        uint32_t Ci = static_cast<uint32_t>(Lo);
+                        if (Ci > 1 && Ci < 0x2000000u) return Lo;
+                        break;
+                    }
+                    }
+                }
+            }
+        }
+
+        {
+            const auto& Lay = AutoDiscovery::g_DiscoveredFFieldLayout;
+            if (Lay.Valid && Lay.XorKey != 0 && !Lay.PipelineValid) {
                 __m128i V = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(enc));
                 V = _mm_xor_si128(V, _mm_set_epi64x(0, static_cast<int64_t>(Lay.XorKey)));
                 V = _mm_or_si128(_mm_slli_epi16(V, Lay.Rol16Amount),
@@ -1547,7 +1581,7 @@ public:
         if (!NameEntryPtr) return {};
 
         const auto& Sd = AutoDiscovery::g_DiscoveredStringDecrypt;
-        const bool UseSd = false;
+        const bool UseSd = Sd.Valid;
 
         const uint16_t WideBit  = UseSd ? Sd.HdrIsWideBit    : V709::HDR_IS_WIDE_BIT;
         const int      LenShift = UseSd ? Sd.HdrLengthShift  : V709::HDR_LENGTH_SHIFT;
