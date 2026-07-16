@@ -787,9 +787,12 @@ public:
             {
                 auto& VT = AutoDiscovery::g_DiscoveredVTables;
                 auto Merge = [](uint64_t& Live, uint64_t Cfg, const char* Name) {
-                    if (Cfg && Cfg != Live) {
-                        std::printf("[autodisc] Phase 1 merge: %s config=0x%llX live=0x%llX → keeping config\n",
+                    if (Live && Cfg && Cfg != Live) {
+                        std::printf("[autodisc] Phase 1 merge: %s config=0x%llX live=0x%llX → keeping LIVE (auto-discovered)\n",
                             Name, (unsigned long long)Cfg, (unsigned long long)Live);
+                    } else if (!Live && Cfg) {
+                        std::printf("[autodisc] Phase 1 merge: %s config=0x%llX (live=0) → using config fallback\n",
+                            Name, (unsigned long long)Cfg);
                         Live = Cfg;
                     }
                 };

@@ -1432,7 +1432,15 @@ public:
             if (en > 0x10000 && en < 0x7FFFFFFFFFFFULL) {
                 uint64_t evtbl = Read<uint64_t>(en);
                 bool VtOk = evtbl >= MODULE_BASE + 0x1000 && evtbl < MODULE_BASE + 0xE9D0000ULL;
-                if (VtOk) m_known_enums.insert(en);
+                if (VtOk) {
+                    uint64_t NamesPtr = Read<uint64_t>(en + ArcDecrypt::Offsets::UEnum::Names);
+                    uint32_t NamesCnt = Read<uint32_t>(en + ArcDecrypt::Offsets::UEnum::Names + 8);
+                    uint32_t NamesMax = Read<uint32_t>(en + ArcDecrypt::Offsets::UEnum::Names + 12);
+                    bool LooksLikeEnum = (NamesPtr > 0x10000 && NamesPtr < 0x7FFFFFFFFFFFULL &&
+                                          NamesCnt > 0 && NamesCnt < 512 &&
+                                          NamesMax >= NamesCnt && NamesMax < 512);
+                    if (LooksLikeEnum) m_known_enums.insert(en);
+                }
                 std::string n = GetNameTheia(en);
                 if (!n.empty() && IsPlausibleUEName(n)) { type_name = n; return; }
             }
@@ -3159,12 +3167,17 @@ public:
             for (uint64_t A : VtStructAddrs) if (func_obj_addrs.count(A)) ++StructInFuncSet;
             for (uint64_t A : VtClassAddrs)  if (func_obj_addrs.count(A)) ++ClassInFuncSet;
             for (uint64_t A : VtEnumAddrs)   if (func_obj_addrs.count(A)) ++EnumInFuncSet;
-            if (StructInFuncSet || ClassInFuncSet || EnumInFuncSet) {
-                std::printf("[vtpre] WARNING: type objects in func_obj_addrs: %u struct, %u class, %u enum — removing them!\n",
-                    StructInFuncSet, ClassInFuncSet, EnumInFuncSet);
+            uint32_t KnownEnumInFuncSet = 0;
+            for (uint64_t A : m_known_enums) if (func_obj_addrs.count(A)) ++KnownEnumInFuncSet;
+            for (uint64_t A : m_known_structs) if (func_obj_addrs.count(A)) ++StructInFuncSet;
+            if (StructInFuncSet || ClassInFuncSet || EnumInFuncSet || KnownEnumInFuncSet) {
+                std::printf("[vtpre] WARNING: type objects in func_obj_addrs: %u struct, %u class, %u enum, %u known_enum — removing them!\n",
+                    StructInFuncSet, ClassInFuncSet, EnumInFuncSet, KnownEnumInFuncSet);
                 for (uint64_t A : VtStructAddrs) func_obj_addrs.erase(A);
                 for (uint64_t A : VtClassAddrs)  func_obj_addrs.erase(A);
                 for (uint64_t A : VtEnumAddrs)   func_obj_addrs.erase(A);
+                for (uint64_t A : m_known_enums) func_obj_addrs.erase(A);
+                for (uint64_t A : m_known_structs) func_obj_addrs.erase(A);
             }
         }
 
@@ -3565,10 +3578,23 @@ public:
                 LoopTotal, SkipNull, SkipSlash, SkipFunc, SkipCdo);
             std::printf("[sdk] After main loop: %zu class, %zu struct, m_known_structs=%zu m_known_enums=%zu\n",
                 PreRcClass, PreRcStruct, m_known_structs.size(), m_known_enums.size());
+
+            std::unordered_set<uint64_t> obj_set_diag;
+            for (const auto& [ii, op] : object_ptrs) obj_set_diag.insert(op);
+            size_t EnInObj = 0, EnNotInObj = 0, EnProcessed = 0, EnInSeen = 0, EnInFunc = 0, EnInStruct = 0;
+            for (uint64_t Ep : m_known_enums) {
+                if (obj_set_diag.count(Ep)) ++EnInObj; else ++EnNotInObj;
+                if (processed_enums.count(Ep)) ++EnProcessed;
+                if (seen.count(Ep)) ++EnInSeen;
+                if (func_obj_addrs.count(Ep)) ++EnInFunc;
+                if (m_known_structs.count(Ep)) ++EnInStruct;
+            }
+            std::printf("[enum-diag] m_known_enums=%zu in_obj=%zu not_in_obj=%zu processed=%zu seen=%zu in_func=%zu in_struct=%zu\n",
+                m_known_enums.size(), EnInObj, EnNotInObj, EnProcessed, EnInSeen, EnInFunc, EnInStruct);
         }
 
         {
-            int EnumPass2 = 0;
+            int EnumPass2 = 0, EnumPass2Rescue = 0;
             for (const auto& [idx, obj_ptr] : object_ptrs) {
                 if (!obj_ptr) continue;
                 if (!m_known_enums.count(obj_ptr)) continue;
@@ -3576,6 +3602,8 @@ public:
                 auto fn_it = addr_to_name.find(obj_ptr);
                 std::string short_name = (fn_it != addr_to_name.end()) ? fn_it->second : std::string();
                 if (short_name.empty() || !IsPlausibleUEName(short_name)) continue;
+                if (short_name.rfind("Default__", 0) == 0) continue;
+                if (short_name[0] == '/') continue;
                 EnumRecord erec{};
                 erec.addr    = obj_ptr;
                 erec.name    = short_name;
@@ -3584,7 +3612,28 @@ public:
                 result.enums.push_back(std::move(erec));
                 ++EnumPass2;
             }
-            std::printf("[sdk] Enum pass 2 (late-discovered): %d extra enums\n", EnumPass2);
+
+            size_t StructsBefore = result.structs.size();
+            result.structs.erase(
+                std::remove_if(result.structs.begin(), result.structs.end(),
+                    [&](const StructRecord& Rec) -> bool {
+                        if (!m_known_enums.count(Rec.addr)) return false;
+                        if (processed_enums.count(Rec.addr)) return false;
+                        if (Rec.functions.size() > 0) return false;
+                        if (Rec.properties.size() > 5) return false;
+                        EnumRecord erec{};
+                        erec.addr = Rec.addr;
+                        erec.name = Rec.name;
+                        erec.package = Rec.package;
+                        processed_enums.insert(Rec.addr);
+                        result.enums.push_back(std::move(erec));
+                        ++EnumPass2Rescue;
+                        return true;
+                    }),
+                result.structs.end());
+
+            std::printf("[sdk] Enum pass 2 (late-discovered): %d extra enums, %d rescued from struct/class\n",
+                EnumPass2, EnumPass2Rescue);
         }
         PrintResolveStats();
         DiagnoseShadowResolution();
@@ -3801,11 +3850,16 @@ public:
             result.structs.push_back(std::move(rec));
             ++extra_structs_added;
         }
-        size_t EnumSkippedShadow = 0;
-        for (uint64_t ep : m_known_enums_hi) {
-            if (seen.count(ep)) continue;
-            if (ep <= 0x10000 || ep >= 0x800000000000ULL) continue;
-            if (m_known_structs.count(ep)) continue;
+        size_t EnumSkippedShadow = 0, EnumSkippedSeen = 0, EnumSkippedRange = 0;
+        size_t EnumSkippedStruct = 0, EnumSkippedName = 0;
+        std::unordered_set<uint64_t> AllKnownEnums = m_known_enums_hi;
+        for (uint64_t E : m_known_enums) AllKnownEnums.insert(E);
+        std::printf("[pass3-enum] m_known_enums_hi=%zu all_known=%zu, iterating...\n",
+            m_known_enums_hi.size(), AllKnownEnums.size());
+        for (uint64_t ep : AllKnownEnums) {
+            if (seen.count(ep)) { ++EnumSkippedSeen; continue; }
+            if (ep <= 0x10000 || ep >= 0x800000000000ULL) { ++EnumSkippedRange; continue; }
+            if (m_known_structs.count(ep)) { ++EnumSkippedStruct; continue; }
             uint64_t Vt = Read<uint64_t>(ep);
             uint64_t VtRva = (Vt >= MODULE_BASE) ? (Vt - MODULE_BASE) : 0;
             bool IsShadowVt = (VtRva >= 0xB400000 && VtRva < 0xB500000);
@@ -3827,7 +3881,7 @@ public:
                 int32_t Ci = m_fname.DecryptFFieldNameCI(ep - 8);
                 if (Ci > 1) name = m_fname.CompIndexToNameLenient(Ci);
             }
-            if (name.empty() || !IsPlausibleUEName(name) || name[0] == '/') continue;
+            if (name.empty() || !IsPlausibleUEName(name) || name[0] == '/') { ++EnumSkippedName; continue; }
             size_t dot = name.rfind('.');
             if (dot != std::string::npos) name = name.substr(dot + 1);
             EnumRecord erec{};
@@ -3839,8 +3893,9 @@ public:
         }
         std::printf("[sdk] struct extras skip: seen=%zu range=%zu noname=%zu slash=%zu\n",
             diag_s_seen, diag_s_range, diag_s_noname, diag_s_slash);
-        std::printf("[sdk] Pass-3 emit extras: +%zu structs, +%zu enums (shadow-skipped=%zu)\n",
-            extra_structs_added, extra_enums_added, EnumSkippedShadow);
+        std::printf("[sdk] Pass-3 emit extras: +%zu structs, +%zu enums (shadow=%zu seen=%zu range=%zu struct=%zu name=%zu)\n",
+            extra_structs_added, extra_enums_added, EnumSkippedShadow, EnumSkippedSeen,
+            EnumSkippedRange, EnumSkippedStruct, EnumSkippedName);
 
         // Sort alphabetically by package then name (used for final emit order)
         auto sort_by_pkg_name = [](const auto& a, const auto& b) {
