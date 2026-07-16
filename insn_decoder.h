@@ -270,10 +270,15 @@ private:
 
             switch (op.type) {
             case ZYDIS_OPERAND_TYPE_MEMORY: {
-                // RIP-relative addressing in 64-bit mode: base == RIP.
                 if (op.mem.base == ZYDIS_REGISTER_RIP && op.mem.disp.has_displacement) {
                     out.hasRipRel = true;
                     out.disp32 = (int32_t)op.mem.disp.value;
+                } else if (op.mem.disp.has_displacement && op.mem.base != ZYDIS_REGISTER_NONE) {
+                    int32_t D = (int32_t)op.mem.disp.value;
+                    if ((D > 0x10 || D < -0x10) && !out.hasImm32) {
+                        out.imm32 = (uint32_t)D;
+                        out.hasImm32 = true;
+                    }
                 }
                 break;
             }

@@ -514,15 +514,52 @@ public:
     // Callers extracting CompIndex must use (dec >> 32).
     uint64_t DecryptUObjSlotNew(const uint8_t enc[16]) const {
         if (m_newPatchActive) {
-            namespace V709 = ArcDecrypt::v20260709;
+            const auto& Sv = AutoDiscovery::g_DiscoveredSlotV709;
+            int R64Amt = Sv.Valid ? Sv.Rol64First : ArcDecrypt::v20260709::UOBJ_SLOT_ROL64_FIRST;
+            int ShImm  = Sv.Valid ? Sv.PshuflwImm : ArcDecrypt::v20260709::UOBJ_SLOT_PSHUFLW;
+            int R32Amt = Sv.Valid ? Sv.Rol32Per   : ArcDecrypt::v20260709::UOBJ_SLOT_ROL32_PER;
             __m128i V = _mm_loadu_si128(reinterpret_cast<const __m128i*>(enc));
-            __m128i R64 = _mm_or_si128(
-                _mm_slli_epi64(V, V709::UOBJ_SLOT_ROL64_FIRST),
-                _mm_srli_epi64(V, 64 - V709::UOBJ_SLOT_ROL64_FIRST));
-            __m128i Sh = _mm_shufflelo_epi16(R64, V709::UOBJ_SLOT_PSHUFLW);
-            __m128i R32 = _mm_or_si128(
-                _mm_slli_epi32(Sh, V709::UOBJ_SLOT_ROL32_PER),
-                _mm_srli_epi32(Sh, 32 - V709::UOBJ_SLOT_ROL32_PER));
+            __m128i R64;
+            switch (R64Amt) {
+#define ROL64_CASE(N) case N: R64 = _mm_or_si128(_mm_slli_epi64(V, N), _mm_srli_epi64(V, 64-N)); break;
+                ROL64_CASE(1) ROL64_CASE(2) ROL64_CASE(3) ROL64_CASE(4)
+                ROL64_CASE(5) ROL64_CASE(7) ROL64_CASE(8) ROL64_CASE(9)
+                ROL64_CASE(10) ROL64_CASE(11) ROL64_CASE(13) ROL64_CASE(15)
+                ROL64_CASE(16) ROL64_CASE(17) ROL64_CASE(19) ROL64_CASE(21)
+                ROL64_CASE(23) ROL64_CASE(25) ROL64_CASE(27) ROL64_CASE(29)
+                ROL64_CASE(31) ROL64_CASE(32) ROL64_CASE(33) ROL64_CASE(35)
+                ROL64_CASE(37) ROL64_CASE(39) ROL64_CASE(40) ROL64_CASE(41)
+                ROL64_CASE(43) ROL64_CASE(45) ROL64_CASE(47) ROL64_CASE(48)
+                ROL64_CASE(49) ROL64_CASE(51) ROL64_CASE(53) ROL64_CASE(54)
+                ROL64_CASE(55) ROL64_CASE(56) ROL64_CASE(57) ROL64_CASE(59)
+                ROL64_CASE(61) ROL64_CASE(63)
+#undef ROL64_CASE
+                default: R64 = V; break;
+            }
+            __m128i Sh;
+            switch (ShImm) {
+#define PSHUFLW_CASE(N) case N: Sh = _mm_shufflelo_epi16(R64, N); break;
+                PSHUFLW_CASE(0x1B) PSHUFLW_CASE(0x1E) PSHUFLW_CASE(0x27)
+                PSHUFLW_CASE(0x39) PSHUFLW_CASE(0x4E) PSHUFLW_CASE(0x6C)
+                PSHUFLW_CASE(0x72) PSHUFLW_CASE(0x78) PSHUFLW_CASE(0x87)
+                PSHUFLW_CASE(0x93) PSHUFLW_CASE(0x9C) PSHUFLW_CASE(0xB1)
+                PSHUFLW_CASE(0xB4) PSHUFLW_CASE(0xC6) PSHUFLW_CASE(0xC9)
+                PSHUFLW_CASE(0xD8) PSHUFLW_CASE(0xE1) PSHUFLW_CASE(0xE4)
+#undef PSHUFLW_CASE
+                default: Sh = R64; break;
+            }
+            __m128i R32;
+            switch (R32Amt) {
+#define ROL32_CASE(N) case N: R32 = _mm_or_si128(_mm_slli_epi32(Sh, N), _mm_srli_epi32(Sh, 32-N)); break;
+                ROL32_CASE(1) ROL32_CASE(2) ROL32_CASE(3) ROL32_CASE(4)
+                ROL32_CASE(5) ROL32_CASE(7) ROL32_CASE(8) ROL32_CASE(9)
+                ROL32_CASE(10) ROL32_CASE(11) ROL32_CASE(13) ROL32_CASE(15)
+                ROL32_CASE(16) ROL32_CASE(17) ROL32_CASE(19) ROL32_CASE(21)
+                ROL32_CASE(23) ROL32_CASE(25) ROL32_CASE(27) ROL32_CASE(29)
+                ROL32_CASE(31)
+#undef ROL32_CASE
+                default: R32 = Sh; break;
+            }
             uint64_t Lo;
             _mm_storel_epi64(reinterpret_cast<__m128i*>(&Lo), R32);
             return Lo;

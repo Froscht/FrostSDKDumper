@@ -2317,6 +2317,123 @@ inline UObjSlotDecryptParams DiscoverUObjSlotDecrypt(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Phase 4b: UObject slot decrypt — v709-style (ROL64+PSHUFLW+ROL32, no PSHUFB)
+//
+// Scans for PSHUFLW sites that have ROL64 before and ROL32 after but NO PSHUFB
+// nearby. Histograms the constant tuple to find the inlined slot decrypt.
+// ─────────────────────────────────────────────────────────────────────────────
+struct UObjSlotV709Params {
+    int      Rol64First   = 0;
+    uint8_t  PshuflwImm   = 0;
+    int      Rol32Per     = 0;
+    uint64_t FirstSiteRva = 0;
+    int      SiteCount    = 0;
+    bool     Valid         = false;
+};
+
+inline UObjSlotV709Params DiscoverUObjSlotV709(const SigScanV2::Scanner& Scanner)
+{
+    UObjSlotV709Params Out;
+    auto Hits = ScanCodeSections(Scanner, "F2 0F 70");
+    std::printf("[autodisc-uobj709] PSHUFLW sites: %zu\n", Hits.size());
+
+    struct Tuple {
+        int Rol64, Rol32;
+        uint8_t Pshuflw;
+    };
+    struct TupleInfo {
+        int Count = 0;
+        uint64_t FirstRva = 0;
+    };
+    auto TupleKey = [](const Tuple& T) -> uint64_t {
+        return (uint64_t(T.Rol64) << 16) | (uint64_t(T.Pshuflw) << 8) | uint64_t(T.Rol32);
+    };
+    std::unordered_map<uint64_t, TupleInfo> Histogram;
+    std::unordered_map<uint64_t, Tuple> TupleData;
+
+    InsnDecoder Dec;
+    for (uint64_t Rva : Hits) {
+        int BackBytes = 64;
+        uint64_t StartRva = (Rva > BackBytes) ? Rva - BackBytes : 0;
+        if (!Scanner.IsTextRVA(StartRva)) StartRva = Rva;
+        const uint8_t* P = Scanner.GetLocalPtr(StartRva);
+        if (!P) continue;
+        uint64_t WindowLen = Rva - StartRva + 64;
+        auto Insns = Dec.Decode(P, static_cast<int>(WindowLen), StartRva);
+
+        int PshuflwIdx = -1;
+        for (int I = 0; I < (int)Insns.size(); ++I) {
+            if (Insns[I].type == INSN_PSHUFLW && Insns[I].rva == Rva) {
+                PshuflwIdx = I;
+                break;
+            }
+        }
+        if (PshuflwIdx < 0) continue;
+
+        bool HasPshufb = false;
+        for (const auto& Ins : Insns)
+            if (Ins.type == INSN_PSHUFB) { HasPshufb = true; break; }
+        if (HasPshufb) continue;
+
+        int Rol64Amt = 0;
+        for (int I = PshuflwIdx - 1; I >= 0 && I >= PshuflwIdx - 10; --I) {
+            if ((Insns[I].type == INSN_PSLLQ || Insns[I].type == INSN_PSLLI_EPI64) &&
+                Insns[I].hasImm8 && Insns[I].imm8 > 0 && Insns[I].imm8 < 64) {
+                Rol64Amt = Insns[I].imm8;
+                break;
+            }
+        }
+        if (!Rol64Amt) continue;
+
+        int Rol32Amt = 0;
+        for (int I = PshuflwIdx + 1; I < (int)Insns.size() && I <= PshuflwIdx + 10; ++I) {
+            if ((Insns[I].type == INSN_PSLLD || Insns[I].type == INSN_PSLLI_EPI32) &&
+                Insns[I].hasImm8 && Insns[I].imm8 > 0 && Insns[I].imm8 < 32) {
+                Rol32Amt = Insns[I].imm8;
+                break;
+            }
+        }
+        if (!Rol32Amt) continue;
+
+        Tuple T{Rol64Amt, Rol32Amt, Insns[PshuflwIdx].imm8};
+        uint64_t K = TupleKey(T);
+        auto& Info = Histogram[K];
+        if (!Info.Count) Info.FirstRva = Rva;
+        Info.Count++;
+        TupleData[K] = T;
+    }
+
+    if (Histogram.empty()) {
+        std::printf("[autodisc-uobj709] no ROL64+PSHUFLW+ROL32 sites found\n");
+        return Out;
+    }
+
+    uint64_t BestKey = 0;
+    int BestCount = 0;
+    for (const auto& [K, Info] : Histogram) {
+        if (Info.Count > BestCount) { BestCount = Info.Count; BestKey = K; }
+    }
+
+    if (BestCount < 3) {
+        std::printf("[autodisc-uobj709] insufficient consensus (best seen %d×, need ≥3)\n", BestCount);
+        return Out;
+    }
+
+    const auto& T = TupleData[BestKey];
+    const auto& Info = Histogram[BestKey];
+    Out.Rol64First   = T.Rol64;
+    Out.PshuflwImm   = T.Pshuflw;
+    Out.Rol32Per     = T.Rol32;
+    Out.FirstSiteRva = Info.FirstRva;
+    Out.SiteCount    = Info.Count;
+    Out.Valid         = true;
+    std::printf("[autodisc-uobj709] slot decrypt: ROL64(%d) → PSHUFLW(0x%02X) → ROL32(%d)  (%d sites, first @ 0x%llX)\n",
+        Out.Rol64First, Out.PshuflwImm, Out.Rol32Per, Out.SiteCount,
+        (unsigned long long)Out.FirstSiteRva);
+    return Out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Phase 5: FNamePool resolver constants (extract via Zydis instruction walk)
 //
 // We already locate the outer FName function via find_fname_func.h. Once we
@@ -3050,46 +3167,79 @@ inline StringDecryptDiscovery DiscoverStringDecryptParams(
     for (auto& Body : Bodies) {
         int ShrCount = 0;
         int AndSmallCount = 0;
-        bool HasImul32 = false;
-        for (const auto& Ins : Body.Insns) {
+        int FirstImulIdx = -1;
+        for (int I = 0; I < (int)Body.Insns.size(); ++I) {
+            const auto& Ins = Body.Insns[I];
             if (Ins.type == INSN_SHR && Ins.hasImm8 && !Ins.hasREX_W &&
                 Ins.imm8 >= 2 && Ins.imm8 <= 15) ShrCount++;
             if (Ins.type == INSN_AND_IMM && Ins.hasImm32 &&
                 (Ins.imm32 == 0x3Fu || Ins.imm32 == 0x3Du)) AndSmallCount++;
-            if (Ins.type == INSN_IMUL && Ins.hasImm32 && Ins.imm32 > 0x1000u &&
-                Ins.imm32 != 0x01000193u) HasImul32 = true;
+            if (FirstImulIdx < 0 && Ins.type == INSN_IMUL && Ins.hasImm32 &&
+                Ins.imm32 > 0x1000u && Ins.imm32 != 0x01000193u)
+                FirstImulIdx = I;
         }
         if (ShrCount < 1 || AndSmallCount < 1) continue;
 
+        int FirstKeyMaskIdx = -1;
         for (int I = 0; I < (int)Body.Insns.size(); ++I) {
+            if (Body.Insns[I].type == INSN_AND_IMM && Body.Insns[I].hasImm32 &&
+                (Body.Insns[I].imm32 == 0x3Fu || Body.Insns[I].imm32 == 0x3Du)) {
+                FirstKeyMaskIdx = I;
+                Out.KeyIndexMask = static_cast<uint8_t>(Body.Insns[I].imm32);
+                break;
+            }
+        }
+        if (FirstKeyMaskIdx < 0) continue;
+
+        int HdrShrIdx = -1;
+        for (int I = FirstKeyMaskIdx - 1; I >= 0; --I) {
             const auto& Ins = Body.Insns[I];
-
             if (Ins.type == INSN_SHR && Ins.hasImm8 && !Ins.hasREX_W &&
-                Ins.imm8 >= 2 && Ins.imm8 <= 15 && !Out.HdrLengthShift) {
+                Ins.imm8 >= 2 && Ins.imm8 <= 15) {
+                HdrShrIdx = I;
                 Out.HdrLengthShift = Ins.imm8;
+                break;
             }
+        }
 
-            if (Ins.type == INSN_AND_IMM && Ins.hasImm32) {
-                uint32_t V = Ins.imm32;
-                if (V == 0x3Fu || V == 0x3Du)
-                    Out.KeyIndexMask = static_cast<uint8_t>(V);
-                if (V == 0x8000u || V == 0x20u || V == 0x100u || V == 0x40u)
-                    Out.HdrIsWideBit = static_cast<uint16_t>(V);
+        if (HdrShrIdx >= 0) {
+            for (int I = HdrShrIdx + 1; I < FirstKeyMaskIdx; ++I) {
+                const auto& Ins = Body.Insns[I];
+                if ((Ins.type == INSN_ADD_IMM || Ins.type == INSN_LEA) &&
+                    Ins.hasImm32 && !Ins.hasREX_W &&
+                    Ins.imm32 > 0x100u && Ins.imm32 < 0x10000u && !Out.KeyInitAdd) {
+                    Out.KeyInitAdd = Ins.imm32;
+                }
             }
+            int WideScanStart = std::max(0, HdrShrIdx - 30);
+            for (int I = WideScanStart; I < HdrShrIdx; ++I) {
+                const auto& Ins = Body.Insns[I];
+                if (Ins.type == INSN_AND_IMM && Ins.hasImm32) {
+                    uint32_t V = Ins.imm32;
+                    if (V == 0x8000u || V == 0x20u || V == 0x100u || V == 0x40u)
+                        Out.HdrIsWideBit = static_cast<uint16_t>(V);
+                }
+                if (Ins.type == INSN_SHR && Ins.hasImm8 && !Ins.hasREX_W &&
+                    Ins.imm8 == 5 && !Out.HdrIsWideBit) {
+                    Out.HdrIsWideBit = 0x20u;
+                }
+            }
+            if (!Out.HdrIsWideBit) Out.HdrIsWideBit = 0x20u;
+        }
 
+        for (int I = FirstKeyMaskIdx; I < (int)Body.Insns.size(); ++I) {
+            const auto& Ins = Body.Insns[I];
             if (Ins.type == INSN_ADD_IMM && Ins.hasImm32 && !Ins.hasREX_W) {
                 uint32_t V = Ins.imm32;
-                if (V > 0x1000u && V < 0x10000u && !Out.KeyInitAdd)
-                    Out.KeyInitAdd = V;
                 if (V > 0x100u && V < 0x1000u && !Out.KeyPairStep)
                     Out.KeyPairStep = V;
             }
         }
 
-        if (HasImul32) {
+        if (FirstImulIdx >= 0) {
             std::vector<uint32_t> ImulImms;
             std::vector<uint32_t> FollowingAdds;
-            for (int I = 0; I < (int)Body.Insns.size(); ++I) {
+            for (int I = FirstImulIdx; I < (int)Body.Insns.size(); ++I) {
                 const auto& Ins = Body.Insns[I];
                 if (Ins.type == INSN_IMUL && Ins.hasImm32 && Ins.imm32 != 0x01000193u) {
                     ImulImms.push_back(Ins.imm32);
@@ -5048,6 +5198,7 @@ inline GUObjectArrayLayout       g_DiscoveredGObjLayout;
 inline FNamePipelineDiscovery    g_DiscoveredFNamePipeline;
 inline SlotHashDiscovery         g_DiscoveredSlotHash;
 inline StringDecryptDiscovery    g_DiscoveredStringDecrypt;
+inline UObjSlotV709Params        g_DiscoveredSlotV709;
 
 // Seed g_DiscoveredFClassGlobals with hardcoded CL-1201801 FFieldClass RVAs so
 // AutoOffsets::DiscoverAll (Probe 10) has a populated fclass_to_type map even

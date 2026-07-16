@@ -363,13 +363,23 @@ public:
                         AutoDiscovery::g_DiscoveredBounds);
             }
 
-            {
+            if (!AutoDiscovery::g_DiscoveredSlotV709.Valid) {
+                std::printf("\n=== Phase 4b: UObject slot decrypt (v709-style) ===\n");
+                AutoDiscovery::g_DiscoveredSlotV709 =
+                    AutoDiscovery::DiscoverUObjSlotV709(m_sigScanner);
+            }
+            if (AutoDiscovery::g_DiscoveredSlotV709.Valid) {
+                AutoDiscovery::g_UseV709SlotHash = true;
+                AutoDiscovery::g_UseV707SlotHash = false;
+                const auto& Sv = AutoDiscovery::g_DiscoveredSlotV709;
+                std::printf("[autodisc] Phase 4: auto-discovered V709 slot (ROL64=%d, PSHUFLW=0x%02X, ROL32=%d, %d sites)\n",
+                    Sv.Rol64First, Sv.PshuflwImm, Sv.Rol32Per, Sv.SiteCount);
+            } else {
                 namespace V709 = ArcDecrypt::v20260709;
                 AutoDiscovery::g_UseV709SlotHash = true;
                 AutoDiscovery::g_UseV707SlotHash = false;
-                std::printf("[autodisc] Phase 4: using V709 slot constants (ROL64=%d, PSHUFLW=0x%02X, ROL32per=%d, HashADD=0x%08X)\n",
-                    V709::UOBJ_SLOT_ROL64_FIRST, V709::UOBJ_SLOT_PSHUFLW,
-                    V709::UOBJ_SLOT_ROL32_PER, V709::SLOT_HASH_ADD);
+                std::printf("[autodisc] Phase 4: fallback V709 slot constants (ROL64=%d, PSHUFLW=0x%02X, ROL32=%d)\n",
+                    V709::UOBJ_SLOT_ROL64_FIRST, V709::UOBJ_SLOT_PSHUFLW, V709::UOBJ_SLOT_ROL32_PER);
             }
 
             // ── Phase 7: FFieldClass NamePrivate decode pipeline ───────
@@ -1465,14 +1475,17 @@ public:
             }
 
             // ── Phase 4.5: Slot hash constant extraction ─────────────────
-            if (!AutoDiscovery::g_DiscoveredSlotHash.Valid &&
-                AutoDiscovery::g_DiscoveredUObjSlot.Valid &&
-                AutoDiscovery::g_DiscoveredUObjSlot.FirstSiteRva)
             {
-                std::printf("\n=== Phase 4.5: UObject slot hash extraction ===\n");
-                AutoDiscovery::g_DiscoveredSlotHash =
-                    AutoDiscovery::DiscoverSlotHashConsts(
-                        m_sigScanner, AutoDiscovery::g_DiscoveredUObjSlot.FirstSiteRva);
+                uint64_t SlotSiteRva = 0;
+                if (AutoDiscovery::g_DiscoveredUObjSlot.Valid && AutoDiscovery::g_DiscoveredUObjSlot.FirstSiteRva)
+                    SlotSiteRva = AutoDiscovery::g_DiscoveredUObjSlot.FirstSiteRva;
+                else if (AutoDiscovery::g_DiscoveredSlotV709.Valid && AutoDiscovery::g_DiscoveredSlotV709.FirstSiteRva)
+                    SlotSiteRva = AutoDiscovery::g_DiscoveredSlotV709.FirstSiteRva;
+                if (!AutoDiscovery::g_DiscoveredSlotHash.Valid && SlotSiteRva) {
+                    std::printf("\n=== Phase 4.5: UObject slot hash extraction ===\n");
+                    AutoDiscovery::g_DiscoveredSlotHash =
+                        AutoDiscovery::DiscoverSlotHashConsts(m_sigScanner, SlotSiteRva);
+                }
             }
 
             // ── Phase 5.7: String decrypt parameter extraction ───────────
