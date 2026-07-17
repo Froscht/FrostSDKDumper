@@ -31,6 +31,7 @@ probe_live_rvas
 /writeup
 *.bin
 /SDK
+/sdk
 /.claude
 SDK_Output_OLD.txt
 *.id2

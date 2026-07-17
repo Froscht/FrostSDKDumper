@@ -53,6 +53,7 @@
 #include "insn_decoder.h"
 #include "func_analyzer.h"
 #include "pe_reader.h"
+#include "qd_engine.h"
 
 namespace AutoDiscovery {
 
@@ -2429,6 +2430,85 @@ inline UObjSlotV709Params DiscoverUObjSlotV709(const SigScanV2::Scanner& Scanner
     Out.Valid         = true;
     std::printf("[autodisc-uobj709] slot decrypt: ROL64(%d) → PSHUFLW(0x%02X) → ROL32(%d)  (%d sites, first @ 0x%llX)\n",
         Out.Rol64First, Out.PshuflwImm, Out.Rol32Per, Out.SiteCount,
+        (unsigned long long)Out.FirstSiteRva);
+    return Out;
+}
+
+struct QDSlotDiscovery {
+    QDProgram Program;
+    uint64_t  FirstSiteRva = 0;
+    int       SiteCount    = 0;
+    bool      Valid        = false;
+};
+
+inline QDSlotDiscovery QDDiscoverUObjSlot(const SigScanV2::Scanner& Scanner)
+{
+    QDSlotDiscovery Out;
+
+    auto PshuflwHits = ScanCodeSections(Scanner, "F2 0F 70");
+    auto PshufbHits  = ScanCodeSections(Scanner, "66 0F 38 00");
+    std::vector<uint64_t> AllAnchors;
+    AllAnchors.insert(AllAnchors.end(), PshuflwHits.begin(), PshuflwHits.end());
+    AllAnchors.insert(AllAnchors.end(), PshufbHits.begin(), PshufbHits.end());
+    std::sort(AllAnchors.begin(), AllAnchors.end());
+    AllAnchors.erase(std::unique(AllAnchors.begin(), AllAnchors.end()), AllAnchors.end());
+
+    std::printf("[qd-slot] scanning %zu SIMD anchor sites\n", AllAnchors.size());
+
+    std::unordered_map<uint64_t, int> ProgHist;
+    std::unordered_map<uint64_t, QDProgram> ProgMap;
+    std::unordered_map<uint64_t, uint64_t> ProgFirstRva;
+
+    InsnDecoder Dec;
+    for (uint64_t Rva : AllAnchors) {
+        int BackBytes = 80;
+        uint64_t StartRva = (Rva > (uint64_t)BackBytes) ? Rva - BackBytes : 0;
+        if (!Scanner.IsTextRVA(StartRva)) StartRva = Rva;
+        const uint8_t* P = Scanner.GetLocalPtr(StartRva);
+        if (!P) continue;
+        uint64_t WindowLen = Rva - StartRva + 80;
+        auto Insns = Dec.Decode(P, static_cast<int>(WindowLen), StartRva);
+
+        int AnchorIdx = -1;
+        for (int I = 0; I < (int)Insns.size(); I++) {
+            if (Insns[I].rva == Rva) { AnchorIdx = I; break; }
+        }
+        if (AnchorIdx < 0) continue;
+
+        auto Rec = QDRecordSIMDChain(Insns, AnchorIdx, Scanner);
+        if (!Rec.Program.Valid || Rec.Program.OpCount < 2) continue;
+
+        uint64_t H = QDProgramHash(Rec.Program);
+        ProgHist[H]++;
+        if (ProgMap.find(H) == ProgMap.end()) {
+            ProgMap[H] = Rec.Program;
+            ProgFirstRva[H] = Rva;
+        }
+    }
+
+    if (ProgHist.empty()) {
+        std::printf("[qd-slot] no valid QD programs recorded\n");
+        return Out;
+    }
+
+    uint64_t BestKey = 0;
+    int BestCount = 0;
+    for (const auto& [K, Count] : ProgHist) {
+        if (Count > BestCount) { BestCount = Count; BestKey = K; }
+    }
+
+    if (BestCount < 3) {
+        std::printf("[qd-slot] insufficient consensus (best seen %d×, need ≥3)\n", BestCount);
+        return Out;
+    }
+
+    Out.Program      = ProgMap[BestKey];
+    Out.FirstSiteRva = ProgFirstRva[BestKey];
+    Out.SiteCount    = BestCount;
+    Out.Valid         = true;
+
+    std::printf("[qd-slot] discovered: %s  (%d sites, first @ 0x%llX)\n",
+        QDProgramToString(Out.Program).c_str(), Out.SiteCount,
         (unsigned long long)Out.FirstSiteRva);
     return Out;
 }
@@ -5199,6 +5279,7 @@ inline FNamePipelineDiscovery    g_DiscoveredFNamePipeline;
 inline SlotHashDiscovery         g_DiscoveredSlotHash;
 inline StringDecryptDiscovery    g_DiscoveredStringDecrypt;
 inline UObjSlotV709Params        g_DiscoveredSlotV709;
+inline QDSlotDiscovery           g_DiscoveredQDSlot;
 
 // Seed g_DiscoveredFClassGlobals with hardcoded CL-1201801 FFieldClass RVAs so
 // AutoOffsets::DiscoverAll (Probe 10) has a populated fclass_to_type map even

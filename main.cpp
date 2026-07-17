@@ -382,6 +382,17 @@ public:
                     V709::UOBJ_SLOT_ROL64_FIRST, V709::UOBJ_SLOT_PSHUFLW, V709::UOBJ_SLOT_ROL32_PER);
             }
 
+            {
+                std::printf("\n=== Phase 4c: QD generic UObject slot recorder ===\n");
+                AutoDiscovery::g_DiscoveredQDSlot =
+                    AutoDiscovery::QDDiscoverUObjSlot(m_sigScanner);
+                if (AutoDiscovery::g_DiscoveredQDSlot.Valid) {
+                    std::printf("[autodisc] Phase 4c: QD slot program recorded (%d ops, %d sites)\n",
+                        AutoDiscovery::g_DiscoveredQDSlot.Program.OpCount,
+                        AutoDiscovery::g_DiscoveredQDSlot.SiteCount);
+                }
+            }
+
             // ── Phase 7: FFieldClass NamePrivate decode pipeline ───────
             if (AutoDiscovery::g_DiscoveredFFieldClassName.Valid) {
                 std::printf("[autodisc] Phase 7 skipped — FFieldClass name decrypt loaded from config (xor=0x%016llX)\n",
@@ -2298,9 +2309,8 @@ public:
                 Unk, (unsigned long long)n_struct_props,
                 n_struct_props ? 100.0 * Unk / n_struct_props : 0.0);
         }
-        ::mkdir("sdk", 0755);
-        std::ofstream sdk_file("sdk/SDK_Output.txt");
-        if (!sdk_file) { std::cerr << "[-] Cannot open sdk/SDK_Output.txt\n"; return; }
+        std::ofstream sdk_file("SDK_Output.txt");
+        if (!sdk_file) { std::cerr << "[-] Cannot open SDK_Output.txt\n"; return; }
 
         // Summary header (mirrors reference tool format)
         sdk_file << "// ============================================================\n"
@@ -2372,7 +2382,7 @@ public:
         sdk_file << "} // namespace ARC\n";
         sdk_file.close();
 
-        std::cout << "\n[+] SDK written to sdk/SDK_Output.txt\n"
+        std::cout << "\n[+] SDK written to SDK_Output.txt\n"
                   << "[+]   Classes:    " << n_classes    << "\n"
                   << "[+]   Structs:    " << n_structs    << "\n"
                   << "[+]   Enums:      " << sdk.enums.size() << "\n"
@@ -2822,6 +2832,13 @@ public:
 "\n",
         SlotRol64, SlotShuf, SlotRol32, UObjSlotOff, UObjSlotStride,
         SlotRol64, SlotRol64, SlotShuf, SlotRol32, SlotRol32);
+
+        if (AutoDiscovery::g_DiscoveredQDSlot.Valid) {
+            std::string QDCode = QDProgramToC(AutoDiscovery::g_DiscoveredQDSlot.Program, "DecryptUObjectSlot_QD");
+            fprintf(F,
+"// ─── 1b. QD-recorded UObject Slot Decode (generic, auto-recorded from binary) ───\n"
+"%s\n", QDCode.c_str());
+        }
 
         fprintf(F,
 "// ─── 2. UObject Slot Hash (selects which of 4 slots to read) ────────────────\n"
