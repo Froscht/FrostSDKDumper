@@ -262,6 +262,7 @@ public:
     SigScan::PEFileReader      m_sigPe;       // shared PE fallback for legacy SigScan (open once)
     bool                       m_sigPeReady = false;
     ConfigLoader::LoadResult   m_configResult;
+    int                        m_boneArrayOffset = 0xE8;
 
     std::unordered_map<uint64_t, std::string> m_cachedAddrToName;
     std::unordered_map<uint64_t, std::string> m_cachedAddrToFullname;
@@ -2397,12 +2398,80 @@ public:
         DumpBoneArrays(object_ptrs, addr_to_name, addr_to_fullname);
     }
 
+    int ProbeBoneArrayOffset(const std::vector<uint64_t>& SkeletonAddrs)
+    {
+        constexpr uint32_t kBoneInfoStride = 12;
+        constexpr uint32_t kMaxBones = 2048;
+        constexpr int kFallback = 0xE8;
+
+        int SampleCount = (int)std::min<size_t>(SkeletonAddrs.size(), 8);
+        std::unordered_map<int, int> OffsetVotes;
+
+        for (int S = 0; S < SampleCount; S++) {
+            uint8_t Obj[0x400];
+            if (!m_reader.Read(SkeletonAddrs[S], Obj, sizeof(Obj))) continue;
+
+            for (int Off = 0x80; Off <= 0x200; Off += 8) {
+                uint64_t ArrPtr = 0;
+                uint32_t ArrCount = 0, ArrMax = 0;
+                std::memcpy(&ArrPtr, Obj + Off, 8);
+                std::memcpy(&ArrCount, Obj + Off + 8, 4);
+                std::memcpy(&ArrMax, Obj + Off + 12, 4);
+
+                if (ArrPtr < 0x10000ULL || ArrPtr > 0xFFFFFFFFFFFFULL) continue;
+                if (ArrCount < 2 || ArrCount > kMaxBones) continue;
+                if (ArrMax < ArrCount || ArrMax > kMaxBones * 2) continue;
+
+                uint32_t ReadSize = std::min(ArrCount, 32u) * kBoneInfoStride;
+                std::vector<uint8_t> Buf(ReadSize);
+                if (!m_reader.Read(ArrPtr, Buf.data(), ReadSize)) continue;
+
+                int32_t Parent0 = 0;
+                std::memcpy(&Parent0, Buf.data() + 8, 4);
+                if (Parent0 != -1 && Parent0 != 0) continue;
+
+                bool ValidHierarchy = true;
+                uint32_t CheckCount = std::min(ArrCount, 32u);
+                for (uint32_t I = 1; I < CheckCount; I++) {
+                    int32_t P = 0;
+                    std::memcpy(&P, Buf.data() + I * kBoneInfoStride + 8, 4);
+                    if (P < -1 || P >= (int32_t)ArrCount || (P >= (int32_t)I && I > 0)) {
+                        ValidHierarchy = false;
+                        break;
+                    }
+                }
+                if (!ValidHierarchy) continue;
+
+                int32_t Ci0 = 0;
+                std::memcpy(&Ci0, Buf.data(), 4);
+                if (Ci0 <= 0 || Ci0 > 50000000) continue;
+
+                std::string TestName = m_fname.CompIndexToName(Ci0);
+                if (TestName.empty()) continue;
+
+                OffsetVotes[Off]++;
+            }
+        }
+
+        if (OffsetVotes.empty()) {
+            std::printf("[bones-probe] no valid offset found, using fallback +0x%X\n", kFallback);
+            return kFallback;
+        }
+
+        int BestOff = kFallback, BestVotes = 0;
+        for (const auto& [Off, Votes] : OffsetVotes) {
+            if (Votes > BestVotes) { BestVotes = Votes; BestOff = Off; }
+        }
+        std::printf("[bones-probe] auto-discovered BoneInfo offset: +0x%X (%d/%d skeletons voted)\n",
+            BestOff, BestVotes, SampleCount);
+        return BestOff;
+    }
+
     void DumpBoneArrays(
             const std::vector<std::pair<int32_t, uint64_t>>& ObjectPtrs,
             const std::unordered_map<uint64_t, std::string>& AddrToName,
             const std::unordered_map<uint64_t, std::string>& AddrToFullname)
     {
-        constexpr uint64_t kBoneArrayOffset = 0xB8;
         constexpr uint32_t kBoneInfoStride  = 12;
         constexpr uint32_t kMaxBones        = 2048;
 
@@ -2421,11 +2490,15 @@ public:
         }
         std::printf("[bones] found %zu USkeleton objects\n", SkeletonAddrs.size());
 
+        m_boneArrayOffset = ProbeBoneArrayOffset(SkeletonAddrs);
+        int BoneArrayOffset = m_boneArrayOffset;
+
         std::ofstream Out("dump_bones.txt");
         if (!Out) { std::printf("[bones] failed to open dump_bones.txt\n"); return; }
         Out << "// ============================================================\n";
         Out << "// ARC Raiders – Skeleton Bone Dump\n";
         Out << "// USkeleton objects: " << SkeletonAddrs.size() << "\n";
+        Out << "// BoneInfo offset: +0x" << std::hex << BoneArrayOffset << std::dec << "\n";
         Out << "// ============================================================\n\n";
 
         uint32_t TotalSkeletons = 0, TotalBones = 0;
@@ -2436,9 +2509,9 @@ public:
 
             uint64_t ArrPtr = 0;
             uint32_t ArrCount = 0, ArrMax = 0;
-            if (!m_reader.Read(SkelPtr + kBoneArrayOffset, &ArrPtr, 8)) continue;
-            if (!m_reader.Read(SkelPtr + kBoneArrayOffset + 8, &ArrCount, 4)) continue;
-            if (!m_reader.Read(SkelPtr + kBoneArrayOffset + 12, &ArrMax, 4)) continue;
+            if (!m_reader.Read(SkelPtr + BoneArrayOffset, &ArrPtr, 8)) continue;
+            if (!m_reader.Read(SkelPtr + BoneArrayOffset + 8, &ArrCount, 4)) continue;
+            if (!m_reader.Read(SkelPtr + BoneArrayOffset + 12, &ArrMax, 4)) continue;
 
             if (ArrCount == 0 || ArrCount > kMaxBones || ArrPtr < 0x10000ULL) continue;
 
@@ -3134,18 +3207,13 @@ public:
 "\n");
 
         fprintf(F,
-"// ─── 9. Bone Array Decrypt (placeholder) ────────────────────────────────────\n"
-"// Bone array decryption requires a per-patch QD program parsed from the\n"
-"// game binary. The signature \"Dec_BoneArray\" locates the function.\n"
-"// The decrypt chain is: SIMD read → XOR key → PSHUFB → shift → MOVQ\n"
-"// Plus optional sentinel XOR and LOD fallback.\n"
-"//\n"
-"// This cannot be auto-generated yet — it requires runtime Zydis parsing\n"
-"// of the game's bone decrypt function. Use Unicorn emulation or implement\n"
-"// a QuickDecrypt-style interpreter (see leaked ARC_Decryptor source).\n"
-"//\n"
-"// Bone offset on SkeletalMeshComponent: typically +0x7A0 (varies per build)\n"
-"\n");
+"// ─── 9. Bone Array (USkeleton) ──────────────────────────────────────────────\n"
+"// USkeleton::ReferenceSkeleton contains TArray<FMeshBoneInfo> (auto-probed).\n"
+"// Each FMeshBoneInfo = { FName(CompIndex, Number), int32 ParentIndex } = 12 bytes.\n"
+"// FNames resolve through the standard FName pipeline (no separate bone decrypt).\n"
+"constexpr uint32_t USkeleton_BoneArrayOffset = 0x%X;\n"
+"constexpr uint32_t BoneInfoStride            = 12;\n"
+"\n", m_boneArrayOffset);
 
         fprintf(F,
 "// ─── Layout Offsets ──────────────────────────────────────────────────────────\n"
