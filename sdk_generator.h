@@ -4045,7 +4045,7 @@ public:
     //     <base>/sdk/<Package>/<Package>_structs.hpp
     //     <base>/sdk/<Package>/<Package>_enums.hpp
     //     <base>/sdk/<Package>/<Package>_functions.hpp
-    static constexpr bool kEmitDumper7 = true;
+    static constexpr bool kEmitDumper7 = false;
 
     // ── Extract last segment of a UE5 path like "/Script/Engine" → "Engine"
     static std::string D7_ShortPackage(const std::string& pkg) {
