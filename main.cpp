@@ -2409,7 +2409,11 @@ public:
 
         for (int S = 0; S < SampleCount; S++) {
             uint8_t Obj[0x400];
-            if (!m_reader.Read(SkeletonAddrs[S], Obj, sizeof(Obj))) continue;
+            if (!m_reader.Read(SkeletonAddrs[S], Obj, sizeof(Obj))) {
+                std::printf("[bones-probe] skel[%d] @ 0x%llX: read failed\n", S, (unsigned long long)SkeletonAddrs[S]);
+                continue;
+            }
+            bool VotedAny = false;
 
             for (int Off = 0x80; Off <= 0x200; Off += 8) {
                 uint64_t ArrPtr = 0;
@@ -2419,28 +2423,30 @@ public:
                 std::memcpy(&ArrMax, Obj + Off + 12, 4);
 
                 if (ArrPtr < 0x10000ULL || ArrPtr > 0xFFFFFFFFFFFFULL) continue;
-                if (ArrCount < 2 || ArrCount > kMaxBones) continue;
+                if (ArrCount < 1 || ArrCount > kMaxBones) continue;
                 if (ArrMax < ArrCount || ArrMax > kMaxBones * 2) continue;
 
                 uint32_t ReadSize = std::min(ArrCount, 32u) * kBoneInfoStride;
                 std::vector<uint8_t> Buf(ReadSize);
                 if (!m_reader.Read(ArrPtr, Buf.data(), ReadSize)) continue;
 
-                int32_t Parent0 = 0;
-                std::memcpy(&Parent0, Buf.data() + 8, 4);
-                if (Parent0 != -1 && Parent0 != 0) continue;
+                if (ArrCount >= 2) {
+                    int32_t Parent0 = 0;
+                    std::memcpy(&Parent0, Buf.data() + 8, 4);
+                    if (Parent0 != -1 && Parent0 != 0) continue;
 
-                bool ValidHierarchy = true;
-                uint32_t CheckCount = std::min(ArrCount, 32u);
-                for (uint32_t I = 1; I < CheckCount; I++) {
-                    int32_t P = 0;
-                    std::memcpy(&P, Buf.data() + I * kBoneInfoStride + 8, 4);
-                    if (P < -1 || P >= (int32_t)ArrCount || (P >= (int32_t)I && I > 0)) {
-                        ValidHierarchy = false;
-                        break;
+                    bool ValidHierarchy = true;
+                    uint32_t CheckCount = std::min(ArrCount, 32u);
+                    for (uint32_t I = 1; I < CheckCount; I++) {
+                        int32_t P = 0;
+                        std::memcpy(&P, Buf.data() + I * kBoneInfoStride + 8, 4);
+                        if (P < -1 || P >= (int32_t)ArrCount || (P >= (int32_t)I && I > 0)) {
+                            ValidHierarchy = false;
+                            break;
+                        }
                     }
+                    if (!ValidHierarchy) continue;
                 }
-                if (!ValidHierarchy) continue;
 
                 int32_t Ci0 = 0;
                 std::memcpy(&Ci0, Buf.data(), 4);
@@ -2450,6 +2456,15 @@ public:
                 if (TestName.empty()) continue;
 
                 OffsetVotes[Off]++;
+                if (Off == 0xE8) VotedAny = true;
+            }
+            if (!VotedAny) {
+                uint64_t ArrPtr = 0; uint32_t ArrCount = 0, ArrMax = 0;
+                std::memcpy(&ArrPtr, Obj + 0xE8, 8);
+                std::memcpy(&ArrCount, Obj + 0xE8 + 8, 4);
+                std::memcpy(&ArrMax, Obj + 0xE8 + 12, 4);
+                std::printf("[bones-probe] skel[%d] @ 0x%llX: no vote for +0xE8 (ptr=0x%llX cnt=%u max=%u)\n",
+                    S, (unsigned long long)SkeletonAddrs[S], (unsigned long long)ArrPtr, ArrCount, ArrMax);
             }
         }
 
