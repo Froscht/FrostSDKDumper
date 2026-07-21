@@ -2409,11 +2409,7 @@ public:
 
         for (int S = 0; S < SampleCount; S++) {
             uint8_t Obj[0x400];
-            if (!m_reader.Read(SkeletonAddrs[S], Obj, sizeof(Obj))) {
-                std::printf("[bones-probe] skel[%d] @ 0x%llX: read failed\n", S, (unsigned long long)SkeletonAddrs[S]);
-                continue;
-            }
-            bool VotedAny = false;
+            if (!m_reader.Read(SkeletonAddrs[S], Obj, sizeof(Obj))) continue;
 
             for (int Off = 0x80; Off <= 0x200; Off += 8) {
                 uint64_t ArrPtr = 0;
@@ -2456,15 +2452,6 @@ public:
                 if (TestName.empty()) continue;
 
                 OffsetVotes[Off]++;
-                if (Off == 0xE8) VotedAny = true;
-            }
-            if (!VotedAny) {
-                uint64_t ArrPtr = 0; uint32_t ArrCount = 0, ArrMax = 0;
-                std::memcpy(&ArrPtr, Obj + 0xE8, 8);
-                std::memcpy(&ArrCount, Obj + 0xE8 + 8, 4);
-                std::memcpy(&ArrMax, Obj + 0xE8 + 12, 4);
-                std::printf("[bones-probe] skel[%d] @ 0x%llX: no vote for +0xE8 (ptr=0x%llX cnt=%u max=%u)\n",
-                    S, (unsigned long long)SkeletonAddrs[S], (unsigned long long)ArrPtr, ArrCount, ArrMax);
             }
         }
 
