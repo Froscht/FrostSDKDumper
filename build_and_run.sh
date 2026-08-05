@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KMOD_DIR="$SCRIPT_DIR/../KernelDriver/src"
+KMOD_DIR="$SCRIPT_DIR/KernelDriver/src"
 KMOD_NAME="memreader"
 BINARY="$SCRIPT_DIR/FrostDumper"
 
@@ -98,7 +98,7 @@ build_dumper() {
             || error "Zydis build failed"
     fi
     g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 \
-        -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+        -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/KernelDriver/include" \
         -o "$BINARY" \
         "$SCRIPT_DIR/main.cpp" "$ZYDIS_OBJ" \
         -lcapstone -lm
@@ -107,28 +107,28 @@ build_dumper() {
     # Also build probe tools (best-effort, not fatal)
     if [[ -f "$SCRIPT_DIR/probe_subprop.cpp" ]]; then
         g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 \
-            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/KernelDriver/include" \
             -o "$SCRIPT_DIR/probe_subprop" \
             "$SCRIPT_DIR/probe_subprop.cpp" -lm 2>/dev/null \
             && info "Probe tool built: probe_subprop" || warn "probe_subprop build skipped"
     fi
     if [[ -f "$SCRIPT_DIR/probe_next.cpp" ]]; then
         g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 \
-            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/KernelDriver/include" \
             -o "$SCRIPT_DIR/probe_next" \
             "$SCRIPT_DIR/probe_next.cpp" -lm 2>/dev/null \
             && info "Probe tool built: probe_next" || warn "probe_next build skipped"
     fi
     if [[ -f "$SCRIPT_DIR/probe_live_rvas.cpp" ]]; then
         g++ -std=c++17 -O2 -march=native \
-            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/KernelDriver/include" \
             -o "$SCRIPT_DIR/probe_live_rvas" \
             "$SCRIPT_DIR/probe_live_rvas.cpp" -lm 2>/dev/null \
             && info "Probe tool built: probe_live_rvas" || warn "probe_live_rvas build skipped"
     fi
     if [[ -f "$SCRIPT_DIR/tools/extract_vtables_offline.cpp" ]]; then
         g++ -std=c++17 -O2 \
-            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/KernelDriver/include" \
             -o "$SCRIPT_DIR/tools/extract_vtables_offline" \
             "$SCRIPT_DIR/tools/extract_vtables_offline.cpp" 2>/dev/null \
             && info "Offline tool built: tools/extract_vtables_offline" || warn "extract_vtables_offline build skipped"
