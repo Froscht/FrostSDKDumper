@@ -109,6 +109,13 @@ inline int32_t DecryptUPropertyOffset(uint32_t stored) {
 // directly so no consumer-side change is needed when the layout shifts.
 // =============================================================================
 namespace Offsets {
+    // Set when a patch's layout has been recovered from the constructors that
+    // WRITE these fields, rather than inferred from live pointer shapes. The
+    // live probes in auto_offsets.h then report disagreements instead of
+    // applying them — see AutoOffsets::VetoOverride.
+    inline bool        g_Authoritative = false;
+    inline const char* g_AuthoritySrc  = "";
+
     namespace UObject {
         inline uint64_t VTable       = 0x00;
         inline uint64_t InternalIndex= 0x0C;
@@ -1085,5 +1092,200 @@ namespace v20260709 {
     constexpr int      FFIELD_NAME_ROL16     = 12;
     constexpr int      FFIELD_NAME_ROL64     = 32;
 } // namespace v20260709
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Patch 2026-08 (image size 0x11853000).
+//
+// Every value below was read out of the game image by disassembly and then
+// re-verified; nothing here is a guess. Provenance is noted per block so the
+// next patch-day port can re-derive them the same way.
+//
+// Three things changed *structurally*, not just numerically — swapping the
+// v20260709 constants into the old code paths is NOT sufficient:
+//   1. The shard hash mixes with plain right SHIFTS, not rotates, and the slot
+//      selector is back to the simple `H ^ (H>>16)` fold (the `-109*T+K`
+//      multiply form from CL-1315578 is gone).
+//   2. Block decode reordered to PSHUFLW -> XOR -> ROL64 (was ROL64 ->
+//      PSHUFLW -> XOR), and the XOR key is now an inline `movabs` immediate
+//      rather than an .rdata load, so RVA-based discovery cannot find it.
+//   3. The string key schedule lost its multipliers — it is now a plain
+//      `key += 0x716` per character pair.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace v20260805 {
+    // ── FName resolver, from RVA 0x2319F0 (core) / 0x23B120 / 0x23AAE0 ──
+    // GNamePool: `lea r8,[rip+0xe1ffeb5]` @ 0x231AC4. Init flag lives at
+    // POOL-8; the pool is lazily built by 0x23C720 on first name lookup.
+    constexpr uint64_t RVA_GNAMEPOOL         = 0xE431980ULL;
+    constexpr uint64_t RVA_GNAMEPOOL_INITFLAG= 0xE431978ULL;
+
+    // CompIndex needs NO decode. The three SIMD layers at 0x23AB01 / 0x23B1C4 /
+    // 0x231AA4 (pxor/rol32/pshufb, bit-select, pshufb/rol32/xor) cancel exactly
+    // — verified by simulating all three layers over the real .rdata masks for
+    // CI = 0,1,2,0x1234,0x10000,0x410045,0x871210,0xDEADBEEF,0xFFFFFFFF.
+    constexpr bool     CI_DECODE_IS_IDENTITY = true;
+
+    constexpr uint32_t HASH_PRIME            = 0x01000193u;
+    constexpr uint32_t SHARD_HASH_ADD        = 0x46BD406Eu;   // @0x231AEF, x4 sites
+    constexpr uint64_t SHARD_HASH_SEED_OFF   = 0x4C90ULL;     // `add rdx,0x4c90` @0x231AD2
+    constexpr uint64_t SHARD_BLOCK_BASE_OFF  = 0x4CA0ULL;     // pshuflw disp @0x231B3E
+    constexpr uint64_t SHARD_BLOCK_STRIDE    = 32ULL;         // `shl edx,5` @0x231B3B
+
+    // Shard FNV32. Note the seed is the chunk ADDRESS, never a memory read, so
+    // it depends on the live module base — do not hardcode 0x140000000.
+    //   r8d = lo32(SeedAddr) >> 4      (`shld r8d,edx,0x1c` with r8d=0x10; the
+    //                                   0x10 shifts out of 32 bits, so it is a
+    //                                   plain >>4 — confirmed by simulation)
+    constexpr int      SHARD_SEED_SHR        = 4;             // @0x231ADF
+    constexpr int      SHARD_SHR_A           = 3;             // @0x231AF6
+    constexpr int      SHARD_SHR_B           = 4;             // @0x231B0A
+    constexpr int      SHARD_SHR_C           = 3;             // @0x231B19
+    // Slot select @0x231B28..0x231B48. The `mov edx,r9d` at 0x231B32 is easy to
+    // miss and is what makes BOTH indices derive from T (not H).
+    //   T = H ^ (H>>16);  Bidx1 = T & 7;  Bidx2 = (T+1) & 7
+    constexpr int      SHARD_SELECT_SHR      = 16;
+
+    // Block decode @0x231B3E..0x231B7C. pshuflw imm 0x93 permutes words
+    // [w0,w1,w2,w3] -> [w3,w0,w1,w2], which on the low qword is exactly
+    // ROL64(x,16); it is applied to the RAW memory operand, before the XOR.
+    constexpr int      BLOCK_PSHUFLW         = 0x93;
+    constexpr uint64_t BLOCK_FNV_XOR         = 0x07C3784BD4ECB382ULL;  // movabs @0x231B51
+    constexpr int      BLOCK_ROL64           = 15;            // `rol r8,0xf` @0x231B61
+
+    // FNV64 fold @0x231B80..0x231BAA. ROL1 is 55 relative to the *pre*-ROL64(15)
+    // block value, i.e. 40 relative to V13.
+    constexpr uint64_t FNV_PRIME             = 0x100000001B3ULL;
+    constexpr uint64_t FNV_ADD               = 0xBB3A9A3B042493AEULL; // movabs @0x231B95
+    constexpr int      FNV_ROL1_PREROT       = 55;            // `rol rdx,0x37`
+    constexpr int      FNV_ROL2              = 57;            // `rol rdx,0x39`
+
+    // Pointer XOR chain: 0x231BB7 (^X1, bswap), 0x23B241 (^X2), 0x23AB4C
+    // (^X3, bswap). Net effect is IDENTITY this patch:
+    //   X2^X3 = 0xD87E9E3E00000000, and bswap64(that) == X1, so
+    //   bswap(bswap(P^X1) ^ X2 ^ X3) == P.
+    constexpr uint64_t FNAME_PTR_XOR1        = 0x3E9E7ED8ULL;
+    constexpr uint64_t FNAME_PTR_XOR2        = 0x0000801B00000000ULL;
+    constexpr uint64_t FNAME_PTR_XOR3        = 0xD87E1E2500000000ULL;
+    constexpr bool     PTR_CHAIN_IS_IDENTITY = true;
+
+    // FNameEntry header @0x23AB69: `shr eax,5; and eax,0x3ff`, wide = sign bit.
+    constexpr int      HDR_LENGTH_SHIFT      = 5;
+    constexpr uint32_t HDR_LENGTH_MASK       = 0x3FFu;
+    constexpr uint16_t HDR_IS_WIDE_BIT       = 0x8000u;
+
+    // String decrypt @0x230020. Keystream is uint16[64]; the base LEA targets
+    // 0xE3707F4 and every load adds +0x58, so the table proper starts there.
+    constexpr uint64_t RVA_FNAME_KEYTABLE    = 0xE37084CULL;
+    constexpr uint32_t KEY_INIT_ADD          = 0x6C22u;       // @0x230059
+    constexpr uint32_t KEY_STEP              = 0x716u;        // @0x2300EC
+    constexpr uint32_t KEY_PAIR_DELTA        = 0x0Bu;         // @0x2300D5
+    constexpr uint8_t  KEY_INDEX_MASK        = 0x3Fu;
+    constexpr int      KEY_NARROW_SHR        = 3;             // narrow only; wide uses the raw u16
+
+    // ── FField::NamePrivate decode ──
+    // Two independent sites agree: 0x454A9F (pand/pandn bit-select form) and
+    // 0x3975B7 (literal pxor form). Their constants differ by exactly one
+    // PSHUFLW(0x39) because the shuffle sits on the other side of the XOR —
+    // i.e. PSHUFLW(K2,0x39) == 0xD2966E6B7A701FF6, the key seen at 0x3975B7.
+    // Cross-checked end-to-end: the static NAME_None template at .rdata
+    // 0xB4E9AC0 (0xE9125C1BEE9842D2) decodes to CI=0, Number=0.
+    //   t   = enc ^ K2
+    //   t   = PSHUFLW(t, 0x39)
+    //   t   = ROL32_per_dword(t, 9)
+    //   raw = t ^ K1
+    //   CI  = hi32(raw), Number = lo32(raw)   [ROL64(raw,32) puts CI in lo32]
+    constexpr uint64_t FFIELD_NAME_XOR_K2    = 0x6E6B7A701FF6D296ULL;
+    constexpr int      FFIELD_NAME_PSHUFLW   = 0x39;
+    constexpr int      FFIELD_NAME_ROL32     = 9;
+    constexpr uint64_t FFIELD_NAME_XOR_K1    = 0x890EF320D7E2DC4CULL;
+    constexpr int      FFIELD_NAME_ROL64     = 32;
+
+    // ── FField / FProperty / UStruct layout ──
+    // From the FField ctor @0x3872B0, FProperty ctor @0x431630, the named
+    // FProperty variant @0x448430 and UStruct::AddCppProperty @0x350460.
+    namespace Off {
+        constexpr uint64_t FField_NamePrivate   = 0x60;   // movdqa [rax+0x60] @0x3873D5
+        constexpr uint64_t FField_FlagsPrivate  = 0x70;
+        constexpr uint64_t FField_Owner         = 0x78;   // bit0 tags "is UObject"
+        constexpr uint64_t FField_Next          = 0x80;   // @0x350467
+        constexpr uint64_t FField_Salt          = 0x88;
+        constexpr uint64_t FField_ClassPrivate  = 0x90;   // @0x3C0E5D
+        constexpr uint64_t FProperty_ElementSize= 0x9C;   // @0x4316CA / 0x43D480
+        constexpr uint64_t FProperty_Flags      = 0xA0;
+        constexpr uint64_t FProperty_Offset     = 0xB4;   // @0x4316F0 / 0x44884E
+        constexpr uint64_t FProperty_ArrayDim   = 0xE0;   // @0x431708
+        constexpr uint64_t FProperty_SubPtr0    = 0x108;  // first subclass field
+        constexpr uint64_t UStruct_ChildProps   = 0x108;  // @0x350460
+    }
+    constexpr uint64_t FFIELD_SALT_SENTINEL   = 0x4F463D342B221910ULL;
+
+    // Offset_Internal encode @0x44884E is `xor eax,0x76C317A2; bswap eax`, so
+    // decode is bswap-THEN-xor. The constant-folded zero case stored at
+    // 0x4316F0 is 0xA217C376 == bswap32(0 ^ key), which confirms the order.
+    constexpr uint32_t PROPERTY_OFFSET_XOR    = 0x76C317A2u;
+
+    // ── GUObjectArray ──
+    // NOT yet confirmed against a live process: the .data slot holds a Theia
+    // placeholder that is fixed up at startup, and the image has no reloc
+    // directory, so only a running game can validate these.
+    constexpr uint64_t RVA_GOBJ_FCA_ENC       = 0xE6ED2A0ULL;  // encrypted FCA ptr (xmmword)
+    constexpr uint64_t RVA_GOBJ_PTR_XOR       = 0xB48A020ULL;  // = 0xA738DD8241D227C2
+    constexpr int      GOBJ_PTR_ROL64         = 38;
+    constexpr int      GOBJ_PTR_PSHUFLW       = 0x39;
+    constexpr uint64_t GOBJ_NUMELEMENTS_OFF   = 0x70;
+    constexpr int      GOBJ_NUMEL_ROL64       = 13;
+    constexpr int      GOBJ_NUMEL_PSHUFLW     = 0xE3;
+    constexpr uint64_t RVA_GOBJ_NUMEL_XOR     = 0xB4DD440ULL;  // low dword 0x86E7194E
+    constexpr uint64_t GOBJ_CHUNKACCESSOR_OFF = 0xA0;          // this + vtable, call vtable[3]
+    constexpr uint64_t GOBJ_CHUNKBLOB_OFF     = 0xD0;
+    constexpr uint32_t GOBJ_VTABLE_SLOT       = 0x18;          // [vt+0x18]
+    constexpr uint32_t GOBJ_ITEM_STRIDE       = 20;            // `lea rax,[r12+r12*4]; shl eax,2`
+    constexpr uint32_t GOBJ_SLOTS_PER_CHUNK   = 65536;         // idx>>16 / idx&0xFFFF
+
+    // Install the disassembly-verified layout into the live Offsets tables.
+    // Called once the FName pipeline has confirmed we are on this patch.
+    //
+    // These are stated with much higher confidence than a live probe can reach:
+    // they come from the constructors that WRITE the fields, so there is no
+    // predicate that could mistake a neighbouring pointer for the real one.
+    // The live probes in auto_offsets.h are the thing that got these wrong last
+    // run (it picked FProperty's own PropertyLinkNext chain at +0xE8..+0x100 as
+    // the subclass pointers, and an always-None FName field as NamePrivate).
+    inline void ApplyOffsets() {
+        namespace O = ArcDecrypt::Offsets;
+
+        O::FField::NamePrivate   = Off::FField_NamePrivate;    // 0x60
+        O::FField::NameEncrypted = Off::FField_NamePrivate;
+        O::FField::Owner         = Off::FField_Owner;          // 0x78
+        O::FField::Next          = Off::FField_Next;           // 0x80
+        O::FField::SaltSentinel  = Off::FField_Salt;           // 0x88
+        O::FField::ClassPrivate  = Off::FField_ClassPrivate;   // 0x90
+
+        O::FProperty::ElementSize     = Off::FProperty_ElementSize;  // 0x9C
+        O::FProperty::PropertyFlags   = Off::FProperty_Flags;        // 0xA0
+        O::FProperty::Offset_Internal = Off::FProperty_Offset;       // 0xB4
+        O::FProperty::ArrayDim        = Off::FProperty_ArrayDim;     // 0xE0
+        O::FProperty::Offset_XOR      = PROPERTY_OFFSET_XOR;
+
+        // All FProperty subclasses start their own fields at +0x108; the base
+        // class ends there. UE declares Map/Enum as two pointers in order.
+        constexpr uint64_t S0 = Off::FProperty_SubPtr0;        // 0x108
+        O::FStructProperty::Struct         = S0;
+        O::FObjectProperty::PropertyClass  = S0;
+        O::FArrayProperty::Inner           = S0;
+        O::FSetProperty::ElementProp       = S0;
+        O::FSoftObjectProperty::PropertyClass = S0;
+        O::FEnumProperty::UnderlyingProp   = S0;
+        O::FEnumProperty::Enum             = S0 + 8;
+        O::FMapProperty::KeyProp           = S0;
+        O::FMapProperty::ValueProp         = S0 + 8;
+        O::FBoolProperty::FieldSize        = S0;
+        O::FBoolProperty::ByteOffset       = S0 + 1;
+        O::FBoolProperty::ByteMask         = S0 + 2;
+        O::FBoolProperty::FieldMask        = S0 + 3;
+
+        O::UStruct::ChildProperties = Off::UStruct_ChildProps;  // 0x108
+        O::UStruct::Children        = Off::UStruct_ChildProps;
+    }
+} // namespace v20260805
 
 } // namespace ArcDecrypt

@@ -1687,7 +1687,15 @@ inline FFieldNameDecryptParams DiscoverFFieldNameDecrypt(
                         uint64_t Out = fn_rotl64(AfterMath, R64);
                         uint32_t TrialCi = static_cast<uint32_t>(Out);
                         uint32_t TrialNum = static_cast<uint32_t>(Out >> 32);
-                        if (TrialCi >= 2 && TrialCi <= 0x2000000u && TrialNum <= 0x10000u) {
+                        // The range test alone accepts ~0.8% of random 64-bit
+                        // values, and this loop tries 792 combos per (cp,np)
+                        // pair — a false positive is close to certain. The
+                        // 2026-08 run accepted CI=0x10000/Num=0 here and
+                        // overwrote a working key with zero. Reject the round
+                        // values that garbage lands on: real CompIndexes are
+                        // never block-aligned.
+                        if (TrialCi >= 2 && TrialCi <= 0x2000000u && TrialNum <= 0x10000u &&
+                            (TrialCi & 0xFFFFu) != 0) {
                             xor_const = (static_cast<uint64_t>(R) << 16) | (static_cast<uint64_t>(S) << 8) | R64;
                             ci = TrialCi; num = TrialNum;
                             return true;

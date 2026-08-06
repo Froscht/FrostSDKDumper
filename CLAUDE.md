@@ -6,7 +6,111 @@ External SDK dumper for ARC Raiders (Unreal Engine 5, Theia-obfuscated). Reads g
 Build: `g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 -I KernelDriver/include -o FrostDumper main.cpp build/Zydis.o -lcapstone -lunicorn -lm`
 Run: `sudo ./build_and_run.sh [PID]`
 
-## Current Patch: CL-1315578 (2026-07-09)
+## Current Patch: CL-1325322 (2026-08-02, image size 0x11853000)
+
+Ported 2026-08-05 from static disassembly, then **every constant below was
+re-confirmed against IDA** (instance `jat2`,
+`pioneer_steam_1.39.x-CL-1325322_2026_08_02__23_04_76pct.exe`, base
+0x140000000 — note this DB is based at 0x140000000, unlike the older `oo5g`/
+`3q7c` instances).
+
+**Still needs a live run.** Everything statically checkable has been checked;
+what remains is the runtime value at 0xE6ED2A0 (a Theia startup fixup) and the
+`Vt2Interpret` emulation of the chunk-accessor vtable call. Run
+`sudo ./build_and_run.sh` with the game up; success looks like a
+`[fname805] Pipeline = Patch20260805 (... N/96 names OK ...)` line, followed by
+`[p805] NumElements = <200k-900k>`.
+
+Constants live in `ArcDecrypt::v20260805` (arc_decrypt.h) with per-value RVA
+provenance. Resolver: `FNameDecryptor::ResolveNamePtr_Patch20260805`.
+GObjectArray: `GObjectArray::InitPatch20260805` (gobjects.h).
+
+### What changed structurally (not just constants)
+Swapping v20260709 constants into the old code paths is **not** sufficient:
+1. Shard hash mixes with plain right SHIFTS (4,3,4,3), not rotates; slot select
+   is back to `T = H^(H>>16); Bidx1 = T&7; Bidx2 = (T+1)&7` — the `-109*T+K`
+   multiply form is gone.
+2. Block decode reordered to `PSHUFLW(raw,0x93) → XOR → ROL64(15)` (was
+   `ROL64 → PSHUFLW → XOR`), and the XOR key is an inline `movabs` immediate,
+   **not** an .rdata load — so RVA-based discovery cannot find it.
+3. String key schedule lost its multipliers: now `key += 0x716` per pair,
+   second index is `(key+0xB)&0x3F`.
+4. FNameEntry header: `length = (hdr>>5) & 0x3FF`, wide = `hdr & 0x8000`
+   (sign bit), was `hdr>>6` / `hdr&0x20`.
+
+### Verified constants (CL-1325322) — all IDA-confirmed
+| Constant | Value | Source RVA |
+|----------|-------|------------|
+| GNamePool | 0xE431980 | `lea r8,[rip]` @0x231AC4 |
+| CI → chunk decode | **identity** (3 SIMD layers cancel; simulated) | 0x23AB01 / 0x23B1C4 / 0x231AA4 |
+| SHARD_HASH_SEED_OFF | 0x4C90 | @0x231AD2 |
+| SHARD_BLOCK_BASE_OFF | 0x4CA0, stride 32 | @0x231B3E / `shl edx,5` |
+| SHARD_HASH_ADD | 0x46BD406E | @0x231AEF (×4) |
+| BLOCK_FNV_XOR | 0x07C3784BD4ECB382 | `movabs` @0x231B51 |
+| BLOCK_ROL64 / PSHUFLW | 15 / 0x93 | @0x231B61 / @0x231B3E |
+| FNV_ADD | 0xBB3A9A3B042493AE | `movabs` @0x231B95 |
+| FNV_ROL1 / ROL2 | 55 (pre-rot) / 57 | @0x231B80 / @0x231BA2 |
+| Pointer XOR chain | **identity** (X2^X3 bswaps to X1) | 0x231BB7 / 0x23B241 / 0x23AB4C |
+| Keystream table | 0xE37084C, uint16[64] | base 0xE3707F4 + 0x58 |
+| KEY_INIT_ADD / STEP / PAIR_DELTA | 0x6C22 / 0x716 / 0x0B | @0x230059 / @0x2300EC / @0x2300D5 |
+| PropertyOffsetXor | 0x76C317A2 (`real = bswap32(stored) ^ key`) | @0x44884E |
+
+### FField NamePrivate decode (CL-1325322)
+```
+t   = enc ^ 0x6E6B7A701FF6D296        (K2)
+t   = PSHUFLW(t, 0x39)
+t   = ROL32_per_dword(t, 9)
+raw = t ^ 0x890EF320D7E2DC4C          (K1)
+CI  = lo32(ROL64(raw, 32))            Number = hi32
+```
+K1 @ .rdata 0xB4E9970, K2 @ 0xB4E9980. Two independent decode sites agree
+(0x454A9F bit-select form, 0x3975B7 literal-pxor form; their keys differ by
+exactly one PSHUFLW(0x39)). The **encoder** in the FField ctor @0x1403873AE is
+`PSHUFLW(ROL32((CI<<32|Number) ^ K1, 23), 0x93) ^ K2` — this decode is its exact
+inverse, verified by round-trip. End-to-end: the static NAME_None template at
+.rdata 0xB4E9AC0 (0xE9125C1BEE9842D2) decodes to CI=0/Number=0.
+
+### Layout (CL-1325322) — from the ctors that write the fields (IDA-confirmed)
+FField @0x3872B0, FProperty @0x431630 / 0x448430, UStruct::AddCppProperty @0x350460.
+
+| Field | Offset |
+|-------|--------|
+| FField::NamePrivate | +0x60 |
+| FField::FlagsPrivate | +0x70 |
+| FField::Owner | +0x78 (bit0 tags "is UObject") |
+| FField::Next | +0x80 |
+| FField::Salt (0x4F463D342B221910) | +0x88 |
+| FField::ClassPrivate | +0x90 |
+| FProperty::ElementSize | +0x9C |
+| FProperty::PropertyFlags | +0xA0 |
+| FProperty::Offset_Internal | +0xB4 |
+| FProperty::ArrayDim | +0xE0 |
+| FProperty link chain (PropertyLink/NextRef/Destructor/PostConstruct) | +0xE8..+0x100 |
+| **All FProperty subclass fields start** | **+0x108** |
+| UStruct::ChildProperties | +0x108 |
+
+⚠️ +0xE8..+0x100 are FProperty's *own* link pointers. They look exactly like
+subclass pointers to a "is there a valid FProperty* here" probe — that is what
+put Inner/KeyProp/Next at +0x100 last run. Subclass probes must start at 0x108.
+
+### GUObjectArray (CL-1325322) — layout IDA-confirmed, runtime ptr unverified
+The array is not in .data; .data holds an encrypted pointer. The old sig-scan
+RVA 0xE6ED190 points at a **CRITICAL_SECTION**, and `+0x50` off it is a live GC
+counter (~79k) that reads as a plausible NumElements — a decoy.
+```
+FCA         = lo64(PSHUFLW(ROL64(xmmword[0xE6ED2A0] ^ [0xB48A020], 38), 0x39))
+NumElements = lo32(PSHUFLW(ROL64(qword[FCA+0x70], 13), 0xE3)) ^ 0x86E7194E   ([0xB4DD440])
+chunks      = vtable[3] call (this = FCA+0xA0, arg = &xmmword[FCA+0xD0])
+item stride = 20, slots per chunk = 65536
+FUObjectItem: +0x00 Object*, +0x08 Flags, +0x0C ClusterRootIndex, +0x10 Serial
+```
+All of the above is IDA-confirmed: FCA decrypt @0x1402DFBB0, NumElements +
+accessor + `call [rax+0x18]` + `lea rax,[r12+r12*4]; shl eax,2` (stride 20)
+@0x1402FF19F..0x1402FF210. The one thing static analysis cannot settle is the
+*value* at 0xE6ED2A0 — a Theia placeholder fixed up at startup (the binary has
+no reloc directory) — so only a running game validates the pointer itself.
+
+## Previous Patch: CL-1315578 (2026-07-09)
 Live-verified 2026-07-14 against PID 8082. Image size 0x117E1000.
 UObject slot decode: ROL64(29) → PSHUFLW(0x39) → ROL32(5) → lo64, CI in hi32.
 FField NamePrivate: XOR(0x8FFAB191C340B792) → ROL16(12) → PSHUFB([07,06,04,05,02,03,00,01]) → ROL64(32).
@@ -376,5 +480,9 @@ Bool-specific field init. FieldSize/ByteOffset/ByteMask/FieldMask setup.
 ## Environment
 - Wine module base: 0x140000000 (memfd)
 - Find PID: `pgrep "GameThread"`, filter out CrashReportClient via `/proc/pid/cmdline`
-- IDA instances: `oo5g` (current dump PioneerGame-e_dumped.exe), `3q7c` (CL-1195482)
-- IDA binary base: 0 (not 0x140000000) — subtract 0x140000000 from live RVAs for IDA addresses
+- IDA instances: `jat2` (CL-1325322, **base 0x140000000** — IDA addr = 0x140000000 + RVA),
+  `oo5g` (older PioneerGame-e_dumped.exe), `3q7c` (CL-1195482)
+- ⚠️ IDA base differs per instance. `oo5g`/`3q7c` are based at 0 (subtract
+  0x140000000 from live RVAs); `jat2` is based at 0x140000000 (add nothing).
+  Check with a known byte before trusting an address — e.g. RVA 0x231B51 must be
+  `49 BA 82 B3 EC D4 4B 78 C3 07` (movabs r10, BLOCK_FNV_XOR).

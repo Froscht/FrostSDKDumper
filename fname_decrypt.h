@@ -137,8 +137,73 @@ public:
     Pipeline ActivePipeline() const { return m_pipeline; }
     void ForcePipeline(Pipeline p) { m_pipeline = p; }
 
+    // Patch 2026-08 detector.
+    //
+    // Deliberately self-validating rather than signature-based: it installs the
+    // pipeline, resolves real CompIndexes and demands printable names back. The
+    // recurring patch-day failure in this codebase has been detectors that
+    // accept a plausible-looking constant and then silently produce garbage
+    // (and, worse, persist it to decrypt_export.json), so "does it actually
+    // decode names" is the only acceptance test used here.
+    bool TryPatch20260805() {
+        namespace P805 = ArcDecrypt::v20260805;
+
+        uint64_t KsRva = P805::RVA_FNAME_KEYTABLE;
+        if (!m_reader.Read(m_base + KsRva, m_ks805, sizeof(m_ks805))) return false;
+        int Nz = 0;
+        for (int I = 0; I < 64; ++I) Nz += (m_ks805[I] != 0);
+        if (Nz < 32) {
+            std::printf("[fname805] keystream @0x%llX only %d/64 nonzero — not this patch\n",
+                (unsigned long long)(m_base + KsRva), Nz);
+            return false;
+        }
+
+        m_patch0805Active = true;
+        int Good = 0;
+        std::string First;
+        for (uint32_t Ci = 1; Ci <= 96 && Good < 8; ++Ci) {
+            uint64_t Ep = ResolveNamePtr_Patch20260805(static_cast<int32_t>(Ci));
+            if (!Ep) continue;
+            std::string S = DecryptNameString_Patch20260805(Ep);
+            if (S.empty() || S.size() > 128) continue;
+            bool Printable = true;
+            for (char C : S)
+                if (static_cast<unsigned char>(C) < 0x20 ||
+                    static_cast<unsigned char>(C) > 0x7E) { Printable = false; break; }
+            if (!Printable) continue;
+            if (First.empty()) First = S;
+            ++Good;
+        }
+        if (Good < 4) {
+            std::printf("[fname805] pipeline installed but only %d/96 CIs gave readable names "
+                        "— rejecting (pool may not be built yet)\n", Good);
+            m_patch0805Active = false;
+            return false;
+        }
+
+        std::memcpy(m_keyTable, m_ks805, sizeof(m_ks805));
+        FNAME_KEY_TABLE_OFF = KsRva;
+        m_keyLoaded = true;
+        // Only now that names actually decode do we trust the rest of the
+        // patch's layout enough to install it. It came from the field-writing
+        // constructors, so it outranks the live pointer-shape probes.
+        ArcDecrypt::v20260805::ApplyOffsets();
+        ArcDecrypt::Offsets::g_Authoritative = true;
+        ArcDecrypt::Offsets::g_AuthoritySrc  = "patch-2026-08 ctor disasm";
+        std::printf("[fname805] Pipeline = Patch20260805 (pool @0x%llX, keystream @0x%llX, "
+                    "%d nz, %d/96 names OK, first=\"%s\")\n",
+            (unsigned long long)(m_base + P805::RVA_GNAMEPOOL),
+            (unsigned long long)(m_base + KsRva), Nz, Good, First.c_str());
+        return true;
+    }
+
     bool Init() {
         if (m_keyLoaded) return true;
+
+        // Newest patch first — it validates by actually decoding names, so a
+        // false positive here is far less likely than in the keytable-nonzero
+        // heuristics below.
+        if (TryPatch20260805()) return true;
 
         // ── Dual-pipeline probe ──
         // 1) Try the CL-1177146 keytable RVA. Valid ⇒ legacy pipeline.
@@ -1076,12 +1141,40 @@ public:
     }
 
 private:
+    // Patch 2026-08 FField::NamePrivate decode, from the inlined decoder at
+    // RVA 0x454A9F (cross-checked against a second, independently compiled site
+    // at 0x3975B7 whose key differs by exactly one PSHUFLW(0x39) because the
+    // shuffle sits on the other side of the XOR — the two agree algebraically).
+    //
+    // Validated end-to-end on a static template: the compile-time NamePrivate
+    // at .rdata 0xB4E9AC0 (0xE9125C1BEE9842D2) decodes to CI=0/Number=0, i.e.
+    // NAME_None, and re-encoding NAME_None reproduces that constant exactly.
+    uint64_t DecodeFFieldName_Patch20260805(uint64_t Enc) const {
+        namespace P805 = ArcDecrypt::v20260805;
+        uint64_t T = Enc ^ P805::FFIELD_NAME_XOR_K2;
+        T = SoftPshuflw(T, P805::FFIELD_NAME_PSHUFLW);
+        // ROL32 is applied per dword lane (psrld/pslld/por), not to the qword.
+        uint32_t Lo = static_cast<uint32_t>(T);
+        uint32_t Hi = static_cast<uint32_t>(T >> 32);
+        Lo = fn_rotl32(Lo, P805::FFIELD_NAME_ROL32);
+        Hi = fn_rotl32(Hi, P805::FFIELD_NAME_ROL32);
+        T = (static_cast<uint64_t>(Hi) << 32) | Lo;
+        T ^= P805::FFIELD_NAME_XOR_K1;
+        // ROL64(...,32) swaps the halves, leaving CI in lo32 and Number in hi32.
+        return fn_rotl64(T, P805::FFIELD_NAME_ROL64);
+    }
+
     int32_t TryDecodeFFieldNameAt(uint64_t ff_addr, uint64_t off) {
         alignas(16) uint8_t enc[16] = {};
         if (!m_reader.Read(ff_addr + off, enc, 16)) return 0;
         bool any = false;
         for (uint8_t b : enc) if (b) { any = true; break; }
         if (!any) return 0;
+        if (m_patch0805Active) {
+            uint64_t Raw;
+            std::memcpy(&Raw, enc, 8);
+            return static_cast<int32_t>(DecodeFFieldName_Patch20260805(Raw) & 0xFFFFFFFFu);
+        }
         uint64_t dec = DecryptUObjSlotNew(enc);
         return static_cast<int32_t>(dec >> 32);
     }
@@ -1244,6 +1337,9 @@ public:
     // g_DiscoveredFName.AllRDataLeas; just need the role-binding pass).
     uint64_t ResolveNamePtrFull(int32_t CompIndex) {
         if (CompIndex <= 0 || !m_keyLoaded) return 0;
+
+        if (m_patch0805Active)
+            return ResolveNamePtr_Patch20260805(CompIndex);
 
         if (m_newPatchActive)
             return ResolveNamePtr_NewPatch(CompIndex);
@@ -1494,6 +1590,124 @@ public:
         uint64_t EntryPtr = (Fv2 ^ BFnvXor ^ V15) + V13 + 2ULL * NameOff;
         if (EntryPtr < 0x10000ULL || EntryPtr >= 0x800000000000ULL) return 0;
         return EntryPtr;
+    }
+
+    // ── Patch 2026-08 (image 0x11853000) ──────────────────────────────────────
+    // Separate from ResolveNamePtr_NewPatch because three stages changed shape,
+    // not just constants: the shard hash mixes with right shifts instead of
+    // rotates, the slot selector dropped the `-109*T` multiply for a plain
+    // `H^(H>>16)` fold, and block decode reordered to PSHUFLW -> XOR -> ROL64.
+    // Trying to express that through the v709 parameter struct would have meant
+    // adding three mode flags to a path that is still needed for older patches.
+    //
+    // Constants and provenance: ArcDecrypt::v20260805 in arc_decrypt.h.
+    uint64_t ResolveNamePtr_Patch20260805(int32_t CompIndex) {
+        namespace P805 = ArcDecrypt::v20260805;
+        if (CompIndex <= 0) return 0;
+
+        // CI needs no decode this patch (the 3 SIMD layers cancel).
+        uint32_t Ci       = static_cast<uint32_t>(CompIndex);
+        uint32_t NameOff  = Ci & 0xFFFFu;
+        uint32_t ChunkOff = (Ci >> 8) & 0xFFFF00u;
+
+        uint64_t GnpRva = AutoDiscovery::g_DiscoveredGNames.Valid
+                        ? AutoDiscovery::g_DiscoveredGNames.GNamesRva
+                        : P805::RVA_GNAMEPOOL;
+        uint64_t ChunkAddr = m_base + GnpRva + ChunkOff;
+
+        // The shard seed is the chunk ADDRESS itself — never dereferenced — so
+        // it is sensitive to the live module base. m_base must be the real one.
+        uint64_t SeedAddr = ChunkAddr + P805::SHARD_HASH_SEED_OFF;
+        uint32_t Lo = static_cast<uint32_t>(SeedAddr);
+        uint32_t Hi = static_cast<uint32_t>(SeedAddr >> 32);
+
+        constexpr uint32_t HP  = P805::HASH_PRIME;
+        constexpr uint32_t ADD = P805::SHARD_HASH_ADD;
+
+        uint32_t H = (Lo >> P805::SHARD_SEED_SHR) * HP + ADD;
+        H = (H >> P805::SHARD_SHR_A) * HP;
+        H = ((H + Hi + ADD) >> P805::SHARD_SHR_B) * HP + ADD;
+        H = (H >> P805::SHARD_SHR_C) * HP + ADD;
+
+        uint32_t T = H ^ (H >> P805::SHARD_SELECT_SHR);
+        uint32_t Bidx1 = T & 7u;
+        uint32_t Bidx2 = (T + 1u) & 7u;
+
+        uint64_t BlockBase = ChunkAddr + P805::SHARD_BLOCK_BASE_OFF;
+        uint64_t Raw1 = 0, Raw2 = 0;
+        if (!m_reader.Read(BlockBase + P805::SHARD_BLOCK_STRIDE * Bidx1, &Raw1, 8)) return 0;
+        if (!m_reader.Read(BlockBase + P805::SHARD_BLOCK_STRIDE * Bidx2, &Raw2, 8)) return 0;
+        if (!Raw1 && !Raw2) return 0;
+
+        // PSHUFLW is applied to the raw memory operand, ahead of the XOR.
+        uint64_t Dec1 = SoftPshuflw(Raw1, P805::BLOCK_PSHUFLW) ^ P805::BLOCK_FNV_XOR;
+        uint64_t Dec2 = SoftPshuflw(Raw2, P805::BLOCK_PSHUFLW) ^ P805::BLOCK_FNV_XOR;
+        uint64_t V13  = fn_rotl64(Dec1, P805::BLOCK_ROL64);
+        uint64_t V15  = fn_rotl64(Dec2, P805::BLOCK_ROL64);
+
+        // The fold consumes the pre-ROL64(15) value, hence FNV_ROL1_PREROT.
+        uint64_t Fv = P805::FNV_PRIME * fn_rotl64(Dec1, P805::FNV_ROL1_PREROT) + P805::FNV_ADD;
+        Fv = P805::FNV_PRIME * fn_rotl64(Fv, P805::FNV_ROL2) + P805::FNV_ADD;
+
+        uint64_t RawPtr = V13 + (V15 ^ Fv) + 2ULL * NameOff;
+
+        // The 3-frame pointer XOR chain is algebraically identity this patch;
+        // apply it anyway so a future patch that breaks the cancellation is
+        // handled by editing constants alone.
+        uint64_t EntryPtr;
+        if (P805::PTR_CHAIN_IS_IDENTITY) {
+            EntryPtr = RawPtr;
+        } else {
+            uint64_t S1 = __builtin_bswap64(RawPtr ^ P805::FNAME_PTR_XOR1);
+            uint64_t S2 = S1 ^ P805::FNAME_PTR_XOR2;
+            EntryPtr = __builtin_bswap64(S2 ^ P805::FNAME_PTR_XOR3);
+        }
+        if (EntryPtr < 0x10000ULL || EntryPtr >= 0x800000000000ULL) return 0;
+        return EntryPtr;
+    }
+
+    std::string DecryptNameString_Patch20260805(uint64_t NameEntryPtr) {
+        namespace P805 = ArcDecrypt::v20260805;
+        if (!NameEntryPtr) return {};
+
+        uint16_t Hdr = 0;
+        if (!m_reader.Read(NameEntryPtr, &Hdr, 2)) return {};
+
+        int  Len    = (Hdr >> P805::HDR_LENGTH_SHIFT) & P805::HDR_LENGTH_MASK;
+        bool IsWide = (Hdr & P805::HDR_IS_WIDE_BIT) != 0;
+        if (Len <= 0 || Len > 512) return {};
+
+        std::vector<uint8_t> Buf(static_cast<size_t>(Len) * (IsWide ? 2 : 1));
+        if (!m_reader.Read(NameEntryPtr + 2, Buf.data(), Buf.size())) return {};
+
+        const uint16_t* Ks = m_ks805;
+        uint32_t Key = static_cast<uint32_t>(Len) + P805::KEY_INIT_ADD;
+        int Pairs = Len & ~1;
+        for (int I = 0; I < Pairs; I += 2) {
+            uint16_t KA = Ks[Key & P805::KEY_INDEX_MASK];
+            uint16_t KB = Ks[(Key + P805::KEY_PAIR_DELTA) & P805::KEY_INDEX_MASK];
+            if (!IsWide) {
+                Buf[I]     ^= static_cast<uint8_t>(KA >> P805::KEY_NARROW_SHR);
+                Buf[I + 1] ^= static_cast<uint8_t>(KB >> P805::KEY_NARROW_SHR);
+            } else {
+                reinterpret_cast<uint16_t*>(Buf.data())[I]     ^= KA;
+                reinterpret_cast<uint16_t*>(Buf.data())[I + 1] ^= KB;
+            }
+            Key += P805::KEY_STEP;
+        }
+        if (Len & 1) {
+            uint16_t KA = Ks[Key & P805::KEY_INDEX_MASK];
+            if (!IsWide) Buf[Pairs] ^= static_cast<uint8_t>(KA >> P805::KEY_NARROW_SHR);
+            else reinterpret_cast<uint16_t*>(Buf.data())[Pairs] ^= KA;
+        }
+
+        std::string Out;
+        Out.reserve(Len);
+        for (int I = 0; I < Len; ++I) {
+            uint16_t C = IsWide ? reinterpret_cast<const uint16_t*>(Buf.data())[I] : Buf[I];
+            Out += static_cast<char>(C & 0xFF);
+        }
+        return Out;
     }
 
     uint64_t ResolveNamePtr_NewPatch(int32_t CompIndex) {
@@ -1833,6 +2047,9 @@ public:
     //   because both compute byte[i] ^= keystream[(key+i)&0x3F] >> bitshift.
     std::string DecryptNameString(uint64_t NameEntryPtr) {
         if (!NameEntryPtr || !m_keyLoaded) return {};
+
+        if (m_patch0805Active)
+            return DecryptNameString_Patch20260805(NameEntryPtr);
 
         if (m_newPatchActive)
             return DecryptNameString_NewPatch(NameEntryPtr);
@@ -2450,6 +2667,8 @@ private:
     bool           m_ks707Loaded = false;
     uint16_t       m_keyTableNewPatch[64];
     bool           m_newPatchActive = false;
+    uint16_t       m_ks805[64] = {};
+    bool           m_patch0805Active = false;
     __m128i        m_seedXor1 = {};
     __m128i        m_seedBlend = {};
     __m128i        m_seedBlendNot = {};

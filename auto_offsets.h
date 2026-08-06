@@ -76,9 +76,30 @@ inline std::pair<K, int> PickMode(const std::unordered_map<K, int>& counts) {
     return {best, best_cnt};
 }
 
+// Set once a patch's layout has been recovered from the code that WRITES the
+// fields (the ctors) rather than inferred from live pointer-shaped values.
+//
+// Those two sources are not equal in quality. The live probes here identify a
+// field by "is there a plausible pointer / small int at this offset", which
+// cannot distinguish a subclass field from FProperty's own PropertyLinkNext
+// chain, nor the real NamePrivate from an always-NAME_None FName field. On the
+// 2026-08 patch that mistake put FField::Next at +0x100 (true: +0x80) and left
+// ElementSize at +0xD0 (true: +0x9C). When the authoritative layout is loaded,
+// disagreements get reported but not applied.
+// The flags themselves live in arc_decrypt.h so that fname_decrypt.h — which
+// detects the patch and is included earlier — can set them.
+inline bool VetoOverride(const char* name, uint64_t slot, uint64_t found) {
+    if (!ArcDecrypt::Offsets::g_Authoritative || found == 0 || found == slot) return false;
+    std::printf("[autoff] %-32s probe says 0x%llX but 0x%llX is authoritative (%s) — not applying\n",
+        name, (unsigned long long)found, (unsigned long long)slot,
+        ArcDecrypt::Offsets::g_AuthoritySrc);
+    return true;
+}
+
 inline void ApplyOffset(const char* name, uint64_t& slot, uint64_t found,
                         int hits, int total, int min_hits)
 {
+    if (VetoOverride(name, slot, found)) return;
     if (found == 0 || hits < min_hits) {
         std::printf("[autoff] %-32s probe weak (best=0x%llX hits=%d/%d, need %d) — keeping 0x%llX\n",
             name, (unsigned long long)found, hits, total, min_hits, (unsigned long long)slot);
@@ -103,6 +124,7 @@ inline void ApplyOffsetSticky(const char* name, uint64_t& slot, uint64_t found,
                               int found_hits, int slot_hits, int total,
                               int min_hits, double keep_threshold = 0.7)
 {
+    if (VetoOverride(name, slot, found)) return;
     if (found == 0 || found_hits < min_hits) {
         std::printf("[autoff] %-32s probe weak (best=0x%llX hits=%d/%d, need %d) — keeping 0x%llX\n",
             name, (unsigned long long)found, found_hits, total, min_hits, (unsigned long long)slot);

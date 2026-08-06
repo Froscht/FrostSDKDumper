@@ -973,6 +973,16 @@ public:
                     AutoDiscovery::g_DiscoveredFFieldName =
                         AutoDiscovery::DiscoverFFieldNameDecrypt(
                             m_reader, MODULE_BASE, uss_samples);
+                    // A zero XOR key means the brute-forcer settled on its
+                    // degenerate "keyless" candidate. That is never a real
+                    // Theia key, and accepting it both breaks this run and gets
+                    // persisted to decrypt_export.json, breaking the next one.
+                    if (AutoDiscovery::g_DiscoveredFFieldName.Valid &&
+                        AutoDiscovery::g_DiscoveredFFieldName.XorConst == 0) {
+                        std::printf("[autodisc] Phase 2 returned a zero XOR key (keyless "
+                                    "candidate) — rejecting, keeping existing key\n");
+                        AutoDiscovery::g_DiscoveredFFieldName.Valid = false;
+                    }
                     if (AutoDiscovery::g_DiscoveredFFieldName.Valid) {
                         uint64_t Live = AutoDiscovery::g_DiscoveredFFieldName.XorConst;
                         uint64_t Hard = FNameDecryptor::FFIELD_NAME_XOR_CL1177146;

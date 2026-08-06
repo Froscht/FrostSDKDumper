@@ -187,6 +187,15 @@ namespace gobjects
         bool Init() {
             if (m_initialized) return true;
 
+            // Newest patch first. It is strictly validated (decrypted pointer
+            // must be off-image heap, NumElements must be >=100k, walk density
+            // must exceed 50%), so it declines cleanly on older builds instead
+            // of shadowing them.
+            if (InitPatch20260805()) {
+                std::printf("[+] GObjectArray via patch-2026-08 path\n");
+                return true;
+            }
+
             if (InitV707()) {
                 return true;
             }
@@ -2280,6 +2289,163 @@ namespace gobjects
         //
         // Each chunk: 65536 × FUObjectItem (20 bytes); Object at +0.
         // ─────────────────────────────────────────────────────────────────
+        // ── InitPatch20260805 — ARC patch 2026-08 (image 0x11853000) ─────────
+        //
+        // Recovered by disassembly; see ArcDecrypt::v20260805 for provenance.
+        // The array is NOT in .data — .data holds an encrypted pointer to it:
+        //   FCA = lo64(PSHUFLW(ROL64(xmmword[0xE6ED2A0] ^ [0xB48A020], 38), 0x39))
+        //   NumElements = lo32(PSHUFLW(ROL64(qword[FCA+0x70], 13), 0xE3)) ^ 0x86E7194E
+        //   chunks      = vtable[3] call, this=FCA+0xA0, arg=&xmmword[FCA+0xD0]
+        //   item stride 20, 65536 slots per chunk   (`lea rax,[r12+r12*4]; shl eax,2`)
+        //
+        // The 545/595/705 concurring call sites for those three shapes make the
+        // layout itself solid. What is NOT pre-validated is the runtime value at
+        // 0xE6ED2A0: the static image ships a Theia placeholder that startup
+        // code fixes up, and the binary has no reloc directory, so this path can
+        // only be confirmed against a live process. Every step below therefore
+        // fails loudly rather than falling through to a heuristic — the previous
+        // run's damage came from a heap scan that "succeeded" on garbage.
+        bool InitPatch20260805() {
+            namespace P805 = ArcDecrypt::v20260805;
+            constexpr uint32_t kSlotsPerChunk = P805::GOBJ_SLOTS_PER_CHUNK;
+            constexpr uint32_t kItemStride    = P805::GOBJ_ITEM_STRIDE;
+
+            auto isHeap = [&](uint64_t p) {
+                if (p < 0x10000ULL || p >= 0x7FFFFFFFFFFFULL) return false;
+                // Must not be inside the module image — the old heap scan
+                // accepted an in-image address and walked nonsense from it.
+                return !(p >= m_base && p < m_base + 0x12000000ULL);
+            };
+            auto isModule = [&](uint64_t p) {
+                return p >= m_base && p < m_base + 0x12000000ULL;
+            };
+            auto rol64 = [](uint64_t v, int n) -> uint64_t {
+                return n ? ((v << n) | (v >> (64 - n))) : v;
+            };
+            auto pshuflw = [](uint64_t v, uint8_t imm) -> uint64_t {
+                uint16_t w[4], o[4];
+                std::memcpy(w, &v, 8);
+                for (int i = 0; i < 4; ++i) o[i] = w[(imm >> (2 * i)) & 3];
+                uint64_t r; std::memcpy(&r, o, 8); return r;
+            };
+
+            // Step 1: decrypt the FChunkedFixedUObjectArray pointer.
+            uint64_t Enc = 0, PtrXor = 0;
+            if (!m_reader.Read(m_base + P805::RVA_GOBJ_FCA_ENC, &Enc, 8) ||
+                !m_reader.Read(m_base + P805::RVA_GOBJ_PTR_XOR, &PtrXor, 8)) {
+                std::printf("[p805] read FCA enc/xor blobs failed\n");
+                return false;
+            }
+            uint64_t Fca = pshuflw(rol64(Enc ^ PtrXor, P805::GOBJ_PTR_ROL64),
+                                   P805::GOBJ_PTR_PSHUFLW);
+            std::printf("[p805] enc=0x%llX xor=0x%llX -> FCA=0x%llX\n",
+                (unsigned long long)Enc, (unsigned long long)PtrXor,
+                (unsigned long long)Fca);
+            if (!isHeap(Fca)) {
+                std::printf("[p805] FCA not a heap pointer — wrong patch, or the "
+                            "Theia startup fixup has not run yet\n");
+                return false;
+            }
+
+            // Step 2: decode NumElements.
+            uint64_t RawN = 0;
+            uint32_t NumElXor = 0;
+            if (!m_reader.Read(Fca + P805::GOBJ_NUMELEMENTS_OFF, &RawN, 8) ||
+                !m_reader.Read(m_base + P805::RVA_GOBJ_NUMEL_XOR, &NumElXor, 4)) {
+                std::printf("[p805] read NumElements failed\n");
+                return false;
+            }
+            uint32_t NumElements =
+                static_cast<uint32_t>(pshuflw(rol64(RawN, P805::GOBJ_NUMEL_ROL64),
+                                              P805::GOBJ_NUMEL_PSHUFLW)) ^ NumElXor;
+            std::printf("[p805] NumElements = %u\n", NumElements);
+            // Floor is deliberately high: the counters that fooled the previous
+            // run's probe sat in the 70k-80k band, and a real dump of this title
+            // has been 200k-900k objects.
+            if (NumElements < 100000 || NumElements > 4000000) {
+                std::printf("[p805] NumElements %u outside [100000, 4000000] — rejecting\n",
+                            NumElements);
+                return false;
+            }
+            uint32_t NumChunksNeeded = (NumElements + kSlotsPerChunk - 1) / kSlotsPerChunk;
+
+            // Step 3: chunk table via the accessor's vtable[3].
+            uint64_t VtablePtr = 0, Fn = 0;
+            if (!m_reader.Read(Fca + P805::GOBJ_CHUNKACCESSOR_OFF, &VtablePtr, 8) ||
+                !isModule(VtablePtr)) {
+                std::printf("[p805] accessor vtable @FCA+0x%llX = 0x%llX (not module)\n",
+                    (unsigned long long)P805::GOBJ_CHUNKACCESSOR_OFF,
+                    (unsigned long long)VtablePtr);
+                return false;
+            }
+            if (!m_reader.Read(VtablePtr + P805::GOBJ_VTABLE_SLOT, &Fn, 8) || !isModule(Fn)) {
+                std::printf("[p805] vtable[3] fn = 0x%llX (not module)\n",
+                    (unsigned long long)Fn);
+                return false;
+            }
+
+            if (m_pebAddr == 0) m_pebAddr = FindPEB();
+            uint64_t ChunksArray = Vt2Interpret(Fn, Fca + P805::GOBJ_CHUNKBLOB_OFF);
+            std::printf("[p805] Vt2Interpret(vt[3]=0x%llX, blob=FCA+0x%llX) => 0x%llX\n",
+                (unsigned long long)Fn,
+                (unsigned long long)P805::GOBJ_CHUNKBLOB_OFF,
+                (unsigned long long)ChunksArray);
+            if (!isHeap(ChunksArray)) {
+                std::printf("[p805] chunks array not heap — aborting (no heuristic fallback:\n"
+                            "       a wrong table here is worse than no dump)\n");
+                return false;
+            }
+
+            // Step 4: walk. Stride 20 comes straight from the index arithmetic,
+            // so it is not auto-detected — a scored guess is what produced the
+            // 18%-hit-rate stride=16 walk last run.
+            uint32_t NumChunks = NumChunksNeeded > 1024 ? 1024 : NumChunksNeeded;
+            std::vector<uint64_t> ChunkPtrs(NumChunks, 0);
+            if (!m_reader.Read(ChunksArray, ChunkPtrs.data(), NumChunks * 8)) {
+                std::printf("[p805] read chunk pointer table failed\n");
+                return false;
+            }
+
+            m_worldFallbackObjects.clear();
+            m_worldFallbackObjects.reserve(NumElements);
+            uint32_t ValidChunks = 0;
+            for (uint32_t Ci = 0; Ci < NumChunks; ++Ci) {
+                uint64_t Chunk = ChunkPtrs[Ci];
+                if (!isHeap(Chunk)) continue;
+                uint32_t SlotsInChunk = kSlotsPerChunk;
+                uint32_t Rem = NumElements - Ci * kSlotsPerChunk;
+                if (Rem < SlotsInChunk) SlotsInChunk = Rem;
+                std::vector<uint8_t> Buf(static_cast<size_t>(SlotsInChunk) * kItemStride);
+                if (!m_reader.Read(Chunk, Buf.data(), Buf.size())) continue;
+                for (uint32_t Si = 0; Si < SlotsInChunk; ++Si) {
+                    uint64_t Obj = 0;
+                    std::memcpy(&Obj, Buf.data() + static_cast<size_t>(Si) * kItemStride, 8);
+                    if (isHeap(Obj)) m_worldFallbackObjects.push_back(Obj);
+                }
+                ++ValidChunks;
+            }
+            std::printf("[p805] walked %u/%u chunks, collected %zu objects\n",
+                ValidChunks, NumChunks, m_worldFallbackObjects.size());
+
+            // A correct walk fills most slots; a wrong base/stride yields a
+            // sparse scatter. Demand both a floor and a decent density.
+            size_t Expect = static_cast<size_t>(NumElements);
+            if (m_worldFallbackObjects.size() < 50000 ||
+                m_worldFallbackObjects.size() * 2 < Expect) {
+                std::printf("[p805] only %zu objects for NumElements=%u (<50%%) — rejecting\n",
+                    m_worldFallbackObjects.size(), NumElements);
+                m_worldFallbackObjects.clear();
+                return false;
+            }
+
+            m_arrayBase        = Fca;
+            m_numElements      = static_cast<int32_t>(NumElements);
+            m_itemStride       = static_cast<int>(kItemStride);
+            m_useWorldFallback = true;
+            m_initialized      = true;
+            return true;
+        }
+
         bool InitPatch20260519() {
             constexpr uint64_t kFcaEncRva     = 0xE3B6270;   // encrypted FCA ptr xmmword
             constexpr uint64_t kFcaMaskRva    = 0xB1E8ED0;   // PSHUFB mask (16B)
