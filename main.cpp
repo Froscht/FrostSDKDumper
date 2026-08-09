@@ -31,6 +31,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
+#include <cstdlib>
 #include <cstdio>
 #include <cassert>
 #include <chrono>
@@ -2297,6 +2299,57 @@ public:
         std::cout << "=== end ProbePropertyCIs ===\n";
     }
 
+    // Steam records the shipped build in the app manifest; the game binary
+    // itself has its version strings stripped by Theia, so this is the only
+    // reliable build identifier available at runtime.
+    struct SteamBuildInfo {
+        std::string BuildId;
+        std::string Updated;
+    };
+    SteamBuildInfo ReadSteamBuildInfo() const {
+        SteamBuildInfo Out;
+        // Under sudo, HOME points at root. The manifest lives in the
+        // invoking user's Steam library, so prefer SUDO_USER.
+        std::vector<std::string> Homes;
+        if (const char* SudoUser = std::getenv("SUDO_USER"))
+            Homes.push_back(std::string("/home/") + SudoUser);
+        if (const char* H = std::getenv("HOME")) Homes.push_back(H);
+        std::vector<std::string> Roots;
+        for (const auto& Home : Homes) {
+            Roots.push_back(std::string(Home) + "/.local/share/Steam/steamapps");
+            Roots.push_back(std::string(Home) + "/.steam/steam/steamapps");
+            Roots.push_back(std::string(Home) + "/Steam/steamapps");
+        }
+        for (const auto& R : Roots) {
+            std::ifstream F(R + "/appmanifest_1808500.acf");
+            if (!F) continue;
+            std::string Line;
+            while (std::getline(F, Line)) {
+                auto Field = [&](const char* Key, std::string& Dst) {
+                    if (!Dst.empty()) return;
+                    size_t K = Line.find(Key);
+                    if (K == std::string::npos) return;
+                    size_t A = Line.find('"', K + std::strlen(Key));
+                    if (A == std::string::npos) return;
+                    size_t B = Line.find('"', A + 1);
+                    if (B == std::string::npos) return;
+                    Dst = Line.substr(A + 1, B - A - 1);
+                };
+                Field("\"buildid\"", Out.BuildId);
+                Field("\"LastUpdated\"", Out.Updated);
+            }
+            if (!Out.BuildId.empty()) break;
+        }
+        if (!Out.Updated.empty()) {
+            time_t T = (time_t)std::strtoll(Out.Updated.c_str(), nullptr, 10);
+            char Buf[32] = {};
+            struct tm Tm{};
+            if (gmtime_r(&T, &Tm)) std::strftime(Buf, sizeof(Buf), "%Y-%m-%d", &Tm);
+            Out.Updated = Buf;
+        }
+        return Out;
+    }
+
     void DumpSDK() {
         std::cout << "\n=== SDK Generator ===\n";
 
@@ -2433,12 +2486,21 @@ public:
                 Unk, (unsigned long long)n_struct_props,
                 n_struct_props ? 100.0 * Unk / n_struct_props : 0.0);
         }
+        SteamBuildInfo SteamInfo = ReadSteamBuildInfo();
         std::ofstream sdk_file("SDK_Output.txt");
         if (!sdk_file) { std::cerr << "[-] Cannot open SDK_Output.txt\n"; return; }
 
         // Summary header (mirrors reference tool format)
         sdk_file << "// ============================================================\n"
                  << "// ARC Raiders SDK - FrostDumper\n"
+                 << "// Dumper build:  " __DATE__ " " __TIME__ "\n"
+                 << "// Game build:    Steam AppID 1808500"
+                 << (SteamInfo.BuildId.empty() ? std::string()
+                        : "  buildid " + SteamInfo.BuildId) << "\n"
+                 << "// Game updated:  " << (SteamInfo.Updated.empty() ? "unknown" : SteamInfo.Updated) << "\n"
+                 << "// Image size:    0x" << std::hex << AutoDiscovery::g_DiscoveredBounds.ImageSize
+                 << std::dec << "  (module base 0x" << std::hex << MODULE_BASE << std::dec << ")\n"
+                 << "// FName pipeline: " << (m_fname.IsV808Active() ? "v20260808" : "legacy") << "\n"
                  << "// PID: " << m_pid << "\n"
                  << "// ============================================================\n"
                  << "//\n"
