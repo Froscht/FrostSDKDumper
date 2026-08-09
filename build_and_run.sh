@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KMOD_DIR="$SCRIPT_DIR/../KernelDriver/src"
+KMOD_DIR="$SCRIPT_DIR/KernelDriver/src"
 KMOD_NAME="memreader"
 BINARY="$SCRIPT_DIR/FrostDumper"
 
@@ -83,7 +83,45 @@ ensure_kmod() {
 # ---------------------------------------------------------------------------
 # 3. Build FrostDumper binary (and optional probe tools)
 # ---------------------------------------------------------------------------
+
+# needs_rebuild <output> <source...>
+# True (0) when <output> is missing or older than any listed source.
+# generated_decrypt.h is written BY the dumper at runtime, so it is excluded
+# from dependency lists — otherwise every run would dirty the next build.
+needs_rebuild() {
+    local out="$1"; shift
+    [[ -f "$out" ]] || return 0
+    local src
+    for src in "$@"; do
+        [[ -e "$src" ]] || continue
+        [[ "$src" -nt "$out" ]] && return 0
+    done
+    return 1
+}
+
+# All headers main.cpp pulls in, minus the runtime-generated one.
+dumper_sources() {
+    printf '%s\n' "$SCRIPT_DIR/main.cpp"
+    local h
+    for h in "$SCRIPT_DIR"/*.h; do
+        [[ "$(basename "$h")" == "generated_decrypt.h" ]] && continue
+        printf '%s\n' "$h"
+    done
+    for h in "$SCRIPT_DIR"/KernelDriver/include/*.h; do
+        [[ -e "$h" ]] && printf '%s\n' "$h"
+    done
+}
+
 build_dumper() {
+    if [[ "${FORCE_REBUILD:-0}" != "1" ]]; then
+        local deps=()
+        mapfile -t deps < <(dumper_sources)
+        if ! needs_rebuild "$BINARY" "${deps[@]}"; then
+            info "FrostDumper up to date – skipping build. (FORCE_REBUILD=1 to force)"
+            build_probes
+            return
+        fi
+    fi
     info "Building FrostDumper ..."
     # Build vendored Zydis 4.0 (single-file amalgamation at zydis/Zydis.c).
     # Cached in build/. Re-migrated from bddisasm on 2026-05-16 — Zydis matches
@@ -98,37 +136,46 @@ build_dumper() {
             || error "Zydis build failed"
     fi
     g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 \
-        -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+        -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/KernelDriver/include" \
         -o "$BINARY" \
         "$SCRIPT_DIR/main.cpp" "$ZYDIS_OBJ" \
         -lcapstone -lm
     info "Binary built: $BINARY"
+    build_probes
+}
 
-    # Also build probe tools (best-effort, not fatal)
-    if [[ -f "$SCRIPT_DIR/probe_subprop.cpp" ]]; then
+# Probe/offline tools — each rebuilt only when its own .cpp is newer.
+build_probes() {
+    if [[ -f "$SCRIPT_DIR/probe_subprop.cpp" ]] && needs_rebuild "$SCRIPT_DIR/probe_subprop" "$SCRIPT_DIR/probe_subprop.cpp"; then
         g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 \
-            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/KernelDriver/include" \
             -o "$SCRIPT_DIR/probe_subprop" \
             "$SCRIPT_DIR/probe_subprop.cpp" -lm 2>/dev/null \
             && info "Probe tool built: probe_subprop" || warn "probe_subprop build skipped"
     fi
-    if [[ -f "$SCRIPT_DIR/probe_next.cpp" ]]; then
+    if [[ -f "$SCRIPT_DIR/probe_patch20260805.cpp" ]] && needs_rebuild "$SCRIPT_DIR/probe_patch20260805" "$SCRIPT_DIR/probe_patch20260805.cpp"; then
+        g++ -std=c++17 -O2 \
+            -o "$SCRIPT_DIR/probe_patch20260805" \
+            "$SCRIPT_DIR/probe_patch20260805.cpp" 2>/dev/null \
+            && info "Probe tool built: probe_patch20260805" || warn "probe_patch20260805 build skipped"
+    fi
+    if [[ -f "$SCRIPT_DIR/probe_next.cpp" ]] && needs_rebuild "$SCRIPT_DIR/probe_next" "$SCRIPT_DIR/probe_next.cpp"; then
         g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 \
-            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/KernelDriver/include" \
             -o "$SCRIPT_DIR/probe_next" \
             "$SCRIPT_DIR/probe_next.cpp" -lm 2>/dev/null \
             && info "Probe tool built: probe_next" || warn "probe_next build skipped"
     fi
-    if [[ -f "$SCRIPT_DIR/probe_live_rvas.cpp" ]]; then
+    if [[ -f "$SCRIPT_DIR/probe_live_rvas.cpp" ]] && needs_rebuild "$SCRIPT_DIR/probe_live_rvas" "$SCRIPT_DIR/probe_live_rvas.cpp"; then
         g++ -std=c++17 -O2 -march=native \
-            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/KernelDriver/include" \
             -o "$SCRIPT_DIR/probe_live_rvas" \
             "$SCRIPT_DIR/probe_live_rvas.cpp" -lm 2>/dev/null \
             && info "Probe tool built: probe_live_rvas" || warn "probe_live_rvas build skipped"
     fi
-    if [[ -f "$SCRIPT_DIR/tools/extract_vtables_offline.cpp" ]]; then
+    if [[ -f "$SCRIPT_DIR/tools/extract_vtables_offline.cpp" ]] && needs_rebuild "$SCRIPT_DIR/tools/extract_vtables_offline" "$SCRIPT_DIR/tools/extract_vtables_offline.cpp"; then
         g++ -std=c++17 -O2 \
-            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/../KernelDriver/include" \
+            -I"$SCRIPT_DIR" -I"$SCRIPT_DIR/KernelDriver/include" \
             -o "$SCRIPT_DIR/tools/extract_vtables_offline" \
             "$SCRIPT_DIR/tools/extract_vtables_offline.cpp" 2>/dev/null \
             && info "Offline tool built: tools/extract_vtables_offline" || warn "extract_vtables_offline build skipped"

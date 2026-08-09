@@ -137,34 +137,6 @@ reclass pass therefore *drops* records whose cast flags give a definite
 non-type verdict, instead of forcing them into the class/struct split.
 `class ptr invalid` and `flags unreadable` never occurred, so a zero-flag
 record is an ordinary instance, not a decode failure.
-```
-UStruct::ChildProperties = +0xD0
-UStruct::PropertiesSize  = +0xD8
-UClass::ClassCastFlags   = +0x120
-```
-**Only `Offset_Internal` (xor+bswap) and `RepNotifyFunc` (SIMD) are obfuscated.**
-ElementSize, ArrayDim, PropertyFlags and RepIndex are plain.
-
-Two traps that read plausibly but are wrong:
-- `+0x9C` is ElementSize, **not** FBoolProperty::FieldSize. It only looks like
-  FieldSize because `ElementSize == FieldSize` for bools.
-- `+0x08` is an MSVC **vbptr** (Theia gives FField two virtual bases), not
-  ClassPrivate. FField vbtable {-8, 0xA0, 0xA8}, FProperty {-8, 0x110, 0x118}.
-
-`FField::ClassPrivate` appears not to exist as a readable field on this build —
-the FField ctor (0x3872B0) never receives or stores an FFieldClass. `+0x90`
-nonetheless carries 20 distinct pointers that make `BuildLiveFFieldClassMap`
-work and drive type detection to 0.0% Unknown, so it is used as ClassPrivate.
-If that ever breaks, the better oracle is that **every FProperty subclass has a
-distinct vtable at +0x00** on this patch (unlike CL-1233465/1299607), and the
-wide class name usually sits immediately before the vbtable `*(this+8)` points
-to.
-
-SuperStruct probed over 600 UStructs: 429 null, 171 valid, 0 junk; chains
-terminate at Object (WorldSettings -> Info -> Actor -> Object). The chain
-printer now requires a module-range vtable and a resolvable name per hop,
-so a mis-classified object truncates the chain instead of emitting
-`Unknown (0x...)` garbage read out of float/UTF-16 data.
 
 ### UObject slot roles (CL-1325322)
 All four slots at `Obj + 0x20 + idx*0x20` share ONE transform; the name just
@@ -237,9 +209,6 @@ V = V ^ 0xAB7645401DC01268                 (= 0xB7148246A35721EF ^ 0x1C62C706BE9
 FName = ROL64(V, 32)
 CompIndex = lo32(FName), Number = hi32(FName)
 ```
-The other three slots hold encrypted pointers (Outer/Class/…) decoded by the
-separate pointer idiom below — which is why sampling them as name candidates
-produced only a handful of distinct ciphertexts.
 
 ### Where the UObject name decrypt must be (narrowed 2026-08-09, superseded)
 Scanning for `pshuflw xmm, [mem]` finds only the pointer idiom — that instruction
@@ -721,5 +690,9 @@ Bool-specific field init. FieldSize/ByteOffset/ByteMask/FieldMask setup.
 ## Environment
 - Wine module base: 0x140000000 (memfd)
 - Find PID: `pgrep "GameThread"`, filter out CrashReportClient via `/proc/pid/cmdline`
-- IDA instances: `oo5g` (current dump PioneerGame-e_dumped.exe), `3q7c` (CL-1195482)
-- IDA binary base: 0 (not 0x140000000) — subtract 0x140000000 from live RVAs for IDA addresses
+- IDA instances: `jat2` (CL-1325322, **base 0x140000000** — IDA addr = 0x140000000 + RVA),
+  `oo5g` (older PioneerGame-e_dumped.exe), `3q7c` (CL-1195482)
+- ⚠️ IDA base differs per instance. `oo5g`/`3q7c` are based at 0 (subtract
+  0x140000000 from live RVAs); `jat2` is based at 0x140000000 (add nothing).
+  Check with a known byte before trusting an address — e.g. RVA 0x231B51 must be
+  `49 BA 82 B3 EC D4 4B 78 C3 07` (movabs r10, BLOCK_FNV_XOR).

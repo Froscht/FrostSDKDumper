@@ -138,8 +138,8 @@ static inline int32_t DecryptPropertyOffset(uint32_t Stored) {
 
 // ─── 5. FName Resolution (ComparisonIndex → string) ─────────────────────────
 // Shard hash: FNV32 with ROLs, slot-select formula: (-109*T+82) ^ ((P*T+ADD)>>16) & 7
-// Block decode: ROL64(13) → PSHUFLW(0x93) → XOR
-// FNV64 fold: ROL(37) + ADD, ROL(40) + ADD
+// Block decode: ROL64(0) → PSHUFLW(0x00) → XOR
+// FNV64 fold: ROL(15) + ADD, ROL(15) + ADD
 // Pointer: 3-step bswap+XOR chain
 
 static inline uint64_t FNameResolveEntry(uint32_t CI) {
@@ -148,36 +148,38 @@ static inline uint64_t FNameResolveEntry(uint32_t CI) {
     uint64_t ChunkAddr = MODULE_BASE + GNAME_POOL_BASE + ChunkOff;
 
     // Shard hash
-    uint64_t SeedAddr = ChunkAddr + 0x2F90ULL;
+    uint64_t SeedAddr = ChunkAddr + 0x4C90ULL;
     uint32_t SeedLo = 0, SeedHi = 0;
     READ_MEMORY(SeedAddr, &SeedLo, 4);
     READ_MEMORY(SeedAddr + 4, &SeedHi, 4);
-    uint32_t H = 0x01000193u * Rotl32(SeedLo, 17) + 0xD5AF8E52u;
-    H = 0x01000193u * Rotl32(H, 13) + SeedHi + 0xD5AF8E52u;
-    H = 0x01000193u * Rotl32(H, 17) + 0xD5AF8E52u;
-    uint32_t T = Rotl32(H, 13);
+    uint32_t H = 0x01000193u * Rotl32(SeedLo, 17) + 0x46BD406Eu;
+    H = 0x01000193u * Rotl32(H, 13) + SeedHi + 0x46BD406Eu;
+    H = 0x01000193u * Rotl32(H, 17) + 0x46BD406Eu;
+    uint32_t T = Rotl32(H, 3);
     uint8_t Pa = (uint8_t)(-109 * T + 82);
-    uint8_t Pb = (uint8_t)((0x01000193u * T + 0xD5AF8E52u) >> 16);
+    uint8_t Pb = (uint8_t)((0x01000193u * T + 0x46BD406Eu) >> 16);
     int Bidx1 = (Pa ^ Pb) & 7;
     int Bidx2 = (Bidx1 + 1) & 7;
 
     // Block decode
-    uint64_t BlockBase = ChunkAddr + 0x2FA0ULL;
+    uint64_t BlockBase = ChunkAddr + 0x4CA0ULL;
     uint64_t Raw1 = 0, Raw2 = 0;
     READ_MEMORY(BlockBase + Bidx1 * 32, &Raw1, 8);
     READ_MEMORY(BlockBase + Bidx2 * 32, &Raw2, 8);
-    uint64_t B1 = SoftPshuflw(Rotl64(Raw1, 13), 0x93) ^ 0x0020006E00690020ULL;
-    uint64_t B2 = SoftPshuflw(Rotl64(Raw2, 13), 0x93) ^ 0x0020006E00690020ULL;
+    uint64_t Dec1 = SoftPshuflw(Raw1, BLOCK_PSHUFLW) ^ BLOCK_FNV_XOR;
+    uint64_t Dec2 = SoftPshuflw(Raw2, BLOCK_PSHUFLW) ^ BLOCK_FNV_XOR;
+    uint64_t B1 = Rotl64(Dec1, BLOCK_ROL64);
+    uint64_t B2 = Rotl64(Dec2, BLOCK_ROL64);
 
     // FNV64 chain
-    uint64_t Fv1 = 0x100000001B3ULL * Rotl64(B1, 37) + 0x10F3A73711CE0312ULL;
-    uint64_t Fv2 = 0x100000001B3ULL * Rotl64(Fv1, 40) + 0x10F3A73711CE0312ULL;
+    uint64_t Fv1 = 0x100000001B3ULL * Rotl64(B1, 15) + 0x07C3784BD4ECB382ULL;
+    uint64_t Fv2 = 0x100000001B3ULL * Rotl64(Fv1, 15) + 0x07C3784BD4ECB382ULL;
     uint64_t RawPtr = B1 + (B2 ^ Fv2) + 2 * NameOff;
 
     // Pointer XOR chain
-    uint64_t Step1 = Bswap64(RawPtr ^ 0x0000000014329DBFULL);
-    uint64_t Step2 = Step1 ^ 0x00002E3400000000ULL;
-    uint64_t EntryPtr = Bswap64(Step2 ^ 0xBF9D1C2000000000ULL);
+    uint64_t Step1 = Bswap64(RawPtr ^ 0x000000003E9E7ED8ULL);
+    uint64_t Step2 = Step1 ^ 0x0000801B00000000ULL;
+    uint64_t EntryPtr = Bswap64(Step2 ^ 0xD87E1E2500000000ULL);
     return EntryPtr;
 }
 
