@@ -37,3 +37,5 @@ SDK_Output_OLD.txt
 *.id2
 *.nam
 *.zip
+decrypt_export.json.imgsize-0x117E1000
+decrypt_export.json.POISONED-0x11853000
