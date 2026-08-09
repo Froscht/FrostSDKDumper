@@ -1126,6 +1126,28 @@ public:
                 Off::FBoolProperty::FieldMask  = V::FBOOLPROP_FIELDMASK;
                 ArcDecrypt::Patch20260421::g_PropertyOffsetXor = V::FPROP_OFFSET_XOR;
                 std::printf("[v808] re-asserted FField layout after auto_offsets\n");
+
+                // GWorld: the pre-object-array phase can only pattern-match
+                // and its compile-time RVA is stale every patch. With the
+                // object array and names up, resolve it exactly instead.
+                AutoDiscovery::g_DiscoveredGWorldV808 = AutoDiscovery::DiscoverGWorldV808(
+                    m_reader, MODULE_BASE, AutoDiscovery::g_DiscoveredBounds,
+                    m_gobj.GetSeedObjects(),
+                    [this](uint64_t O) { return m_fname.GetName(O); },
+                    [this](uint64_t O) { return m_fname.GetClassPtrV808(O); },
+                    nullptr, 0);
+                if (AutoDiscovery::g_DiscoveredGWorldV808.Valid) {
+                    const auto& G = AutoDiscovery::g_DiscoveredGWorldV808;
+                    if (ArcDecrypt::RVA_GWORLD != G.Rva)
+                        std::printf("[v808] GWorld drift: 0x%llX -> 0x%llX (auto-fixed)\n",
+                            (unsigned long long)ArcDecrypt::RVA_GWORLD,
+                            (unsigned long long)G.Rva);
+                    ArcDecrypt::RVA_GWORLD = G.Rva;
+                    AutoDiscovery::g_DiscoveredWorld.GWorldRva  = G.Rva;
+                    AutoDiscovery::g_DiscoveredWorld.GWorldAbs  = MODULE_BASE + G.Rva;
+                    AutoDiscovery::g_DiscoveredWorld.DoubleDeref = G.DoubleDeref;
+                    AutoDiscovery::g_DiscoveredWorld.Valid      = true;
+                }
             }
 
             // If auto_offsets found a new ChildProperties offset, re-run

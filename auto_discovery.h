@@ -3771,6 +3771,150 @@ inline std::string DecryptNarrow(const std::vector<uint8_t>& Cipher, int Length,
 
 } // namespace V808Detail
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GWorld, resolved from the live object graph (CL-1325322)
+//
+// The pre-object-array GWorld phase can only pattern-match, and its compile-time
+// RVA goes stale every patch. Once the object array and the name pipeline are up
+// the answer is exact: find the UObject whose class is named "World", then look
+// for the .data slot that points at it.
+//
+// On this patch the slot is NOT a direct UWorld* — it holds a wrapper whose first
+// qword is the UWorld (observed: .data+0xE859548 -> 0xE1A500A0 -> 0x179BCE020
+// "PracticeRangeArray", class "World"). Both shapes are searched and the one that
+// matches is reported, so a future patch flipping back to a direct pointer needs
+// no change.
+// ─────────────────────────────────────────────────────────────────────────────
+struct GWorldV808 {
+    bool     Valid       = false;
+    bool     DoubleDeref = false;
+    uint64_t Rva         = 0;
+    uint64_t WorldPtr    = 0;
+    std::string WorldName;
+};
+
+inline GWorldV808 DiscoverGWorldV808(
+    IMemoryReader& Reader, uint64_t Base, const ModuleBounds& Bounds,
+    const std::vector<uint64_t>& Objects,
+    const std::function<std::string(uint64_t)>& NameOf,
+    const std::function<uint64_t(uint64_t)>& ClassOf,
+    const uint8_t* TextBytes, size_t TextSize)
+{
+    GWorldV808 Out;
+    if (!Bounds.Valid || !Bounds.DataSize) return Out;
+
+    std::vector<uint64_t> Worlds;
+    for (uint64_t Obj : Objects) {
+        uint64_t Cls = ClassOf(Obj);
+        if (!Cls) continue;
+        if (NameOf(Cls) != "World") continue;
+        // Skip the CDO — Default__World is a template, never the live world.
+        if (NameOf(Obj).rfind("Default__", 0) == 0) continue;
+        Worlds.push_back(Obj);
+    }
+    if (Worlds.empty()) {
+        std::printf("[gworld-v808] no UWorld instance in the object array "
+                    "(main menu / loading?)\n");
+        return Out;
+    }
+    std::printf("[gworld-v808] %zu UWorld instance(s); first = 0x%llX \"%s\"\n",
+        Worlds.size(), (unsigned long long)Worlds[0], NameOf(Worlds[0]).c_str());
+
+    std::vector<uint8_t> Data(Bounds.DataSize);
+    if (!Reader.Read(Base + Bounds.DataRva, Data.data(), Data.size())) {
+        // Fall back to page-wise reads; a single unreadable page must not
+        // abort the whole sweep.
+        for (uint64_t Off = 0; Off < Bounds.DataSize; Off += 0x1000) {
+            size_t N = (size_t)std::min<uint64_t>(0x1000, Bounds.DataSize - Off);
+            if (!Reader.Read(Base + Bounds.DataRva + Off, Data.data() + Off, N))
+                std::memset(Data.data() + Off, 0, N);
+        }
+    }
+
+    auto IsHeap = [](uint64_t V) { return V >= 0x10000ULL && V < 0x800000000000ULL; };
+
+    // Pass 1 — direct UWorld*.
+    for (uint64_t W : Worlds) {
+        for (uint64_t Off = 0; Off + 8 <= Data.size(); Off += 8) {
+            uint64_t V;
+            std::memcpy(&V, Data.data() + Off, 8);
+            if (V != W) continue;
+            Out.Valid = true; Out.Rva = Bounds.DataRva + Off;
+            Out.WorldPtr = W;  Out.WorldName = NameOf(W);
+            std::printf("[gworld-v808] direct GWorld at RVA 0x%llX -> 0x%llX \"%s\"\n",
+                (unsigned long long)Out.Rva, (unsigned long long)W, Out.WorldName.c_str());
+            return Out;
+        }
+    }
+
+    // Pass 2 — wrapper: .data slot -> struct whose first qword is the UWorld.
+    // Deduplicate the candidate pointers first; .data repeats the same handful
+    // of globals thousands of times and one probe read each is otherwise slow.
+    std::unordered_map<uint64_t, std::vector<uint64_t>> Cands;
+    for (uint64_t Off = 0; Off + 8 <= Data.size(); Off += 8) {
+        uint64_t V;
+        std::memcpy(&V, Data.data() + Off, 8);
+        if (IsHeap(V) && !(V >= Base && V < Base + Bounds.ImageSize))
+            Cands[V].push_back(Bounds.DataRva + Off);
+    }
+    std::unordered_set<uint64_t> WorldSet(Worlds.begin(), Worlds.end());
+    std::printf("[gworld-v808] no direct slot; probing %zu distinct .data pointers "
+                "for a wrapper\n", Cands.size());
+    struct Hit { uint64_t Rva; uint64_t Wrapper; uint64_t World; };
+    std::vector<Hit> Hits;
+    for (const auto& [Ptr, Offs] : Cands) {
+        uint64_t First = 0;
+        if (!Reader.Read(Ptr, &First, 8)) continue;
+        if (!WorldSet.count(First)) continue;
+        for (uint64_t R : Offs) Hits.push_back({R, Ptr, First});
+    }
+    if (Hits.empty()) {
+        std::printf("[gworld-v808] no .data slot references any UWorld instance\n");
+        return Out;
+    }
+
+    // Several .data globals reach the same UWorld. They are NOT distinguishable
+    // by code references: a capstone sweep of the whole .text found ZERO
+    // rip-relative references to any of them, so Theia reaches GWorld through
+    // computed paths only. What does separate them is the wrapper shape.
+    //
+    // Observed wrappers are all {UWorld*, UObject*, 0xFFFFFFFF, ...}. The ones
+    // that are world-subsystem records carry the subsystem at +0x08 (e.g.
+    // "SignificanceManager", with its name inline as UTF-16 from +0x18).
+    // GWorld itself has no named object there. That filter is a heuristic,
+    // not a proof — if it ever picks wrong, every candidate is printed below
+    // so the right RVA can be read straight off the log.
+    auto HasNamedSecond = [&](uint64_t Wrapper) -> bool {
+        uint64_t Second = 0;
+        if (!Reader.Read(Wrapper + 8, &Second, 8)) return false;
+        if (Second < 0x10000ULL || Second >= 0x800000000000ULL) return false;
+        uint64_t Vt = 0;
+        if (!Reader.Read(Second, &Vt, 8)) return false;
+        if (Vt < Base || Vt >= Base + Bounds.ImageSize) return false;
+        return !NameOf(Second).empty();
+    };
+    std::printf("[gworld-v808] %zu candidate slots:\n", Hits.size());
+    for (const auto& H : Hits)
+        std::printf("[gworld-v808]   RVA 0x%llX -> 0x%llX  subsystem_record=%d\n",
+            (unsigned long long)H.Rva, (unsigned long long)H.Wrapper,
+            (int)HasNamedSecond(H.Wrapper));
+    std::stable_sort(Hits.begin(), Hits.end(), [&](const Hit& A, const Hit& B) {
+        bool Sa = HasNamedSecond(A.Wrapper), Sb = HasNamedSecond(B.Wrapper);
+        if (Sa != Sb) return !Sa;          // plain world slots first
+        return A.Rva < B.Rva;              // then lowest RVA, for determinism
+    });
+
+    Out.Valid = true; Out.DoubleDeref = true;
+    Out.Rva = Hits[0].Rva; Out.WorldPtr = Hits[0].World;
+    Out.WorldName = NameOf(Hits[0].World);
+    std::printf("[gworld-v808] GWorld at RVA 0x%llX -> 0x%llX -> 0x%llX \"%s\" "
+                "(double-deref)\n",
+        (unsigned long long)Out.Rva, (unsigned long long)Hits[0].Wrapper,
+        (unsigned long long)Hits[0].World, Out.WorldName.c_str());
+    return Out;
+}
+inline GWorldV808 g_DiscoveredGWorldV808;
+
 inline V808Discovery DiscoverV808Pipeline(const SigScanV2::Scanner& Scanner,
                                           IMemoryReader& Reader, uint64_t Base,
                                           const ModuleBounds& Bounds,
