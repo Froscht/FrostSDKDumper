@@ -1247,6 +1247,10 @@ namespace v20260808 {
     // object pointers, 0 junk. Chains terminate at Object, e.g.
     // WorldSettings -> Info -> Actor -> Object.
     constexpr uint64_t USTRUCT_SUPER_OFF     = 0xA8ULL;
+    // UEnum is not a UStruct, so this shares the byte offset with
+    // SuperStruct without conflicting. Probed live: EPixelFormat ->
+    // PF_Unknown/PF_A32B32G32R32F, EOrientation -> Orient_Horizontal/...
+    constexpr uint64_t UENUM_NAMES_OFF       = 0xA8ULL;
     // FBoolProperty::SetBoolSize @0x451980 writes ElementSize at +0x9C AND the
     // bool quad at +0x108..+0x10B. +0x9C only *looks* like FieldSize because
     // ElementSize == FieldSize for bools.

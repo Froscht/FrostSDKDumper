@@ -124,6 +124,9 @@ FBoolProperty::FieldSize = +0x108, ByteOffset +0x109, ByteMask +0x10A,
                            FieldMask +0x10B                     (SetBoolSize @0x451980)
 subclass data (Inner/Struct/PropertyClass/…) = +0x108 and up
 UStruct::SuperStruct     = +0xA8   plain ptr, 0 when no parent
+UEnum::Names             = +0xA8   TArray<TPair<FName,int64>> (UEnum is
+                                   not a UStruct, so no conflict)
+UClass::ClassCastFlags   = +0x120  exact metaclass oracle
 UStruct::ChildProperties = +0xD0
 UStruct::PropertiesSize  = +0xD8
 UClass::ClassCastFlags   = +0x120

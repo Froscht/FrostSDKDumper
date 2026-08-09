@@ -1120,6 +1120,7 @@ public:
                 Off::FProperty::Offset_XOR    = V::FPROP_OFFSET_XOR;
                 Off::UStruct::PropertiesSize  = V::USTRUCT_PROPSIZE_OFF;
                 Off::UStruct::SuperStruct     = V::USTRUCT_SUPER_OFF;
+                Off::UEnum::Names             = V::UENUM_NAMES_OFF;
                 Off::FBoolProperty::ByteOffset = V::FBOOLPROP_BYTEOFFSET;
                 Off::FBoolProperty::ByteMask   = V::FBOOLPROP_BYTEMASK;
                 Off::FBoolProperty::FieldMask  = V::FBOOLPROP_FIELDMASK;
@@ -1565,7 +1566,10 @@ public:
                     Off::FProperty::Offset_XOR    = V::FPROP_OFFSET_XOR;
                     Off::UStruct::PropertiesSize  = V::USTRUCT_PROPSIZE_OFF;
                 Off::UStruct::SuperStruct     = V::USTRUCT_SUPER_OFF;
+                Off::UEnum::Names             = V::UENUM_NAMES_OFF;
                     Off::UStruct::SuperStruct     = V::USTRUCT_SUPER_OFF;
+                Off::UEnum::Names             = V::UENUM_NAMES_OFF;
+                    Off::UEnum::Names             = V::UENUM_NAMES_OFF;
                     Off::FBoolProperty::ByteOffset = V::FBOOLPROP_BYTEOFFSET;
                     Off::FBoolProperty::ByteMask   = V::FBOOLPROP_BYTEMASK;
                     Off::FBoolProperty::FieldMask  = V::FBOOLPROP_FIELDMASK;

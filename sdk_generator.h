@@ -3473,7 +3473,12 @@ public:
                         if (Disc.EnumRVA && VtRva == Disc.EnumRVA) VtConfirmedEnum = true;
                     }
                 }
-                if (!shape_ok && !VtConfirmedEnum && !m_known_enums.count(obj_ptr)) continue;
+                // ClassCastFlags already proved this is a UEnum; the shape
+                // check only validates UEnum::Names, whose offset is not
+                // established for this patch. Emit the enum with an empty
+                // body rather than dropping it.
+                if (!cast_flags_decided && !shape_ok && !VtConfirmedEnum &&
+                    !m_known_enums.count(obj_ptr)) continue;
 
                 EnumRecord erec{};
                 erec.addr    = obj_ptr;
@@ -3759,8 +3764,21 @@ public:
                 if (!Rec.super_addr)
                     PropagateDown(Rec.addr);
 
-            size_t Promoted = 0, Demoted = 0, VtLocked = 0;
+            size_t Promoted = 0, Demoted = 0, VtLocked = 0, CastLocked = 0;
             for (auto& Rec : result.structs) {
+                // ClassCastFlags is exact; the vtable sets and the
+                // inheritance propagation below are heuristics. Let the
+                // oracle decide whenever it has an opinion.
+                if (uint64_t Cf = ReadClassCastFlags(Rec.addr)) {
+                    if (Cf & CASTCLASS_UClass) {
+                        if (!Rec.is_class) ++Promoted;
+                        Rec.is_class = true;  ++CastLocked;  continue;
+                    }
+                    if (Cf & CASTCLASS_UScriptStruct) {
+                        if (Rec.is_class) ++Demoted;
+                        Rec.is_class = false; ++CastLocked;  continue;
+                    }
+                }
                 if (VtStructAddrs.count(Rec.addr)) {
                     if (Rec.is_class) ++Demoted;
                     Rec.is_class = false;
@@ -3783,6 +3801,9 @@ public:
                 }
             }
 
+            if (CastLocked)
+                std::printf("[sdk-cast] reclass: %zu decided by ClassCastFlags, %zu by vtable\n",
+                    CastLocked, VtLocked);
             size_t FinalClasses = 0, FinalStructs = 0;
             for (const auto& Rec : result.structs) {
                 if (Rec.is_class) ++FinalClasses;
@@ -3870,7 +3891,7 @@ public:
         // that live in chunks the structural scan doesn't reach). For each,
         // resolve name live and emit a minimal record.
         size_t extra_structs_added = 0, extra_enums_added = 0;
-        size_t diag_s_seen = 0, diag_s_range = 0, diag_s_noname = 0, diag_s_slash = 0;
+        size_t diag_s_seen = 0, diag_s_range = 0, diag_s_noname = 0, diag_s_slash = 0, diag_s_notatype = 0;
         for (uint64_t sp : m_known_structs) {
             if (seen.count(sp)) { ++diag_s_seen; continue; }
             if (sp <= 0x10000 || sp >= 0x800000000000ULL) { ++diag_s_range; continue; }
@@ -3888,12 +3909,22 @@ public:
             if (name[0] == '/') { ++diag_s_slash; continue; }
             size_t dot = name.rfind('.');
             if (dot != std::string::npos) name = name.substr(dot + 1);
+            // The oracle both filters and classifies here. A non-zero
+            // ClassCastFlags that names neither UClass nor UScriptStruct
+            // means this object is not a type at all (CDO, package, …) —
+            // this pass used to emit those as structs unconditionally.
+            bool CastIsClass = false;
+            if (uint64_t Cf = ReadClassCastFlags(sp)) {
+                if (Cf & CASTCLASS_UClass)             CastIsClass = true;
+                else if (Cf & CASTCLASS_UScriptStruct) CastIsClass = false;
+                else { ++diag_s_notatype; continue; }
+            }
             StructRecord rec{};
             rec.addr = sp;
             rec.name = name;
             rec.package = resolvePackage(sp);
             rec.props_size = Read<uint32_t>(sp + ArcDecrypt::Offsets::UStruct::PropertiesSize);
-            rec.is_class = false;
+            rec.is_class = CastIsClass;
             rec.super_addr = Read<uint64_t>(sp + ArcDecrypt::Offsets::UStruct::SuperStruct);
             // Properties chain walk — own-only via ChildProperties.
             // (See main pass above for why broad-scan was removed.)
@@ -3953,6 +3984,9 @@ public:
         }
         std::printf("[sdk] struct extras skip: seen=%zu range=%zu noname=%zu slash=%zu\n",
             diag_s_seen, diag_s_range, diag_s_noname, diag_s_slash);
+        if (diag_s_notatype)
+            std::printf("[sdk-cast] Pass-3 extras: %zu candidates rejected as non-types by ClassCastFlags\n",
+                diag_s_notatype);
         std::printf("[sdk] Pass-3 emit extras: +%zu structs, +%zu enums (shadow=%zu seen=%zu range=%zu struct=%zu name=%zu)\n",
             extra_structs_added, extra_enums_added, EnumSkippedShadow, EnumSkippedSeen,
             EnumSkippedRange, EnumSkippedStruct, EnumSkippedName);
