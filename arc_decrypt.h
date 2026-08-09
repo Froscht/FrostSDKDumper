@@ -1243,6 +1243,10 @@ namespace v20260808 {
     constexpr uint64_t FPROP_OFFSETINT_OFF   = 0xB4ULL;
     constexpr uint32_t FPROP_OFFSET_XOR      = 0x76C317A2u;
     constexpr uint64_t USTRUCT_PROPSIZE_OFF  = 0xD8ULL;
+    // Probed live over 600 UStructs: 429 null (no parent), 171 valid
+    // object pointers, 0 junk. Chains terminate at Object, e.g.
+    // WorldSettings -> Info -> Actor -> Object.
+    constexpr uint64_t USTRUCT_SUPER_OFF     = 0xA8ULL;
     // FBoolProperty::SetBoolSize @0x451980 writes ElementSize at +0x9C AND the
     // bool quad at +0x108..+0x10B. +0x9C only *looks* like FieldSize because
     // ElementSize == FieldSize for bools.

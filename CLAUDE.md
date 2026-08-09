@@ -123,6 +123,7 @@ FProperty::ArrayDim      = +0xE0   plain i32   (ctor)
 FBoolProperty::FieldSize = +0x108, ByteOffset +0x109, ByteMask +0x10A,
                            FieldMask +0x10B                     (SetBoolSize @0x451980)
 subclass data (Inner/Struct/PropertyClass/…) = +0x108 and up
+UStruct::SuperStruct     = +0xA8   plain ptr, 0 when no parent
 UStruct::ChildProperties = +0xD0
 UStruct::PropertiesSize  = +0xD8
 UClass::ClassCastFlags   = +0x120
@@ -144,6 +145,12 @@ If that ever breaks, the better oracle is that **every FProperty subclass has a
 distinct vtable at +0x00** on this patch (unlike CL-1233465/1299607), and the
 wide class name usually sits immediately before the vbtable `*(this+8)` points
 to.
+
+SuperStruct probed over 600 UStructs: 429 null, 171 valid, 0 junk; chains
+terminate at Object (WorldSettings -> Info -> Actor -> Object). The chain
+printer now requires a module-range vtable and a resolvable name per hop,
+so a mis-classified object truncates the chain instead of emitting
+`Unknown (0x...)` garbage read out of float/UTF-16 data.
 
 ### UObject slot roles (CL-1325322)
 All four slots at `Obj + 0x20 + idx*0x20` share ONE transform; the name just

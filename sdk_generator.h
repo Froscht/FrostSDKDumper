@@ -2010,8 +2010,15 @@ public:
             std::unordered_set<uint64_t> chain_seen;
             int depth = 0;
             while (cur && chain_seen.insert(cur).second && depth < 16) {
+                // A SuperStruct slot on a mis-classified object reads as
+                // whatever happened to sit there — float pairs, UTF-16
+                // text, stale handles. Require a module-range vtable and a
+                // resolvable name before printing, so a bad classification
+                // truncates the chain instead of emitting garbage.
+                uint64_t chain_vt = Read<uint64_t>(cur);
+                if (chain_vt < MODULE_BASE || chain_vt >= MODULE_BASE + 0x11853000ULL) break;
                 std::string nm = GetNameTheia(cur);
-                if (nm.empty()) nm = "Unknown";
+                if (nm.empty()) break;
                 uint32_t sz = Read<uint32_t>(cur + ArcDecrypt::Offsets::UStruct::PropertiesSize);
                 oss << "//   " << std::string(depth * 2, ' ') << "→ " << nm
                     << " (0x" << std::hex << cur << ", size=" << std::dec << sz << ")\n";
