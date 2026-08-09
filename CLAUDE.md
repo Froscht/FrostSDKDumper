@@ -185,6 +185,33 @@ The constant pair `0xBF6D1474CC9622A5 / 0xAB7645401DC01268` is what earlier
 notes logged at 0x4D5341 as an unexplained "FName-shaped decoder" — it is the
 UObject slot decrypt.
 
+### GWorld (CL-1325322, verified 2026-08-09)
+`RVA 0xE859548`, and it is a **double-deref**: the slot holds a wrapper whose
+first qword is the UWorld (0xE859548 -> 0xE1A500A0 -> UWorld).
+
+`DiscoverGWorldV808` resolves it from the live object graph instead of by
+sig-scan: find the object whose class is named "World" (skipping the
+`Default__World` CDO), then sweep .data for the slot that reaches it. It runs
+after the object array is up, so the older pre-array GWorld phase and the
+`mapstate` check still print "unavailable" — cosmetic, the anchor is corrected
+right afterwards.
+
+Two traps found while building this:
+- **No direct `UWorld*` slot exists** in .data, only wrapper slots.
+- **Xref ranking does not work.** A full capstone sweep of .text found ZERO
+  rip-relative references to any candidate — Theia reaches GWorld through
+  computed paths only. An earlier ranking that approximated the displacement as
+  the last 4 instruction bytes produced 9/8/6 counts that were pure noise and
+  picked the wrong slot.
+
+What does separate them: three .data slots reach the same UWorld and every
+wrapper looks like `{UWorld*, UObject*, 0xFFFFFFFF, ...}`. The world-subsystem
+records carry the subsystem at +0x08 (e.g. "SignificanceManager", its name
+inline as UTF-16 from +0x18); GWorld has no named object there. Exactly one
+candidate passes. That filter is a heuristic, not a proof, so every candidate is
+logged with its `subsystem_record` verdict — if it ever picks wrong, the correct
+RVA can be read straight off the log.
+
 ### SDK output (CL-1325322, 2026-08-09)
 ```
 Classes 19349   Structs 61042   Enums 877   Functions 48415
