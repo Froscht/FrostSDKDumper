@@ -1,19 +1,257 @@
 # FrostSDKDumper — Consolidated Reference
 
 ## Project Overview
-External SDK dumper for ARC Raiders (Unreal Engine 5, Theia-obfuscated). Reads game memory via `/dev/memreader` kernel module (or `process_vm_readv` fallback). Outputs `SDK_Output.txt` + per-class `.hpp` files. Runs on Linux against Wine-hosted game process.
+External SDK dumper for ARC Raiders (Unreal Engine 5, Theia-obfuscated). Reads game memory via `/dev/memreader` kernel module (or `process_vm_readv` fallback). Outputs `SDK_Output.txt` + `generated_decrypt.h` + `dump_bones.txt`. Runs on Linux against Wine-hosted game process.
 
 Build: `g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 -I KernelDriver/include -o FrostDumper main.cpp build/Zydis.o -lcapstone -lunicorn -lm`
 Run: `sudo ./build_and_run.sh [PID]`
 
-## Current Patch: CL-1315578 (2026-07-09)
+## Current Patch: CL-1325322 (2026-08-08)
+Image size 0x11853000. IDA instance `qe3o` (`pioneer_steam_1.39.x-CL-1325322_2026_08_08__22_23_83pct.exe`), IDA base 0x140000000 (NOT 0 like older instances).
+
+**FName pipeline: SOLVED and live-verified** 2026-08-08 vs PID 16430 — sequential pool walk decodes 60/60 engine names. See "CL-1325322 FName Pipeline" below.
+
+**GObjectArray: SOLVED and live-verified** 2026-08-08 — 291388 objects enumerated, chunk array passes the InternalIndex invariant 256/256. GUObjectArray = RVA 0xE6ED190 (confirmed: object registration calls `sub_1404B0BF0(&unk_14E6ED190, Obj)`). Key facts from `sub_1404B0BF0`:
+- chunks_manager blob at **GUObjectArray + 0x110**, decrypt = `PSHUFLW(ROL64(raw_lo64 ^ xmmword_14B48A020, 38), 0x39)`
+- chunk-pointer array comes from **vtable[3]** (offset 24) on `mgr + 0xA0`, arg = 128-bit blob at `mgr + 0xD0`
+- **FUObjectItem stride = 20** (not 24 — this is why prior scans failed), 65536 items/chunk
+- `Chunk = ChunkArray[Index >> 16]`, `Item = Chunk + 20 * (Index & 0xFFFF)`, `Item + 16` = flags dword
+- UObject InternalIndex at **+0x0C**
+
+vtable[3] is a small PEB-salted thunk, but **Theia ships ~100 interchangeable
+variants and picks a different one per process launch** — the vtable itself moves
+too (0x14B51ADC0 in one run, 0x14B51ADA0 in the next). Two observed shapes:
+```
+0x1404C15F0:  PSHUFLW(blob,0x8D) -> pxor rip-const -> ROL64(46)
+              -> xor (0xB2DA4299DB155ED3 ^ (0x4D56C2E0 + PEB))
+0x1404B7A90:  (blob & A) | (~blob & B)  [pand/pandn/por, rip-consts]
+              -> PSHUFLW(0x93) -> ROL16(12) [psllw/psrlw]
+              -> xor (0x4802830B + PEB) broadcast   ... no movabs at all
+```
+Pattern-matching a fixed op list therefore breaks on the next launch. The dumper
+now **interprets** the thunk instead (`EmulateChunkThunkV808`, a small SSE
+subset interpreter covering movdqa/movq/pand/pandn/por/pxor/pshufd/pshuflw/
+pshufb/psllw-q/psrlw-q plus `mov r,imm`, `add rax, gs:[0x60]`, `xor`, `rol`).
+Unsupported opcode aborts rather than guessing.
+
+No uprobe needed: the PEB is found by scanning writable memory for `PEB+0x10 ==
+ImageBaseAddress (0x140000000)` with a valid Ldr / ProcessParameters /
+ProcessHeap triple — Wine puts it at 0x7FFD0000.
+
+**Do not gate this on structural plausibility — gate it on the InternalIndex invariant.** `*(u32*)(Obj + 0x0C) == ChunkIdx * 65536 + Slot` holds for every live FUObjectItem and for no unrelated heap region. Earlier heap sweeps accepted float arrays as object arrays because they only checked "pointer-shaped".
+
+### Theia pointer decryption (CL-1325322, verified 2026-08-09)
+This idiom appears at 112 sites and is **pointer** decryption, NOT name decoding —
+the result is dereferenced directly (`mov qword ptr [rax+0x160], 0` at 0x1403ABD1B2,
+`movzx ebp, byte ptr [rcx+0x21B]` at 0x1403ABEBC8):
+```
+Ptr = ROL32(PSHUFLW(enc, 0x39) ^ xmmword_14B4E02B0, 9) ^ 0x890EF320D7E2DC4C
+      (ROL32 is per-dword: psrld 0x17 | pslld 9)
+xmmword_14B4E02B0 lane0 = 0xD2966E6B7A701FF6
+```
+All 112 sites share the same constant pair. Sites read `[reg+0x60]` (105) and
+`[reg+0x80]` (7). **Do not mistake this for the FName path** — a lot of time was
+lost treating UObject +0x20/+0x40/+0x60/+0x80 as name slots when they are
+encrypted pointers (Outer/Class/etc.), which is why only a handful of distinct
+ciphertexts occur: many objects share the same class and outer.
+
+Theia uses a **different constant pair per site**. Two other confirmed FName-shaped
+decoders, both reading container elements rather than UObject fields:
+```
+0x1404D5341:  FName = ROL64(PSHUFLW(e,0x39) ^ 0xBF6D1474CC9622A5, 62) ^ 0xAB7645401DC01268
+0x1404D4BC9:  ROL64(13) -> PSHUFB[rip] -> ROL64(10)
+```
+Consequence: brute-forcing transform families is hopeless. Find the exact site.
+
+**UObject::GetFName: SOLVED and live-verified** 2026-08-09 — 290063/290063 objects
+named, 141694 distinct. See `ArcDecrypt::v20260808::UOBJ_NAME_*`. The decisive
+anchor was the **AngelScript binding signature strings** in .rdata: the string
+`"FName GetName() const"` (0x14C084885) is referenced by a registration site that
+loads the native function pointer immediately before it (`lea rax, [rip-...]`
+at 0x14422B053 → RVA 0x343950). That function is UObject::GetFName in full.
+
+Two properties made this impossible to guess and cost most of the search time:
+the slot is **hash-selected** from four candidates (so no fixed offset ever
+scores), and there is a final **ROL64(32)** after the second XOR.
+
+SDK output after the fix: 14199 classes, 33411 structs, 879 enums, 14062
+functions. Properties still 0 — FField/FProperty layout is the remaining gap.
+
+**Use the AngelScript signature strings as the general anchor on future patches.**
+They survive Theia (they are needed at runtime for script binding) and name the
+exact native function for anything script-visible: GetName, GetNameByIndex,
+GetOuter, class/struct/enum accessors.
+
+### CL-1325322 FField layout (verified 2026-08-09)
+Anchor again a source-path string: `.../UObject/PropertyBool.cpp` (0x14B506FEC)
+is referenced from `sub_1404478A0`, the FBoolProperty size check. Its assert path
+decodes the field name for the message, which exposes both the offset and the
+transform:
+```
+FField::NamePrivate      = +0x60
+FField::Next             = +0x80    (probed live: 205/300 chains)
+UStruct::ChildProperties = +0xD0    (probed live: 258/400 structs)
+FBoolProperty::FieldSize = +0x9C    (bittest against 278 ⇒ sizes 1,2,4,8)
+
+Name = ROL64(ROL32(PSHUFLW(E ^ 0xDB4ADB4ADB4ADB4A, 0x39) ^ 0x09DCB521A13AC4BC, 9)
+             ^ 0x890EF320D7E2DC4C, 32)
+```
+The blend in the binary is `(E & A) | (~E & B)` with A = 0x24B5… and B = 0xDB4A…;
+B == ~A so it collapses to a plain XOR with B. Decoding real chains yields
+MaxScrollbackSize / PrimaryActorTick / StaticMesh / AssetUserData.
+
+The generic Phase 2 and auto_offsets probes cannot find any of this (they need a
+working name decode to score candidates — the thing they are trying to discover)
+and they overwrite the values, so main re-asserts the layout after they run.
+
+Full verified FField/FProperty layout. Offsets marked (ctor) come from the
+FProperty constructors (0x448430 / 0x4316F0), `FProperty::SetupOffset`
+(0x43D380) and the member-clone routine at 0x42A16A, which copies the whole
+set in one place and is the best single confirmation of the layout:
+```
+FField::NamePrivate      = +0x60   encrypted (16B stored)
+FField::FlagsPrivate     = +0x70   plain u32
+FField::Owner            = +0x78   tagged ptr, bit0=1 ⇒ UObject
+FField::Next             = +0x80   plain ptr
+FField salt sentinel     = +0x88   const 0x4F463D342B221910
+FProperty::RepIndex      = +0x98   plain u16
+FProperty::ElementSize   = +0x9C   plain i32   (ctor)
+FProperty::PropertyFlags = +0xA0   plain u64   (ctor)
+FProperty::Offset_Internal = +0xB4 bswap32(real ^ 0x76C317A2)   (ctor)
+FProperty::RepNotifyFunc = +0xD0   encrypted FName
+FProperty::ArrayDim      = +0xE0   plain i32   (ctor)
+FBoolProperty::FieldSize = +0x108, ByteOffset +0x109, ByteMask +0x10A,
+                           FieldMask +0x10B                     (SetBoolSize @0x451980)
+subclass data (Inner/Struct/PropertyClass/…) = +0x108 and up
+UStruct::ChildProperties = +0xD0
+UStruct::PropertiesSize  = +0xD8
+UClass::ClassCastFlags   = +0x120
+```
+**Only `Offset_Internal` (xor+bswap) and `RepNotifyFunc` (SIMD) are obfuscated.**
+ElementSize, ArrayDim, PropertyFlags and RepIndex are plain.
+
+Two traps that read plausibly but are wrong:
+- `+0x9C` is ElementSize, **not** FBoolProperty::FieldSize. It only looks like
+  FieldSize because `ElementSize == FieldSize` for bools.
+- `+0x08` is an MSVC **vbptr** (Theia gives FField two virtual bases), not
+  ClassPrivate. FField vbtable {-8, 0xA0, 0xA8}, FProperty {-8, 0x110, 0x118}.
+
+`FField::ClassPrivate` appears not to exist as a readable field on this build —
+the FField ctor (0x3872B0) never receives or stores an FFieldClass. `+0x90`
+nonetheless carries 20 distinct pointers that make `BuildLiveFFieldClassMap`
+work and drive type detection to 0.0% Unknown, so it is used as ClassPrivate.
+If that ever breaks, the better oracle is that **every FProperty subclass has a
+distinct vtable at +0x00** on this patch (unlike CL-1233465/1299607), and the
+wide class name usually sits immediately before the vbtable `*(this+8)` points
+to.
+
+### UObject slot roles (CL-1325322)
+All four slots at `Obj + 0x20 + idx*0x20` share ONE transform; the name just
+needs a final ROL64(32) to bring CompIndex into the low dword:
+```
+Ptr   = ROL64(PSHUFLW(enc, 0x39) ^ 0xBF6D1474CC9622A5, 62) ^ 0xAB7645401DC01268
+FName = ROL64(Ptr, 32)          → CompIndex = lo32, Number = hi32
+NameIdx  = hash (see UObject::GetFName below)
+ClassIdx = (NameIdx + 2) & 3    verified: 120/120 UFunctions → the "Function" UClass
+OuterIdx = (NameIdx + 3) & 3    verified: ExecuteUbergraph → Object
+```
+`GetOuterPtr` had no v808 path, so `m_owner_to_funcs` was keyed on garbage and
+**function parameters came back empty** even though the param FFields sat
+correctly at UFunction+0xD0 with Owner pointing at the function. Confirmed
+independently: 172/200 UFunctions have a valid param chain there.
+
+The constant pair `0xBF6D1474CC9622A5 / 0xAB7645401DC01268` is what earlier
+notes logged at 0x4D5341 as an unexplained "FName-shaped decoder" — it is the
+UObject slot decrypt.
+
+### SDK output (CL-1325322, 2026-08-09)
+```
+Classes 19349   Structs 61042   Enums 877   Functions 48415
+Properties 344994 (344522 named)   FProperty_Unknown 0.0%
+struct_props 276822   param_props 68172
+Naming rate 290781/290781 = 100.0%   unique names 141901
+```
+
+### CL-1325322 UObject::GetFName (RVA 0x343950, verified 2026-08-09)
+```
+Seed = Obj + 0x10
+P = 0x1000193, ADD = 0x31F5C55F
+H = (lo32(Seed) >> 4) * P + ADD
+H = ROL32(H, 22) * P
+H = H + hi32(Seed) + ADD
+H = (H >> 4)   * P + ADD
+H = (H >> 0xA) * P + ADD
+S = H ^ (H >> 16)
+Idx = ((((~S | 0x565AFC0) & 0x565AFC1) | (S & 2)) ^ 0x565AFC3) & 3
+Slot = Obj + 0x20 + Idx * 0x20            <-- four slots, hash-selected
+V = ROL64(PSHUFLW(*Slot, 0x39) ^ 0xBF6D1474CC9622A5, 62)
+V = V ^ 0xAB7645401DC01268                 (= 0xB7148246A35721EF ^ 0x1C62C706BE973387)
+FName = ROL64(V, 32)
+CompIndex = lo32(FName), Number = hi32(FName)
+```
+The other three slots hold encrypted pointers (Outer/Class/…) decoded by the
+separate pointer idiom below — which is why sampling them as name candidates
+produced only a handful of distinct ciphertexts.
+
+### Where the UObject name decrypt must be (narrowed 2026-08-09, superseded)
+Scanning for `pshuflw xmm, [mem]` finds only the pointer idiom — that instruction
+form is the wrong anchor. Theia's field decrypt is normally:
+```
+movdqa xmm0, [reg + disp]      ; 66 0F 6F /r   (or movdqu, F3 0F 6F)
+pxor   xmm0, xmmword[rip]
+psrlq/psllq -> por             ; ROL64
+pshufb xmm0, xmmword[rip]      ; or pshuflw
+movq   rax, xmm0
+```
+Scan for that form and **exclude RSP/RBP/RIP as base** — stack-local pointer
+decrypts otherwise dominate the histogram (1715 sites at `[rsp+0x60]`, 1628 at
+`[rsp+0x50]`) and drown out the object-field sites. With those excluded only
+~70 object-field sites remain, at disp 0x10 (12), 0x20 (8), 0x50 (19),
+0x70 (2), 0x110 (18), 0x150 (18). The UObject name decrypt is among these.
+
+FNames handed to the name helpers (`sub_1405087E0`, `sub_140526F40`) are often
+**plaintext** qwords read straight from a struct (`mov rcx, [rbx]`), so not every
+FName in the game is encrypted. Plaintext FName dwords do exist inside UObjects
+at +0xB0, +0xC8, +0xD8, +0xE8 and resolve to real names (+0xD8 yields class
+names: FloatProperty, ObjectProperty, StructProperty, NameProperty), but all are
+dominated by "None" and none is the object's own name. A plaintext sweep of
+0x00..0x418 over 600 spread-sampled objects found no high-diversity name field,
+so NamePrivate is encrypted.
+
+### Uprobes do not work on this target (established 2026-08-09)
+The game's code is mapped from `/memfd:wine-mapping` as **`r-xs` (MAP_SHARED)**.
+Address resolution is fine — the driver's reported `file_offset` matches the VMA's
+`pgoff + (vaddr - vm_start)` exactly — but no probe ever fires. Four probes at four
+different addresses (0x1404C1602 PEB salt, 0x140231AB9 CompIndex, 0x140230020
+string decrypt, plus the dumper's own 0x1404A84A4) all reported `active: true`
+with `total_hits: 0`, including during active gameplay and UI interaction.
+Treat live-capture via uprobe as unavailable; the dumper's `CaptureSimdPebKey()`
+uprobe path is dead weight for the same reason. Get the PEB by scanning for
+`PEB+0x10 == ImageBaseAddress` instead (see the GObjectArray section).
+
+### Investigation pitfalls (cost real time on 2026-08-09)
+- **Never sample the first N entries of the object array.** They are clone
+  instances of one class; no field varies, so every search returns nothing and
+  every negative result is meaningless. Sample with a stride across all chunks.
+- **Valid-CompIndex membership is a weak filter.** Names sit 4–8 CI steps apart
+  inside a chunk, so chunk-0 density is ~7.6% and the full set is dense in the
+  low range. Solving an unknown XOR constant against "lands in a valid CI" yields
+  plateaus at exactly |ValidCi| and degenerate answers (all objects → one name).
+- **Exclude constant and zero-valued columns before solving.** A slot that is
+  identical across objects makes every candidate constant "work".
+- Score candidates by **distinct decoded names**, never by hit count alone.
+
+### Config hygiene (fixed 2026-08-08)
+`config_loader.h` used to gate only the `offsets` block on image_size; anchors, patch constants, vtables, GNames and the FName resolver loaded anyway and then caused auto-discovery phases 3/5/6/7/8 to be SKIPPED with stale values. A failed run also overwrote `decrypt_export.json` under the new patch tag, so the next run accepted the garbage as matching. Now: image_size mismatch discards the WHOLE config, and `AutoExport::ArchiveForeignConfig()` renames a foreign-patch config to `decrypt_export.json.imgsize-0xXXXX` instead of clobbering it.
+
+## Previous Patch: CL-1315578 (2026-07-09)
 Live-verified 2026-07-14 against PID 8082. Image size 0x117E1000.
 UObject slot decode: ROL64(29) → PSHUFLW(0x39) → ROL32(5) → lo64, CI in hi32.
 FField NamePrivate: XOR(0x8FFAB191C340B792) → ROL16(12) → PSHUFB([07,06,04,05,02,03,00,01]) → ROL64(32).
 PropertyOffsetXor: 0xA271DBC5. Field offsets shifted +0x50 from CL-1299607.
 FName shard hash uses `-109*T+82` slot-select formula (NOT `H^(H>>16)` like CL-1299607).
 
-SDK stats (2026-07-14): 27602 classes, 14450 structs, 2930 enums, 40124 functions, 286137 properties (285140 named), 0% FProperty_Unknown.
+SDK stats (2026-07-21): 85831 classes/structs (21315 classes, 64516 structs), 2939 enums, 61564 functions, 310065 properties (309085 named), 0% FProperty_Unknown, 192 skeletons, 9338 bones.
 
 Previous patch (CL-1299607, 2026-07-07): FField NamePrivate: PSHUFB→XOR→ROL64. Shard hash: -109*T+166 slot-select. PropertyOffsetXor: 0x057F15E5.
 
@@ -44,6 +282,9 @@ Previous patch (CL-1201801): 99.85% naming, ~298K properties, 33200 classes, 111
 | `auto_offsets.h` | FField/FProperty sub-pointer offset auto-probing |
 | `sig_scan.h` / `sig_scan_v2.h` | AOB pattern scanner (page-aware, VMP-tolerant) |
 | `emu_fname.h` | Unicorn-based FName emulation (EMU mode, slower fallback) |
+| `qd_engine.h` | QuickDecrypt micro-program interpreter (record/replay/codegen SIMD chains) |
+| `insn_decoder.h` | Zydis 4.0 wrapper — InsnType enum, DecodedInsn, InsnDecoder |
+| `func_analyzer.h` | Function analysis — ROL pair detection, SIMD/LEA target extraction |
 
 ### Discovery Phases (auto_discovery.h)
 0. Module bounds (PE header parse)
@@ -53,10 +294,12 @@ Previous patch (CL-1201801): 99.85% naming, ~298K properties, 33200 classes, 111
 2. FField NamePrivate XOR key extraction
 3. FProperty Offset_Internal XOR key + bswap extraction
 4. UObject slot decrypt params (PSHUFB mask + PXOR constant + ROL64 amount)
+   - 4c: QD generic slot recorder (records arbitrary SIMD chain via Zydis, histogram consensus)
 5. FName function RVA (via xor+bswap caller-frame anchor)
 6. GNamePool base (call-chain .data LEA walk from FName fn)
 7. FName keystream table (clustered .rdata loads in FName call chain)
 8. FFieldClass globals (5-arg constructor pattern)
+9. USkeleton BoneInfo offset (auto-probed via bone hierarchy invariant on sample objects)
 
 ### What Auto-Discovers vs. Hardcoded
 **Auto-discovers (survives patches zero-touch):**
@@ -65,8 +308,9 @@ Previous patch (CL-1201801): 99.85% naming, ~298K properties, 33200 classes, 111
 - FName decrypt entry function
 - FName XOR/ROL constants (extracted from function body)
 - FProperty Offset XOR key
-- UObject slot decrypt SIMD params
+- UObject slot decrypt SIMD params (+ QD-recorded generic program)
 - GNamePool base + keystream table
+- USkeleton BoneInfo TArray offset (hierarchy-validated auto-probe)
 - Engine vtable RVAs (UClass, UScriptStruct, UFunction, UEnum, UPackage, BPGC)
 - chunks_manager via Unicorn emulation of vtable[7]
 
@@ -80,6 +324,58 @@ Previous patch (CL-1201801): 99.85% naming, ~298K properties, 33200 classes, 111
 - SHARD_HASH_ADD, FNV_ADD, BLOCK_FNV_XOR, block ROL/PSHUFLW constants
 - FField NamePrivate decode (now auto-discovered by Phase 2c — fallback still exists)
 - GUObjectArray NumElements offset (+0x5C on CL-1315578)
+
+### CL-1325322 FName Pipeline (live-verified 2026-08-08, `ArcDecrypt::v20260808`)
+```
+GNamePool @ RVA 0xE431980 (inline .data array, NOT a pointer — the heap-probe
+tie-breaker in Phase 6 picks the wrong candidate on this patch).
+Keystream  @ RVA 0xE3707F4, uint16[160], decrypt entries start at index +44.
+
+CI → chunk: identity (SIMD chain across sub_1402319F0/B120/AAE0 cancels)
+  NameOff = CI & 0xFFFF, ChunkOff = (CI >> 8) & 0xFFFF00
+
+Shard Hash (FNV32, SHR-based — the disasm at 0x140231AD9, NOT the pseudocode):
+  SeedAddr = ChunkAddr + 0x4C90
+  Lo = lo32(SeedAddr), Hi = hi32(SeedAddr)
+  H = (Lo >> 4) * P + 0x46BD406E
+  H = (H  >> 3) * P
+  H = H + Hi + 0x46BD406E
+  H = (H  >> 4) * P + 0x46BD406E
+  H = (H  >> 3) * P + 0x46BD406E
+  S = H ^ (H >> 16)
+  Bidx1 = S & 7, Bidx2 = (S + 1) & 7
+
+Block Decode (8 blocks at ChunkAddr + 0x4CA0, stride 32):
+  Block = ROL64(PSHUFLW(raw, 0x93) ^ 0x07C3784BD4ECB382, 15)
+
+FNV64 Chain:
+  Fv1 = 0x100000001B3 * ROL64(V13, 40) + 0xBB3A9A3B042493AE
+  Fv2 = 0x100000001B3 * ROL64(Fv1, 57) + 0xBB3A9A3B042493AE
+  RawPtr = V13 + (V15 ^ Fv2) + 2*NameOff
+
+Pointer XOR Chain (unchanged shape):
+  Step1 = bswap64(RawPtr ^ 0x3E9E7ED8)
+  Step2 = Step1 ^ 0x0000801B00000000
+  EntryPtr = bswap64(Step2 ^ 0xD87E1E2500000000)
+
+String Header (16-bit):
+  length = (hdr >> 5) & 0x3FF
+  isWide = (hdr & 0x8000) != 0          <-- moved from 0x20
+  bytes  = isWide ? ((hdr >> 4) & 0x7FE) : (hdr >> 5)
+
+String Decrypt (sub_140230020) — linear schedule, the v709 LCG is gone:
+  K = (length + 34) & 0xFF
+  per pair: buf[i]   ^= KeyTable[(K & 0x3F) + 44] >> 3   (narrow; wide skips >>3)
+            buf[i+1] ^= KeyTable[((K + 11) & 0x3F) + 44] >> 3
+            K = (K + 22) & 0xFF
+  odd tail: one more with (K & 0x3F) + 44
+```
+
+Phase 6.7 (`DiscoverV808Pipeline`) pins both anchors against known plaintext
+instead of sig-scanning: CI=0 must decode to "None" (4-char narrow), then the
+keystream is found by sweeping .data/.rdata for the table satisfying the 4-byte
+"None" constraint, and the whole thing is confirmed by decoding "ByteProperty".
+Zero hardcoded RVAs on the hot path.
 
 ## Key Constants (CL-1315578 / v20260709)
 
@@ -345,6 +641,7 @@ Bool-specific field init. FieldSize/ByteOffset/ByteMask/FieldMask setup.
 | UStruct::ChildProperties | +0x168 | +0xB0 | +0x108 | +0x118 | +0xC8 | +0xF0 |
 | UStruct::PropertiesSize | — | — | +0x110 | +0xE0 | +0x90 | +0xD0 |
 | PropertyOffsetXor | — | — | 0xBAB939DB | 0xEAABEC11 | 0x057F15E5 | 0xA271DBC5 |
+| USkeleton::BoneInfo | — | — | — | — | — | +0xE8 (auto-probed) |
 
 ## Critical Rules (Learned from Past Bugs)
 

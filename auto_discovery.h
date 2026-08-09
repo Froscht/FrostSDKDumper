@@ -3405,6 +3405,11 @@ struct GNamesDiscovery {
     // candidate). RVA_FNAME_KEY_TABLE = SimdBlockRva + 0xA0.
     uint64_t SimdBlockRva  = 0;
     int      SimdBlockRefs = 0;
+    // Every ranked .data target from the walk, highest ref count first. The
+    // heap-pointer heuristic that picks GNamesRva misfires when the pool is an
+    // inline .data array instead of a pointer table (CL-1325322), so later
+    // phases re-validate against this list by actually decoding a name.
+    std::vector<std::pair<uint64_t, int>> Candidates;
 };
 
 // One known-non-FNamePool zone: a centerpoint RVA + half-width radius.
@@ -3565,6 +3570,12 @@ inline GNamesDiscovery DiscoverGNamesViaFNameWalk(
         return out;  // Valid stays false
     }
 
+    for (const auto& [t, c] : sorted) {
+        if (inExcludeZone(t)) continue;
+        out.Candidates.emplace_back(t, c);
+        if (out.Candidates.size() >= 32) break;
+    }
+
     out.GNamesRva = best;
     out.RefCount  = bestCount;
     out.Valid     = true;
@@ -3608,6 +3619,281 @@ inline GNamesDiscovery DiscoverGNamesViaFNameWalk(
                     (unsigned long long)(simd_block_rva + 0xA0));
     }
     return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 6.7: CL-1325322 (v20260808) FName pipeline validation
+//
+// Both the pool base and the keystream table are pinned by decoding known
+// plaintext rather than by trusting a sig-scan, so this survives RVA drift
+// with zero edits:
+//
+//   1. Pool — CompIndex 0 is "None" in every FNamePool ever shipped. Run the
+//      v808 resolve over each ranked .data candidate and keep the one whose
+//      entry header reports a 4-char narrow string. If no candidate survives,
+//      sweep .data at 8-byte stride as a fallback.
+//   2. Keystream — with the pool fixed we know the 4 ciphertext bytes of
+//      "None" and exactly which 4 table slots XOR into them. That is a 32-bit
+//      constraint; sweeping .data/.rdata for it yields a unique hit.
+//   3. Confirm — decode the *second* pool entry and require "ByteProperty".
+//      Two independent plaintexts make a false positive implausible.
+// ─────────────────────────────────────────────────────────────────────────────
+struct V808Discovery {
+    bool     Valid         = false;
+    bool     Confirmed     = false;   // second plaintext ("ByteProperty") matched
+    uint64_t PoolRva       = 0;
+    uint64_t KeystreamRva  = 0;
+    int      KeystreamBase = ArcDecrypt::v20260808::KEYSTREAM_BASE_INDEX;
+};
+inline V808Discovery g_DiscoveredV808;
+
+namespace V808Detail {
+
+inline uint64_t Rotl64(uint64_t V, int N) {
+    N &= 63;
+    return N ? ((V << N) | (V >> (64 - N))) : V;
+}
+
+inline uint64_t Pshuflw(uint64_t V, int Imm) {
+    uint16_t W[4];
+    for (int I = 0; I < 4; ++I) W[I] = (uint16_t)(V >> (16 * I));
+    uint64_t R = 0;
+    for (int I = 0; I < 4; ++I)
+        R |= (uint64_t)W[(Imm >> (2 * I)) & 3] << (16 * I);
+    return R;
+}
+
+// Verbatim transcription of the SHR chain at 0x140231AD9..0x140231B22.
+inline uint32_t ShardHash(uint64_t SeedAddr) {
+    namespace V = ArcDecrypt::v20260808;
+    uint32_t Lo = (uint32_t)SeedAddr;
+    uint32_t Hi = (uint32_t)(SeedAddr >> 32);
+    uint32_t H = (Lo >> V::SHARD_SHIFT_A) * V::HASH_PRIME + V::SHARD_HASH_ADD;
+    H = (H >> V::SHARD_SHIFT_B) * V::HASH_PRIME;
+    H = H + Hi + V::SHARD_HASH_ADD;
+    H = (H >> V::SHARD_SHIFT_A) * V::HASH_PRIME + V::SHARD_HASH_ADD;
+    H = (H >> V::SHARD_SHIFT_B) * V::HASH_PRIME + V::SHARD_HASH_ADD;
+    return H;
+}
+
+inline uint64_t DecodeBlock(uint64_t Raw) {
+    namespace V = ArcDecrypt::v20260808;
+    return Rotl64(Pshuflw(Raw, V::BLOCK_PSHUFLW) ^ V::BLOCK_FNV_XOR, V::BLOCK_ROL64);
+}
+
+// Resolve a CompIndex to an FNameEntry address for a hypothetical pool base.
+// Block reads come from the module cache so candidate sweeps stay cheap.
+inline uint64_t ResolveEntry(const SigScanV2::Scanner& Scanner, uint64_t Base,
+                             uint64_t PoolRva, uint32_t Ci)
+{
+    namespace V = ArcDecrypt::v20260808;
+    uint32_t NameOff  = Ci & 0xFFFFu;
+    uint32_t ChunkOff = (Ci >> 8) & 0xFFFF00u;
+    uint64_t ChunkRva = PoolRva + ChunkOff;
+
+    uint64_t H = ShardHash(Base + ChunkRva + V::SHARD_HASH_SEED_OFF);
+    uint32_t S = (uint32_t)H ^ ((uint32_t)H >> 16);
+    uint32_t B1 = S & 7u;
+    uint32_t B2 = (S + 1u) & 7u;
+
+    uint64_t BlockRva = ChunkRva + V::SHARD_BLOCK_BASE_OFF;
+    const uint8_t* P1 = Scanner.GetLocalPtr(BlockRva + V::SHARD_BLOCK_STRIDE * B1);
+    const uint8_t* P2 = Scanner.GetLocalPtr(BlockRva + V::SHARD_BLOCK_STRIDE * B2);
+    if (!P1 || !P2) return 0;
+    if (BlockRva + V::SHARD_BLOCK_STRIDE * 8 > Scanner.CacheSize()) return 0;
+
+    uint64_t Raw1 = 0, Raw2 = 0;
+    std::memcpy(&Raw1, P1, 8);
+    std::memcpy(&Raw2, P2, 8);
+    if (!Raw1 && !Raw2) return 0;
+
+    uint64_t V13 = DecodeBlock(Raw1);
+    uint64_t V15 = DecodeBlock(Raw2);
+
+    uint64_t Fv = V::FNV_PRIME * Rotl64(V13, V::FNV_ROL1) + V::FNV_ADD;
+    Fv = V::FNV_PRIME * Rotl64(Fv, V::FNV_ROL2) + V::FNV_ADD;
+
+    uint64_t RawPtr = V13 + (V15 ^ Fv) + 2ULL * NameOff;
+    uint64_t Step1 = __builtin_bswap64(RawPtr ^ V::FNAME_PTR_XOR1);
+    uint64_t Step2 = Step1 ^ V::FNAME_PTR_XOR2;
+    uint64_t Entry = __builtin_bswap64(Step2 ^ V::FNAME_PTR_XOR3);
+    if (Entry < 0x10000ULL || Entry >= 0x800000000000ULL) return 0;
+    return Entry;
+}
+
+struct EntryHeader {
+    uint16_t Raw    = 0;
+    int      Length = 0;
+    bool     IsWide = false;
+    int      Bytes  = 0;
+};
+
+inline bool ReadHeader(IMemoryReader& Reader, uint64_t Entry, EntryHeader& Out) {
+    namespace V = ArcDecrypt::v20260808;
+    uint16_t Hdr = 0;
+    if (!Reader.Read(Entry, &Hdr, 2) || !Hdr) return false;
+    Out.Raw    = Hdr;
+    Out.Length = (Hdr >> V::HDR_LENGTH_SHIFT) & V::HDR_LENGTH_MASK;
+    Out.IsWide = (Hdr & V::HDR_IS_WIDE_BIT) != 0;
+    Out.Bytes  = Out.IsWide ? ((Hdr >> 4) & 0x7FE) : (Hdr >> V::HDR_LENGTH_SHIFT);
+    return Out.Length > 0 && Out.Length <= 1023;
+}
+
+// Table slot indices touched when decrypting a string of the given length,
+// in emission order. Mirrors the loop at 0x1402300B4.
+inline void KeySlots(int Length, std::vector<int>& Out) {
+    namespace V = ArcDecrypt::v20260808;
+    Out.clear();
+    uint32_t K = ((uint32_t)Length + V::KEY_INIT_ADD) & 0xFFu;
+    int I = 0;
+    for (; I + 1 < Length; I += 2) {
+        Out.push_back((int)(K & V::KEY_INDEX_MASK));
+        Out.push_back((int)((K + V::KEY_SECOND_DELTA) & V::KEY_INDEX_MASK));
+        K = (K + V::KEY_PAIR_ADVANCE) & 0xFFu;
+    }
+    if (Length & 1) Out.push_back((int)(K & V::KEY_INDEX_MASK));
+}
+
+inline std::string DecryptNarrow(const std::vector<uint8_t>& Cipher, int Length,
+                                 const uint16_t* Table, int BaseIdx)
+{
+    namespace V = ArcDecrypt::v20260808;
+    std::vector<int> Slots;
+    KeySlots(Length, Slots);
+    std::string Out;
+    Out.reserve(Length);
+    for (int I = 0; I < Length && I < (int)Slots.size() && I < (int)Cipher.size(); ++I) {
+        uint8_t K = (uint8_t)(Table[Slots[I] + BaseIdx] >> V::NARROW_KEY_SHIFT);
+        Out.push_back((char)(Cipher[I] ^ K));
+    }
+    return Out;
+}
+
+} // namespace V808Detail
+
+inline V808Discovery DiscoverV808Pipeline(const SigScanV2::Scanner& Scanner,
+                                          IMemoryReader& Reader, uint64_t Base,
+                                          const ModuleBounds& Bounds,
+                                          const GNamesDiscovery& Gn)
+{
+    namespace V = ArcDecrypt::v20260808;
+    using namespace V808Detail;
+    V808Discovery Out;
+
+    if (!Bounds.Valid || Scanner.CacheSize() == 0) {
+        std::printf("[autodisc-v808] no module cache / bounds — skipped\n");
+        return Out;
+    }
+
+    // ── Step 1: pool base, pinned by CompIndex 0 having a 4-char narrow name ──
+    auto PoolLooksRight = [&](uint64_t PoolRva, EntryHeader& H0, uint64_t& E0) -> bool {
+        E0 = ResolveEntry(Scanner, Base, PoolRva, 0);
+        if (!E0) return false;
+        if (!ReadHeader(Reader, E0, H0)) return false;
+        return H0.Length == 4 && !H0.IsWide;
+    };
+
+    std::vector<uint64_t> PoolCandidates;
+    if (Gn.GNamesRva) PoolCandidates.push_back(Gn.GNamesRva);
+    for (const auto& [Rva, Refs] : Gn.Candidates) {
+        (void)Refs;
+        PoolCandidates.push_back(Rva);
+    }
+    PoolCandidates.push_back(V::RVA_GNAMEPOOL);
+
+    uint64_t PoolRva = 0, Entry0 = 0;
+    EntryHeader H0;
+    for (uint64_t Cand : PoolCandidates) {
+        if (PoolLooksRight(Cand, H0, Entry0)) { PoolRva = Cand; break; }
+    }
+
+    if (!PoolRva) {
+        std::printf("[autodisc-v808] no ranked candidate resolved CI=0 — sweeping .data\n");
+        uint64_t Lo = Bounds.DataRva;
+        uint64_t Hi = std::min<uint64_t>(Bounds.DataRva + Bounds.DataSize, Scanner.CacheSize());
+        if (Hi > V::SHARD_BLOCK_BASE_OFF + 0x100) Hi -= V::SHARD_BLOCK_BASE_OFF + 0x100;
+        for (uint64_t Rva = Lo & ~7ULL; Rva < Hi; Rva += 8) {
+            if (PoolLooksRight(Rva, H0, Entry0)) { PoolRva = Rva; break; }
+        }
+    }
+
+    if (!PoolRva) {
+        std::printf("[autodisc-v808] pool not found — v808 pipeline unavailable\n");
+        return Out;
+    }
+    std::printf("[autodisc-v808] pool RVA = 0x%llX (CI=0 header 0x%04X, len=4 narrow)\n",
+        (unsigned long long)PoolRva, H0.Raw);
+
+    // ── Step 2: keystream, pinned by "None" ciphertext ──
+    std::vector<uint8_t> Cipher0(4, 0);
+    if (!Reader.Read(Entry0 + 2, Cipher0.data(), 4)) {
+        std::printf("[autodisc-v808] could not read CI=0 ciphertext\n");
+        return Out;
+    }
+    std::vector<int> Slots0;
+    KeySlots(4, Slots0);
+
+    static const char kNone[4] = { 'N', 'o', 'n', 'e' };
+    uint8_t Want[4];
+    for (int I = 0; I < 4; ++I)
+        Want[I] = (uint8_t)(Cipher0[I] ^ (uint8_t)kNone[I]);
+
+    auto TableMatches = [&](const uint8_t* P) -> bool {
+        for (int I = 0; I < 4; ++I) {
+            uint16_t E = 0;
+            std::memcpy(&E, P + 2 * (Slots0[I] + Out.KeystreamBase), 2);
+            if ((uint8_t)(E >> V::NARROW_KEY_SHIFT) != Want[I]) return false;
+        }
+        return true;
+    };
+
+    uint64_t KsRva = 0;
+    const uint8_t* Cache = Scanner.CacheData();
+    uint64_t Span = (uint64_t)V::KEYSTREAM_ENTRIES * 2;
+    for (uint64_t Sec = 0; Sec < 2 && !KsRva; ++Sec) {
+        uint64_t Lo = Sec ? Bounds.RDataRva : Bounds.DataRva;
+        uint64_t Sz = Sec ? Bounds.RDataSize : Bounds.DataSize;
+        uint64_t Hi = std::min<uint64_t>(Lo + Sz, Scanner.CacheSize());
+        if (Hi < Span) continue;
+        Hi -= Span;
+        for (uint64_t Rva = Lo & ~1ULL; Rva < Hi; Rva += 2) {
+            if (TableMatches(Cache + Rva)) { KsRva = Rva; break; }
+        }
+    }
+
+    if (!KsRva) {
+        std::printf("[autodisc-v808] keystream not found by known-plaintext sweep — "
+                    "falling back to constant 0x%llX\n", (unsigned long long)V::RVA_KEYSTREAM);
+        KsRva = V::RVA_KEYSTREAM;
+    }
+
+    uint16_t Table[V::KEYSTREAM_ENTRIES] = {};
+    if (!Reader.Read(Base + KsRva, Table, sizeof(Table))) {
+        std::printf("[autodisc-v808] keystream read failed @ 0x%llX\n",
+            (unsigned long long)(Base + KsRva));
+        return Out;
+    }
+
+    Out.PoolRva      = PoolRva;
+    Out.KeystreamRva = KsRva;
+    Out.Valid        = true;
+
+    // ── Step 3: independent confirmation on the second pool entry ──
+    uint32_t NextCi = (uint32_t)((2 + H0.Bytes + 1) & ~1) / 2;
+    uint64_t Entry1 = ResolveEntry(Scanner, Base, PoolRva, NextCi);
+    EntryHeader H1;
+    std::string Second;
+    if (Entry1 && ReadHeader(Reader, Entry1, H1) && !H1.IsWide) {
+        std::vector<uint8_t> Cipher1(H1.Bytes, 0);
+        if (Reader.Read(Entry1 + 2, Cipher1.data(), H1.Bytes))
+            Second = DecryptNarrow(Cipher1, H1.Length, Table, Out.KeystreamBase);
+    }
+    Out.Confirmed = (Second == "ByteProperty");
+
+    std::printf("[autodisc-v808] keystream RVA = 0x%llX (base index +%d), CI=0x%X -> \"%s\" %s\n",
+        (unsigned long long)KsRva, Out.KeystreamBase, NextCi, Second.c_str(),
+        Out.Confirmed ? "✓ CONFIRMED" : "(expected \"ByteProperty\")");
+    return Out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

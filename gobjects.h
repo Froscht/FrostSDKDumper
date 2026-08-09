@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
+#include <functional>
 #include <immintrin.h>
 #ifdef _WIN32
 #include <Windows.h>
@@ -98,6 +99,43 @@ namespace gobjects
 
         void SetPid(int pid) { m_pid = pid; }
         void SetPeb(uint64_t peb) { m_pebAddr = peb; }
+
+        // Optional ground-truth gate for chunk-table candidates. Structural
+        // checks (vtable range, chunk readability, cap-8 plausibility) accept
+        // plenty of unrelated heap that merely looks array-shaped; on
+        // CL-1325322 that produced a 66-chunk "array" of float data. Once the
+        // FName pipeline resolves, a real chunk table is the one whose objects
+        // actually have names, so main installs a resolver here and candidates
+        // must clear it before being accepted.
+        using NameProbe = std::function<std::string(uint64_t)>;
+        void SetNameProbe(NameProbe Probe) { m_nameProbe = std::move(Probe); }
+
+        // Fraction of sampled objects that must yield a plausible name.
+        static constexpr int kNameProbeSamples = 24;
+        static constexpr int kNameProbeMinPct  = 25;
+
+        bool ChunkLooksNamed(uint64_t ChunkPtr, uint32_t ItemsPerChunk,
+                             uint32_t ItemStride) const
+        {
+            if (!m_nameProbe) return true;  // no probe installed → structural only
+            int Named = 0, Sampled = 0;
+            uint32_t Step = ItemsPerChunk / kNameProbeSamples;
+            if (!Step) Step = 1;
+            for (int S = 0; S < kNameProbeSamples; ++S) {
+                uint64_t Obj = 0;
+                if (!m_reader.Read(ChunkPtr + (uint64_t)S * Step * ItemStride, &Obj, 8)) continue;
+                if (Obj < 0x10000ULL || Obj >= 0x800000000000ULL) continue;
+                ++Sampled;
+                std::string Nm = m_nameProbe(Obj);
+                if (Nm.empty() || Nm.size() > 128) continue;
+                bool Clean = true;
+                for (char C : Nm)
+                    if ((unsigned char)C < 32 || (unsigned char)C > 126) { Clean = false; break; }
+                if (Clean) ++Named;
+            }
+            if (Sampled < kNameProbeSamples / 3) return false;
+            return Named * 100 >= Sampled * kNameProbeMinPct;
+        }
 
         // Late module-base update — used when the live module base differs
         // from the constructor value (e.g. HyperVReader reports the real
@@ -494,6 +532,317 @@ namespace gobjects
         // chunks_manager) and the chunk count, iterate 65536 * 20 bytes per
         // chunk, collecting every non-null Object pointer into the flat list.
         // Drops duplicates so the object count reflects unique UObjects.
+        // ── CL-1325322 chunk-array discovery ─────────────────────────────
+        // The chunk-pointer array is produced by a small thunk at
+        // chunks_manager vtable[3]. Theia ships ~100 interchangeable variants of
+        // this thunk and picks a different one per process launch, so its shape
+        // is NOT fixed: one variant uses `pxor` + `psllq/psrlq` + `movabs`,
+        // another uses `pand/pandn/por` select + `psllw/psrlw` and derives the
+        // salt purely from `mov eax, imm32` + `gs:[0x60]`. Pattern-matching a
+        // fixed op list therefore breaks on the next launch.
+        //
+        // Instead the thunk is interpreted. Only the SSE subset Theia actually
+        // emits is supported; anything else aborts the emulation rather than
+        // guessing. The answer is then checked against the FUObjectItem
+        // invariant (`*(u32*)(Obj + 0x0C) == ChunkIdx * 65536 + Slot`), which
+        // no unrelated heap region satisfies.
+        struct XmmReg { uint8_t B[16]; };
+
+        static uint64_t XmmLo(const XmmReg& R) {
+            uint64_t V; std::memcpy(&V, R.B, 8); return V;
+        }
+
+        // Returns false if the thunk uses an instruction outside the supported
+        // subset — the caller then treats chunk discovery as failed.
+        bool EmulateChunkThunkV808(uint64_t ThunkAddr, const uint8_t Blob[16],
+                                   uint64_t Peb, uint64_t& OutResult)
+        {
+            uint8_t Code[0x100] = {};
+            if (!m_reader.Read(ThunkAddr, Code, sizeof(Code))) return false;
+
+            XmmReg X[16] = {};
+            uint64_t G[16] = {};
+
+            auto LoadMem = [&](bool RipRel, int32_t Disp, uint64_t NextRva,
+                               int BaseReg, uint8_t* Dst, int Len) -> bool {
+                if (RipRel) return m_reader.Read(ThunkAddr + NextRva + Disp, Dst, Len);
+                if (BaseReg == 2 && Disp == 0) {           // [rdx] = the blob
+                    std::memcpy(Dst, Blob, Len);
+                    return true;
+                }
+                return false;
+            };
+
+            size_t P = 0;
+            while (P < sizeof(Code) - 12) {
+                size_t Start = P;
+                uint8_t Rex = 0;
+                while (P < sizeof(Code) && Code[P] == 0x65) ++P;   // gs: segment prefix
+                uint8_t Pfx = 0;
+                if (Code[P] == 0x66 || Code[P] == 0xF2 || Code[P] == 0xF3) Pfx = Code[P++];
+                if ((Code[P] & 0xF0) == 0x40) Rex = Code[P++];
+
+                // add rax, gs:[0x60]  →  48 03 04 25 60 00 00 00
+                if (Code[P] == 0x03 && Code[P + 1] == 0x04 && Code[P + 2] == 0x25) {
+                    uint32_t Abs; std::memcpy(&Abs, Code + P + 3, 4);
+                    if (Abs != 0x60) return false;
+                    G[0] += Peb;
+                    P += 7;
+                    continue;
+                }
+                // mov r32, imm32  /  movabs r64, imm64
+                if ((Code[P] & 0xF8) == 0xB8) {
+                    int Reg = (Code[P] & 7) | ((Rex & 1) << 3);
+                    if (Rex & 8) { std::memcpy(&G[Reg], Code + P + 1, 8); P += 9; }
+                    else { uint32_t V; std::memcpy(&V, Code + P + 1, 4); G[Reg] = V; P += 5; }
+                    continue;
+                }
+                // xor r64, r64  →  48 31 /r
+                if (Code[P] == 0x31 && (Rex & 8)) {
+                    uint8_t M = Code[P + 1];
+                    int Src = ((M >> 3) & 7) | ((Rex & 4) << 1);
+                    int Dst = (M & 7) | ((Rex & 1) << 3);
+                    if ((M >> 6) != 3) return false;
+                    G[Dst] ^= G[Src];
+                    P += 2;
+                    continue;
+                }
+                // rol r64, imm8  →  48 C1 /0 ib
+                if (Code[P] == 0xC1 && (Rex & 8)) {
+                    uint8_t M = Code[P + 1];
+                    if ((M >> 6) != 3 || ((M >> 3) & 7) != 0) return false;
+                    int Dst = (M & 7) | ((Rex & 1) << 3);
+                    G[Dst] = Rotl64Local(G[Dst], Code[P + 2]);
+                    P += 3;
+                    continue;
+                }
+                if (Code[P] == 0xC3) { OutResult = XmmLo(X[0]); return true; }   // ret
+                if (Code[P] != 0x0F) return false;
+                ++P;
+
+                uint8_t Op = Code[P++];
+                bool Pshufb = false;
+                if (Op == 0x38 && Code[P] == 0x00) { Pshufb = true; ++P; }
+
+                uint8_t M = Code[P];
+                int Mod = M >> 6;
+                int Reg = ((M >> 3) & 7) | ((Rex & 4) << 1);
+                int Rm  = (M & 7) | ((Rex & 1) << 3);
+                ++P;
+                bool RipRel = (Mod == 0 && (M & 7) == 5);
+                int32_t Disp = 0;
+                if (RipRel) { std::memcpy(&Disp, Code + P, 4); P += 4; }
+                else if (Mod == 1) { Disp = (int8_t)Code[P]; P += 1; }
+                else if (Mod == 2) { std::memcpy(&Disp, Code + P, 4); P += 4; }
+                else if (Mod != 3 && (M & 7) == 4) return false;   // SIB unsupported
+
+                uint8_t Src[16] = {};
+                bool IsMem = (Mod != 3);
+                if (IsMem && Op != 0x71 && Op != 0x72 && Op != 0x73) {
+                    int Len = (Op == 0x7E && Pfx == 0xF3) ? 8 : 16;
+                    if (!LoadMem(RipRel, Disp, P, Mod == 3 ? -1 : (M & 7), Src, Len))
+                        return false;
+                } else if (!IsMem) {
+                    std::memcpy(Src, X[Rm].B, 16);
+                }
+
+                auto Lanes16 = [](uint8_t* B, int Shift, bool Left) {
+                    for (int I = 0; I < 8; ++I) {
+                        uint16_t V; std::memcpy(&V, B + I * 2, 2);
+                        V = Left ? (uint16_t)(V << Shift) : (uint16_t)(V >> Shift);
+                        std::memcpy(B + I * 2, &V, 2);
+                    }
+                };
+                auto Lanes32 = [](uint8_t* B, int Shift, bool Left) {
+                    for (int I = 0; I < 4; ++I) {
+                        uint32_t V; std::memcpy(&V, B + I * 4, 4);
+                        V = Left ? (V << Shift) : (V >> Shift);
+                        std::memcpy(B + I * 4, &V, 4);
+                    }
+                };
+                auto Lanes64 = [](uint8_t* B, int Shift, bool Left) {
+                    for (int I = 0; I < 2; ++I) {
+                        uint64_t V; std::memcpy(&V, B + I * 8, 8);
+                        V = Left ? (V << Shift) : (V >> Shift);
+                        std::memcpy(B + I * 8, &V, 8);
+                    }
+                };
+
+                if (Pshufb) {
+                    XmmReg R{};
+                    for (int I = 0; I < 16; ++I)
+                        R.B[I] = (Src[I] & 0x80) ? 0 : X[Reg].B[Src[I] & 0x0F];
+                    X[Reg] = R;
+                    continue;
+                }
+
+                switch (Op) {
+                    case 0x6F:                                  // movdqa/movdqu load
+                        std::memcpy(X[Reg].B, Src, 16); break;
+                    case 0x7F:                                  // movdqa store (reg form only)
+                        if (IsMem) return false;
+                        X[Rm] = X[Reg]; break;
+                    case 0x6E:                                  // movd/movq xmm, r/m
+                        std::memset(X[Reg].B, 0, 16);
+                        std::memcpy(X[Reg].B, IsMem ? Src : (uint8_t*)&G[Rm], (Rex & 8) ? 8 : 4);
+                        break;
+                    case 0x7E:
+                        if (Pfx == 0xF3) {                      // movq xmm, xmm/m64
+                            std::memset(X[Reg].B, 0, 16);
+                            std::memcpy(X[Reg].B, Src, 8);
+                        } else if (Rex & 8) {                   // movq r/m64, xmm
+                            std::memcpy(&G[Rm], X[Reg].B, 8);
+                        } else return false;
+                        break;
+                    case 0xD6:                                  // movq xmm/m64, xmm
+                        if (IsMem) return false;
+                        std::memset(X[Rm].B, 0, 16);
+                        std::memcpy(X[Rm].B, X[Reg].B, 8);
+                        break;
+                    case 0xDB: for (int I = 0; I < 16; ++I) X[Reg].B[I] &= Src[I]; break;   // pand
+                    case 0xDF: for (int I = 0; I < 16; ++I) X[Reg].B[I] = (uint8_t)(~X[Reg].B[I] & Src[I]); break;  // pandn
+                    case 0xEB: for (int I = 0; I < 16; ++I) X[Reg].B[I] |= Src[I]; break;   // por
+                    case 0xEF: for (int I = 0; I < 16; ++I) X[Reg].B[I] ^= Src[I]; break;   // pxor
+                    case 0x70: {                                // pshufd / pshuflw / pshufhw
+                        uint8_t Imm = Code[P++];
+                        XmmReg R{};
+                        if (Pfx == 0x66) {
+                            for (int I = 0; I < 4; ++I)
+                                std::memcpy(R.B + I * 4, Src + ((Imm >> (2 * I)) & 3) * 4, 4);
+                        } else if (Pfx == 0xF2) {
+                            std::memcpy(R.B, Src, 16);
+                            for (int I = 0; I < 4; ++I)
+                                std::memcpy(R.B + I * 2, Src + ((Imm >> (2 * I)) & 3) * 2, 2);
+                        } else return false;
+                        X[Reg] = R;
+                        break;
+                    }
+                    case 0x71: case 0x72: case 0x73: {          // psrlw/psllw etc (group)
+                        int Sub = (M >> 3) & 7;
+                        uint8_t Imm = Code[P++];
+                        bool Left = (Sub == 6);
+                        if (Sub != 2 && Sub != 6) return false;
+                        uint8_t* T = X[Rm].B;
+                        if (Op == 0x71) Lanes16(T, Imm, Left);
+                        else if (Op == 0x72) Lanes32(T, Imm, Left);
+                        else Lanes64(T, Imm, Left);
+                        break;
+                    }
+                    default:
+                        return false;
+                }
+                if (P <= Start) return false;
+            }
+            return false;
+        }
+
+        bool ChunkArrayPassesIndexInvariant(uint64_t ChunkArray) {
+            namespace V = ArcDecrypt::v20260808;
+            uint64_t Chunk0 = 0;
+            if (!m_reader.Read(ChunkArray, &Chunk0, 8)) return false;
+            if (Chunk0 < 0x10000ULL || Chunk0 >= 0x800000000000ULL) return false;
+
+            constexpr uint32_t kProbe = 256;
+            std::vector<uint8_t> Buf((size_t)kProbe * V::FUOBJECTITEM_STRIDE);
+            if (!m_reader.Read(Chunk0, Buf.data(), Buf.size())) return false;
+
+            int Checked = 0, Match = 0;
+            for (uint32_t I = 0; I < kProbe; ++I) {
+                uint64_t Obj = 0;
+                std::memcpy(&Obj, Buf.data() + (size_t)I * V::FUOBJECTITEM_STRIDE, 8);
+                if (Obj < 0x10000ULL || Obj >= 0x800000000000ULL) continue;
+                uint32_t Idx = 0;
+                if (!m_reader.Read(Obj + V::UOBJECT_INTERNAL_IDX, &Idx, 4)) continue;
+                ++Checked;
+                if (Idx == I) ++Match;
+            }
+            if (Checked < 32) return false;
+            return Match * 100 >= Checked * 90;
+        }
+
+        uint64_t DiscoverChunkArrayV808(int& OutNumChunks, int32_t& OutNumElements) {
+            namespace V = ArcDecrypt::v20260808;
+            OutNumChunks = 0;
+            OutNumElements = 0;
+
+            uint64_t GObj = m_base + V::RVA_GUOBJECTARRAY;
+
+            uint8_t Enc[16] = {}, Key[16] = {};
+            if (!m_reader.Read(GObj + V::GOBJ_CHUNKMGR_OFF, Enc, 16)) return 0;
+            if (!m_reader.Read(m_base + V::CHUNKMGR_XOR_RVA, Key, 16)) return 0;
+
+            uint64_t EncLo = 0, KeyLo = 0;
+            std::memcpy(&EncLo, Enc, 8);
+            std::memcpy(&KeyLo, Key, 8);
+            uint64_t Mgr = SoftPshuflw64(Rotl64Local(EncLo ^ KeyLo, V::CHUNKMGR_ROL64),
+                                         V::CHUNKMGR_PSHUFLW);
+            if (Mgr < 0x10000ULL || Mgr >= 0x800000000000ULL) {
+                std::printf("[gobj-v808] chunks_manager decrypt gave implausible 0x%llX\n",
+                    (unsigned long long)Mgr);
+                return 0;
+            }
+
+            uint64_t Vtbl = 0, Thunk = 0;
+            uint8_t Blob[16] = {};
+            if (!m_reader.Read(Mgr + V::MGR_VTABLE_OFF, &Vtbl, 8)) return 0;
+            if (!m_reader.Read(Vtbl + 8ULL * V::MGR_VTABLE_SLOT, &Thunk, 8)) return 0;
+            if (!m_reader.Read(Mgr + V::MGR_BLOB_OFF, Blob, 16)) return 0;
+            std::printf("[gobj-v808] chunks_manager=0x%llX vtable=0x%llX thunk=0x%llX\n",
+                (unsigned long long)Mgr, (unsigned long long)Vtbl, (unsigned long long)Thunk);
+
+            if (!m_pebAddr) m_pebAddr = FindPEB();
+            if (!m_pebAddr) {
+                std::printf("[gobj-v808] PEB unknown — cannot resolve the session salt\n");
+                return 0;
+            }
+
+            uint64_t Arr = 0;
+            if (!EmulateChunkThunkV808(Thunk, Blob, m_pebAddr, Arr)) {
+                std::printf("[gobj-v808] thunk at 0x%llX uses an unsupported instruction — "
+                            "cannot emulate\n", (unsigned long long)Thunk);
+                return 0;
+            }
+
+            std::printf("[gobj-v808] PEB=0x%llX chunk_array=0x%llX (thunk emulated)\n",
+                (unsigned long long)m_pebAddr, (unsigned long long)Arr);
+
+            if (!ChunkArrayPassesIndexInvariant(Arr)) {
+                std::printf("[gobj-v808] chunk array failed the InternalIndex invariant — rejected\n");
+                return 0;
+            }
+
+            for (int I = 0; I < 128; ++I) {
+                uint64_t C = 0;
+                if (!m_reader.Read(Arr + 8ULL * I, &C, 8)) break;
+                if (C < 0x10000ULL || C >= 0x800000000000ULL) break;
+                ++OutNumChunks;
+            }
+
+            uint32_t Num = 0;
+            if (m_reader.Read(GObj + V::GOBJ_NUMELEMENTS_OFF, &Num, 4) &&
+                Num > 1000 && Num < 4000000)
+            {
+                OutNumElements = (int32_t)Num;
+            }
+
+            std::printf("[gobj-v808] verified: %d chunks, NumElements=%d (stride %u, %u/chunk)\n",
+                OutNumChunks, OutNumElements, V::FUOBJECTITEM_STRIDE, V::ITEMS_PER_CHUNK);
+            return Arr;
+        }
+
+        static uint64_t Rotl64Local(uint64_t V, int N) {
+            N &= 63;
+            return N ? ((V << N) | (V >> (64 - N))) : V;
+        }
+        static uint64_t SoftPshuflw64(uint64_t V, int Imm) {
+            uint16_t W[4];
+            for (int I = 0; I < 4; ++I) W[I] = (uint16_t)(V >> (16 * I));
+            uint64_t R = 0;
+            for (int I = 0; I < 4; ++I)
+                R |= (uint64_t)W[(Imm >> (2 * I)) & 3] << (16 * I);
+            return R;
+        }
+
         bool InitFromChunksCanonical(uint64_t chunks_array, int num_chunks,
                                      int32_t max_expected = 0) {
             if (!chunks_array || num_chunks <= 0) return false;
@@ -689,6 +1038,7 @@ namespace gobjects
 
         uint64_t       m_base;
         IMemoryReader& m_reader;
+        NameProbe      m_nameProbe;
         uint64_t       m_arrayBase;
         uint64_t       m_chunkPtr;
         int32_t        m_numElements;
@@ -975,6 +1325,13 @@ namespace gobjects
                             std::printf("[canon28] heap-scan reject @ 0x%llX: cap-8=0x%llX implausible\n",
                                 (unsigned long long)(base_addr + off),
                                 (unsigned long long)cap);
+                            continue;
+                        }
+                        if (!ChunkLooksNamed(cp0, ITEMS_PER_CHUNK, ITEM_STRIDE)) {
+                            std::printf("[canon28] heap-scan reject @ 0x%llX: cp0=0x%llX "
+                                        "passes structural checks but its objects have no names\n",
+                                (unsigned long long)(base_addr + off),
+                                (unsigned long long)cp0);
                             continue;
                         }
                         std::printf("[canon28] heap-scan candidate @ 0x%llX: "

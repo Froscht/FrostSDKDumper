@@ -595,12 +595,32 @@ public:
         //         is discoverable via structural probing.
         // Tier 2: structural heap scan — last resort, slow but always works.
         m_gobj.SetPid(m_pid);
+        m_gobj.SetNameProbe([this](uint64_t Obj) -> std::string {
+            return m_fname.GetName(Obj);
+        });
         bool gobj_ok = false;
 
         AutoExport::WriteAll("decrypt_export.json", MODULE_BASE);
 
-        // Tier 1: layout BFS
+        // Tier 0: CL-1325322 chunks_manager path. Goes first because its
+        // result is checked against the FUObjectItem InternalIndex invariant,
+        // which is ground truth — the structural tiers below only ever produce
+        // "looks array-shaped" candidates.
         {
+            int NumChunks = 0;
+            int32_t NumElements = 0;
+            uint64_t Arr = m_gobj.DiscoverChunkArrayV808(NumChunks, NumElements);
+            if (Arr && NumChunks > 0 &&
+                m_gobj.InitFromChunksCanonical(Arr, NumChunks, NumElements))
+            {
+                std::cout << "[+] GObjectArray initialized via v808 chunks_manager ("
+                          << m_gobj.GetNumElements() << " objects)\n";
+                gobj_ok = true;
+            }
+        }
+
+        // Tier 1: layout BFS
+        if (!gobj_ok) {
             AutoDiscovery::g_DiscoveredGObjLayout =
                 AutoDiscovery::DiscoverGUObjectArrayLayout(
                     m_reader, MODULE_BASE, ArcDecrypt::RVA_GOBJECT_ARRAY_BASE,
@@ -1048,8 +1068,14 @@ public:
             // If code-discovered ChildProperties offset produced 0 FFields,
             // the offset is wrong for this session (Theia per-session layout
             // randomization). Clear it so auto_offsets runtime probe runs.
+            // On v808 the layout is binary-derived and independently verified,
+            // so an empty FClass map means the FFieldClass probe failed — not
+            // that the offsets are wrong. Resetting them here would replace
+            // correct values with stale CL-1299607 constants and poison every
+            // probe that runs afterwards.
             if (AutoDiscovery::g_DiscoveredFFieldLayout.Valid &&
-                AutoDiscovery::g_LiveFClassMap.empty()) {
+                AutoDiscovery::g_LiveFClassMap.empty() &&
+                !m_fname.IsV808Active()) {
                 std::printf("[layout-fix] Code-discovered ChildProperties=+0x%X produced 0 FFields "
                     "— clearing for runtime re-probe\n",
                     AutoDiscovery::g_DiscoveredFFieldLayout.ChildPropsOff);
@@ -1069,6 +1095,34 @@ public:
             AutoDiscovery::SeedHardcodedFClassGlobals_CL1201801();
             AutoOffsets::DiscoverAll(m_reader, MODULE_BASE,
                                      m_gobj.GetSeedObjects(), m_fname);
+
+            // The generic Phase 2 / auto_offsets probes cannot resolve the
+            // FField layout on this patch (they need a working name decode to
+            // score candidates, which is exactly what they are trying to find)
+            // and they overwrite the values we already know. Re-assert the
+            // binary-derived layout afterwards so it wins.
+            if (m_fname.IsV808Active()) {
+                namespace V = ArcDecrypt::v20260808;
+                namespace Off = ArcDecrypt::Offsets;
+                Off::FField::NamePrivate      = V::FFIELD_NAME_OFF;
+                Off::FField::NameEncrypted    = V::FFIELD_NAME_OFF;
+                Off::FField::Next             = V::FFIELD_NEXT_OFF;
+                Off::UStruct::ChildProperties = V::USTRUCT_CHILDPROPS;
+                Off::FBoolProperty::FieldSize = V::FBOOLPROP_FIELDSIZE;
+                Off::FField::Owner            = V::FFIELD_OWNER_OFF;
+                Off::FField::ClassPrivate     = V::FFIELD_CLASSPRIV_OFF;
+                Off::FProperty::ArrayDim      = V::FPROP_ARRAYDIM_OFF;
+                Off::FProperty::ElementSize   = V::FPROP_ELEMSIZE_OFF;
+                Off::FProperty::PropertyFlags = V::FPROP_PROPFLAGS_OFF;
+                Off::FProperty::Offset_Internal = V::FPROP_OFFSETINT_OFF;
+                Off::FProperty::Offset_XOR    = V::FPROP_OFFSET_XOR;
+                Off::UStruct::PropertiesSize  = V::USTRUCT_PROPSIZE_OFF;
+                Off::FBoolProperty::ByteOffset = V::FBOOLPROP_BYTEOFFSET;
+                Off::FBoolProperty::ByteMask   = V::FBOOLPROP_BYTEMASK;
+                Off::FBoolProperty::FieldMask  = V::FBOOLPROP_FIELDMASK;
+                ArcDecrypt::Patch20260421::g_PropertyOffsetXor = V::FPROP_OFFSET_XOR;
+                std::printf("[v808] re-asserted FField layout after auto_offsets\n");
+            }
 
             // If auto_offsets found a new ChildProperties offset, re-run
             // live FFieldClass map with the corrected offsets.
@@ -1473,8 +1527,74 @@ public:
                 }
             }
 
+            // ── Phase 6.7: CL-1325322 plaintext-verified pipeline ────────
+            // Runs before Phase 5.5 so that a confirmed v808 adoption makes the
+            // older sig-scan-derived constants irrelevant instead of fighting
+            // them. Both anchors are pinned by decoding "None"/"ByteProperty",
+            // so a successful adopt is ground truth, not a heuristic.
+            {
+                std::printf("\n=== Phase 6.7: v20260808 FName pipeline (plaintext-verified) ===\n");
+                AutoDiscovery::g_DiscoveredV808 =
+                    AutoDiscovery::DiscoverV808Pipeline(
+                        m_sigScanner, m_reader, MODULE_BASE,
+                        AutoDiscovery::g_DiscoveredBounds,
+                        AutoDiscovery::g_DiscoveredGNames);
+                if (AutoDiscovery::g_DiscoveredV808.Valid &&
+                    m_fname.AdoptV808(AutoDiscovery::g_DiscoveredV808))
+                {
+                    // FField/UStruct layout that goes with this patch. Derived
+                    // from the PropertyBool.cpp assert path and confirmed by
+                    // live probing; the generic Phase 2 probes cannot find them
+                    // because they need a working FField name decode first.
+                    namespace V = ArcDecrypt::v20260808;
+                    namespace Off = ArcDecrypt::Offsets;
+                    Off::FField::NamePrivate      = V::FFIELD_NAME_OFF;
+                    Off::FField::NameEncrypted    = V::FFIELD_NAME_OFF;
+                    Off::FField::Next             = V::FFIELD_NEXT_OFF;
+                    Off::UStruct::ChildProperties = V::USTRUCT_CHILDPROPS;
+                    Off::FBoolProperty::FieldSize = V::FBOOLPROP_FIELDSIZE;
+                    Off::FField::Owner            = V::FFIELD_OWNER_OFF;
+                    Off::FField::ClassPrivate     = V::FFIELD_CLASSPRIV_OFF;
+                    Off::FProperty::ArrayDim      = V::FPROP_ARRAYDIM_OFF;
+                    Off::FProperty::ElementSize   = V::FPROP_ELEMSIZE_OFF;
+                    Off::FProperty::PropertyFlags = V::FPROP_PROPFLAGS_OFF;
+                    Off::FProperty::Offset_Internal = V::FPROP_OFFSETINT_OFF;
+                    Off::FProperty::Offset_XOR    = V::FPROP_OFFSET_XOR;
+                    Off::UStruct::PropertiesSize  = V::USTRUCT_PROPSIZE_OFF;
+                    Off::FBoolProperty::ByteOffset = V::FBOOLPROP_BYTEOFFSET;
+                    Off::FBoolProperty::ByteMask   = V::FBOOLPROP_BYTEMASK;
+                    Off::FBoolProperty::FieldMask  = V::FBOOLPROP_FIELDMASK;
+                    ArcDecrypt::Patch20260421::g_PropertyOffsetXor = V::FPROP_OFFSET_XOR;
+
+                    // Publish it as a Phase-2c result too. Every downstream
+                    // re-probe (auto_offsets ProbeChildProperties/ProbeFFieldNext,
+                    // sdk_generator's autocal-next brute force) is already gated
+                    // on this struct being valid, so filling it in makes them all
+                    // stand down instead of overwriting binary-derived values with
+                    // weaker heuristics. The autocal-next sweep in particular only
+                    // scans 0x00..0x78 and can therefore never re-find Next=0x80.
+                    auto& L = AutoDiscovery::g_DiscoveredFFieldLayout;
+                    L.ChildPropsOff   = static_cast<uint32_t>(V::USTRUCT_CHILDPROPS);
+                    L.NextOff         = static_cast<uint32_t>(V::FFIELD_NEXT_OFF);
+                    L.NamePrivateOff  = static_cast<uint32_t>(V::FFIELD_NAME_OFF);
+                    L.OwnerOff        = static_cast<uint32_t>(V::FFIELD_OWNER_OFF);
+                    L.ClassPrivateOff = static_cast<uint32_t>(V::FFIELD_CLASSPRIV_OFF);
+                    L.Valid           = true;
+
+                    auto& FP = AutoDiscovery::g_DiscoveredFPropertyLayout;
+                    FP.ArrayDimOff    = static_cast<uint32_t>(V::FPROP_ARRAYDIM_OFF);
+                    FP.ElementSizeOff = static_cast<uint32_t>(V::FPROP_ELEMSIZE_OFF);
+
+                    std::printf("[v808] FField layout applied: Name=+0x%llX Next=+0x%llX "
+                                "ChildProperties=+0x%llX\n",
+                        (unsigned long long)V::FFIELD_NAME_OFF,
+                        (unsigned long long)V::FFIELD_NEXT_OFF,
+                        (unsigned long long)V::USTRUCT_CHILDPROPS);
+                }
+            }
+
             // ── Phase 5.5: Structured FName pipeline extraction ──────────
-            if (!AutoDiscovery::g_DiscoveredFNamePipeline.Valid) {
+            if (!m_fname.IsV808Active() && !AutoDiscovery::g_DiscoveredFNamePipeline.Valid) {
                 std::printf("\n=== Phase 5.5: FName pipeline structured extraction ===\n");
                 AutoDiscovery::g_DiscoveredFNamePipeline =
                     AutoDiscovery::DiscoverFNamePipeline(m_sigScanner, fname_rva);

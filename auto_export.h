@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <ctime>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -547,7 +548,34 @@ inline void EmitAutoDiscovery(JsonWriter& W) {
     W.CloseObj();
 }
 
+inline void ArchiveForeignConfig(const char* Path) {
+    std::ifstream Is(Path);
+    if (!Is) return;
+    std::string Content((std::istreambuf_iterator<char>(Is)),
+                         std::istreambuf_iterator<char>());
+    Is.close();
+
+    size_t P = Content.find("\"image_size\"");
+    if (P == std::string::npos) return;
+    size_t Q = Content.find('"', Content.find(':', P));
+    if (Q == std::string::npos) return;
+    size_t R = Content.find('"', Q + 1);
+    if (R == std::string::npos) return;
+
+    std::string OldSize = Content.substr(Q + 1, R - Q - 1);
+    char LiveSize[32];
+    std::snprintf(LiveSize, sizeof(LiveSize), "0x%llX",
+        (unsigned long long)AutoDiscovery::g_DiscoveredBounds.ImageSize);
+    if (OldSize == LiveSize) return;
+
+    std::string Archive = std::string(Path) + ".imgsize-" + OldSize;
+    if (std::rename(Path, Archive.c_str()) == 0)
+        std::printf("[autoexport] archived previous-patch config → %s\n", Archive.c_str());
+}
+
 inline bool WriteAll(const char* Path, uint64_t ModuleBase) {
+    ArchiveForeignConfig(Path);
+
     std::ofstream Os(Path);
     if (!Os) {
         std::printf("[autoexport] failed to open %s for writing\n", Path);

@@ -660,20 +660,21 @@ inline LoadResult LoadDiscoveryConfig(const char* Path) {
     if (ModBlock.IsObj())
         Result.ConfigImageSize = ModBlock["image_size"].Hex64();
 
-    LoadAnchors(Root);            Result.SectionsLoaded++;
+    const bool SameImage =
+        Result.ConfigImageSize > 0 &&
+        Result.ConfigImageSize == AutoDiscovery::g_DiscoveredBounds.ImageSize;
 
-    if (Result.ConfigImageSize > 0 &&
-        Result.ConfigImageSize == AutoDiscovery::g_DiscoveredBounds.ImageSize) {
-        LoadOffsets(Root);
-        std::printf("[config] offsets loaded (image_size 0x%llX matches)\n",
-            (unsigned long long)Result.ConfigImageSize);
-    } else if (Result.ConfigImageSize > 0) {
-        std::printf("[config] skipping offsets (image_size mismatch: config=0x%llX live=0x%llX)\n",
+    if (!SameImage) {
+        std::printf("[config] PATCH DRIFT: config image_size=0x%llX live=0x%llX\n",
             (unsigned long long)Result.ConfigImageSize,
             (unsigned long long)AutoDiscovery::g_DiscoveredBounds.ImageSize);
+        std::printf("[config] every cached RVA/constant is stale — discarding whole config, "
+                    "running full auto-discovery\n");
+        return Result;
     }
-    Result.SectionsLoaded++;
 
+    LoadAnchors(Root);            Result.SectionsLoaded++;
+    LoadOffsets(Root);            Result.SectionsLoaded++;
     LoadPatchConstants(Root);     Result.SectionsLoaded++;
 
     LoadAutoDiscoveryVTables(Root);          Result.SectionsLoaded++;

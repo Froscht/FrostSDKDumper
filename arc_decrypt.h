@@ -1086,4 +1086,176 @@ namespace v20260709 {
     constexpr int      FFIELD_NAME_ROL64     = 32;
 } // namespace v20260709
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CL-1325322 (image size 0x11853000). Live-verified 2026-08-08 against PID
+// 16430 — sequential pool walk decoded 60/60 engine names cleanly.
+//
+// Reversed from three chained functions (IDA base 0x140000000):
+//   sub_1402319F0  core pool resolve  (shard hash, block decode, FNV, PTR_XOR1)
+//   sub_14023B120  middle stage       (PTR_XOR2)
+//   sub_14023AAE0  outer stage        (PTR_XOR3, header length extract)
+//   sub_140230020  string decrypt     (keystream XOR, narrow/wide widen pass)
+//
+// Divergences from v20260709 that matter:
+//   • Shard hash uses SHR (4,3,4,3), NOT ROL. IDA's pseudocode renders the
+//     slot select as `-109*T + 110`; the disassembly at 0x140231B28 shows the
+//     real form is `H ^ (H >> 16)`. Trust the disasm (see CLAUDE.md note on
+//     the decompiler shard-hash bug).
+//   • Block decode order is PSHUFLW → XOR → ROL64(15); v709 was ROL64 first.
+//   • Wide-string flag moved to bit 15 (0x8000); length is (hdr >> 5) & 0x3FF.
+//   • Key schedule is linear (+22 per pair, second index +11) — the v709
+//     multiply/add LCG is gone.
+//   • Keystream entries are indexed from +44, not +96/+0xE8.
+// The CI → (chunk, name offset) SIMD chain spans all three functions and
+// cancels to identity (verified by simulating the PSHUFB/ROL/blend masks at
+// 0x14B4C3380 / 0x3390 / 0x3840 / 0x3850 / 0x3860 / 0x3870 / 0x34F0).
+// ─────────────────────────────────────────────────────────────────────────────
+namespace v20260808 {
+    constexpr uint64_t RVA_GNAMEPOOL         = 0xE431980ULL;
+    constexpr uint64_t RVA_KEYSTREAM         = 0xE3707F4ULL;
+    constexpr int      KEYSTREAM_BASE_INDEX  = 44;
+    constexpr int      KEYSTREAM_ENTRIES     = 160;
+
+    constexpr uint32_t HASH_PRIME            = 0x01000193u;
+    constexpr uint32_t SHARD_HASH_ADD        = 0x46BD406Eu;
+    constexpr uint64_t SHARD_HASH_SEED_OFF   = 0x4C90ULL;
+    constexpr uint64_t SHARD_BLOCK_BASE_OFF  = 0x4CA0ULL;
+    constexpr uint64_t SHARD_BLOCK_STRIDE    = 32ULL;
+    constexpr int      SHARD_SHIFT_A         = 4;
+    constexpr int      SHARD_SHIFT_B         = 3;
+
+    constexpr int      BLOCK_PSHUFLW         = 0x93;
+    constexpr int      BLOCK_ROL64           = 15;
+    constexpr uint64_t BLOCK_FNV_XOR         = 0x07C3784BD4ECB382ULL;
+
+    constexpr uint64_t FNV_PRIME             = 0x100000001B3ULL;
+    constexpr uint64_t FNV_ADD               = 0xBB3A9A3B042493AEULL;
+    constexpr int      FNV_ROL1              = 40;
+    constexpr int      FNV_ROL2              = 57;
+
+    constexpr uint64_t FNAME_PTR_XOR1        = 0x3E9E7ED8ULL;
+    constexpr uint64_t FNAME_PTR_XOR2        = 0x0000801B00000000ULL;
+    constexpr uint64_t FNAME_PTR_XOR3        = 0xD87E1E2500000000ULL;
+
+    constexpr uint16_t HDR_IS_WIDE_BIT       = 0x8000u;
+    constexpr int      HDR_LENGTH_SHIFT      = 5;
+    constexpr uint16_t HDR_LENGTH_MASK       = 0x3FFu;
+    constexpr uint32_t KEY_INIT_ADD          = 34u;
+    constexpr uint32_t KEY_PAIR_ADVANCE      = 22u;
+    constexpr uint32_t KEY_SECOND_DELTA      = 11u;
+    constexpr uint8_t  KEY_INDEX_MASK        = 0x3Fu;
+    constexpr int      NARROW_KEY_SHIFT      = 3;
+
+    // ── GUObjectArray (from sub_1404B0BF0, the object-registration path) ──
+    //   v3  = load128(GUObjectArray + 0x110) ^ xmmword_14B48A020
+    //   mgr = PSHUFLW(ROL64(v3.lane0, 38), 0x39)
+    //   arr = (*(fn**)(*(void**)(mgr + 0xA0) + 24))(mgr + 0xA0, mgr + 0xD0)
+    //   chunk = arr[Index >> 16];  item = chunk + 20 * (Index & 0xFFFF)
+    // Chunks are NOT page aligned (observed 0x71BD0008), so heap sweeps that
+    // assume alignment will never find them — go through the manager.
+    constexpr uint64_t RVA_GUOBJECTARRAY     = 0xE6ED190ULL;
+    constexpr uint64_t GOBJ_CHUNKMGR_OFF     = 0x110ULL;
+    constexpr uint64_t GOBJ_NUMELEMENTS_OFF  = 0x50ULL;
+    constexpr uint64_t CHUNKMGR_XOR_RVA      = 0xB48A020ULL;
+    constexpr int      CHUNKMGR_ROL64        = 38;
+    constexpr int      CHUNKMGR_PSHUFLW      = 0x39;
+    constexpr uint64_t MGR_VTABLE_OFF        = 0xA0ULL;
+    constexpr uint64_t MGR_BLOB_OFF          = 0xD0ULL;
+    constexpr uint64_t MGR_VTABLE_SLOT       = 3ULL;
+
+    constexpr uint32_t FUOBJECTITEM_STRIDE   = 20;
+    constexpr uint32_t ITEMS_PER_CHUNK       = 65536;
+    constexpr uint64_t UOBJECT_INTERNAL_IDX  = 0x0CULL;
+
+    // Fallbacks for the vtable[3] body; the live thunk is interpreted at
+    // runtime instead (see EmulateChunkThunkV808) because Theia rotates the
+    // variant per process launch.
+    constexpr int      THUNK_PSHUFLW         = 0x8D;
+    constexpr int      THUNK_ROL64           = 46;
+    constexpr uint64_t THUNK_XOR_RVA         = 0xB517910ULL;
+    constexpr uint64_t THUNK_SALT_IMM64      = 0xB2DA4299DB155ED3ULL;
+    constexpr uint32_t THUNK_PEB_ADD         = 0x4D56C2E0u;
+
+    // ── UObject::GetFName (native AngelScript binding @ RVA 0x343950) ─────
+    // Found via the AngelScript signature string "FName GetName() const"
+    // (0x14C084885): the registration site loads the native function pointer
+    // right before the signature. Verified live: 799/800 objects named,
+    // 761 distinct names.
+    //
+    //   Seed = Obj + 0x10
+    //   H = ROL32((lo32(Seed) >> 4) * P + ADD, 22) * P
+    //   H = ((H + hi32(Seed) + ADD) >> 4) * P + ADD
+    //   H = (H >> 0xA) * P + ADD
+    //   S = H ^ (H >> 16)
+    //   Idx = ((((~S | 0x565AFC0) & 0x565AFC1) | (S & 2)) ^ 0x565AFC3)
+    //   Slot = Obj + 0x20 + Idx * 0x20
+    //   FName = ROL64(ROL64(PSHUFLW(*Slot, 0x39) ^ XOR1, 62) ^ XOR2, 32)
+    //   CompIndex = lo32(FName), Number = hi32(FName)
+    //
+    // The two pieces that make this work and that guessing never recovers:
+    // the slot is hash-selected (no fixed offset ever succeeds), and there is
+    // a final ROL64(32) after the second XOR.
+    constexpr uint64_t UOBJ_NAME_SEED_OFF    = 0x10ULL;
+    constexpr uint64_t UOBJ_NAME_SLOT_BASE   = 0x20ULL;
+    constexpr uint64_t UOBJ_NAME_SLOT_STRIDE = 0x20ULL;
+    constexpr uint32_t UOBJ_SLOT_HASH_PRIME  = 0x1000193u;
+    constexpr uint32_t UOBJ_SLOT_HASH_ADD    = 0x31F5C55Fu;
+    constexpr int      UOBJ_SLOT_HASH_ROL    = 22;
+    constexpr int      UOBJ_SLOT_SHIFT_A     = 4;
+    constexpr int      UOBJ_SLOT_SHIFT_B     = 4;
+    constexpr int      UOBJ_SLOT_SHIFT_C     = 0xA;
+    constexpr uint32_t UOBJ_SLOT_MASK_A      = 0x565AFC0u;
+    constexpr uint32_t UOBJ_SLOT_MASK_B      = 0x565AFC1u;
+    constexpr uint32_t UOBJ_SLOT_MASK_C      = 0x565AFC3u;
+    constexpr int      UOBJ_NAME_PSHUFLW     = 0x39;
+    constexpr uint64_t UOBJ_NAME_XOR1        = 0xBF6D1474CC9622A5ULL;
+    constexpr int      UOBJ_NAME_ROL1        = 62;
+    constexpr uint64_t UOBJ_NAME_XOR2        = 0xAB7645401DC01268ULL;
+    constexpr int      UOBJ_NAME_ROL2        = 32;
+
+    // ── FField / UStruct layout (from PropertyBool.cpp assert path, 0x4478A0)
+    // The blend there is `(E & A) | (~E & B)` with A = 0x24B5… and B = 0xDB4A…;
+    // since B == ~A that collapses to a plain XOR with B.
+    // Offsets confirmed live by probing: ChildProperties +0xD0 (258/400 structs),
+    // FField::Next +0x80 (205/300 chains).
+    constexpr uint64_t FFIELD_NAME_OFF       = 0x60ULL;
+    constexpr uint64_t FFIELD_NEXT_OFF       = 0x80ULL;
+    constexpr uint64_t USTRUCT_CHILDPROPS    = 0xD0ULL;
+    // Probed live over 501 FFields walked through the Next chain:
+    //   +0x78 points back to the owning UStruct (332/400)
+    //   +0x90 holds 20 distinct pointers = the 20 FFieldClass type objects
+    //   +0x94 is 1 for every field  → ArrayDim
+    //   +0x9C is 1/4/8/16/24/80     → ElementSize (FBoolProperty reads this
+    //         same slot as its field size, which is why the assert at 0x4478A0
+    //         bittests it against 1,2,4,8)
+    constexpr uint64_t FFIELD_OWNER_OFF      = 0x78ULL;
+    constexpr uint64_t FFIELD_CLASSPRIV_OFF  = 0x90ULL;
+    constexpr uint64_t FPROP_ELEMSIZE_OFF    = 0x9CULL;
+    // From the FProperty ctors (0x448430 / 0x4316F0) and the clone routine at
+    // 0x42A16A, which copies the whole member set in one place:
+    //   ElementSize +0x9C, PropertyFlags +0xA0, ArrayDim +0xE0 — all plain.
+    //   Offset_Internal +0xB4 is the ONLY obfuscated scalar:
+    //     stored = bswap32(real ^ KEY)  ⇒  real = bswap32(stored) ^ KEY
+    //   FProperty::SetupOffset @0x43D46C writes it; the ctor seeds it with
+    //   0xA217C376, which is exactly encode(0).
+    constexpr uint64_t FPROP_ARRAYDIM_OFF    = 0xE0ULL;
+    constexpr uint64_t FPROP_PROPFLAGS_OFF   = 0xA0ULL;
+    constexpr uint64_t FPROP_OFFSETINT_OFF   = 0xB4ULL;
+    constexpr uint32_t FPROP_OFFSET_XOR      = 0x76C317A2u;
+    constexpr uint64_t USTRUCT_PROPSIZE_OFF  = 0xD8ULL;
+    // FBoolProperty::SetBoolSize @0x451980 writes ElementSize at +0x9C AND the
+    // bool quad at +0x108..+0x10B. +0x9C only *looks* like FieldSize because
+    // ElementSize == FieldSize for bools.
+    constexpr uint64_t FBOOLPROP_FIELDSIZE   = 0x108ULL;
+    constexpr uint64_t FBOOLPROP_BYTEOFFSET  = 0x109ULL;
+    constexpr uint64_t FBOOLPROP_BYTEMASK    = 0x10AULL;
+    constexpr uint64_t FBOOLPROP_FIELDMASK   = 0x10BULL;
+    constexpr uint64_t FFIELD_NAME_BLEND     = 0xDB4ADB4ADB4ADB4AULL;
+    constexpr int      FFIELD_NAME_PSHUFLW   = 0x39;
+    constexpr uint64_t FFIELD_NAME_XOR1      = 0x09DCB521A13AC4BCULL;
+    constexpr int      FFIELD_NAME_ROL32     = 9;
+    constexpr uint64_t FFIELD_NAME_XOR2      = 0x890EF320D7E2DC4CULL;
+    constexpr int      FFIELD_NAME_ROL64     = 32;
+} // namespace v20260808
+
 } // namespace ArcDecrypt
