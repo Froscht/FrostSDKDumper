@@ -52,6 +52,7 @@ struct StructRecord {
     std::vector<PropertyRecord>  properties;
     std::vector<FunctionRecord>  functions;
     bool                     is_class;      // UClass (vs UScriptStruct)
+    bool                     drop = false;  // set by the ClassCastFlags reclass pass
 };
 
 struct EnumEntry {
@@ -3764,7 +3765,7 @@ public:
                 if (!Rec.super_addr)
                     PropagateDown(Rec.addr);
 
-            size_t Promoted = 0, Demoted = 0, VtLocked = 0, CastLocked = 0;
+            size_t Promoted = 0, Demoted = 0, VtLocked = 0, CastLocked = 0, CastDropped = 0;
             for (auto& Rec : result.structs) {
                 // ClassCastFlags is exact; the vtable sets and the
                 // inheritance propagation below are heuristics. Let the
@@ -3778,6 +3779,17 @@ public:
                         if (Rec.is_class) ++Demoted;
                         Rec.is_class = false; ++CastLocked;  continue;
                     }
+                    // Definite non-type: packages and functions both pass
+                    // the "has SuperStruct / has ChildProperties" shape
+                    // test that got them collected in the first place.
+                    Rec.drop = true;  ++CastDropped;  continue;
+                }
+                // Flags of 0 means the object's class carries no cast bits,
+                // i.e. it is an ordinary instance. Measured: every such record
+                // here is a CDO. Only drop those, so a record whose class ptr
+                // failed to decode is still classified by the fallbacks below.
+                if (Rec.name.rfind("Default__", 0) == 0) {
+                    Rec.drop = true;  ++CastDropped;  continue;
                 }
                 if (VtStructAddrs.count(Rec.addr)) {
                     if (Rec.is_class) ++Demoted;
@@ -3801,9 +3813,15 @@ public:
                 }
             }
 
-            if (CastLocked)
-                std::printf("[sdk-cast] reclass: %zu decided by ClassCastFlags, %zu by vtable\n",
-                    CastLocked, VtLocked);
+            if (CastDropped) {
+                result.structs.erase(
+                    std::remove_if(result.structs.begin(), result.structs.end(),
+                                   [](const StructRecord& R){ return R.drop; }),
+                    result.structs.end());
+            }
+            if (CastLocked || CastDropped)
+                std::printf("[sdk-cast] reclass: %zu decided by ClassCastFlags, %zu by vtable, "
+                            "%zu dropped as non-types\n", CastLocked, VtLocked, CastDropped);
             size_t FinalClasses = 0, FinalStructs = 0;
             for (const auto& Rec : result.structs) {
                 if (Rec.is_class) ++FinalClasses;

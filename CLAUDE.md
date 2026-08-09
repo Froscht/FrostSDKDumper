@@ -127,6 +127,17 @@ UStruct::SuperStruct     = +0xA8   plain ptr, 0 when no parent
 UEnum::Names             = +0xA8   TArray<TPair<FName,int64>> (UEnum is
                                    not a UStruct, so no conflict)
 UClass::ClassCastFlags   = +0x120  exact metaclass oracle
+```
+
+Objects that merely *look* like types (a non-null SuperStruct or a walkable
+ChildProperties chain) are mostly not types. Measured over 6000 such
+objects: 2339 UFunction, 1050 UPackage, 818 CDOs (flags 0, all named
+`Default__*`), against 956 UClass / 606 UScriptStruct / 230 UEnum. The
+reclass pass therefore *drops* records whose cast flags give a definite
+non-type verdict, instead of forcing them into the class/struct split.
+`class ptr invalid` and `flags unreadable` never occurred, so a zero-flag
+record is an ordinary instance, not a decode failure.
+```
 UStruct::ChildProperties = +0xD0
 UStruct::PropertiesSize  = +0xD8
 UClass::ClassCastFlags   = +0x120
