@@ -209,16 +209,29 @@ tagged back-pointer, so for the right offset the field's owner IS the object
 walked from: `(value & ~1) == obj` holds for 102 of the sampled fields and
 for nothing else. Prefer it over name-based scoring wherever it applies.
 
-**FField::Next is found but deliberately not adopted.** The probe picks
-+0x80 correctly, but ties with its runner-up (14 chained names each), so the
-margin test refuses to overwrite. Two mistakes led there and are worth not
-repeating: an absolute score threshold is the wrong instrument, because how
-many chains the seed sample contains varies run to run; and counting the
-first field's name gives every candidate the same score, since that name
-decodes regardless of Next — only names reached *through* Next separate
-anything. Even corrected, the sample is too thin to be decisive here.
-Reporting without adopting is the right end state: the value is in the log
-for a human, and a weak signal never overwrites a working offset.
+**FField::Next is found but deliberately not adopted, and this looks
+final.** The probe picks +0x80 correctly and the scoring was improved twice,
+but no version separates it from its runner-up well enough to justify
+overwriting a working offset:
+```
+names only, first field counted        14 vs 14   no separation at all
+names reached through Next only        14 vs 14   still tied
++ ascending Offset_Internal, 3 links   53 vs 44   best, still not decisive
++ ascending, 5 links, 4 names          42 vs 40   tightening made it worse
+```
+Some other offset genuinely yields equally long ascending chains — plausibly
+the UField list, which is a real linked list of real fields and so passes
+every structural test Next does. Separating them needs a criterion that
+distinguishes *which* list, not how well-formed it is.
+
+Two mistakes on the way, both worth not repeating: an absolute score
+threshold is the wrong instrument, because how many chains the seed sample
+contains varies run to run; and counting the first field's name gives every
+candidate an identical score, since that name decodes regardless of Next.
+
+Reporting without adopting is the right end state. The value is in the log
+for a human, and after the +0x150 incident a weak signal must never
+overwrite a working offset.
 
 **FBoolProperty cannot be anchored on its immediate alone.** The 0x01010000
 store also initialises unrelated structures, and the most common

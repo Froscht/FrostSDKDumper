@@ -1659,7 +1659,7 @@ public:
                     if (!m_reader.Read(Fp + Nx, &Nn, 8)) break;
                     Fp = Nn;
                 }
-                if (Ascending && Links >= 5 && Seen.size() >= 4) ++Total;
+                if (Ascending && Links >= 3 && Seen.size() >= 2) ++Total;
             }
             if (Total > BestLen) { SecondLen = BestLen; BestLen = Total; BestNext = Nx; }
             else if (Total > SecondLen) { SecondLen = Total; }
