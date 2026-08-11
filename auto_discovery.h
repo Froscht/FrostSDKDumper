@@ -3948,25 +3948,24 @@ inline std::string DecryptWide(const std::vector<uint8_t>& Cipher, int Length,
 // real slot while looking entirely reasonable.
 inline uint32_t SlotHash(uint64_t ObjPtr) {
     namespace V = ArcDecrypt::v20260811;
+    const auto& S = ArcDecrypt::g_Sheet;
     uint64_t Seed = ObjPtr + V::UOBJ_NAME_SEED_OFF;
     uint32_t Lo = (uint32_t)Seed;
     uint32_t Hi = (uint32_t)(Seed >> 32);
-    uint32_t H = Rotl32(Lo, V::UOBJ_SLOT_HASH_ROL) * V::UOBJ_SLOT_HASH_PRIME
-               + V::UOBJ_SLOT_HASH_ADD;
-    H = ((H >> V::UOBJ_SLOT_SHIFT_A) * V::UOBJ_SLOT_HASH_PRIME) + Hi + V::UOBJ_SLOT_HASH_ADD;
-    H = ((H >> V::UOBJ_SLOT_SHIFT_B) * V::UOBJ_SLOT_HASH_PRIME) + V::UOBJ_SLOT_HASH_ADD;
-    H = ((H >> V::UOBJ_SLOT_SHIFT_C) * V::UOBJ_SLOT_HASH_PRIME) + V::UOBJ_SLOT_HASH_ADD;
+    uint32_t H = Rotl32(Lo, S.SlotHashRol) * S.SlotHashPrime + S.SlotHashAdd;
+    H = ((H >> S.SlotShiftA) * S.SlotHashPrime) + Hi + S.SlotHashAdd;
+    H = ((H >> S.SlotShiftB) * S.SlotHashPrime) + S.SlotHashAdd;
+    H = ((H >> S.SlotShiftC) * S.SlotHashPrime) + S.SlotHashAdd;
     return H ^ (H >> 16);
 }
 
 inline uint32_t NameSlotIndex(uint64_t ObjPtr) {
-    namespace V = ArcDecrypt::v20260811;
-    return (SlotHash(ObjPtr) & 3u) ^ V::UOBJ_SLOT_NAME_XOR;
+    return (SlotHash(ObjPtr) & 3u) ^ ArcDecrypt::g_Sheet.SlotNameXor;
 }
 
 inline uint64_t DecodeSlot(uint64_t Enc) {
-    namespace V = ArcDecrypt::v20260811;
-    return Rol16x4(Pshufb8(Enc, V::UOBJ_NAME_PSHUFB), V::UOBJ_NAME_ROL16) ^ V::UOBJ_NAME_XOR;
+    const auto& S = ArcDecrypt::g_Sheet;
+    return Rol16x4(Pshufb8(Enc, S.SlotPshufb), S.SlotRol16) ^ S.SlotXor64;
 }
 
 // Generic Theia pointer idiom on this patch; also decrypts the standalone

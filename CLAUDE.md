@@ -177,6 +177,22 @@ CompIndex 0 == "None"       validates the whole FName pipeline
   nothing else comes close. Validate by decrypting and checking the vtable
   lands in-module and its slot-6 thunk in .text.
 
+**The sheet is live, not compiled.** Everything auto-resolve can extract sits
+in `ArcDecrypt::g_Sheet` (arc_decrypt.h), defaulted to the v20260811 numbers
+and read by the v811 paths at runtime. A patch that only moves these values
+no longer needs a source edit. Adoption order matters and is deliberate:
+the chunks_manager global is adopted in Phase 6.5 straight away because its
+validator already decrypted it and checked the vtable/thunk, while the slot
+values are only *staged* there — they cannot be judged until objects exist.
+Phase 7.5 scores them and swaps them in only if they beat what is loaded.
+
+**Self-healing is verified, not assumed.** Sabotaging `SlotShiftA` (3 -> 4)
+and running against the live game: the loaded selector scores 104/400 =
+26.0% (chance level), is rejected, the auto-resolved values score 400/400,
+get adopted, and the run finishes at a 100.0% naming rate. Repeat that test
+after touching any of this — a self-healing path that has never fired is
+unproven.
+
 The structural slot validator in `ScoreNameSlotSelector` exists for the bug
 class that is otherwise silent: the name slot is identifiable *without* the
 hash, because a decrypted name has CompIndex in the high dword and Number

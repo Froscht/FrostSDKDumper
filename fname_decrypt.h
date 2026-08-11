@@ -2666,32 +2666,21 @@ public:
     // silently becomes `(x * P) & (M + Hi + ADD)` and produces a hash with
     // zero correlation to the real slot while looking entirely reasonable.
     uint32_t ObjSlotHashV811(uint64_t ObjPtr) const {
-        namespace V = ArcDecrypt::v20260811;
-        uint64_t Seed = ObjPtr + V::UOBJ_NAME_SEED_OFF;
-        uint32_t Lo = static_cast<uint32_t>(Seed);
-        uint32_t Hi = static_cast<uint32_t>(Seed >> 32);
-        constexpr uint32_t P = V::UOBJ_SLOT_HASH_PRIME;
-        constexpr uint32_t A = V::UOBJ_SLOT_HASH_ADD;
-
-        uint32_t H = fn_rotl32(Lo, V::UOBJ_SLOT_HASH_ROL) * P + A;
-        H = ((H >> V::UOBJ_SLOT_SHIFT_A) * P) + Hi + A;
-        H = ((H >> V::UOBJ_SLOT_SHIFT_B) * P) + A;
-        H = ((H >> V::UOBJ_SLOT_SHIFT_C) * P) + A;
-        return H ^ (H >> 16);
+        return AutoDiscovery::V811Detail::SlotHash(ObjPtr);
     }
 
     uint32_t ObjNameSlotIndexV811(uint64_t ObjPtr) const {
-        namespace V = ArcDecrypt::v20260811;
-        return (ObjSlotHashV811(ObjPtr) & 3u) ^ V::UOBJ_SLOT_NAME_XOR;
+        return AutoDiscovery::V811Detail::NameSlotIndex(ObjPtr);
     }
 
     uint64_t GetObjFNameV811(uint64_t ObjPtr) const {
         namespace V = ArcDecrypt::v20260811;
-        uint64_t Slot = ObjPtr + V::UOBJ_NAME_SLOT_BASE +
-                        V::UOBJ_NAME_SLOT_STRIDE * ObjNameSlotIndexV811(ObjPtr);
+        (void)sizeof(V::UOBJ_NAME_SLOT_BASE);
+        const auto& Sh = ArcDecrypt::g_Sheet;
+        uint64_t Slot = ObjPtr + Sh.SlotBase + Sh.SlotStride * ObjNameSlotIndexV811(ObjPtr);
         uint64_t Enc = 0;
         if (!m_reader.Read(Slot, &Enc, 8)) return 0;
-        return fn_rotl64(AutoDiscovery::V811Detail::DecodeSlot(Enc), V::UOBJ_NAME_ROL64);
+        return fn_rotl64(AutoDiscovery::V811Detail::DecodeSlot(Enc), Sh.SlotFinalRol);
     }
 
     std::string GetNameV811(uint64_t ObjPtr) {
@@ -2897,20 +2886,21 @@ public:
     // i.e. SlotRel is measured from the class slot, not the name slot.
     uint64_t DecodeObjSlotPtrV811(uint64_t ObjPtr, uint32_t SlotRel) const {
         namespace V = ArcDecrypt::v20260811;
+        (void)sizeof(V::UOBJ_NAME_SLOT_BASE);
+        const auto& Sh = ArcDecrypt::g_Sheet;
         uint32_t Idx = (ObjSlotHashV811(ObjPtr) + SlotRel) & 3u;
         uint64_t Enc = 0;
-        if (!m_reader.Read(ObjPtr + V::UOBJ_NAME_SLOT_BASE +
-                           V::UOBJ_NAME_SLOT_STRIDE * Idx, &Enc, 8) || !Enc)
+        if (!m_reader.Read(ObjPtr + Sh.SlotBase + Sh.SlotStride * Idx, &Enc, 8) || !Enc)
             return 0;
         uint64_t Ptr = AutoDiscovery::V811Detail::DecodeSlot(Enc);
         if (Ptr < 0x10000ULL || Ptr >= 0x800000000000ULL) return 0;
         return Ptr;
     }
     uint64_t GetClassPtrV811(uint64_t ObjPtr) const {
-        return DecodeObjSlotPtrV811(ObjPtr, ArcDecrypt::v20260811::UOBJ_SLOT_CLASS_ADJ);
+        return DecodeObjSlotPtrV811(ObjPtr, ArcDecrypt::g_Sheet.SlotClassAdj);
     }
     uint64_t GetOuterPtrV811(uint64_t ObjPtr) const {
-        return DecodeObjSlotPtrV811(ObjPtr, ArcDecrypt::v20260811::UOBJ_SLOT_OUTER_ADJ);
+        return DecodeObjSlotPtrV811(ObjPtr, ArcDecrypt::g_Sheet.SlotOuterAdj);
     }
 
     uint64_t DecodeObjSlotPtrV808(uint64_t ObjPtr, uint32_t SlotRel) const {

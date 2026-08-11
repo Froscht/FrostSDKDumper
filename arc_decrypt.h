@@ -1499,6 +1499,41 @@ namespace v20260811 {
 // auto_offsets runs, because the generic probes need a working FField name
 // decode to score candidates — the very thing they are trying to discover —
 // and they overwrite these values on the way out.
+// ─────────────────────────────────────────────────────────────────────────────
+// The live sheet.
+//
+// Everything auto_resolve.h can extract and validate lives here rather than in
+// a constexpr namespace, so a patch that only moves these values no longer
+// requires a source edit. Defaults are the v20260811 numbers; Phase 6.5
+// overwrites them only after extraction succeeds, and the FName "None"
+// self-test plus the structural slot scorer decide whether it was right.
+// ─────────────────────────────────────────────────────────────────────────────
+struct LiveSheet {
+    bool     Resolved = false;
+
+    uint32_t SlotHashPrime = v20260811::UOBJ_SLOT_HASH_PRIME;
+    uint32_t SlotHashAdd   = v20260811::UOBJ_SLOT_HASH_ADD;
+    int      SlotHashRol   = v20260811::UOBJ_SLOT_HASH_ROL;
+    int      SlotShiftA    = v20260811::UOBJ_SLOT_SHIFT_A;
+    int      SlotShiftB    = v20260811::UOBJ_SLOT_SHIFT_B;
+    int      SlotShiftC    = v20260811::UOBJ_SLOT_SHIFT_C;
+
+    uint32_t SlotNameXor   = v20260811::UOBJ_SLOT_NAME_XOR;
+    uint32_t SlotClassAdj  = v20260811::UOBJ_SLOT_CLASS_ADJ;
+    uint32_t SlotOuterAdj  = v20260811::UOBJ_SLOT_OUTER_ADJ;
+    uint64_t SlotBase      = v20260811::UOBJ_NAME_SLOT_BASE;
+    uint64_t SlotStride    = v20260811::UOBJ_NAME_SLOT_STRIDE;
+
+    uint8_t  SlotPshufb[8] = { 1, 4, 6, 0, 3, 7, 2, 5 };
+    int      SlotRol16     = v20260811::UOBJ_NAME_ROL16;
+    uint64_t SlotXor64     = v20260811::UOBJ_NAME_XOR;
+    int      SlotFinalRol  = v20260811::UOBJ_NAME_ROL64;
+
+    uint64_t ChunkMgrRva   = v20260811::RVA_CHUNKMGR_GLOBAL;
+};
+
+inline LiveSheet g_Sheet;
+
 inline void ApplyOffsets811() {
     namespace V = v20260811;
     namespace Off = Offsets;

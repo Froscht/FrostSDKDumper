@@ -1131,6 +1131,8 @@ public:
                 ArcDecrypt::ApplyOffsets811();
                 std::printf("[v811] re-asserted FField layout after auto_offsets\n");
 
+                ScoreAndAdoptSlotSelector();
+
                 // The pre-object-array GWorld phase can only pattern-match and
                 // its compile-time RVA is stale every patch. Now that the
                 // object array and names are up, resolve it from the live
@@ -1432,6 +1434,70 @@ public:
         }
     }
 
+    // Score the loaded slot selector against ground truth, and swap in the
+    // auto-resolved one if it does better.
+    //
+    // Ground truth needs no hash: a decrypted name carries CompIndex in the
+    // high dword and FName::Number (almost always 0) in the low one, while the
+    // class and outer pointers fill the low dword and leave the high clear.
+    // Objects with exactly one slot of that shape settle the question. This is
+    // the only check that catches a hash which is wrong but still plausible —
+    // it returns a number, it selects a slot, and the sole symptom is a naming
+    // rate that looks mediocre rather than broken.
+    AutoResolve::GetFNameInfo m_resolvedGetFName;
+
+    void ScoreAndAdoptSlotSelector() {
+        const auto& Seeds = m_gobj.GetSeedObjects();
+        if (Seeds.size() < 64) {
+            std::printf("[autoresolve] only %zu seed objects — skipping slot scoring\n",
+                Seeds.size());
+            return;
+        }
+
+        auto ReadSlot = [this](uint64_t Obj, uint32_t Idx) -> uint64_t {
+            const auto& S = ArcDecrypt::g_Sheet;
+            uint64_t Enc = 0;
+            if (!m_reader.Read(Obj + S.SlotBase + S.SlotStride * Idx, &Enc, 8)) return 0;
+            if (!Enc) return 0;
+            return AutoDiscovery::V811Detail::DecodeSlot(Enc);
+        };
+
+        auto Loaded = AutoResolve::ScoreNameSlotSelector(
+            Seeds, ReadSlot,
+            [](uint64_t O) { return AutoDiscovery::V811Detail::NameSlotIndex(O); });
+
+        std::printf("[autoresolve] slot selector in use: %d/%d objects agree (%.1f%%)\n",
+            Loaded.Agree, Loaded.Samples, 100.0 * Loaded.Rate);
+
+        if (Loaded.Confident) return;
+
+        std::printf("[autoresolve] loaded selector is NOT trustworthy — trying the "
+                    "auto-resolved one\n");
+        if (!m_resolvedGetFName.Valid) {
+            std::printf("[autoresolve] nothing extracted to fall back to; names will be wrong\n");
+            return;
+        }
+
+        ArcDecrypt::LiveSheet Saved = ArcDecrypt::g_Sheet;
+        if (!AutoResolve::AdoptGetFName(m_resolvedGetFName, m_sigScanner)) {
+            std::printf("[autoresolve] extracted values failed their sanity check — keeping current\n");
+            return;
+        }
+
+        auto Fresh = AutoResolve::ScoreNameSlotSelector(
+            Seeds, ReadSlot,
+            [](uint64_t O) { return AutoDiscovery::V811Detail::NameSlotIndex(O); });
+        std::printf("[autoresolve] auto-resolved selector: %d/%d agree (%.1f%%)\n",
+            Fresh.Agree, Fresh.Samples, 100.0 * Fresh.Rate);
+
+        if (Fresh.Rate > Loaded.Rate && Fresh.Confident) {
+            std::printf("[autoresolve] adopted the auto-resolved slot selector\n");
+        } else {
+            ArcDecrypt::g_Sheet = Saved;
+            std::printf("[autoresolve] auto-resolved selector is no better — reverted\n");
+        }
+    }
+
     void DiscoverFNameConsts() {
         // 1. Locate the outer FName decrypt entry. Two anchors run in
         //    sequence; whichever finds it first wins. Both must come back
@@ -1650,6 +1716,10 @@ public:
                     }
                     std::printf("[autoresolve] GetFName: %d/%d values match the compiled sheet\n",
                         Agree, (int)(sizeof(Cmp) / sizeof(Cmp[0])));
+                    // Staged, not adopted: the slot values cannot be checked
+                    // until objects exist. Phase 7.5 scores them and swaps
+                    // them in only if they beat what is already loaded.
+                    m_resolvedGetFName = Gf;
                 }
 
                 auto Mg = AutoResolve::FindChunkMgrGlobal(
@@ -1673,6 +1743,11 @@ public:
                                TRva >= AutoDiscovery::g_DiscoveredBounds.TextRva &&
                                TRva <  AutoDiscovery::g_DiscoveredBounds.TextEnd();
                     });
+                // The global is safe to adopt straight away: the validator
+                // already decrypted it and confirmed the vtable lands in the
+                // module with a thunk in .text.
+                if (Mg.Valid) ArcDecrypt::g_Sheet.ChunkMgrRva = Mg.GlobalRva;
+
                 if (Mg.Valid && Mg.GlobalRva != ArcDecrypt::v20260811::RVA_CHUNKMGR_GLOBAL)
                     std::printf("[autoresolve]   DRIFT chunks_manager 0x%llX != compiled 0x%llX\n",
                         (unsigned long long)Mg.GlobalRva,

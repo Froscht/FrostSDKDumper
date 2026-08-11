@@ -804,7 +804,7 @@ namespace gobjects
             OutNumElements = 0;
 
             uint8_t Enc[16] = {};
-            if (!m_reader.Read(m_base + V::RVA_CHUNKMGR_GLOBAL, Enc, 16)) return 0;
+            if (!m_reader.Read(m_base + ArcDecrypt::g_Sheet.ChunkMgrRva, Enc, 16)) return 0;
             uint64_t EncLo = 0;
             std::memcpy(&EncLo, Enc, 8);
 

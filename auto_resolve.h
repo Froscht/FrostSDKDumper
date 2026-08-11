@@ -397,6 +397,50 @@ inline GetFNameInfo FindGetFName(const SigScanV2::Scanner& Scanner,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The live sheet.
+//
+// Everything auto-resolve can extract and validate lives here rather than in a
+// constexpr namespace, so a patch that moves these values does not require a
+// rebuild. Defaults are the compile-time v20260811 numbers; Phase 6.5
+// overwrites them only after the extraction has been checked, and the FName
+// self-test ("None") plus the slot scorer are the two things that get to say
+// whether it was right.
+// ─────────────────────────────────────────────────────────────────────────────
+// Fold an extracted GetFName into the sheet. The PSHUFB mask is read from the
+// module rather than assumed, because it is the one field whose bytes are not
+// recoverable from the instruction stream.
+inline bool AdoptGetFName(const GetFNameInfo& I,
+                          const SigScanV2::Scanner& Scanner,
+                          ArcDecrypt::LiveSheet& S = ArcDecrypt::g_Sheet)
+{
+    if (!I.Valid || I.Which != GetFNameInfo::Role::Name) return false;
+    if (!I.Add || !I.Rol || !I.SlotStride || !I.Xor64) return false;
+
+    uint8_t Mask[8];
+    const uint8_t* P = Scanner.GetLocalPtr(I.PshufbMaskRva);
+    if (!P) return false;
+    std::memcpy(Mask, P, 8);
+    for (int K = 0; K < 8; ++K)
+        if ((Mask[K] & 0x80) == 0 && (Mask[K] & 0x7F) > 7) return false;   // not a byte permute
+
+    S.SlotHashPrime = I.Prime;
+    S.SlotHashAdd   = I.Add;
+    S.SlotHashRol   = I.Rol;
+    S.SlotShiftA    = I.ShiftA;
+    S.SlotShiftB    = I.ShiftB;
+    S.SlotShiftC    = I.ShiftC;
+    S.SlotNameXor   = I.SlotXor;
+    S.SlotBase      = I.SlotBase;
+    S.SlotStride    = I.SlotStride;
+    std::memcpy(S.SlotPshufb, Mask, 8);
+    S.SlotRol16     = I.Rol16;
+    S.SlotXor64     = I.Xor64;
+    S.SlotFinalRol  = I.FinalRol64;
+    S.Resolved      = true;
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Structural validation of the slot selector.
 //
 // This is the check that matters most, because the failure it catches is
@@ -421,18 +465,17 @@ struct SlotScore {
 
 inline SlotScore ScoreNameSlotSelector(
         const std::vector<uint64_t>& Objects,
-        const std::function<uint64_t(uint64_t)>& ReadSlotDecrypted,
+        const std::function<uint64_t(uint64_t, uint32_t)>& ReadSlotDecrypted,
         const std::function<uint32_t(uint64_t)>& PredictIndex,
-        uint64_t SlotBase, uint64_t SlotStride, int MaxSamples = 400)
+        int MaxSamples = 400)
 {
-    (void)SlotBase; (void)SlotStride;
     SlotScore S;
     for (uint64_t Obj : Objects) {
         if (S.Samples >= MaxSamples) break;
 
         int Found = -1, Count = 0;
         for (uint32_t I = 0; I < 4; ++I) {
-            uint64_t V = ReadSlotDecrypted(Obj + I);   // caller encodes index in the low bits
+            uint64_t V = ReadSlotDecrypted(Obj, I);
             if ((V & 0xFFFFFFFFull) == 0 && (V >> 32) != 0) { Found = (int)I; ++Count; }
         }
         if (Count != 1) continue;                      // ambiguous — skip
