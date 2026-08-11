@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h>
@@ -1508,6 +1510,33 @@ namespace v20260811 {
 // overwrites them only after extraction succeeds, and the FName "None"
 // self-test plus the structural slot scorer decide whether it was right.
 // ─────────────────────────────────────────────────────────────────────────────
+// The shard hash is recorded as a program, not a fixed op list. Its shape
+// already changed once — CL-1325322 seeded it with `Lo >> 4`, build 24653108
+// with a `mov r8d,0x10 ; shld r8d,edx,0x1A` pair yielding
+// (0x40000000 | (Lo >> 6)) — so assume the alphabet, never the sequence.
+struct HashOp {
+    enum Kind { SeedShr, SeedRol, SeedShld, Rol, Shr, Imul, Add, AddHi } K = Imul;
+    uint32_t A = 0;
+    uint32_t B = 0;
+};
+
+inline uint32_t RunHashProgram(const std::vector<HashOp>& Ops, uint32_t Lo, uint32_t Hi) {
+    uint32_t H = Lo;
+    for (const auto& O : Ops) {
+        switch (O.K) {
+            case HashOp::SeedShr:  H = Lo >> (O.A & 31); break;
+            case HashOp::SeedRol:  { uint32_t N = O.A & 31; H = N ? ((Lo << N) | (Lo >> (32 - N))) : Lo; break; }
+            case HashOp::SeedShld: { uint32_t N = O.A & 31; H = (uint32_t)(O.B << N) | (N ? (Lo >> (32 - N)) : 0); break; }
+            case HashOp::Rol:      { uint32_t N = O.A & 31; if (N) H = (H << N) | (H >> (32 - N)); break; }
+            case HashOp::Shr:   H >>= (O.A & 31); break;
+            case HashOp::Imul:  H *= O.A; break;
+            case HashOp::Add:   H += O.A; break;
+            case HashOp::AddHi: H += Hi; break;
+        }
+    }
+    return H;
+}
+
 struct LiveSheet {
     bool     Resolved = false;
 
@@ -1530,6 +1559,27 @@ struct LiveSheet {
     int      SlotFinalRol  = v20260811::UOBJ_NAME_ROL64;
 
     uint64_t ChunkMgrRva   = v20260811::RVA_CHUNKMGR_GLOBAL;
+
+    // FName pipeline. An empty ShardHashProgram means "use the compiled
+    // shard hash"; auto-resolve fills it once CI=0 has decoded to "None".
+    uint64_t PoolRva      = v20260811::RVA_GNAMEPOOL;
+    uint64_t SeedOff      = v20260811::SHARD_HASH_SEED_OFF;
+    uint64_t BlockBase    = v20260811::SHARD_BLOCK_BASE_OFF;
+    uint64_t BlockStride  = v20260811::SHARD_BLOCK_STRIDE;
+    std::vector<HashOp> ShardHashProgram;
+
+    uint8_t  BlockPshufb[8] = { 1, 4, 6, 0, 3, 7, 2, 5 };
+    int      BlockRol16     = v20260811::BLOCK_ROL16;
+    uint64_t BlockXor       = v20260811::BLOCK_FNV_XOR;
+
+    uint64_t FnvPrime = v20260811::FNV_PRIME;
+    uint64_t FnvAdd   = v20260811::FNV_ADD;
+    int      FnvRol1  = v20260811::FNV_ROL1;
+    int      FnvRol2  = v20260811::FNV_ROL2;
+
+    // Table address plus base index, so indexing is simply idx*2 from here.
+    uint64_t KeystreamWindowRva =
+        v20260811::RVA_KEYSTREAM + (uint64_t)v20260811::KEYSTREAM_BASE_INDEX * 2;
 };
 
 inline LiveSheet g_Sheet;

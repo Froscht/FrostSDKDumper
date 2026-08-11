@@ -1722,6 +1722,55 @@ public:
                     m_resolvedGetFName = Gf;
                 }
 
+                {
+                    namespace V = ArcDecrypt::v20260811;
+                    auto Fp = AutoResolve::ResolveFNamePipeline(
+                        m_sigScanner, AutoDiscovery::g_DiscoveredBounds, MODULE_BASE,
+                        [this](uint64_t A, void* B, size_t N) { return m_reader.Read(A, B, N); },
+                        V::KEY_INIT_ADD, V::NARROW_KEY_SHIFT);
+                    if (Fp.Valid) {
+                        struct { const char* Name; unsigned long long Got, Want; } C2[] = {
+                            { "pool",       Fp.Res.PoolRva,     V::RVA_GNAMEPOOL          },
+                            { "seed off",   Fp.Res.SeedOff,     V::SHARD_HASH_SEED_OFF    },
+                            { "block base", Fp.Res.BlockBase,   V::SHARD_BLOCK_BASE_OFF   },
+                            { "block xor",  Fp.Res.BlockXor,    V::BLOCK_FNV_XOR          },
+                            { "fnv add",    Fp.Res.FnvAdd,      V::FNV_ADD                },
+                            { "fnv rol1",   (unsigned)Fp.Res.FnvRol1, (unsigned)V::FNV_ROL1 },
+                            { "fnv rol2",   (unsigned)Fp.Res.FnvRol2, (unsigned)V::FNV_ROL2 },
+                            { "keystream",  Fp.KeystreamWindowRva,
+                              V::RVA_KEYSTREAM + (uint64_t)V::KEYSTREAM_BASE_INDEX * 2    },
+                        };
+                        int A2 = 0;
+                        for (const auto& C : C2) {
+                            if (C.Got == C.Want) { ++A2; continue; }
+                            std::printf("[autoresolve]   DRIFT %-10s extracted 0x%llX != compiled 0x%llX\n",
+                                C.Name, C.Got, C.Want);
+                        }
+                        std::printf("[autoresolve] FName: %d/%d values match the compiled sheet\n",
+                            A2, (int)(sizeof(C2) / sizeof(C2[0])));
+
+                        // Safe to adopt outright: the candidate only got here
+                        // by decoding CI=0 to "None" and a second, longer name
+                        // cleanly. No single wrong constant survives both.
+                        auto& Sh = ArcDecrypt::g_Sheet;
+                        Sh.PoolRva     = Fp.Res.PoolRva;
+                        Sh.SeedOff     = Fp.Res.SeedOff;
+                        Sh.BlockBase   = Fp.Res.BlockBase;
+                        Sh.ShardHashProgram = Fp.Res.Hash;
+                        Sh.BlockRol16  = Fp.Res.BlockRol16;
+                        Sh.BlockXor    = Fp.Res.BlockXor;
+                        Sh.FnvPrime    = Fp.Res.FnvPrime;
+                        Sh.FnvAdd      = Fp.Res.FnvAdd;
+                        Sh.FnvRol1     = Fp.Res.FnvRol1;
+                        Sh.FnvRol2     = Fp.Res.FnvRol2;
+                        Sh.KeystreamWindowRva = Fp.KeystreamWindowRva;
+                        if (const uint8_t* Bm = m_sigScanner.GetLocalPtr(Fp.Res.BlockMaskRva))
+                            std::memcpy(Sh.BlockPshufb, Bm, 8);
+                        Sh.Resolved = true;
+                        std::printf("[autoresolve] FName pipeline adopted into the live sheet\n");
+                    }
+                }
+
                 auto Mg = AutoResolve::FindChunkMgrGlobal(
                     m_sigScanner, AutoDiscovery::g_DiscoveredBounds,
                     [this](uint64_t Rva) -> bool {

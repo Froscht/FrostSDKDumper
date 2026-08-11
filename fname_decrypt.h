@@ -384,13 +384,17 @@ public:
     // the module image holds an at-rest form that shares no value with it.
     bool AdoptV811() {
         namespace V = ArcDecrypt::v20260811;
-        if (!m_reader.Read(m_base + V::RVA_KEYSTREAM, m_keyTable811, sizeof(m_keyTable811))) {
+        const auto& Sh = ArcDecrypt::g_Sheet;
+        // Read from the window (table + base index) so a resolved keystream
+        // needs no separate base, and read it LIVE: the module image holds an
+        // at-rest form that shares no value with the running table.
+        if (!m_reader.Read(m_base + Sh.KeystreamWindowRva, m_keyTable811, 128)) {
             std::printf("[fname] v811 keystream read failed @ 0x%llX\n",
-                (unsigned long long)(m_base + V::RVA_KEYSTREAM));
+                (unsigned long long)(m_base + Sh.KeystreamWindowRva));
             return false;
         }
-        m_pool811Rva = V::RVA_GNAMEPOOL;
-        m_ks811Base  = V::KEYSTREAM_BASE_INDEX;
+        m_pool811Rva = Sh.PoolRva;
+        m_ks811Base  = 0;
         m_v811Active = true;
         m_keyLoaded  = true;
 
@@ -412,9 +416,9 @@ public:
                 if (!std::isalnum(C) && C != '_') { Clean = false; break; }
             if (Clean) Second = S;
         }
-        std::printf("[fname] Pipeline = v20260811 (pool 0x%llX, keystream 0x%llX+%d) — CI=0 -> \"None\" ✓%s%s\n",
-            (unsigned long long)V::RVA_GNAMEPOOL, (unsigned long long)V::RVA_KEYSTREAM,
-            V::KEYSTREAM_BASE_INDEX,
+        std::printf("[fname] Pipeline = v20260811 (pool 0x%llX, keystream window 0x%llX%s) — CI=0 -> \"None\" ✓%s%s\n",
+            (unsigned long long)Sh.PoolRva, (unsigned long long)Sh.KeystreamWindowRva,
+            Sh.Resolved ? ", auto-resolved" : "",
             Second.empty() ? "" : " 2nd plaintext: ", Second.c_str());
         return true;
     }
@@ -1823,27 +1827,28 @@ public:
         namespace X = AutoDiscovery::V811Detail;
         if (CompIndex < 0 || !m_v811Active) return 0;
 
+        const auto& Sh = ArcDecrypt::g_Sheet;
         uint32_t Ci = static_cast<uint32_t>(CompIndex);
         uint32_t NameOff  = Ci & 0xFFFFu;
         uint32_t ChunkOff = (Ci >> 8) & 0xFFFF00u;
         uint64_t ChunkAddr = m_base + m_pool811Rva + ChunkOff;
 
-        uint32_t H = X::ShardHash(ChunkAddr + V::SHARD_HASH_SEED_OFF);
+        uint32_t H = X::ShardHash(ChunkAddr + Sh.SeedOff);
         uint32_t S = H ^ (H >> 16);
         uint32_t Bidx1 = S & 7u;
         uint32_t Bidx2 = (S + 1u) & 7u;
 
-        uint64_t BlockBase = ChunkAddr + V::SHARD_BLOCK_BASE_OFF;
+        uint64_t BlockBase = ChunkAddr + Sh.BlockBase;
         uint64_t Raw1 = 0, Raw2 = 0;
-        if (!m_reader.Read(BlockBase + V::SHARD_BLOCK_STRIDE * Bidx1, &Raw1, 8)) return 0;
-        if (!m_reader.Read(BlockBase + V::SHARD_BLOCK_STRIDE * Bidx2, &Raw2, 8)) return 0;
+        if (!m_reader.Read(BlockBase + Sh.BlockStride * Bidx1, &Raw1, 8)) return 0;
+        if (!m_reader.Read(BlockBase + Sh.BlockStride * Bidx2, &Raw2, 8)) return 0;
         if (!Raw1 && !Raw2) return 0;
 
         uint64_t V13 = X::DecodeBlock(Raw1);
         uint64_t V15 = X::DecodeBlock(Raw2);
 
-        uint64_t Fv = V::FNV_PRIME * fn_rotl64(V13, V::FNV_ROL1) + V::FNV_ADD;
-        Fv = V::FNV_PRIME * fn_rotl64(Fv, V::FNV_ROL2) + V::FNV_ADD;
+        uint64_t Fv = Sh.FnvPrime * fn_rotl64(V13, Sh.FnvRol1) + Sh.FnvAdd;
+        Fv = Sh.FnvPrime * fn_rotl64(Fv, Sh.FnvRol2) + Sh.FnvAdd;
 
         // The four-step xor/bswap chain cancels to the identity here, so the
         // raw sum already is the entry address. See CLAUDE.md.

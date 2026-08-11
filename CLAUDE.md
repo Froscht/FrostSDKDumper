@@ -177,6 +177,27 @@ CompIndex 0 == "None"       validates the whole FName pipeline
   nothing else comes close. Validate by decrypting and checking the vtable
   lands in-module and its slot-6 thunk in .text.
 
+**Coverage.** Auto-resolve now recovers the FName pipeline as well as the
+slot accessors and the object array, all validated rather than assumed:
+```
+FName pipeline   8/8   pool, seed off, block base, block xor, FNV add/rol,
+                       keystream window — anchored on the FNV-64 prime
+                       0x100000001B3 and proved by CI=0 -> "None"
+GetFName        11/11   anchored on the FNV-32 prime, consensus over 9 copies
+chunks_manager   exact  anchored on the FUObjectItem stride-20 idiom
+```
+Three traps cost real time while building this and are handled explicitly:
+- **The FNV-64 immediate is `B3 01 00 00 00 01 00 00`,** not
+  `B3 01 00 00 01 00 00 00`. The wrong byte order finds zero sites and looks
+  like the anchor does not exist.
+- **The hash collector must stop at `S = H ^ (H >> 16)`.** Otherwise it runs
+  on into the FNV-64 fold and swallows its 40/41-bit rotates as hash steps.
+  Every constant still comes out correct and only the program is wrong, so
+  the symptom is CI=0 resolving to garbage — which reads as a bad pool
+  address, not a bad hash.
+- **The keystream sweep must read LIVE memory.** Sweeping the module cache
+  finds nothing, because the table is decrypted in place at load.
+
 **The sheet is live, not compiled.** Everything auto-resolve can extract sits
 in `ArcDecrypt::g_Sheet` (arc_decrypt.h), defaulted to the v20260811 numbers
 and read by the v811 paths at runtime. A patch that only moves these values
@@ -186,7 +207,10 @@ validator already decrypted it and checked the vtable/thunk, while the slot
 values are only *staged* there — they cannot be judged until objects exist.
 Phase 7.5 scores them and swaps them in only if they beat what is loaded.
 
-**Self-healing is verified, not assumed.** Sabotaging `SlotShiftA` (3 -> 4)
+**Self-healing is verified on both halves.** Sabotaging the FName side
+(`PoolRva` -> 0xDEAD000, `KeystreamWindowRva` -> 0xBEEF000) still finishes at
+a 100.0% naming rate: auto-resolve recovers 0xE38FA00 and 0xE2CE894 and
+adopts them. Sabotaging `SlotShiftA` (3 -> 4)
 and running against the live game: the loaded selector scores 104/400 =
 26.0% (chance level), is rejected, the auto-resolved values score 400/400,
 get adopted, and the run finishes at a 100.0% naming rate. Repeat that test

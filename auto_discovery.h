@@ -3830,6 +3830,9 @@ inline uint32_t ShardHash(uint64_t SeedAddr) {
     namespace V = ArcDecrypt::v20260811;
     uint32_t Lo = (uint32_t)SeedAddr;
     uint32_t Hi = (uint32_t)(SeedAddr >> 32);
+    const auto& Sh = ArcDecrypt::g_Sheet;
+    if (!Sh.ShardHashProgram.empty())
+        return ArcDecrypt::RunHashProgram(Sh.ShardHashProgram, Lo, Hi);
     uint32_t H = (V::SHARD_SEED_OR | (Lo >> V::SHARD_SEED_SHR)) * V::HASH_PRIME
                + V::SHARD_HASH_ADD;
     H = Rotl32(H, V::SHARD_ROL_A) * V::HASH_PRIME;
@@ -3840,8 +3843,8 @@ inline uint32_t ShardHash(uint64_t SeedAddr) {
 }
 
 inline uint64_t DecodeBlock(uint64_t Raw) {
-    namespace V = ArcDecrypt::v20260811;
-    return Rol16x4(Pshufb8(Raw, V::BLOCK_PSHUFB), V::BLOCK_ROL16) ^ V::BLOCK_FNV_XOR;
+    const auto& S = ArcDecrypt::g_Sheet;
+    return Rol16x4(Pshufb8(Raw, S.BlockPshufb), S.BlockRol16) ^ S.BlockXor;
 }
 
 inline uint64_t ResolveEntry(const SigScanV2::Scanner& Scanner, uint64_t Base,

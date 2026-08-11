@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <unordered_map>
 #include <functional>
+#include <cctype>
+#include <cstdlib>
 
 #include "sig_scanner_v2.h"
 #include "insn_decoder.h"
@@ -438,6 +440,418 @@ inline bool AdoptGetFName(const GetFNameInfo& I,
     S.SlotFinalRol  = I.FinalRol64;
     S.Resolved      = true;
     return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The FNamePool resolver.
+//
+// Anchored on the FNV-64 prime 0x100000001B3, which has moved no more than its
+// 32-bit sibling. Only a handful of functions carry it, and the resolver is the
+// one that also loads a .data global with a LEA.
+//
+// The shard hash is NOT extracted as a fixed op list. Its shape already changed
+// once — CL-1325322 seeded it with `Lo >> 4`, build 24653108 with a
+// `mov r8d,0x10 ; shld r8d,edx,0x1A` pair that yields (0x40000000 | (Lo >> 6))
+// — so it is recorded as a small program and interpreted. Same reasoning as the
+// chunk thunks: assume the alphabet, never the sequence.
+// ─────────────────────────────────────────────────────────────────────────────
+struct FNameResolverInfo {
+    bool     Valid = false;
+    uint64_t Rva   = 0;
+
+    uint64_t PoolRva     = 0;
+    uint64_t SeedOff     = 0;
+    uint64_t BlockBase   = 0;
+
+    std::vector<ArcDecrypt::HashOp> Hash;
+
+    uint64_t BlockMaskRva = 0;
+    int      BlockRol16   = 0;
+    uint64_t BlockXor     = 0;
+
+    uint64_t FnvPrime = 0;
+    uint64_t FnvAdd   = 0;
+    int      FnvRol1  = 0;
+    int      FnvRol2  = 0;
+
+    std::string Reject;
+};
+
+namespace Detail {
+
+// `add r32, r32` — how the seed's high dword joins the chain. Register-to-
+// register adds do not come back from the decoder with usable operands.
+inline bool IsRegAdd32(const SigScanV2::Scanner& Scanner, uint64_t Rva) {
+    const uint8_t* P = Scanner.GetLocalPtr(Rva);
+    if (!P) return false;
+    int I = ((P[0] & 0xF0) == 0x40) ? 1 : 0;
+    return P[I] == 0x01 && (P[I + 1] & 0xC0) == 0xC0;
+}
+
+// `mov r32, imm32` (B8+r). Feeds the SHLD seed form.
+inline bool ReadMovImm32(const SigScanV2::Scanner& Scanner, uint64_t Rva, uint32_t& Out) {
+    const uint8_t* P = Scanner.GetLocalPtr(Rva);
+    if (!P) return false;
+    int I = ((P[0] & 0xF0) == 0x40) ? 1 : 0;
+    if ((P[I] & 0xF8) != 0xB8) return false;
+    std::memcpy(&Out, P + I + 1, 4);
+    return true;
+}
+
+} // namespace Detail
+
+inline std::vector<uint64_t> FindFnv64Sites(const SigScanV2::Scanner& Scanner,
+                                            const AutoDiscovery::ModuleBounds& Bounds)
+{
+    std::vector<uint64_t> Out;
+    if (!Bounds.Valid || !Bounds.TextSize) return Out;
+    const uint8_t Imm[8] = { 0xB3, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00 };
+    for (uint64_t R = Bounds.TextRva; R + 8 <= Bounds.TextEnd(); ++R) {
+        const uint8_t* P = Scanner.GetLocalPtr(R);
+        if (!P || std::memcmp(P, Imm, 8) != 0) continue;
+        uint64_t F = FuncAnalyze::FindFunctionStart(Scanner, R);
+        if (F) Out.push_back(F);
+    }
+    std::sort(Out.begin(), Out.end());
+    Out.erase(std::unique(Out.begin(), Out.end()), Out.end());
+    return Out;
+}
+
+inline FNameResolverInfo ExtractFNameResolver(const SigScanV2::Scanner& Scanner,
+                                              const AutoDiscovery::ModuleBounds& Bounds,
+                                              uint64_t FuncRva)
+{
+    FNameResolverInfo R;
+    R.Rva = FuncRva;
+
+    auto Insns = FuncAnalyze::DecodeWindowAt(Scanner, FuncRva, 1024);
+    if (Insns.size() < 30) { R.Reject = "too short"; return R; }
+
+    size_t End = Insns.size();
+    std::vector<uint64_t> Movabs;
+    bool InHash = false;
+    bool HashDone = false;
+    int  ImulSeen = 0;
+
+    for (size_t I = 0; I < End; ++I) {
+        const auto& In = Insns[I];
+
+        if (In.type == INSN_LEA && In.hasRipRel && !R.PoolRva) {
+            uint64_t T = In.ResolveRipRVA();
+            if (T >= Bounds.DataRva && T < Bounds.DataEnd()) R.PoolRva = T;
+        }
+
+        // The seed offset is a large add-immediate on a 64-bit register, just
+        // before the hash starts.
+        if (In.type == INSN_ADD_IMM && In.hasImm32 && !InHash &&
+            In.imm32 >= 0x100 && In.imm32 < 0x100000 && !R.SeedOff)
+            R.SeedOff = In.imm32;
+
+        if (In.type == INSN_SHLD && In.hasImm8) {
+            uint32_t Mv = 0;
+            for (size_t K = (I >= 3 ? I - 3 : 0); K < I; ++K)
+                if (Detail::ReadMovImm32(Scanner, Insns[K].rva, Mv)) break;
+            R.Hash.push_back({ ArcDecrypt::HashOp::SeedShld, In.imm8, Mv });
+            InHash = true;
+            continue;
+        }
+
+        if (In.type == INSN_IMUL && In.hasImm32 && In.imm32 == FNV32_PRIME) {
+            if (!InHash) {
+                // No SHLD seed: whatever shaped Lo immediately before is it.
+                for (size_t K = I; K-- > 0 && K + 4 > I; ) {
+                    if (Insns[K].type == INSN_SHR && Insns[K].hasImm8) {
+                        R.Hash.push_back({ ArcDecrypt::HashOp::SeedShr, Insns[K].imm8, 0 }); break;
+                    }
+                    if (Insns[K].type == INSN_ROL && Insns[K].hasImm8) {
+                        R.Hash.push_back({ ArcDecrypt::HashOp::SeedRol, Insns[K].imm8, 0 }); break;
+                    }
+                }
+                InHash = true;
+            }
+            ++ImulSeen;
+            if (!HashDone) R.Hash.push_back({ ArcDecrypt::HashOp::Imul, FNV32_PRIME, 0 });
+            continue;
+        }
+
+        if (!InHash) continue;
+
+        // The hash ends at `S = H ^ (H >> 16)`. Without this the collector runs
+        // on into the FNV-64 fold and swallows its 40/41-bit rotates as if they
+        // were hash steps — the constants all come out right and only the
+        // program is wrong, which resolves CI=0 to garbage and looks like a
+        // bad pool address.
+        if (!HashDone && In.type == INSN_SHR && In.hasImm8 && In.imm8 == 16 && ImulSeen >= 3)
+            HashDone = true;
+
+        if (!HashDone) {
+            if (In.type == INSN_ADD_IMM && In.hasImm32) { R.Hash.push_back({ ArcDecrypt::HashOp::Add, In.imm32, 0 }); continue; }
+            if (In.type == INSN_ROL && In.hasImm8)      { R.Hash.push_back({ ArcDecrypt::HashOp::Rol, In.imm8, 0 }); continue; }
+            if (In.type == INSN_SHR && In.hasImm8) {
+                if (In.imm8 == 16 || In.imm8 == 32) continue;   // S fold, Hi extract
+                R.Hash.push_back({ ArcDecrypt::HashOp::Shr, In.imm8, 0 });
+                continue;
+            }
+            if (Detail::IsRegAdd32(Scanner, In.rva)) { R.Hash.push_back({ ArcDecrypt::HashOp::AddHi, 0, 0 }); continue; }
+        }
+
+        if (In.type == INSN_MOVDQA && !In.hasRipRel && !R.BlockBase) {
+            uint64_t Disp = 0;
+            if (Detail::ReadMovdqaDisp(Scanner, In.rva, In.length, Disp) && Disp >= 0x100)
+                R.BlockBase = Disp;
+        }
+        if ((In.type == INSN_PSHUFB || In.type == INSN_MOVQ) && In.hasRipRel && !R.BlockMaskRva) {
+            uint64_t T = In.ResolveRipRVA();
+            if (T >= Bounds.RDataRva && T < Bounds.RDataEnd()) R.BlockMaskRva = T;
+        }
+        if (In.type == INSN_PSLLW && In.hasImm8 && !R.BlockRol16) R.BlockRol16 = In.imm8;
+        if (In.imm64) Movabs.push_back(In.imm64);
+    }
+
+    for (uint64_t M : Movabs) {
+        if (M == 0x100000001B3ULL) { R.FnvPrime = M; continue; }
+        if (!R.BlockXor) R.BlockXor = M;
+        else if (!R.FnvAdd && M != R.BlockXor) R.FnvAdd = M;
+    }
+
+    // The two 64-bit rotates that fold the FNV chain.
+    std::vector<int> Big;
+    for (const auto& In : Insns)
+        if (In.type == INSN_ROL && In.hasImm8 && In.imm8 >= 32) Big.push_back(In.imm8);
+    if (Big.size() >= 2) { R.FnvRol1 = Big[0]; R.FnvRol2 = Big[1]; }
+
+    if (!R.PoolRva)      { R.Reject = "no .data pool lea";      return R; }
+    if (!R.SeedOff)      { R.Reject = "no seed offset";         return R; }
+    if (!R.BlockBase)    { R.Reject = "no block base";          return R; }
+    if (!R.BlockMaskRva) { R.Reject = "no block mask";          return R; }
+    if (!R.BlockXor)     { R.Reject = "no block xor";           return R; }
+    if (!R.FnvPrime)     { R.Reject = "no FNV-64 prime";        return R; }
+    if (!R.FnvAdd)       { R.Reject = "no FNV-64 addend";       return R; }
+    if (!R.FnvRol1 || !R.FnvRol2) { R.Reject = "missing FNV rotates"; return R; }
+    if (R.Hash.size() < 5) { R.Reject = "hash program too short"; return R; }
+    if (!R.BlockRol16) R.BlockRol16 = 2;
+
+    R.Valid = true;
+    return R;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Resolve the whole FName pipeline and prove it with plaintext.
+//
+// No candidate is accepted on structure alone. CompIndex 0 has been the name
+// "None" in every build so far, which is four bytes of known plaintext — enough
+// to pin the keystream by sweep and, in doing so, to confirm that the pool, the
+// shard hash, the block decode and the FNV fold were all extracted correctly.
+// If any one of them is wrong, no keystream in the image satisfies the
+// constraint and the candidate is simply rejected.
+// ─────────────────────────────────────────────────────────────────────────────
+struct FNamePipelineInfo {
+    bool              Valid = false;
+    FNameResolverInfo Res;
+    uint64_t          KeystreamWindowRva = 0;   // table + base*2, so indexing is idx*2
+    uint64_t          EntryZero = 0;
+    std::string       Second;                   // a second decoded name, for the log
+};
+
+using ReadFn = std::function<bool(uint64_t, void*, size_t)>;
+
+namespace Detail {
+
+inline uint64_t Rotl64R(uint64_t V, int N) {
+    N &= 63; return N ? ((V << N) | (V >> (64 - N))) : V;
+}
+inline uint64_t Rol16x4R(uint64_t V, int N) {
+    uint64_t R = 0;
+    for (int I = 0; I < 4; ++I) {
+        uint16_t W = (uint16_t)(V >> (16 * I));
+        W = (uint16_t)((W << N) | (W >> (16 - N)));
+        R |= (uint64_t)W << (16 * I);
+    }
+    return R;
+}
+inline uint64_t Pshufb8R(uint64_t V, const uint8_t* M) {
+    uint8_t S[8], O[8];
+    std::memcpy(S, &V, 8);
+    for (int I = 0; I < 8; ++I) O[I] = (M[I] & 0x80) ? 0 : S[M[I] & 7];
+    uint64_t R = 0; std::memcpy(&R, O, 8); return R;
+}
+
+} // namespace Detail
+
+// Resolve one CompIndex with a candidate's constants.
+inline uint64_t ResolveEntryWith(const FNameResolverInfo& R, const uint8_t* Mask,
+                                 uint64_t ModuleBase, uint32_t Ci, const ReadFn& Read)
+{
+    uint32_t NameOff  = Ci & 0xFFFFu;
+    uint32_t ChunkOff = (Ci >> 8) & 0xFFFF00u;
+    uint64_t ChunkAddr = ModuleBase + R.PoolRva + ChunkOff;
+
+    uint64_t Seed = ChunkAddr + R.SeedOff;
+    uint32_t H = ArcDecrypt::RunHashProgram(R.Hash, (uint32_t)Seed, (uint32_t)(Seed >> 32));
+    uint32_t S = H ^ (H >> 16);
+
+    uint64_t BlockBase = ChunkAddr + R.BlockBase;
+    uint64_t Raw1 = 0, Raw2 = 0;
+    if (!Read(BlockBase + 32ULL * (S & 7u), &Raw1, 8)) return 0;
+    if (!Read(BlockBase + 32ULL * ((S + 1u) & 7u), &Raw2, 8)) return 0;
+    if (!Raw1 && !Raw2) return 0;
+
+    uint64_t V13 = Detail::Rol16x4R(Detail::Pshufb8R(Raw1, Mask), R.BlockRol16) ^ R.BlockXor;
+    uint64_t V15 = Detail::Rol16x4R(Detail::Pshufb8R(Raw2, Mask), R.BlockRol16) ^ R.BlockXor;
+
+    uint64_t Fv = R.FnvPrime * Detail::Rotl64R(V13, R.FnvRol1) + R.FnvAdd;
+    Fv = R.FnvPrime * Detail::Rotl64R(Fv, R.FnvRol2) + R.FnvAdd;
+
+    uint64_t E = V13 + (V15 ^ Fv) + 2ULL * NameOff;
+    if (E < 0x10000ULL || E >= 0x800000000000ULL) return 0;
+    return E;
+}
+
+inline FNamePipelineInfo ResolveFNamePipeline(const SigScanV2::Scanner& Scanner,
+                                              const AutoDiscovery::ModuleBounds& Bounds,
+                                              uint64_t ModuleBase,
+                                              const ReadFn& Read,
+                                              uint32_t KeyInitAdd,
+                                              int NarrowShift)
+{
+    FNamePipelineInfo Out;
+    auto Cands = FindFnv64Sites(Scanner, Bounds);
+    std::printf("[autoresolve] %zu functions carry the FNV-64 prime\n", Cands.size());
+
+    std::unordered_map<std::string, int> Rejects;
+    int NExtract = 0, NMask = 0, NEntry = 0, NLen = 0;
+
+    for (uint64_t F : Cands) {
+        FNameResolverInfo R = ExtractFNameResolver(Scanner, Bounds, F);
+        if (getenv("FROST_AR_DEBUG") && F >= 0x23E000 && F < 0x240000)
+            std::printf("[ar-dbg] fn 0x%llX valid=%d reject=%s pool=0x%llX seed=0x%llX "
+                        "blk=0x%llX mask=0x%llX xor=0x%llX fnvadd=0x%llX rol=%d/%d ops=%zu\n",
+                (unsigned long long)F, (int)R.Valid, R.Reject.c_str(),
+                (unsigned long long)R.PoolRva, (unsigned long long)R.SeedOff,
+                (unsigned long long)R.BlockBase, (unsigned long long)R.BlockMaskRva,
+                (unsigned long long)R.BlockXor, (unsigned long long)R.FnvAdd,
+                R.FnvRol1, R.FnvRol2, R.Hash.size());
+        if (!R.Valid) { ++Rejects[R.Reject.empty() ? "?" : R.Reject]; continue; }
+        ++NExtract;
+        if (getenv("FROST_AR_DEBUG"))
+            std::printf("[ar-dbg] extracted fn 0x%llX pool=0x%llX seed=0x%llX blk=0x%llX\n",
+                (unsigned long long)F, (unsigned long long)R.PoolRva,
+                (unsigned long long)R.SeedOff, (unsigned long long)R.BlockBase);
+
+        const uint8_t* Mask = Scanner.GetLocalPtr(R.BlockMaskRva);
+        if (!Mask) { ++Rejects["mask unreadable"]; continue; }
+        ++NMask;
+
+        uint64_t E0 = ResolveEntryWith(R, Mask, ModuleBase, 0, Read);
+        if (!E0) { ++Rejects["CI=0 did not resolve"]; continue; }
+        ++NEntry;
+
+        uint16_t Hdr = 0;
+        if (!Read(E0, &Hdr, 2) || !Hdr) { ++Rejects["entry header unreadable"]; continue; }
+        int Len = (int)((((uint32_t)Hdr >> 6) & 0xFFFFFFC0u) | ((uint32_t)Hdr & 0x3Fu));
+        if (Len != 4) { ++Rejects["CI=0 length != 4"]; continue; }
+        ++NLen;
+
+        uint8_t Cipher[4] = {};
+        if (!Read(E0 + 2, Cipher, 4)) continue;
+
+        // Sweep for the keystream window that turns those four bytes into
+        // "None". One position settles it; there is no second solution.
+        const char* Want = "None";
+        uint32_t K = ((uint32_t)Len + KeyInitAdd);
+        // Sweep LIVE memory, not the module cache. The keystream is decrypted
+        // in place at load: a static read of the table yields bytes that share
+        // not one value with the running one, and most of them never occur in
+        // the at-rest form at all.
+        uint64_t Lo = Bounds.RDataRva, Hi = Bounds.DataEnd();
+        uint64_t FoundWin = 0;
+        constexpr size_t Chunk = 1u << 20, Tail = 0x80;
+        std::vector<uint8_t> Buf(Chunk + Tail);
+        for (uint64_t Off = Lo; Off < Hi && !FoundWin; Off += Chunk) {
+            size_t N = (size_t)std::min<uint64_t>(Chunk + Tail, Hi - Off);
+            if (N <= Tail) break;
+            if (!Read(ModuleBase + Off, Buf.data(), N)) continue;
+            for (size_t W = 0; W + Tail <= N; W += 2) {
+                bool Ok = true;
+                for (int I = 0; I < 4 && Ok; ++I) {
+                    uint16_t Ks = 0;
+                    std::memcpy(&Ks, Buf.data() + W + (size_t)(((K + (uint32_t)I) & 0x3Fu) * 2), 2);
+                    uint8_t Dec = (uint8_t)(Cipher[I] ^ (uint8_t)(Ks >> NarrowShift));
+                    if (Dec != (uint8_t)Want[I]) Ok = false;
+                }
+                if (Ok) { FoundWin = Off + W; break; }
+            }
+        }
+        if (!FoundWin) { ++Rejects["no keystream matched \"None\""]; continue; }
+
+        Out.Res = R;
+        Out.KeystreamWindowRva = FoundWin;
+        Out.EntryZero = E0;
+
+        // Decode a second, longer name so the log carries a real confirmation
+        // rather than a four-byte coincidence.
+        uint8_t WinBuf[128] = {};
+        if (!Read(ModuleBase + FoundWin, WinBuf, sizeof(WinBuf))) continue;
+        const uint8_t* Win = WinBuf;
+        for (uint32_t Ci = 1; Ci < 512 && Out.Second.empty(); ++Ci) {
+            uint64_t E = ResolveEntryWith(R, Mask, ModuleBase, Ci, Read);
+            if (!E) continue;
+            uint16_t H2 = 0;
+            if (!Read(E, &H2, 2) || !H2) continue;
+            int L2 = (int)((((uint32_t)H2 >> 6) & 0xFFFFFFC0u) | ((uint32_t)H2 & 0x3Fu));
+            if (L2 < 4 || L2 > 40 || (H2 & 0x800)) continue;
+            std::vector<uint8_t> B((size_t)L2);
+            if (!Read(E + 2, B.data(), (size_t)L2)) continue;
+            uint32_t K2 = (uint32_t)L2 + KeyInitAdd;
+            std::string S2;
+            bool Clean = true;
+            for (int I = 0; I < L2; ++I) {
+                uint16_t Ks = 0;
+                std::memcpy(&Ks, Win + (size_t)(((K2 + (uint32_t)I) & 0x3Fu) * 2), 2);
+                uint8_t C = (uint8_t)(B[(size_t)I] ^ (uint8_t)(Ks >> NarrowShift));
+                if (!std::isalnum(C) && C != '_') { Clean = false; break; }
+                S2.push_back((char)C);
+            }
+            if (Clean && S2.size() >= 4) Out.Second = S2;
+        }
+
+        // Four bytes of plaintext can be hit by accident, and a wrong
+        // KEY_INIT_ADD would still let some window satisfy them. Requiring a
+        // second, longer name to decode cleanly closes that off: no single
+        // wrong constant survives both.
+        if (Out.Second.empty()) {
+            std::printf("[autoresolve]   candidate @ 0x%llX matched \"None\" but no second "
+                        "name decoded — rejected as coincidence\n",
+                (unsigned long long)R.Rva);
+            Out.KeystreamWindowRva = 0;
+            Out.EntryZero = 0;
+            continue;
+        }
+        Out.Valid = true;
+
+        std::printf("[autoresolve] FName pipeline @ 0x%llX — pool 0x%llX seed +0x%llX "
+                    "block +0x%llX, keystream window 0x%llX\n",
+            (unsigned long long)R.Rva, (unsigned long long)R.PoolRva,
+            (unsigned long long)R.SeedOff, (unsigned long long)R.BlockBase,
+            (unsigned long long)FoundWin);
+        std::printf("[autoresolve]   %zu-op hash, block mask 0x%llX rol16 %d xor 0x%016llX, "
+                    "FNV add 0x%016llX rol %d/%d\n",
+            R.Hash.size(), (unsigned long long)R.BlockMaskRva, R.BlockRol16,
+            (unsigned long long)R.BlockXor, (unsigned long long)R.FnvAdd,
+            R.FnvRol1, R.FnvRol2);
+        std::printf("[autoresolve]   CI=0 -> \"None\" ✓%s%s\n",
+            Out.Second.empty() ? "" : "  2nd plaintext: ", Out.Second.c_str());
+        return Out;
+    }
+
+    std::printf("[autoresolve] no FName pipeline candidate decoded CI=0 to \"None\" "
+                "(%d extracted, %d with mask, %d resolved CI=0, %d gave length 4)\n",
+        NExtract, NMask, NEntry, NLen);
+    std::vector<std::pair<std::string, int>> Rk(Rejects.begin(), Rejects.end());
+    std::sort(Rk.begin(), Rk.end(), [](const auto& A, const auto& B){ return A.second > B.second; });
+    for (size_t I = 0; I < Rk.size() && I < 6; ++I)
+        std::printf("[autoresolve]   %6d x %s\n", Rk[I].second, Rk[I].first.c_str());
+    return Out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
