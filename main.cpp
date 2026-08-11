@@ -1476,6 +1476,50 @@ public:
         }
         if (Objs.size() < 32) return;
 
+        // Stage 1: ChildProperties and Owner together, with no names involved.
+        // FField::Owner is a tagged back-pointer, so for the right pair the
+        // field's owner IS the object we walked from. Nothing unrelated
+        // reproduces that, which pins ChildProperties far more sharply than
+        // "points somewhere plausible" ever could.
+        uint64_t BestOwner = 0;
+        {
+            int Best = 0;
+            uint64_t BestCpLocal = 0;
+            for (uint64_t Cp = 0x80; Cp <= 0x180; Cp += 8) {
+                std::vector<uint8_t> Fb(0x140);
+                std::vector<std::pair<uint64_t, std::vector<uint8_t>>> Fields;
+                for (size_t I = 0; I < Objs.size() && Fields.size() < 120; ++I) {
+                    uint64_t Fp = 0;
+                    std::memcpy(&Fp, Objs[I].data() + Cp, 8);
+                    if (!Plausible(Fp)) continue;
+                    if (!m_reader.Read(Fp, Fb.data(), Fb.size())) continue;
+                    Fields.push_back({ Seeds[I], Fb });
+                }
+                if (Fields.size() < 16) continue;
+                for (uint64_t Ow = 0x40; Ow <= 0x130; Ow += 8) {
+                    int N = 0;
+                    for (const auto& [Obj, B] : Fields) {
+                        uint64_t V = 0;
+                        std::memcpy(&V, B.data() + Ow, 8);
+                        if ((V & ~1ULL) == Obj) ++N;
+                    }
+                    if (N > Best) { Best = N; BestCpLocal = Cp; BestOwner = Ow; }
+                }
+            }
+            if (Best >= 8) {
+                // Only Owner is taken from this stage. The ChildProperties
+                // offset it happens to pair with is not reported, because the
+                // UField chain at a different offset produces back-pointers
+                // too and would make the number look like a verdict it is not.
+                (void)BestCpLocal;
+                std::printf("[autoresolve] FField::Owner probe: +0x%llX "
+                            "(%d fields point back at their struct)\n",
+                    (unsigned long long)BestOwner, Best);
+            } else {
+                BestOwner = 0;
+            }
+        }
+
         std::vector<std::pair<uint64_t, int>> CpCand;
         for (uint64_t Cp = 0x80; Cp <= 0x180; Cp += 8) {
             int N = 0;
@@ -1565,6 +1609,63 @@ public:
         ArcDecrypt::Offsets::UStruct::ChildProperties = BestCp;
         ArcDecrypt::Offsets::FField::NamePrivate      = BestNm;
         ArcDecrypt::Offsets::FField::NameEncrypted    = BestNm;
+        if (BestOwner) {
+            if (BestOwner != V::FFIELD_OWNER_OFF)
+                std::printf("[autoresolve]   DRIFT FField::Owner 0x%llX vs 0x%llX — adopting\n",
+                    (unsigned long long)BestOwner, (unsigned long long)V::FFIELD_OWNER_OFF);
+            ArcDecrypt::Offsets::FField::Owner = BestOwner;
+        }
+
+        // Stage 3: with ChildProperties and NamePrivate settled, Next is the
+        // offset that turns single fields into the longest chains of distinct
+        // decodable names.
+        uint64_t BestNext = 0; int BestLen = 0, SecondLen = 0;
+        for (uint64_t Nx = 0x40; Nx <= 0x130; Nx += 8) {
+            int Total = 0;
+            for (size_t I = 0; I < Objs.size() && I < 60; ++I) {
+                uint64_t Fp = 0;
+                std::memcpy(&Fp, Objs[I].data() + BestCp, 8);
+                std::set<std::string> Seen;
+                for (int Step = 0; Step < 8 && Plausible(Fp); ++Step) {
+                    uint64_t Enc = 0;
+                    if (!m_reader.Read(Fp + BestNm, &Enc, 8) || !Enc) break;
+                    uint64_t Vv = m_fname.SoftPshuflwPublic(Enc, 0x8D);
+                    Vv = m_fname.Rotl64Public(Vv, 46);
+                    Vv = m_fname.SoftPshuflwPublic(Vv, 0x4B);
+                    Vv = m_fname.Rotl64Public(Vv, 32);
+                    int32_t Ci = (int32_t)(Vv & 0xFFFFFFFFu);
+                    if (Ci <= 0 || Ci > 0x4000000) break;
+                    std::string S = m_fname.DecryptNameString_V811(
+                                        m_fname.ResolveNamePtr_V811(Ci));
+                    if (S.size() < 3 || S.size() > 96) break;
+                    // Only names reached THROUGH Next count. The first field
+                    // decodes no matter what Nx is, so counting it gives every
+                    // candidate the same score and the probe cannot separate
+                    // anything — which is exactly what a tie with the runner-up
+                    // was telling us.
+                    if (Step > 0 && !Seen.insert(S).second) break;
+                    uint64_t Nn = 0;
+                    if (!m_reader.Read(Fp + Nx, &Nn, 8)) break;
+                    Fp = Nn;
+                }
+                Total += (int)Seen.size();
+            }
+            if (Total > BestLen) { SecondLen = BestLen; BestLen = Total; BestNext = Nx; }
+            else if (Total > SecondLen) { SecondLen = Total; }
+        }
+        // An absolute threshold is the wrong instrument here — how many chains
+        // the seed sample happens to contain varies. What matters is that the
+        // winner stands clear of the runner-up; a wrong offset produces almost
+        // nothing, so the margin is large whenever the answer is real.
+        std::printf("[autoresolve] FField::Next probe: +0x%llX (%d chained distinct names, "
+                    "runner-up %d)\n",
+            (unsigned long long)BestNext, BestLen, SecondLen);
+        if (BestNext && BestLen >= 8 && BestLen >= 2 * SecondLen + 4) {
+            if (BestNext != V::FFIELD_NEXT_OFF)
+                std::printf("[autoresolve]   DRIFT FField::Next 0x%llX vs 0x%llX — adopting\n",
+                    (unsigned long long)BestNext, (unsigned long long)V::FFIELD_NEXT_OFF);
+            ArcDecrypt::Offsets::FField::Next = BestNext;
+        }
     }
 
     void ScoreAndAdoptSlotSelector() {
@@ -1900,6 +2001,18 @@ public:
                         else if (Ka)
                             std::printf("[autoresolve]   key init 0x%X matches the compiled sheet\n", Ka);
                         if (Ka) Sh.KeyInitAdd = Ka;
+
+                        uint64_t Bb = AutoResolve::ExtractBoolFieldBase(
+                            m_sigScanner, AutoDiscovery::g_DiscoveredBounds,
+                            Sh.PropOffsetInternal);
+                        if (Bb && Bb != V::FBOOLPROP_FIELDSIZE)
+                            std::printf("[autoresolve]   DRIFT bool bytes extracted 0x%llX "
+                                        "!= compiled 0x%llX\n",
+                                (unsigned long long)Bb,
+                                (unsigned long long)V::FBOOLPROP_FIELDSIZE);
+                        else if (Bb)
+                            std::printf("[autoresolve]   bool bytes match the compiled sheet\n");
+                        if (Bb) Sh.BoolFieldBase = Bb;
                     }
                 }
 

@@ -1582,6 +1582,9 @@ struct LiveSheet {
     // derived from any decode.
     uint32_t KeyInitAdd = v20260811::KEY_INIT_ADD;
 
+    // Base of FieldSize/ByteOffset/ByteMask/FieldMask, from SetBoolSize.
+    uint64_t BoolFieldBase = v20260811::FBOOLPROP_FIELDSIZE;
+
     // Recovered from FProperty::SetupOffset.
     uint64_t PropOffsetInternal = v20260811::FPROP_OFFSETINT_OFF;
     uint32_t PropOffsetXor      = v20260811::FPROP_OFFSET_XOR;
@@ -1613,10 +1616,10 @@ inline void ApplyOffsets811() {
     // FProperty::SetupOffset, and this function runs after that.
     Off::FProperty::Offset_Internal = g_Sheet.PropOffsetInternal;
     Off::FProperty::Offset_XOR      = g_Sheet.PropOffsetXor;
-    Off::FBoolProperty::FieldSize   = V::FBOOLPROP_FIELDSIZE;
-    Off::FBoolProperty::ByteOffset  = V::FBOOLPROP_BYTEOFFSET;
-    Off::FBoolProperty::ByteMask    = V::FBOOLPROP_BYTEMASK;
-    Off::FBoolProperty::FieldMask   = V::FBOOLPROP_FIELDMASK;
+    Off::FBoolProperty::FieldSize   = g_Sheet.BoolFieldBase;
+    Off::FBoolProperty::ByteOffset  = g_Sheet.BoolFieldBase + 1;
+    Off::FBoolProperty::ByteMask    = g_Sheet.BoolFieldBase + 2;
+    Off::FBoolProperty::FieldMask   = g_Sheet.BoolFieldBase + 3;
     Patch20260421::g_PropertyOffsetXor = g_Sheet.PropOffsetXor;
 }
 

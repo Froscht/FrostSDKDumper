@@ -904,6 +904,51 @@ inline SlotScore ScoreNameSlotSelector(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// FBoolProperty's four bytes, from SetBoolSize.
+//
+// The constructor initialises FieldSize/ByteOffset/ByteMask/FieldMask as one
+// dword store of 0x01010000, which is a distinctive enough immediate to anchor
+// on directly. The displacement of that store is the base of the four bytes.
+// ─────────────────────────────────────────────────────────────────────────────
+inline uint64_t ExtractBoolFieldBase(const SigScanV2::Scanner& Scanner,
+                                     const AutoDiscovery::ModuleBounds& Bounds,
+                                     uint64_t PropOffsetInternal)
+{
+    std::unordered_map<uint64_t, int> Votes;
+    for (uint64_t R = Bounds.TextRva; R + 12 <= Bounds.TextEnd(); ++R) {
+        const uint8_t* P = Scanner.GetLocalPtr(R);
+        if (!P) continue;
+        size_t I = ((P[0] & 0xF0) == 0x40) ? 1 : 0;
+        if (P[I] != 0xC7) continue;
+        uint8_t M = P[I + 1];
+        if (((M >> 3) & 7) != 0 || ((M >> 6) & 3) != 2) continue;   // /0, disp32
+        bool HasSib = (M & 7) == 4;
+        if (HasSib && (P[I + 2] & 7) == 4) continue;    // [rsp+...] — a stack buffer
+        size_t Dp = I + 2 + (HasSib ? 1 : 0);
+        uint32_t Disp = 0, Imm = 0;
+        std::memcpy(&Disp, P + Dp, 4);
+        std::memcpy(&Imm,  P + Dp + 4, 4);
+        if (Imm != 0x01010000u) continue;
+
+        // The immediate alone is not distinctive — it also initialises
+        // unrelated structures, and the most common displacement is the wrong
+        // one. FBoolProperty's four bytes sit immediately past the FProperty
+        // base, and Offset_Internal is inside that base, so anchoring the
+        // window on the already-resolved offset picks out exactly one site.
+        if (!PropOffsetInternal) continue;
+        if (Disp <= PropOffsetInternal || Disp - PropOffsetInternal > 0x80) continue;
+
+        ++Votes[Disp];
+    }
+    uint64_t Best = 0; int BestN = 0;
+    for (const auto& [V, N] : Votes) if (N > BestN) { BestN = N; Best = V; }
+    if (Best)
+        std::printf("[autoresolve] FBoolProperty bytes at +0x%llX (%d site%s)\n",
+            (unsigned long long)Best, BestN, BestN == 1 ? "" : "s");
+    return Best;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // KEY_INIT_ADD, from the string-decrypt sites.
 //
 // This one cannot be recovered by decoding alone: only its value mod 64

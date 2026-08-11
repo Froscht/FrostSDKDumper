@@ -195,10 +195,38 @@ KEY_INIT_ADD     exact  0x7216, 154 votes across 116 table-load sites. It
                        that — so it is read out of the string-decrypt sites,
                        found via a rip-LEA whose target sits just below the
                        resolved keystream window
-FField layout    exact  ChildProperties +0x100 and NamePrivate +0x70, probed
-                       against the live object graph after the array is up
+FField layout    exact  ChildProperties +0x100, NamePrivate +0x70 and
+                       Owner +0xA0, probed against the live object graph
+                       after the array is up
+FBoolProperty    exact  the four bytes at +0x120, from the 0x01010000 store
+                       in SetBoolSize
+FField::Next     reported, NOT adopted — see below
 chunks_manager   exact  anchored on the FUObjectItem stride-20 idiom
 ```
+
+**Owner is the sharpest FField test and needs no names at all.** It is a
+tagged back-pointer, so for the right offset the field's owner IS the object
+walked from: `(value & ~1) == obj` holds for 102 of the sampled fields and
+for nothing else. Prefer it over name-based scoring wherever it applies.
+
+**FField::Next is found but deliberately not adopted.** The probe picks
++0x80 correctly, but ties with its runner-up (14 chained names each), so the
+margin test refuses to overwrite. Two mistakes led there and are worth not
+repeating: an absolute score threshold is the wrong instrument, because how
+many chains the seed sample contains varies run to run; and counting the
+first field's name gives every candidate the same score, since that name
+decodes regardless of Next — only names reached *through* Next separate
+anything. Even corrected, the sample is too thin to be decisive here.
+Reporting without adopting is the right end state: the value is in the log
+for a human, and a weak signal never overwrites a working offset.
+
+**FBoolProperty cannot be anchored on its immediate alone.** The 0x01010000
+store also initialises unrelated structures, and the most common
+displacement is the wrong one (+0xB0, four sites, all vector inits). Nor
+does a byte store follow it, contrary to what the CL-1325322 notes imply.
+What does isolate it: skip `[rsp+...]` forms, then keep only displacements
+just past the already-resolved `Offset_Internal` — FBoolProperty's bytes sit
+immediately after the FProperty base. That leaves exactly one site.
 
 **The FField probe is the one place where the weak-filter trap bites for
 real.** Scoring candidates by "how many decode to a printable name" gave a
