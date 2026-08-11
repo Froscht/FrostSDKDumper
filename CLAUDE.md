@@ -139,6 +139,52 @@ All 105 rip constants sit in one block at `.rdata 0xB47C3C0..0xB47CB4F`.
 `vt#24 slot6 (0x4BDEC0)` is encrypted at rest; reconstruct it by inverting its
 partner `0x4B1150` rather than reading it.
 
+### Patch-day automation (auto_resolve.h, added 2026-08-11)
+Phase 6.5, advisory. Relocates and re-extracts the two pieces that cost the
+most manual reversing, then prints them against the compiled sheet so drift
+is visible the moment a patch lands. On build 24653108 it recovers
+**11/11 GetFName constants and the chunks_manager global exactly**, with no
+hardcoded RVA on either path.
+
+Three invariants Theia has never moved carry the whole thing:
+```
+FNV-32 prime 0x1000193      locates every slot accessor and the shard hash
+FUObjectItem stride 20      locates the object-array access routine
+CompIndex 0 == "None"       validates the whole FName pipeline
+```
+
+- **Slot accessors**: scan .text for `imul r32,r32,0x1000193` (the immediate
+  sits 2 bytes after the 0x69 opcode either way, so scan the immediate and
+  check backwards). 12468 functions carry 4+ of them, so prefilter on a
+  `pshufb xmm,[rip]` within the first 256 bytes before decoding — that cuts
+  to 222 and is what makes the pass affordable. **Do not cap the candidate
+  list instead**: the real GetFName sat past a 2000-entry cap on this build,
+  which produced "0 Name copies" and looked like a missing feature.
+- **Classify by role before taking consensus.** Class / Outer / Name share
+  one FNV chain and differ only in the slot adjustment (`S&3`, `(S+1)&3`,
+  `(S&3)^2`). 194 / 19 / 9 copies of each here. Averaging over all of them
+  yields a slot xor of 0 and a wrong final rotate, because only the Name
+  copies carry those. The role split also hands you the Class/Outer slot
+  offsets for free.
+- **Theia's clones are free redundancy.** Take the per-field majority across
+  copies rather than trusting whichever is found first; all 9 Name copies
+  agreed on every value here. The RVA is deliberately not compared — which
+  clone is found first carries no information.
+- **chunks_manager**: the 20-byte FUObjectItem stride forces a distinctive
+  index computation (`lea r,[r+r*4]` with index==base and scale 4, then
+  `shl r32,2`). 734 such sites; take the containing function and the first
+  rip-relative SIMD load from .data. 377 of them vote for 0xE64B260 and
+  nothing else comes close. Validate by decrypting and checking the vtable
+  lands in-module and its slot-6 thunk in .text.
+
+The structural slot validator in `ScoreNameSlotSelector` exists for the bug
+class that is otherwise silent: the name slot is identifiable *without* the
+hash, because a decrypted name has CompIndex in the high dword and Number
+(almost always 0) in the low dword, while pointer slots fill the low dword
+and leave the high clear. Objects with exactly one such slot are ground
+truth to score any candidate hash against. A wrong hash still returns a
+plausible number and still picks *a* slot — it just picks the wrong one.
+
 ### Anchors that survived this patch
 The AngelScript binding signature strings and the CoreUObject source-path
 assert strings both still work and remain the fastest route to any

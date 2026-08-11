@@ -58,6 +58,7 @@
 #include "gobjects.h"
 #include "fname_decrypt.h"
 using FNameDecryptor = FName::FNameDecryptor;
+#include "auto_resolve.h"
 #include "auto_offsets.h"
 #include "auto_export.h"
 #include "config_loader.h"
@@ -1614,6 +1615,72 @@ public:
             // older sig-scan-derived constants irrelevant instead of fighting
             // them. Both anchors are pinned by decoding "None"/"ByteProperty",
             // so a successful adopt is ground truth, not a heuristic.
+            // Patch-day automation: relocate and re-extract the two pieces
+            // that cost the most manual reversing, using the invariants Theia
+            // has never moved. Purely advisory this run — it prints what it
+            // finds next to the compile-time values so drift is visible the
+            // moment a patch lands, without risking a working pipeline.
+            {
+                std::printf("\n=== Phase 6.5: auto-resolve (advisory) ===\n");
+                auto Gf = AutoResolve::FindGetFName(m_sigScanner,
+                                                    AutoDiscovery::g_DiscoveredBounds);
+                if (Gf.Valid) {
+                    namespace V = ArcDecrypt::v20260811;
+                    // The RVA is deliberately not compared: Theia ships many
+                    // identical copies and which one is found first carries no
+                    // information. Only the extracted constants matter.
+                    struct { const char* Name; unsigned long long Got, Want; } Cmp[] = {
+                        { "add",        Gf.Add,            V::UOBJ_SLOT_HASH_ADD      },
+                        { "rol",        (unsigned)Gf.Rol,  (unsigned)V::UOBJ_SLOT_HASH_ROL },
+                        { "shiftA",     (unsigned)Gf.ShiftA, (unsigned)V::UOBJ_SLOT_SHIFT_A },
+                        { "shiftB",     (unsigned)Gf.ShiftB, (unsigned)V::UOBJ_SLOT_SHIFT_B },
+                        { "shiftC",     (unsigned)Gf.ShiftC, (unsigned)V::UOBJ_SLOT_SHIFT_C },
+                        { "slot xor",   Gf.SlotXor,        V::UOBJ_SLOT_NAME_XOR      },
+                        { "slot base",  Gf.SlotBase,       V::UOBJ_NAME_SLOT_BASE     },
+                        { "pshufb",     Gf.PshufbMaskRva,  V::UOBJ_NAME_PSHUFB_RVA    },
+                        { "rol16",      (unsigned)Gf.Rol16, (unsigned)V::UOBJ_NAME_ROL16 },
+                        { "xor64",      Gf.Xor64,          V::UOBJ_NAME_XOR           },
+                        { "final rol",  (unsigned)Gf.FinalRol64, (unsigned)V::UOBJ_NAME_ROL64 },
+                    };
+                    int Agree = 0;
+                    for (const auto& C : Cmp) {
+                        if (C.Got == C.Want) { ++Agree; continue; }
+                        std::printf("[autoresolve]   DRIFT %-10s extracted 0x%llX != compiled 0x%llX\n",
+                            C.Name, C.Got, C.Want);
+                    }
+                    std::printf("[autoresolve] GetFName: %d/%d values match the compiled sheet\n",
+                        Agree, (int)(sizeof(Cmp) / sizeof(Cmp[0])));
+                }
+
+                auto Mg = AutoResolve::FindChunkMgrGlobal(
+                    m_sigScanner, AutoDiscovery::g_DiscoveredBounds,
+                    [this](uint64_t Rva) -> bool {
+                        namespace V = ArcDecrypt::v20260811;
+                        uint8_t Enc[16] = {};
+                        if (!m_reader.Read(MODULE_BASE + Rva, Enc, 16)) return false;
+                        uint64_t Lo = 0;
+                        std::memcpy(&Lo, Enc, 8);
+                        uint64_t Mgr = AutoDiscovery::V811Detail::DecodePointer(Lo);
+                        if (Mgr < 0x10000ULL || Mgr >= 0x800000000000ULL) return false;
+                        uint64_t Vt = 0, Thunk = 0;
+                        if (!m_reader.Read(Mgr + V::MGR_VTABLE_OFF, &Vt, 8)) return false;
+                        uint64_t VtRva = Vt - MODULE_BASE;
+                        if (Vt < MODULE_BASE || VtRva >= AutoDiscovery::g_DiscoveredBounds.ImageSize)
+                            return false;
+                        if (!m_reader.Read(Vt + 8ULL * V::MGR_VTABLE_SLOT, &Thunk, 8)) return false;
+                        uint64_t TRva = Thunk - MODULE_BASE;
+                        return Thunk > MODULE_BASE &&
+                               TRva >= AutoDiscovery::g_DiscoveredBounds.TextRva &&
+                               TRva <  AutoDiscovery::g_DiscoveredBounds.TextEnd();
+                    });
+                if (Mg.Valid && Mg.GlobalRva != ArcDecrypt::v20260811::RVA_CHUNKMGR_GLOBAL)
+                    std::printf("[autoresolve]   DRIFT chunks_manager 0x%llX != compiled 0x%llX\n",
+                        (unsigned long long)Mg.GlobalRva,
+                        (unsigned long long)ArcDecrypt::v20260811::RVA_CHUNKMGR_GLOBAL);
+                else if (Mg.Valid)
+                    std::printf("[autoresolve] chunks_manager matches the compiled sheet\n");
+            }
+
             {
                 // Phase 6.6 runs first: its anchors are fixed RVAs validated
                 // by plaintext rather than sig-scan results, so a successful
