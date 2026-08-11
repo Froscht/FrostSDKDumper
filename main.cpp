@@ -1132,6 +1132,7 @@ public:
                 std::printf("[v811] re-asserted FField layout after auto_offsets\n");
 
                 ScoreAndAdoptSlotSelector();
+                ProbeAndAdoptFFieldLayout();
 
                 // The pre-object-array GWorld phase can only pattern-match and
                 // its compile-time RVA is stale every patch. Now that the
@@ -1446,6 +1447,126 @@ public:
     // rate that looks mediocre rather than broken.
     AutoResolve::GetFNameInfo m_resolvedGetFName;
 
+    // Probe ChildProperties and FField::NamePrivate against ground truth.
+    //
+    // These were never findable by the generic probes, because scoring a
+    // candidate needs a working FField name decode — the very thing they were
+    // trying to discover. That is no longer true: the object array and the
+    // FName pipeline are both up by the time this runs, so a candidate can
+    // simply be asked to produce real names and counted.
+    //
+    // Two stages, because the naive sweep is far too many reads: narrow
+    // ChildProperties first on the cheap test that it points somewhere
+    // plausible, then only sweep NamePrivate for the survivors.
+    void ProbeAndAdoptFFieldLayout() {
+        const auto& Seeds = m_gobj.GetSeedObjects();
+        if (Seeds.size() < 64) {
+            std::printf("[autoresolve] too few seed objects for the FField probe\n");
+            return;
+        }
+        auto Plausible = [](uint64_t P) {
+            return P >= 0x10000ULL && P < 0x800000000000ULL && (P & 7) == 0;
+        };
+
+        std::vector<std::vector<uint8_t>> Objs;
+        for (uint64_t O : Seeds) {
+            if (Objs.size() >= 300) break;
+            std::vector<uint8_t> B(0x200);
+            if (m_reader.Read(O, B.data(), B.size())) Objs.push_back(std::move(B));
+        }
+        if (Objs.size() < 32) return;
+
+        std::vector<std::pair<uint64_t, int>> CpCand;
+        for (uint64_t Cp = 0x80; Cp <= 0x180; Cp += 8) {
+            int N = 0;
+            for (const auto& B : Objs) {
+                uint64_t P = 0;
+                std::memcpy(&P, B.data() + Cp, 8);
+                if (Plausible(P)) ++N;
+            }
+            if (N >= (int)Objs.size() / 8) CpCand.push_back({ Cp, N });
+        }
+        std::sort(CpCand.begin(), CpCand.end(),
+            [](const auto& A, const auto& B) { return A.second > B.second; });
+        if (CpCand.size() > 6) CpCand.resize(6);
+
+        uint64_t BestCp = 0, BestNm = 0;
+        int BestHits = 0, BestChains = 0, BestDistinct = 0;
+        for (const auto& [Cp, _] : CpCand) {
+            for (uint64_t Nm = 0x40; Nm <= 0x100; Nm += 8) {
+                // Counting decodable names is far too weak a filter — a wrong
+                // pair scored 80/80 and, once adopted, cut the property count
+                // from 281k to 7k. Score DISTINCT names instead, and demand a
+                // walkable chain whose Offset_Internal values ascend. Both are
+                // properties no unrelated pointer chain reproduces.
+                std::set<std::string> Distinct;
+                int Chains = 0, Tried = 0;
+                for (const auto& B : Objs) {
+                    if (Tried >= 80) break;
+                    uint64_t Fp = 0;
+                    std::memcpy(&Fp, B.data() + Cp, 8);
+                    if (!Plausible(Fp)) continue;
+                    ++Tried;
+
+                    int Good = 0;
+                    uint32_t PrevOff = 0;
+                    bool Ascending = true;
+                    for (int Step = 0; Step < 6 && Plausible(Fp); ++Step) {
+                        uint64_t Enc = 0;
+                        if (!m_reader.Read(Fp + Nm, &Enc, 8) || !Enc) break;
+                        uint64_t Vv = m_fname.SoftPshuflwPublic(Enc, 0x8D);
+                        Vv = m_fname.Rotl64Public(Vv, 46);
+                        Vv = m_fname.SoftPshuflwPublic(Vv, 0x4B);
+                        Vv = m_fname.Rotl64Public(Vv, 32);
+                        int32_t Ci = (int32_t)(Vv & 0xFFFFFFFFu);
+                        if (Ci <= 0 || Ci > 0x4000000) break;
+                        std::string S = m_fname.DecryptNameString_V811(
+                                            m_fname.ResolveNamePtr_V811(Ci));
+                        if (S.size() < 3 || S.size() > 96) break;
+                        bool Clean = true;
+                        for (unsigned char C : S)
+                            if (!std::isalnum(C) && C != '_') { Clean = false; break; }
+                        if (!Clean) break;
+                        Distinct.insert(S);
+                        ++Good;
+
+                        uint32_t Stored = 0;
+                        if (m_reader.Read(Fp + ArcDecrypt::g_Sheet.PropOffsetInternal, &Stored, 4)) {
+                            uint32_t Real = __builtin_bswap32(Stored) ^ ArcDecrypt::g_Sheet.PropOffsetXor;
+                            if (Real > 0x20000) Ascending = false;
+                            else if (Step && Real < PrevOff) Ascending = false;
+                            PrevOff = Real;
+                        }
+                        uint64_t Nx = 0;
+                        if (!m_reader.Read(Fp + ArcDecrypt::Offsets::FField::Next, &Nx, 8)) break;
+                        Fp = Nx;
+                    }
+                    if (Good >= 3 && Ascending) ++Chains;
+                }
+                int Score = Chains * 100 + (int)Distinct.size();
+                if (Score > BestHits) { BestHits = Score; BestCp = Cp; BestNm = Nm;
+                                        BestChains = Chains; BestDistinct = (int)Distinct.size(); }
+            }
+        }
+
+        namespace V = ArcDecrypt::v20260811;
+        std::printf("[autoresolve] FField probe: best ChildProperties +0x%llX, "
+                    "NamePrivate +0x%llX (%d valid chains, %d distinct names)\n",
+            (unsigned long long)BestCp, (unsigned long long)BestNm, BestChains, BestDistinct);
+        if (BestChains < 10 || BestDistinct < 20) {
+            std::printf("[autoresolve] FField probe inconclusive — keeping compiled offsets\n");
+            return;
+        }
+        if (BestCp != V::USTRUCT_CHILDPROPS || BestNm != V::FFIELD_NAME_OFF)
+            std::printf("[autoresolve]   DRIFT ChildProperties 0x%llX vs 0x%llX, "
+                        "NamePrivate 0x%llX vs 0x%llX — adopting the probed pair\n",
+                (unsigned long long)BestCp, (unsigned long long)V::USTRUCT_CHILDPROPS,
+                (unsigned long long)BestNm, (unsigned long long)V::FFIELD_NAME_OFF);
+        ArcDecrypt::Offsets::UStruct::ChildProperties = BestCp;
+        ArcDecrypt::Offsets::FField::NamePrivate      = BestNm;
+        ArcDecrypt::Offsets::FField::NameEncrypted    = BestNm;
+    }
+
     void ScoreAndAdoptSlotSelector() {
         const auto& Seeds = m_gobj.GetSeedObjects();
         if (Seeds.size() < 64) {
@@ -1727,7 +1848,7 @@ public:
                     auto Fp = AutoResolve::ResolveFNamePipeline(
                         m_sigScanner, AutoDiscovery::g_DiscoveredBounds, MODULE_BASE,
                         [this](uint64_t A, void* B, size_t N) { return m_reader.Read(A, B, N); },
-                        V::KEY_INIT_ADD, V::NARROW_KEY_SHIFT);
+                        ArcDecrypt::g_Sheet.KeyInitAdd, V::NARROW_KEY_SHIFT);
                     if (Fp.Valid) {
                         struct { const char* Name; unsigned long long Got, Want; } C2[] = {
                             { "pool",       Fp.Res.PoolRva,     V::RVA_GNAMEPOOL          },
@@ -1768,6 +1889,17 @@ public:
                             std::memcpy(Sh.BlockPshufb, Bm, 8);
                         Sh.Resolved = true;
                         std::printf("[autoresolve] FName pipeline adopted into the live sheet\n");
+
+                        uint32_t Ka = AutoResolve::ExtractKeyInitAdd(
+                            m_sigScanner, AutoDiscovery::g_DiscoveredBounds,
+                            Fp.KeystreamWindowRva);
+                        if (Ka && (Ka & 0x3F) != (V::KEY_INIT_ADD & 0x3F))
+                            std::printf("[autoresolve]   DRIFT key init  extracted 0x%X "
+                                        "(mod 64 = %u) != compiled 0x%X (mod 64 = %u)\n",
+                                Ka, Ka & 0x3F, V::KEY_INIT_ADD, V::KEY_INIT_ADD & 0x3F);
+                        else if (Ka)
+                            std::printf("[autoresolve]   key init 0x%X matches the compiled sheet\n", Ka);
+                        if (Ka) Sh.KeyInitAdd = Ka;
                     }
                 }
 

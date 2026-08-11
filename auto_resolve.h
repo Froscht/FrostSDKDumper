@@ -904,6 +904,67 @@ inline SlotScore ScoreNameSlotSelector(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// KEY_INIT_ADD, from the string-decrypt sites.
+//
+// This one cannot be recovered by decoding alone: only its value mod 64
+// matters, and that is already absorbed into the keystream window the sweep
+// finds. It has to be read out of the code.
+//
+// The window gives a way in. The decrypt sites reach the table as
+// `word [table + idx*2 + disp]` after a `lea r64,[rip+table]`, and
+// table + disp == window. So find a rip-LEA whose target sits just below the
+// window, then take the large add-immediate in the same function — that is
+// `Key = Length + KEY_INIT_ADD`.
+// ─────────────────────────────────────────────────────────────────────────────
+inline uint32_t ExtractKeyInitAdd(const SigScanV2::Scanner& Scanner,
+                                  const AutoDiscovery::ModuleBounds& Bounds,
+                                  uint64_t WindowRva)
+{
+    if (!WindowRva) return 0;
+    std::unordered_map<uint32_t, int> Votes;
+    int Sites = 0;
+
+    for (uint64_t R = Bounds.TextRva; R + 7 <= Bounds.TextEnd(); ++R) {
+        const uint8_t* P = Scanner.GetLocalPtr(R);
+        if (!P) continue;
+        if ((P[0] & 0xF8) != 0x48 || P[1] != 0x8D) continue;
+        if ((P[2] & 0xC7) != 0x05) continue;                  // mod=00, rm=101 => rip-relative
+        int32_t Disp = 0;
+        std::memcpy(&Disp, P + 3, 4);
+        uint64_t T = R + 7 + (uint64_t)(int64_t)Disp;
+        if (T >= WindowRva || WindowRva - T > 0x400) continue; // table sits just below the window
+
+        ++Sites;
+        // The key init is a large add-immediate on a 32-bit register, within
+        // reach of the table load in either direction.
+        for (int K = -0x120; K < 0x120; ++K) {
+            const uint8_t* B = Scanner.GetLocalPtr(R + (uint64_t)(int64_t)K);
+            if (!B) continue;
+            size_t I = ((B[0] & 0xF0) == 0x40) ? 1 : 0;
+            uint32_t Imm = 0;
+            if (B[I] == 0x05) {                                // add eax, imm32
+                std::memcpy(&Imm, B + I + 1, 4);
+            } else if (B[I] == 0x81 && ((B[I + 1] >> 3) & 7) == 0 &&
+                       (B[I + 1] & 0xC0) == 0xC0) {            // add r32, imm32
+                std::memcpy(&Imm, B + I + 2, 4);
+            } else if (B[I] == 0x8D && ((B[I + 1] >> 6) & 3) == 2 &&
+                       (B[I + 1] & 7) != 4 && (B[I + 1] & 7) != 5) {
+                std::memcpy(&Imm, B + I + 2, 4);               // lea r32,[reg+imm32]
+            } else {
+                continue;
+            }
+            if (Imm >= 0x100 && Imm < 0x10000) ++Votes[Imm];
+        }
+    }
+
+    uint32_t Best = 0; int BestN = 0;
+    for (const auto& [V, N] : Votes) if (N > BestN) { BestN = N; Best = V; }
+    std::printf("[autoresolve] KEY_INIT_ADD: %d table-load sites, best 0x%X (%d votes)\n",
+        Sites, Best, BestN);
+    return Best;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // FProperty layout, from FProperty::SetupOffset.
 //
 // One function gives up four values at once, which is why it is worth

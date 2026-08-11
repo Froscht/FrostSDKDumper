@@ -1577,6 +1577,11 @@ struct LiveSheet {
     int      FnvRol1  = v20260811::FNV_ROL1;
     int      FnvRol2  = v20260811::FNV_ROL2;
 
+    // Only its value mod 64 matters, and the keystream sweep already absorbs
+    // that, so this is read out of the string-decrypt sites rather than
+    // derived from any decode.
+    uint32_t KeyInitAdd = v20260811::KEY_INIT_ADD;
+
     // Recovered from FProperty::SetupOffset.
     uint64_t PropOffsetInternal = v20260811::FPROP_OFFSETINT_OFF;
     uint32_t PropOffsetXor      = v20260811::FPROP_OFFSET_XOR;

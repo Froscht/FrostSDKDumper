@@ -1822,6 +1822,9 @@ public:
     // Straight transcription of sub_1402319F0 → sub_14023B120 → sub_14023AAE0.
     // The CI SIMD chain across those three frames cancels to identity, so the
     // raw CompIndex feeds the offset split directly.
+    uint64_t SoftPshuflwPublic(uint64_t V, int Imm) const { return SoftPshuflw(V, Imm); }
+    uint64_t Rotl64Public(uint64_t V, int N) const { return fn_rotl64(V, N); }
+
     uint64_t ResolveNamePtr_V811(int32_t CompIndex) const {
         namespace V = ArcDecrypt::v20260811;
         namespace X = AutoDiscovery::V811Detail;
@@ -1959,7 +1962,7 @@ public:
         if (!m_reader.Read(NameEntryPtr + 2, Buf.data(), ByteCount)) return {};
 
         // One cyclic sequence, +1 per element. No pairing, no LCG.
-        uint32_t Key = static_cast<uint32_t>(Length) + V::KEY_INIT_ADD;
+        uint32_t Key = static_cast<uint32_t>(Length) + ArcDecrypt::g_Sheet.KeyInitAdd;
         auto Slot = [&](uint32_t K) -> uint16_t {
             return m_keyTable811[(K & V::KEY_INDEX_MASK) + m_ks811Base];
         };

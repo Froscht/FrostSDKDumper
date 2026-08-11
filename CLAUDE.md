@@ -189,8 +189,26 @@ FProperty        4/4    Offset_Internal +0xC4 and its XOR, ClassCastFlags
                        FProperty::SetupOffset, anchored on `xor r32,imm32 ;
                        bswap r32`, the Offset_Internal encoding, which
                        appears essentially nowhere else
+KEY_INIT_ADD     exact  0x7216, 154 votes across 116 table-load sites. It
+                       cannot be derived from decoding — only its value mod
+                       64 matters and the keystream sweep already absorbs
+                       that — so it is read out of the string-decrypt sites,
+                       found via a rip-LEA whose target sits just below the
+                       resolved keystream window
+FField layout    exact  ChildProperties +0x100 and NamePrivate +0x70, probed
+                       against the live object graph after the array is up
 chunks_manager   exact  anchored on the FUObjectItem stride-20 idiom
 ```
+
+**The FField probe is the one place where the weak-filter trap bites for
+real.** Scoring candidates by "how many decode to a printable name" gave a
+confident 80/80 for the wrong pair (+0x150 / +0xD8); adopting it cut the
+property count from 281k to 7k. The fix is the rule already written in this
+file — score DISTINCT names, never hit count — plus a chain walk that
+requires at least three linked fields whose `Offset_Internal` values ascend.
+With both, the correct pair wins with 18 valid chains and 136 distinct
+names and the wrong one scores nothing. Do not weaken this back to a
+per-field test.
 `ReadClassCastFlags` was gated on `IsV808Active()` alone, so the metaclass
 oracle was silently off on this patch — `GetClassPtrAuto` resolved fine and
 the function returned 0 before ever reading the flags. With it on, the
@@ -217,6 +235,9 @@ the chunks_manager global is adopted in Phase 6.5 straight away because its
 validator already decrypted it and checked the vtable/thunk, while the slot
 values are only *staged* there — they cannot be judged until objects exist.
 Phase 7.5 scores them and swaps them in only if they beat what is loaded.
+
+**Self-healing is verified on every area.** FField offsets sabotaged to
+0x148 / 0xB8 are probed back to 0x100 / 0x70 and adopted.
 
 **Self-healing is verified on all three areas.** Sabotaging the property
 offsets (`PropOffsetInternal` -> 0x99, `PropOffsetXor` -> 0x11223344,
