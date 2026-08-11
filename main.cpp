@@ -1771,6 +1771,35 @@ public:
                     }
                 }
 
+                {
+                    namespace V = ArcDecrypt::v20260811;
+                    auto Pl = AutoResolve::ExtractPropertyLayout(
+                        m_sigScanner, AutoDiscovery::g_DiscoveredBounds);
+                    if (Pl.Valid) {
+                        struct { const char* Name; unsigned long long Got, Want; } C3[] = {
+                            { "offset",     Pl.OffsetInternal, V::FPROP_OFFSETINT_OFF    },
+                            { "offset xor", Pl.OffsetXor,      V::FPROP_OFFSET_XOR       },
+                            { "cast flags", Pl.CastFlagsOff,   V::UCLASS_CASTFLAGS_OFF   },
+                            { "prop size",  Pl.PropSizeOff,    V::USTRUCT_PROPSIZE_OFF   },
+                        };
+                        int A3 = 0;
+                        for (const auto& C : C3) {
+                            if (C.Got == C.Want) { ++A3; continue; }
+                            std::printf("[autoresolve]   DRIFT %-10s extracted 0x%llX != compiled 0x%llX\n",
+                                C.Name, C.Got, C.Want);
+                        }
+                        std::printf("[autoresolve] FProperty: %d/%d values match the compiled sheet\n",
+                            A3, (int)(sizeof(C3) / sizeof(C3[0])));
+
+                        auto& Sh = ArcDecrypt::g_Sheet;
+                        Sh.PropOffsetInternal = Pl.OffsetInternal;
+                        Sh.PropOffsetXor      = Pl.OffsetXor;
+                        if (Pl.CastFlagsOff) Sh.ClassCastFlagsOff = Pl.CastFlagsOff;
+                        if (Pl.PropSizeOff)  Sh.StructPropSizeOff = Pl.PropSizeOff;
+                        std::printf("[autoresolve] FProperty layout adopted into the live sheet\n");
+                    }
+                }
+
                 auto Mg = AutoResolve::FindChunkMgrGlobal(
                     m_sigScanner, AutoDiscovery::g_DiscoveredBounds,
                     [this](uint64_t Rva) -> bool {

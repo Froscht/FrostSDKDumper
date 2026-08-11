@@ -27,6 +27,7 @@
 #include <functional>
 #include <cctype>
 #include <cstdlib>
+#include <type_traits>
 
 #include "sig_scanner_v2.h"
 #include "insn_decoder.h"
@@ -900,6 +901,138 @@ inline SlotScore ScoreNameSlotSelector(
     if (S.Samples) S.Rate = (double)S.Agree / (double)S.Samples;
     S.Confident = S.Samples >= 50 && S.Rate >= 0.95;
     return S;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FProperty layout, from FProperty::SetupOffset.
+//
+// One function gives up four values at once, which is why it is worth
+// anchoring on rather than probing the offsets individually:
+//
+//   test  byte [cls + CastFlagsOff], 8      ; ClassCastFlags & CASTCLASS_UStruct
+//   mov   dword [prop + OffsetOff], enc(0)
+//   mov   ecx,  dword [owner + PropSizeOff] ; UStruct::PropertiesSize
+//   xor   eax,  KEY
+//   bswap eax
+//   mov   dword [prop + OffsetOff], eax     ; Offset_Internal
+//
+// The `xor r32,imm32 ; bswap r32` pair is the anchor: it is the encoding of
+// Offset_Internal and appears essentially nowhere else. Take consensus across
+// every site — a single mis-decode then cannot decide anything.
+// ─────────────────────────────────────────────────────────────────────────────
+struct PropertyLayoutInfo {
+    bool     Valid          = false;
+    uint32_t OffsetXor      = 0;
+    uint64_t OffsetInternal = 0;
+    uint64_t CastFlagsOff   = 0;
+    uint64_t PropSizeOff    = 0;
+    int      Sites          = 0;
+    int      XorVotes       = 0;
+};
+
+namespace Detail {
+
+// `mov [reg + disp8/32], r32` (89 /r). Returns the displacement.
+inline bool ReadMovStoreDisp(const uint8_t* P, size_t Max, uint64_t& Out, size_t& Len) {
+    if (Max < 3) return false;
+    size_t I = ((P[0] & 0xF0) == 0x40) ? 1 : 0;
+    if (P[I] != 0x89) return false;
+    uint8_t M = P[I + 1];
+    uint8_t Mod = (M >> 6) & 3, Rm = M & 7;
+    if (Mod == 3) return false;                  // register destination
+    size_t Dp = I + 2;
+    if (Rm == 4) ++Dp;                           // SIB
+    if (Mod == 1) { Out = P[Dp]; Len = Dp + 1; return true; }
+    if (Mod == 2) { uint32_t V; std::memcpy(&V, P + Dp, 4); Out = V; Len = Dp + 4; return true; }
+    return false;
+}
+
+// `test byte [reg + disp8/32], imm8` (F6 /0 ib).
+inline bool ReadTestByteDisp(const uint8_t* P, size_t Max, uint64_t& Out, uint8_t& Imm) {
+    if (Max < 4) return false;
+    size_t I = ((P[0] & 0xF0) == 0x40) ? 1 : 0;
+    if (P[I] != 0xF6) return false;
+    uint8_t M = P[I + 1];
+    if (((M >> 3) & 7) != 0) return false;
+    uint8_t Mod = (M >> 6) & 3, Rm = M & 7;
+    if (Mod == 3 || Mod == 0) return false;
+    size_t Dp = I + 2;
+    if (Rm == 4) ++Dp;
+    if (Mod == 1) { Out = P[Dp]; Imm = P[Dp + 1]; return true; }
+    uint32_t V; std::memcpy(&V, P + Dp, 4); Out = V; Imm = P[Dp + 4];
+    return true;
+}
+
+} // namespace Detail
+
+inline PropertyLayoutInfo ExtractPropertyLayout(const SigScanV2::Scanner& Scanner,
+                                                const AutoDiscovery::ModuleBounds& Bounds)
+{
+    PropertyLayoutInfo Out;
+    if (!Bounds.Valid || !Bounds.TextSize) return Out;
+
+    std::unordered_map<uint32_t, int> XorVotes;
+    std::unordered_map<uint64_t, int> OffVotes, FlagVotes, SizeVotes;
+
+    for (uint64_t R = Bounds.TextRva; R + 16 <= Bounds.TextEnd(); ++R) {
+        const uint8_t* P = Scanner.GetLocalPtr(R);
+        if (!P) continue;
+        if (P[0] != 0x35 || P[5] != 0x0F || P[6] != 0xC8) continue;   // xor eax,imm32 ; bswap eax
+
+        uint32_t Key = 0;
+        std::memcpy(&Key, P + 1, 4);
+        if (!Key) continue;
+
+        // The store that follows carries Offset_Internal's displacement.
+        uint64_t Disp = 0; size_t Len = 0;
+        const uint8_t* Q = Scanner.GetLocalPtr(R + 7);
+        if (!Q || !Detail::ReadMovStoreDisp(Q, 16, Disp, Len)) continue;
+        if (Disp < 0x40 || Disp > 0x400) continue;
+
+        ++Out.Sites;
+        ++XorVotes[Key];
+        ++OffVotes[Disp];
+
+        // Look back for the cast-flag test and the PropertiesSize load.
+        for (int K = 8; K < 160; ++K) {
+            const uint8_t* B = Scanner.GetLocalPtr(R - (uint64_t)K);
+            if (!B) break;
+            uint64_t D2 = 0; uint8_t Imm = 0;
+            if (Detail::ReadTestByteDisp(B, 8, D2, Imm) && Imm == 8 &&
+                D2 >= 0x100 && D2 <= 0x400)
+                ++FlagVotes[D2];
+        }
+        for (int K = 1; K < 40; ++K) {
+            const uint8_t* B = Scanner.GetLocalPtr(R - (uint64_t)K);
+            if (!B) break;
+            size_t I = ((B[0] & 0xF0) == 0x40) ? 1 : 0;
+            if (B[I] != 0x8B) continue;                    // mov r32, [reg+disp]
+            uint8_t M = B[I + 1];
+            if (((M >> 6) & 3) != 2) continue;             // disp32 form
+            uint32_t V; std::memcpy(&V, B + I + 2 + ((M & 7) == 4 ? 1 : 0), 4);
+            if (V >= 0x80 && V <= 0x400) ++SizeVotes[V];
+        }
+    }
+
+    auto Top = [](const auto& M) {
+        typename std::decay<decltype(M)>::type::key_type BestK{};
+        int BestN = 0;
+        for (const auto& [K, N] : M) if (N > BestN) { BestN = N; BestK = K; }
+        return std::pair<decltype(BestK), int>{ BestK, BestN };
+    };
+
+    if (Out.Sites < 2) return Out;
+    auto XK = Top(XorVotes);   Out.OffsetXor      = XK.first;  Out.XorVotes = XK.second;
+    auto OK = Top(OffVotes);   Out.OffsetInternal = OK.first;
+    auto FK = Top(FlagVotes);  Out.CastFlagsOff   = FK.first;
+    auto SK = Top(SizeVotes);  Out.PropSizeOff    = SK.first;
+    Out.Valid = Out.OffsetXor && Out.OffsetInternal;
+
+    std::printf("[autoresolve] FProperty layout: %d encode sites — offset +0x%llX "
+                "xor 0x%08X (%d votes), cast flags +0x%llX, PropertiesSize +0x%llX\n",
+        Out.Sites, (unsigned long long)Out.OffsetInternal, Out.OffsetXor, Out.XorVotes,
+        (unsigned long long)Out.CastFlagsOff, (unsigned long long)Out.PropSizeOff);
+    return Out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

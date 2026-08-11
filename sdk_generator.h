@@ -1868,10 +1868,15 @@ public:
     static constexpr uint64_t kClassCastFlagsOff = 0x120ULL;
 
     uint64_t ReadClassCastFlags(uint64_t obj_ptr) {
-        if (!m_fname.IsV808Active()) return 0;
+        // Was gated on v808 alone, which silently disabled the metaclass
+        // oracle on every later pipeline: GetClassPtrAuto still resolved, but
+        // this returned 0 before ever reading the flags.
+        if (!m_fname.IsV811Active() && !m_fname.IsV808Active()) return 0;
         uint64_t Cls = m_fname.GetClassPtrAuto(obj_ptr);
         if (Cls < 0x10000ULL || Cls >= 0x800000000000ULL) return 0;
-        return Read<uint64_t>(Cls + kClassCastFlagsOff);
+        uint64_t Off = m_fname.IsV811Active()
+                     ? ArcDecrypt::g_Sheet.ClassCastFlagsOff : kClassCastFlagsOff;
+        return Read<uint64_t>(Cls + Off);
     }
 
     std::vector<FunctionRecord> ReadFunctionsFromMap(uint64_t owner_addr) {

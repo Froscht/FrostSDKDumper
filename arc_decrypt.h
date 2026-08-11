@@ -1577,6 +1577,12 @@ struct LiveSheet {
     int      FnvRol1  = v20260811::FNV_ROL1;
     int      FnvRol2  = v20260811::FNV_ROL2;
 
+    // Recovered from FProperty::SetupOffset.
+    uint64_t PropOffsetInternal = v20260811::FPROP_OFFSETINT_OFF;
+    uint32_t PropOffsetXor      = v20260811::FPROP_OFFSET_XOR;
+    uint64_t ClassCastFlagsOff  = v20260811::UCLASS_CASTFLAGS_OFF;
+    uint64_t StructPropSizeOff  = v20260811::USTRUCT_PROPSIZE_OFF;
+
     // Table address plus base index, so indexing is simply idx*2 from here.
     uint64_t KeystreamWindowRva =
         v20260811::RVA_KEYSTREAM + (uint64_t)v20260811::KEYSTREAM_BASE_INDEX * 2;
@@ -1592,19 +1598,21 @@ inline void ApplyOffsets811() {
     Off::FField::Next               = V::FFIELD_NEXT_OFF;
     Off::FField::Owner              = V::FFIELD_OWNER_OFF;
     Off::UStruct::ChildProperties   = V::USTRUCT_CHILDPROPS;
-    Off::UStruct::PropertiesSize    = V::USTRUCT_PROPSIZE_OFF;
+    Off::UStruct::PropertiesSize    = g_Sheet.StructPropSizeOff;
     Off::UStruct::SuperStruct       = V::USTRUCT_SUPER_OFF;
     Off::UEnum::Names               = V::UENUM_NAMES_OFF;
     Off::FProperty::ArrayDim        = V::FPROP_ARRAYDIM_OFF;
     Off::FProperty::ElementSize     = V::FPROP_ELEMSIZE_OFF;
     Off::FProperty::PropertyFlags   = V::FPROP_PROPFLAGS_OFF;
-    Off::FProperty::Offset_Internal = V::FPROP_OFFSETINT_OFF;
-    Off::FProperty::Offset_XOR      = V::FPROP_OFFSET_XOR;
+    // These four come from the sheet: auto-resolve recovers them from
+    // FProperty::SetupOffset, and this function runs after that.
+    Off::FProperty::Offset_Internal = g_Sheet.PropOffsetInternal;
+    Off::FProperty::Offset_XOR      = g_Sheet.PropOffsetXor;
     Off::FBoolProperty::FieldSize   = V::FBOOLPROP_FIELDSIZE;
     Off::FBoolProperty::ByteOffset  = V::FBOOLPROP_BYTEOFFSET;
     Off::FBoolProperty::ByteMask    = V::FBOOLPROP_BYTEMASK;
     Off::FBoolProperty::FieldMask   = V::FBOOLPROP_FIELDMASK;
-    Patch20260421::g_PropertyOffsetXor = V::FPROP_OFFSET_XOR;
+    Patch20260421::g_PropertyOffsetXor = g_Sheet.PropOffsetXor;
 }
 
 } // namespace ArcDecrypt

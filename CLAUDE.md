@@ -184,8 +184,19 @@ FName pipeline   8/8   pool, seed off, block base, block xor, FNV add/rol,
                        keystream window — anchored on the FNV-64 prime
                        0x100000001B3 and proved by CI=0 -> "None"
 GetFName        11/11   anchored on the FNV-32 prime, consensus over 9 copies
+FProperty        4/4    Offset_Internal +0xC4 and its XOR, ClassCastFlags
+                       +0x1E8, PropertiesSize +0x110 — all four out of
+                       FProperty::SetupOffset, anchored on `xor r32,imm32 ;
+                       bswap r32`, the Offset_Internal encoding, which
+                       appears essentially nowhere else
 chunks_manager   exact  anchored on the FUObjectItem stride-20 idiom
 ```
+`ReadClassCastFlags` was gated on `IsV808Active()` alone, so the metaclass
+oracle was silently off on this patch — `GetClassPtrAuto` resolved fine and
+the function returned 0 before ever reading the flags. With it on, the
+reclass pass drops ~28k objects that merely looked like structs, which is
+the intended behaviour: a non-null SuperStruct or a walkable
+ChildProperties chain does not make something a type.
 Three traps cost real time while building this and are handled explicitly:
 - **The FNV-64 immediate is `B3 01 00 00 00 01 00 00`,** not
   `B3 01 00 00 01 00 00 00`. The wrong byte order finds zero sites and looks
@@ -207,7 +218,13 @@ validator already decrypted it and checked the vtable/thunk, while the slot
 values are only *staged* there — they cannot be judged until objects exist.
 Phase 7.5 scores them and swaps them in only if they beat what is loaded.
 
-**Self-healing is verified on both halves.** Sabotaging the FName side
+**Self-healing is verified on all three areas.** Sabotaging the property
+offsets (`PropOffsetInternal` -> 0x99, `PropOffsetXor` -> 0x11223344,
+`ClassCastFlagsOff` -> 0x77) changes nothing about the output: auto-resolve
+recovers 0xC4 / 0xEE0CA1CB / 0x1E8 and the run produces the same property
+count at 0.0% unknown.
+
+**Self-healing is verified on both FName halves.** Sabotaging the FName side
 (`PoolRva` -> 0xDEAD000, `KeystreamWindowRva` -> 0xBEEF000) still finishes at
 a 100.0% naming rate: auto-resolve recovers 0xE38FA00 and 0xE2CE894 and
 adopts them. Sabotaging `SlotShiftA` (3 -> 4)
