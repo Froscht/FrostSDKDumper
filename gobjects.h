@@ -712,6 +712,29 @@ namespace gobjects
                     case 0xDF: for (int I = 0; I < 16; ++I) X[Reg].B[I] = (uint8_t)(~X[Reg].B[I] & Src[I]); break;  // pandn
                     case 0xEB: for (int I = 0; I < 16; ++I) X[Reg].B[I] |= Src[I]; break;   // por
                     case 0xEF: for (int I = 0; I < 16; ++I) X[Reg].B[I] ^= Src[I]; break;   // pxor
+                    case 0xFD: {                                        // paddw
+                        // Theia emits `paddw xmm,xmm` (self-add) as a
+                        // 1-bit left shift. Seen in 2 of the 74 thunk
+                        // variants; without it those abort the emulation.
+                        for (int I = 0; I < 8; ++I) {
+                            uint16_t A, Bv;
+                            std::memcpy(&A,  X[Reg].B + I * 2, 2);
+                            std::memcpy(&Bv, Src + I * 2, 2);
+                            A = (uint16_t)(A + Bv);
+                            std::memcpy(X[Reg].B + I * 2, &A, 2);
+                        }
+                        break;
+                    }
+                    case 0xFE: {                                        // paddd
+                        for (int I = 0; I < 4; ++I) {
+                            uint32_t A, Bv;
+                            std::memcpy(&A,  X[Reg].B + I * 4, 4);
+                            std::memcpy(&Bv, Src + I * 4, 4);
+                            A = A + Bv;
+                            std::memcpy(X[Reg].B + I * 4, &A, 4);
+                        }
+                        break;
+                    }
                     case 0x70: {                                // pshufd / pshuflw / pshufhw
                         uint8_t Imm = Code[P++];
                         XmmReg R{};

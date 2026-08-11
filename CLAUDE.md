@@ -6,7 +6,141 @@ External SDK dumper for ARC Raiders (Unreal Engine 5, Theia-obfuscated). Reads g
 Build: `g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 -I KernelDriver/include -o FrostDumper main.cpp build/Zydis.o -lcapstone -lunicorn -lm`
 Run: `sudo ./build_and_run.sh [PID]`
 
-## Current Patch: CL-1325322 (2026-08-08)
+## Current Patch: Steam build 24653108 (2026-08-11)
+Image size **0x117E9000**. Dump: `module_dump_0x140000000.bin`.
+**FULLY REVERSED AND LIVE-VERIFIED 2026-08-11 vs PID 53906** — 9048 sampled
+objects, 100.0% named, 0 "None", 5509 distinct names.
+
+### Verified constant sheet
+```
+GNamePool          RVA 0xE38FA00      pool-init flag 0xE38F9F8
+FName resolver     RVA 0x23EC40       narrow 0x2411CC, wide 0x24A2E0
+GUObjectArray      RVA 0xE64B260      standalone encrypted 16B global (NO struct!)
+UObject::GetFName  RVA 0x5027E0
+keystream table    RVA 0xE2CE7F4      uint16[144], decrypt window at +0xA0
+
+CI decode:  CI = lo32( PSHUFLW(enc ^ 0xCA5BCA5BCA5BCA5B, 0x8C) >> 18
+                       ^ 0x0000063EEF1B0319 ) ^ 0xDB155ED3
+CI encode:  enc = PSHUFLW( ROL64(CI ^ 0xB2DA4299DB155ED3, 18), 0x72 )
+                  ^ 0xC63ED2A018607637
+  NameOff = CI & 0xFFFF ; ChunkOff = (CI >> 8) & 0xFFFF00
+
+Shard hash (P = 0x1000193, ADD = 0x6E149835), SeedAddr = ChunkAddr + 0x6550:
+  H = (0x40000000 | (Lo >> 6)) * P + ADD        ; mov r8d,0x10 ; shld r8d,edx,0x1A
+  H = ROL32(H, 0x15) * P                        ; NOTE: no +ADD on this step
+  H = ROL32(H + Hi + ADD, 0x1A) * P + ADD
+  H = (H >> 0x0B) * P + ADD
+  S = H ^ (H >> 16) ; B1 = S & 7 ; B2 = (S + 1) & 7
+
+Block decode (8 blocks at ChunkAddr + 0x6560, stride 32):
+  D = ROL16( PSHUFB(raw, [01 04 06 00 03 07 02 05]), 2 ) ^ 0x01554577E835E9F4
+FNV64 (P64 = 0x100000001B3, ADD64 = 0x323C186F5D5C1B15):
+  Fv1 = ROL64(V13, 0x28) * P64 + ADD64
+  Fv2 = ROL64(Fv1, 0x29) * P64 + ADD64
+  EntryPtr = V13 + (V15 ^ Fv2) + 2*NameOff      <-- pointer chain is a NO-OP, see below
+
+FNameEntry header (uint16 at EntryPtr, string at EntryPtr+2):
+  length = ((h >> 6) & ~0x3F) | (h & 0x3F)      ; wide = (h & 0x800) != 0
+String decrypt (single cyclic sequence, no LCG):
+  K = length + 0x7216                            ; index (K + i) & 0x3F, +1 per element
+  narrow: buf[i] ^= (uint8)(KS[(K+i) & 0x3F] >> 3)
+  wide  : buf[i] ^= KS[(K+i) & 0x3F]             ; full uint16, NO >>3
+
+UObject::GetFName (RVA 0x5027E0, P = 0x1000193, ADD = 0x21B21773):
+  Seed = Obj + 0x10 (the ADDRESS), Lo = lo32, Hi = hi32
+  H = ROL32(Lo, 0x18) * P + ADD
+  H = (H >> 3) * P + Hi + ADD
+  H = (H >> 8) * P + ADD
+  H = (H >> 3) * P + ADD
+  S = H ^ (H >> 16) ; Idx = (S & 3) ^ 2 ; Slot = Obj + 0x20 + Idx * 0x20
+  V = ROL16( PSHUFB(*Slot, [01 04 06 00 03 07 02 05]), 2 ) ^ 0x01554577E835E9F4
+  FName = ROL64(V, 32)   -> CompIndex = lo32, Number = hi32
+  Class = S & 3 ; Outer = (S + 1) & 3
+```
+
+### GUObjectArray (verified: NumElements 281066, invariant 104/104)
+There is **no GUObjectArray struct on this patch.** The chunks_manager is a
+standalone encrypted 16-byte global, addressed rip-absolute at all 838 read
+sites, with **zero writes and zero `lea`s**. Searching for a base pointer or an
+xref-ranked `lea` finds nothing — anchor on the absolute RVA.
+```
+Mgr = lo64( PSHUFB( ROL32_perdword( PSHUFLW(xmmword[0xE64B260], 0x4B)
+                                    ^ 0x8387081898D8D8DD, 5 ),
+                    [06 02 00 07 05 01 03 04] ) )
+  key mask @ 0xB3F4030, shuffle mask @ 0xB3F4040
+NumElements = lo32( ROL16(PSHUFB(xmmword[Mgr+0x30], [01 04 06 00]), 2) )
+              ^ 0xE835E9F4                       ; mask @ 0xB447380
+vtable      = [Mgr + 0x60]        (offsets are -0x40 vs CL-1325322)
+blob        = xmmword[Mgr + 0x90]
+thunk       = vtable[6] = [vt + 0x30]            (was slot 3 on CL-1325322)
+FUObjectItem stride 20, 65536/chunk; UObject::InternalIndex at +0x0C
+```
+PEB = 0x7FFD0000 (Wine). Gate PEB candidates on the InternalIndex invariant —
+150 of 151 candidates that pass the Ldr/ProcessParameters/ProcessHeap triple
+fail the invariant 104/104, the right one passes 104/104. Perfect separation.
+
+### Layout (all live-verified)
+```
+UStruct::SuperStruct      +0xA8     UStruct::ChildProperties  +0x100
+UStruct::Children         +0xF8     UStruct::PropertiesSize   +0x110
+UStruct::MinAlignment     +0xD8     UField::Next              +0x90
+UClass::ClassCastFlags    +0x1E8
+FField::NamePrivate       +0x70     FField::Next              +0x80
+FField salt sentinel      +0x88     FField::FlagsPrivate      +0x98
+FField::Owner             +0xA0     (tagged, bit0=1 => UObject)
+FProperty sentinel        +0xA8     RepIndex                  +0xB0
+PropertyFlags             +0xB8     Offset_Internal           +0xC4
+RepNotifyFunc             +0xE0     ArrayDim                  +0xF0
+BlueprintRepCondition     +0xF4     ElementSize               +0xF8
+links                     +0x100..+0x118          sizeof(FProperty) = 0x120
+FBoolProperty FieldSize/ByteOffset/ByteMask/FieldMask = +0x120..+0x123
+
+Offset_Internal = bswap32(stored) ^ 0xEE0CA1CB
+FField::NamePrivate is KEY-FREE: PSHUFLW(0x8D) -> ROL64(46) -> PSHUFLW(0x4B) -> ROL64(32)
+Pointer idiom: PSHUFB( ROL32( PSHUFLW(E, 0x4B) ^ 0x8387081898D8D8DD, 5 ),
+                       [06 02 00 07 05 01 03 04] )
+```
+
+### Traps specific to this patch
+- **The keystream table must be read LIVE.** The module dump holds the
+  at-rest form; runtime decrypts it in place. A static extraction of
+  0xE2CE7F4 yields bytes that share not one value with the live table, and
+  13 of 23 live bytes never occur in the static form at all. Same applies to
+  `.text 0x4BD000-0x4BDFFF` (entropy 7.1 vs 4.4 in neighbours) and to
+  `RVA 0x234000-0x239000`, which is 0xCC-filled in the dump.
+- **The FName pointer chain is an algebraic no-op.** `bswap64(0x43231D85) ==
+  0x851D234300000000`, so `EntryPtr == RawPtr`. It is split across two
+  functions purely as obfuscation. Safe to drop from the hot path.
+- **The CI blend `(E&A)|(~E&B)` collapses to `E ^ B`** because `B == ~A`
+  (`A = 0x35A4...`, `B = 0xCA5B...`). Same for several thunks.
+- `&` binds looser than `+` in **both Python and C++**. `(x*P)&M32 + Hi + ADD`
+  silently parses as `(x*P) & (M32+Hi+ADD)`. This produced a hash with exactly
+  zero correlation to the true slot (uniform 4x4 contingency table) while
+  looking completely reasonable, and cost a full debugging cycle. Parenthesise
+  the mask.
+
+### chunks_manager thunk family (mapped 2026-08-11)
+Not a loose set of variants: a table of **37 consecutive 0x40-byte vtables at
+.rdata 0xB47FB80..0xB4804C0**, each holding an inverse encrypt/decrypt pair at
+slots 5 and 6. **74 thunks, 73 structurally unique** — semantic normalisation
+over the primitive alphabet yields 73 distinct shapes for 73 decodable thunks.
+Runtime picks one via `hash % 37` (dispatcher at RVA 0x4AFE00, `movabs rdx,
+0xDD67C8A60DD67C8B; mul; shr 5; lea *9; lea *4` then a 37-way switch).
+
+**Pattern-matching a fixed op list cannot work. Interpretation is mandatory.**
+The interpreter needs exactly 22 mnemonics; `paddw`/`paddd` appear only as
+self-add (a 1-bit left shift) in 3 of 74 variants and are easy to miss.
+Only `[rdx]` and `gs:[0x60]` are ever read; no branches, no calls, no writes.
+All 105 rip constants sit in one block at `.rdata 0xB47C3C0..0xB47CB4F`.
+`vt#24 slot6 (0x4BDEC0)` is encrypted at rest; reconstruct it by inverting its
+partner `0x4B1150` rather than reading it.
+
+### Anchors that survived this patch
+The AngelScript binding signature strings and the CoreUObject source-path
+assert strings both still work and remain the fastest route to any
+script-visible native function. Use them first on the next patch.
+
+## Previous Patch: CL-1325322 (2026-08-08)
 Image size 0x11853000. IDA instance `qe3o` (`pioneer_steam_1.39.x-CL-1325322_2026_08_08__22_23_83pct.exe`), IDA base 0x140000000 (NOT 0 like older instances).
 
 **FName pipeline: SOLVED and live-verified** 2026-08-08 vs PID 16430 — sequential pool walk decodes 60/60 engine names. See "CL-1325322 FName Pipeline" below.

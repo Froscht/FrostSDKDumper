@@ -187,7 +187,6 @@ public:
         // Only now that names actually decode do we trust the rest of the
         // patch's layout enough to install it. It came from the field-writing
         // constructors, so it outranks the live pointer-shape probes.
-        ArcDecrypt::v20260805::ApplyOffsets();
         ArcDecrypt::Offsets::g_Authoritative = true;
         ArcDecrypt::Offsets::g_AuthoritySrc  = "patch-2026-08 ctor disasm";
         std::printf("[fname805] Pipeline = Patch20260805 (pool @0x%llX, keystream @0x%llX, "
@@ -1768,9 +1767,6 @@ public:
         if (EntryPtr < 0x10000ULL || EntryPtr >= 0x800000000000ULL) return 0;
         return EntryPtr;
     }
-        if (EntryPtr < 0x10000ULL || EntryPtr >= 0x800000000000ULL) return 0;
-        return EntryPtr;
-    }
 
     std::string DecryptNameString_Patch20260805(uint64_t NameEntryPtr) {
         namespace P805 = ArcDecrypt::v20260805;
@@ -1877,9 +1873,6 @@ public:
             uint16_t W = WBuf[J];
             if (!W) break;
             Out.push_back(W < 0x80 ? static_cast<char>(W) : '?');
-        }
-        return Out;
-    }
         }
         return Out;
     }
