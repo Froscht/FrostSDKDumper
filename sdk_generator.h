@@ -2077,7 +2077,10 @@ public:
                 std::string nm = GetNameTheia(cur);
                 if (nm.empty()) break;
                 uint32_t sz = Read<uint32_t>(cur + ArcDecrypt::Offsets::UStruct::PropertiesSize);
-                oss << "//   " << std::string(depth * 2, ' ') << "→ " << nm
+                // ASCII only: the SDK is a C++ header that gets opened in whatever encoding
+            // the reader's editor defaults to, and a UTF-8 arrow renders as mojibake
+            // ("â...") in any Latin-1 view.
+            oss << "//   " << std::string(depth * 2, ' ') << "-> " << nm
                     << " (0x" << std::hex << cur << ", size=" << std::dec << sz << ")\n";
                 cur = Read<uint64_t>(cur + ArcDecrypt::Offsets::UStruct::SuperStruct);
                 ++depth;
@@ -4414,7 +4417,7 @@ public:
         // ── 2. Per-package files ──────────────────────────────────────────
         auto write_header = [](std::ofstream& f, const std::string& pkg, const std::string& kind) {
             f << "#pragma once\n\n";
-            f << "// FrostDumper — " << pkg << "_" << kind << ".hpp\n";
+            f << "// FrostDumper - " << pkg << "_" << kind << ".hpp\n";
             f << "// Auto-generated. Do not edit.\n\n";
             f << "#ifdef _MSC_VER\n#pragma pack(push, 0x8)\n#endif\n\n";
             f << "namespace SDK\n{\n\n";
@@ -4595,7 +4598,7 @@ public:
                 write_header(f, pkg, "functions");
                 auto emit_fn_table = [&](const StructRecord& rec) {
                     if (rec.functions.empty()) return;
-                    f << "// " << rec.name << " — " << rec.functions.size() << " functions\n";
+                    f << "// " << rec.name << " - " << rec.functions.size() << " functions\n";
                     for (const auto& fn : rec.functions) {
                         f << "//   0x" << std::hex << fn.fn_addr
                           << "  flags=0x" << fn.flags
@@ -4616,7 +4619,7 @@ public:
         {
             std::ofstream m(base_dir + "/sdk.hpp");
             m << "#pragma once\n\n";
-            m << "// FrostDumper — master sdk.hpp\n";
+            m << "// FrostDumper - master sdk.hpp\n";
             m << "// Packages: " << std::dec << all_pkgs.size() << "\n\n";
             m << "#include \"sdk/Basic.hpp\"\n\n";
             m << "// Enums (no cross-package deps)\n";
