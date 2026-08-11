@@ -1,0 +1,248 @@
+{
+  "schema": "frostsdk.decrypt-export/v1",
+  "timestamp": "2026-08-11T13:02:47Z",
+  "patch": "imgsize-0x0",
+  "module": {
+    "base": "0x140000000",
+    "bounds_valid": false
+  },
+  "anchors": {
+    "rva_gworld": "0xE83FC58",
+    "rva_gnames_base": "0xE0ED7D0",
+    "rva_fname_key_table": "0xDE5B6E0",
+    "rva_gobject_array_base": "0xE4F8F60",
+    "rva_simd_objarray_xor": "0xAD2FC50",
+    "rva_elem_mask_a": "0xAD8EE10",
+    "rva_elem_mask_b": "0xAD8EE20",
+    "rva_elem_xor_key": "0xAD8EE30",
+    "rva_cidx_xor1": "0xAD30540",
+    "rva_v707_gnamepool": "0xE4F2A00",
+    "rva_v707_keytable": "0xE4318E4",
+    "rva_v707_seed_xor1": "0xB4FD4B0",
+    "rva_v707_seed_blend": "0xB4FD690",
+    "rva_v707_seed_blend_not": "0xB4FD680",
+    "rva_v707_seed_xor2": "0xB4FD6A0",
+    "rva_v707_seed_xor3": "0xB4FD620",
+    "rva_v707_seed_xor4": "0xB4FD4C0",
+    "rva_v707_chunk_xor": "0xB4FD840"
+  },
+  "offsets": {
+    "ustruct": {
+      "super_struct": "0xB0",
+      "children": "0xC8",
+      "child_properties": "0xC8",
+      "properties_size": "0xD0",
+      "min_alignment": "0x94"
+    },
+    "uenum": {
+      "names": "0x60"
+    },
+    "ufunction": {
+      "vtable": "0x0",
+      "next_ptr": "0x48",
+      "function_flags": "0x128",
+      "native_func": "0x150",
+      "num_parms": "0x12C"
+    },
+    "uclass": {
+      "func_map_pairs_data": "0x218",
+      "func_map_num": "0x220",
+      "func_map_max": "0x224",
+      "func_map_pair_stride": "0x18"
+    },
+    "ffield": {
+      "vtable": "0x0",
+      "class_private": "0xC0",
+      "next": "0x78",
+      "owner": "0x80",
+      "name_private": "0xA0",
+      "name_encrypted": "0xA0",
+      "salt_sentinel": "0xB0"
+    },
+    "ffield_class": {
+      "element_size": "0x70"
+    },
+    "fproperty": {
+      "array_dim": "0x110",
+      "element_size": "0xD0",
+      "offset_internal": "0xE4",
+      "offset_xor": "0xA271DBC5",
+      "property_flags": "0xE8"
+    },
+    "fbool_property": {
+      "field_size": "0x138",
+      "byte_offset": "0x139",
+      "byte_mask": "0x13A",
+      "field_mask": "0x13B"
+    },
+    "fproperty_subclass": {
+      "fstruct_property__struct": "0x138",
+      "fobject_property__property_class": "0x138",
+      "fenum_property__underlying_prop": "0x138",
+      "fenum_property__enum": "0x140",
+      "farray_property__inner": "0x138",
+      "fset_property__element_prop": "0x138",
+      "fsoftobject_property__property_class": "0x138",
+      "fmap_property__key_prop": "0x138",
+      "fmap_property__value_prop": "0x140"
+    },
+    "uworld": {
+      "persistent_level": "0xA0",
+      "levels": "0x360"
+    },
+    "uscene_component": {
+      "component_to_world": "0x2E0"
+    }
+  },
+  "patch_constants": {
+    "fname_block": {
+      "fnv_prime": "0x100000001B3",
+      "fnv_offset": "0x2AE2DE663CDF7F3A",
+      "fnv_rol1": 57,
+      "fnv_rol2": 42,
+      "block_pshuflw": 45,
+      "block_rol16": 15,
+      "ptr_xor1": "0x2ECA4D72",
+      "ptr_xor2": "0x20CE00000000",
+      "ptr_xor3": "0x724DEAE000000000",
+      "bhash_add": "0x9583237A",
+      "chunk_block_ptr_off": 216,
+      "ansi_key_base": -25184,
+      "wide_key_base": 40352
+    },
+    "fnv32_slot": {
+      "prime": "0x1000193",
+      "k": "0x866DFAD3",
+      "hash_off": "0x90",
+      "slot_off": "0xA0"
+    },
+    "uobj_slot": {
+      "sentinel": "0xB982F16865A5F21",
+      "rol64": 45,
+      "pshuflw_imm": 30,
+      "fname_rol": 32
+    },
+    "objarray": {
+      "rol32": 20,
+      "rol16": 12
+    },
+    "cidx": {
+      "rol16": 14,
+      "pshuflw_imm": 147,
+      "hdr_xor": "0xA48BA45",
+      "hdr_rol": 30
+    },
+    "uprop": {
+      "fname_offset": "0x50",
+      "fname_xor_key": "0x19AE9873B7A3AC48"
+    },
+    "patch20260421": {
+      "entry_handle_xor": "0x91BB95D79830CB3D",
+      "entry_field_xor": "0x1C4B859",
+      "rva_gnames_base_new": "0xDB5BE80",
+      "g_property_offset_xor": "0xA271DBC5",
+      "uobj_slot_20260428": {
+        "xor_scalar": "0x5EA772D07F910744"
+      }
+    }
+  },
+  "autodiscovery": {
+    "vtables": {
+      "valid": false,
+      "script_struct_rva": "0x0",
+      "class_native_rva": "0x0",
+      "function_rva": "0x0",
+      "enum_rva": "0x0",
+      "package_rva": "0x0",
+      "bpgc_rva": "0x0",
+      "wbpgc_rva": "0x0",
+      "smbpgc_rva": "0x0",
+      "anim_bpgc_rva": "0x0",
+      "asclass_rva": "0x0",
+      "asstruct_rva": "0x0",
+      "asfunction_rvas": []
+    },
+    "world": {
+      "valid": false,
+      "gworld_rva": "0x0",
+      "gworld_abs": "0x0",
+      "persistent_level_abs": "0x0",
+      "persistent_level_offset": "0x0",
+      "actors_data_offset": "0x0",
+      "actors_count_offset": "0x0",
+      "actors_count": 0,
+      "double_deref": true
+    },
+    "ffield_name_decrypt": {
+      "valid": false,
+      "xor_const": "0x0",
+      "rol32_amount": 13,
+      "rol64_amount": 7,
+      "two_shuffle": false,
+      "shuf_imm1": 0,
+      "shuf_imm2": 0,
+      "ts_rol64": 0
+    },
+    "fproperty_offset_xor": {
+      "valid": false,
+      "offset_reader_rva": "0x0",
+      "offset_internal": "0x0",
+      "xor_key": "0x0",
+      "validated_hits": 0
+    },
+    "uobj_slot_decrypt": {
+      "valid": false,
+      "shuf_mask_rva": "0x0",
+      "xor_const_rva": "0x0",
+      "xor_scalar": "0x0",
+      "rol64_amount": 32,
+      "shuf_mask_bytes": ["0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00", "0x00"]
+    },
+    "ffield_class_name": {
+      "valid": false,
+      "xor_const_rva": "0x0",
+      "xor_lo64": "0x0",
+      "ffield_class_offset": "0x0",
+      "name_private_offset": "0x0",
+      "pshuflw_imm": 27,
+      "rol32_amount": 7,
+      "rol64_amount": 32,
+      "consensus_site_count": 0
+    },
+    "gnames": {
+      "valid": false,
+      "gnames_rva": "0x0",
+      "ref_count": 0,
+      "simd_block_rva": "0x0",
+      "simd_block_refs": 0
+    },
+    "fname_keystream": {
+      "valid": false,
+      "keystream_rva": "0x0",
+      "cluster_base": "0x0",
+      "window_hits": 0
+    },
+    "guobjarray_layout": {
+      "valid": false,
+      "struct_abs": "0x0",
+      "num_elements_off": "0x0",
+      "num_elements": "0x0",
+      "chunks_array_ptr": "0x0",
+      "num_chunks": 0,
+      "valid_chunks_probed": 0,
+      "indirection_depth": 0,
+      "path_offsets": []
+    },
+    "fname_resolver_consts": {
+      "valid": false,
+      "function_start_rva": "0x0",
+      "all_imm64": [],
+      "all_pshuflw_imm": [],
+      "all_rol_imm": [],
+      "all_rdata_leas": []
+    },
+    "ffield_class_globals": [
+
+    ]
+  }
+}

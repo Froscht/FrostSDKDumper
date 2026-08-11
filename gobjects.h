@@ -792,6 +792,88 @@ namespace gobjects
             return Match * 100 >= Checked * 90;
         }
 
+        // Steam build 24653108. There is no GUObjectArray struct on this
+        // patch: the chunks_manager is a standalone encrypted 16-byte global,
+        // addressed rip-absolute at all 838 read sites with zero writes and
+        // zero leas, so neither a base pointer nor an xref-ranked lea exists
+        // to find it by. The absolute RVA is the only anchor.
+        uint64_t DiscoverChunkArrayV811(int& OutNumChunks, int32_t& OutNumElements) {
+            namespace V = ArcDecrypt::v20260811;
+            namespace X = AutoDiscovery::V811Detail;
+            OutNumChunks = 0;
+            OutNumElements = 0;
+
+            uint8_t Enc[16] = {};
+            if (!m_reader.Read(m_base + V::RVA_CHUNKMGR_GLOBAL, Enc, 16)) return 0;
+            uint64_t EncLo = 0;
+            std::memcpy(&EncLo, Enc, 8);
+
+            uint64_t Mgr = X::DecodePointer(EncLo);
+            if (Mgr < 0x10000ULL || Mgr >= 0x800000000000ULL) {
+                std::printf("[gobj-v811] chunks_manager decrypt gave implausible 0x%llX\n",
+                    (unsigned long long)Mgr);
+                return 0;
+            }
+
+            uint64_t Vtbl = 0, Thunk = 0;
+            uint8_t Blob[16] = {};
+            if (!m_reader.Read(Mgr + V::MGR_VTABLE_OFF, &Vtbl, 8)) return 0;
+            if (!m_reader.Read(Vtbl + 8ULL * V::MGR_VTABLE_SLOT, &Thunk, 8)) return 0;
+            if (!m_reader.Read(Mgr + V::MGR_BLOB_OFF, Blob, 16)) return 0;
+
+            uint64_t VtRva = Vtbl - m_base;
+            bool InPool = VtRva >= V::THUNK_VTABLE_POOL_LO && VtRva < V::THUNK_VTABLE_POOL_HI;
+            std::printf("[gobj-v811] chunks_manager=0x%llX vtable=0x%llX (rva 0x%llX, %s) thunk=0x%llX\n",
+                (unsigned long long)Mgr, (unsigned long long)Vtbl, (unsigned long long)VtRva,
+                InPool ? "in the 37-vtable pool" : "OUTSIDE the pool",
+                (unsigned long long)Thunk);
+
+            if (!m_pebAddr) m_pebAddr = FindPEB();
+            if (!m_pebAddr) {
+                std::printf("[gobj-v811] PEB unknown — cannot resolve the session salt\n");
+                return 0;
+            }
+
+            uint64_t Arr = 0;
+            if (!EmulateChunkThunkV808(Thunk, Blob, m_pebAddr, Arr)) {
+                std::printf("[gobj-v811] thunk at 0x%llX uses an unsupported instruction — "
+                            "cannot emulate\n", (unsigned long long)Thunk);
+                return 0;
+            }
+
+            std::printf("[gobj-v811] PEB=0x%llX chunk_array=0x%llX (thunk emulated)\n",
+                (unsigned long long)m_pebAddr, (unsigned long long)Arr);
+
+            if (!ChunkArrayPassesIndexInvariant(Arr)) {
+                std::printf("[gobj-v811] chunk array failed the InternalIndex invariant — rejected\n");
+                return 0;
+            }
+
+            for (int I = 0; I < 128; ++I) {
+                uint64_t C = 0;
+                if (!m_reader.Read(Arr + 8ULL * I, &C, 8)) break;
+                if (C < 0x10000ULL || C >= 0x800000000000ULL) break;
+                ++OutNumChunks;
+            }
+
+            // NumElements is encrypted too, at mgr+0x30.
+            uint8_t NumRaw[16] = {}, NumMask[16] = {};
+            if (m_reader.Read(Mgr + V::MGR_NUMELEMENTS_OFF, NumRaw, 16) &&
+                m_reader.Read(m_base + V::NUMELEM_PSHUFB_RVA, NumMask, 16))
+            {
+                uint64_t RawLo = 0;
+                std::memcpy(&RawLo, NumRaw, 8);
+                uint64_t Dec = X::Rol16x4(X::Pshufb8(RawLo, NumMask), V::NUMELEM_ROL16);
+                uint32_t Num = (uint32_t)Dec ^ V::NUMELEM_XOR;
+                if (Num > 1000 && Num < 4000000) OutNumElements = (int32_t)Num;
+                else std::printf("[gobj-v811] NumElements decoded to %u — out of range, ignored\n", Num);
+            }
+
+            std::printf("[gobj-v811] verified: %d chunks, NumElements=%d (stride %u, %u/chunk)\n",
+                OutNumChunks, OutNumElements, V::FUOBJECTITEM_STRIDE, V::ITEMS_PER_CHUNK);
+            return Arr;
+        }
+
         uint64_t DiscoverChunkArrayV808(int& OutNumChunks, int32_t& OutNumElements) {
             namespace V = ArcDecrypt::v20260808;
             OutNumChunks = 0;

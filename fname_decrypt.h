@@ -28,6 +28,7 @@
 //   wide:   same but XOR full uint16_t (no >> 3)
 // =============================================================================
 
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -375,6 +376,49 @@ public:
     // keystream against known plaintext. Called from main after auto-discovery;
     // it takes priority over every older pipeline because both of its anchors
     // are plaintext-verified rather than sig-scanned.
+    bool IsV811Active() const { return m_v811Active; }
+
+    // Steam build 24653108. Both anchors are fixed RVAs rather than sig-scan
+    // results, so the only thing that can validate them is plaintext: CI=0
+    // must decode to "None". The keystream MUST be read from live memory —
+    // the module image holds an at-rest form that shares no value with it.
+    bool AdoptV811() {
+        namespace V = ArcDecrypt::v20260811;
+        if (!m_reader.Read(m_base + V::RVA_KEYSTREAM, m_keyTable811, sizeof(m_keyTable811))) {
+            std::printf("[fname] v811 keystream read failed @ 0x%llX\n",
+                (unsigned long long)(m_base + V::RVA_KEYSTREAM));
+            return false;
+        }
+        m_pool811Rva = V::RVA_GNAMEPOOL;
+        m_ks811Base  = V::KEYSTREAM_BASE_INDEX;
+        m_v811Active = true;
+        m_keyLoaded  = true;
+
+        std::string Probe = DecryptNameString_V811(ResolveNamePtr_V811(0));
+        if (Probe != "None") {
+            std::printf("[fname] v811 self-test failed (CI=0 gave \"%s\", expected \"None\") — not adopting\n",
+                Probe.c_str());
+            m_v811Active = false;
+            return false;
+        }
+        // Entries sit 4-8 CompIndex steps apart, so CI=1 lands mid-string and
+        // decodes to noise. Sweep for the first genuine name instead.
+        std::string Second;
+        for (int32_t Ci = 1; Ci < 512 && Second.empty(); ++Ci) {
+            std::string S = DecryptNameString_V811(ResolveNamePtr_V811(Ci));
+            if (S.size() < 3) continue;
+            bool Clean = true;
+            for (unsigned char C : S)
+                if (!std::isalnum(C) && C != '_') { Clean = false; break; }
+            if (Clean) Second = S;
+        }
+        std::printf("[fname] Pipeline = v20260811 (pool 0x%llX, keystream 0x%llX+%d) — CI=0 -> \"None\" ✓%s%s\n",
+            (unsigned long long)V::RVA_GNAMEPOOL, (unsigned long long)V::RVA_KEYSTREAM,
+            V::KEYSTREAM_BASE_INDEX,
+            Second.empty() ? "" : " 2nd plaintext: ", Second.c_str());
+        return true;
+    }
+
     bool AdoptV808(const AutoDiscovery::V808Discovery& Disc) {
         namespace V = ArcDecrypt::v20260808;
         if (!Disc.Valid || !Disc.PoolRva) return false;
@@ -1035,6 +1079,16 @@ public:
         std::array<uint64_t, 4> out{};
         if (!obj_base || !m_keyLoaded) return out;
 
+        if (m_v811Active) {
+            int n = 0;
+            for (uint32_t Rel = 0; Rel < 4; ++Rel) {
+                uint64_t P = DecodeObjSlotPtrV811(obj_base, Rel);
+                if (P) out[n++] = P;
+                if (n == 4) break;
+            }
+            if (n) return out;
+        }
+
         if (m_v808Active) {
             int n = 0;
             for (uint32_t Rel = 0; Rel < 4; ++Rel) {
@@ -1118,6 +1172,18 @@ public:
     //   blend (E & A) | (~E & B) with B = ~A  ⇒  plain XOR with B
     //   PSHUFLW(0x39) → XOR C → ROL32(9) per dword → XOR D → ROL64(32)
     // Live-verified: yields MaxScrollbackSize / PrimaryActorTick / StaticMesh …
+    // Key-free on this patch: no XOR constant anywhere in the chain.
+    int32_t DecryptFFieldNameCI_V811(uint64_t FieldAddr) const {
+        namespace V = ArcDecrypt::v20260811;
+        uint64_t Enc = 0;
+        if (!m_reader.Read(FieldAddr + V::FFIELD_NAME_OFF, &Enc, 8) || !Enc) return 0;
+        uint64_t Vv = SoftPshuflw(Enc, V::FFIELD_NAME_PSHUFLW_A);
+        Vv = fn_rotl64(Vv, V::FFIELD_NAME_ROL64_A);
+        Vv = SoftPshuflw(Vv, V::FFIELD_NAME_PSHUFLW_B);
+        Vv = fn_rotl64(Vv, V::FFIELD_NAME_ROL64_B);
+        return static_cast<int32_t>(Vv & 0xFFFFFFFFu);
+    }
+
     int32_t DecryptFFieldNameCI_V808(uint64_t FieldAddr) const {
         namespace V = ArcDecrypt::v20260808;
         uint64_t Enc = 0;
@@ -1137,6 +1203,9 @@ public:
         // same ciphertext through eight wrong-patch transforms whose acceptance
         // window (ci < 0x06A00000) is far wider than ours, so a bogus decode
         // would win and latch m_ffieldNameOff on the way out.
+        if (m_v811Active)
+            return DecryptFFieldNameCI_V811(ff_addr);
+
         if (m_v808Active)
             return DecryptFFieldNameCI_V808(ff_addr);
         // Patch CL-1177146 PRIMARY PATH: FField+0x70 with the NEW pipeline
@@ -1402,6 +1471,9 @@ public:
     // FName-fn rip-rel scan (we already collect candidates in
     // g_DiscoveredFName.AllRDataLeas; just need the role-binding pass).
     uint64_t ResolveNamePtrFull(int32_t CompIndex) {
+        if (m_v811Active)
+            return (CompIndex < 0) ? 0 : ResolveNamePtr_V811(CompIndex);
+
         if (m_v808Active)
             return (CompIndex < 0) ? 0 : ResolveNamePtr_V808(CompIndex);
 
@@ -1733,6 +1805,40 @@ public:
     // Straight transcription of sub_1402319F0 → sub_14023B120 → sub_14023AAE0.
     // The CI SIMD chain across those three frames cancels to identity, so the
     // raw CompIndex feeds the offset split directly.
+    uint64_t ResolveNamePtr_V811(int32_t CompIndex) const {
+        namespace V = ArcDecrypt::v20260811;
+        namespace X = AutoDiscovery::V811Detail;
+        if (CompIndex < 0 || !m_v811Active) return 0;
+
+        uint32_t Ci = static_cast<uint32_t>(CompIndex);
+        uint32_t NameOff  = Ci & 0xFFFFu;
+        uint32_t ChunkOff = (Ci >> 8) & 0xFFFF00u;
+        uint64_t ChunkAddr = m_base + m_pool811Rva + ChunkOff;
+
+        uint32_t H = X::ShardHash(ChunkAddr + V::SHARD_HASH_SEED_OFF);
+        uint32_t S = H ^ (H >> 16);
+        uint32_t Bidx1 = S & 7u;
+        uint32_t Bidx2 = (S + 1u) & 7u;
+
+        uint64_t BlockBase = ChunkAddr + V::SHARD_BLOCK_BASE_OFF;
+        uint64_t Raw1 = 0, Raw2 = 0;
+        if (!m_reader.Read(BlockBase + V::SHARD_BLOCK_STRIDE * Bidx1, &Raw1, 8)) return 0;
+        if (!m_reader.Read(BlockBase + V::SHARD_BLOCK_STRIDE * Bidx2, &Raw2, 8)) return 0;
+        if (!Raw1 && !Raw2) return 0;
+
+        uint64_t V13 = X::DecodeBlock(Raw1);
+        uint64_t V15 = X::DecodeBlock(Raw2);
+
+        uint64_t Fv = V::FNV_PRIME * fn_rotl64(V13, V::FNV_ROL1) + V::FNV_ADD;
+        Fv = V::FNV_PRIME * fn_rotl64(Fv, V::FNV_ROL2) + V::FNV_ADD;
+
+        // The four-step xor/bswap chain cancels to the identity here, so the
+        // raw sum already is the entry address. See CLAUDE.md.
+        uint64_t EntryPtr = V13 + (V15 ^ Fv) + 2ULL * NameOff;
+        if (EntryPtr < 0x10000ULL || EntryPtr >= 0x800000000000ULL) return 0;
+        return EntryPtr;
+    }
+
     uint64_t ResolveNamePtr_V808(int32_t CompIndex) const {
         namespace V = ArcDecrypt::v20260808;
         if (CompIndex < 0 || !m_v808Active) return 0;
@@ -1815,6 +1921,53 @@ public:
     // Transcription of sub_140230020. The trailing narrow→wide widening pass
     // in the original writes UTF-16 into the caller's buffer; we consume the
     // narrow bytes directly and skip it.
+    std::string DecryptNameString_V811(uint64_t NameEntryPtr) {
+        namespace V = ArcDecrypt::v20260811;
+        if (!NameEntryPtr || !m_v811Active) return {};
+
+        uint16_t Header = 0;
+        if (!m_reader.Read(NameEntryPtr, &Header, 2) || !Header) return {};
+
+        bool IsWide = (Header & V::HDR_IS_WIDE_BIT) != 0;
+        int Length = static_cast<int>(
+            ((static_cast<uint32_t>(Header) >> V::HDR_LENGTH_HI_SHIFT) & V::HDR_LENGTH_HI_MASK)
+            | (static_cast<uint32_t>(Header) & V::HDR_LENGTH_LO_MASK));
+        if (Length <= 0 || Length > 1023) return {};
+
+        int ByteCount = IsWide ? Length * 2 : Length;
+        if (ByteCount <= 0 || ByteCount > 2048) return {};
+
+        std::vector<uint8_t> Buf(ByteCount, 0);
+        if (!m_reader.Read(NameEntryPtr + 2, Buf.data(), ByteCount)) return {};
+
+        // One cyclic sequence, +1 per element. No pairing, no LCG.
+        uint32_t Key = static_cast<uint32_t>(Length) + V::KEY_INIT_ADD;
+        auto Slot = [&](uint32_t K) -> uint16_t {
+            return m_keyTable811[(K & V::KEY_INDEX_MASK) + m_ks811Base];
+        };
+
+        std::string Out;
+        Out.reserve(Length);
+        if (!IsWide) {
+            for (int I = 0; I < Length; ++I) {
+                uint8_t C = Buf[I] ^ static_cast<uint8_t>(Slot(Key + static_cast<uint32_t>(I))
+                                                          >> V::NARROW_KEY_SHIFT);
+                if (!C) break;
+                Out.push_back(static_cast<char>(C));
+            }
+            return Out;
+        }
+
+        // Wide XORs the full uint16 with no shift.
+        for (int I = 0; I < Length; ++I) {
+            uint16_t C = static_cast<uint16_t>(Buf[I * 2] | (static_cast<uint16_t>(Buf[I * 2 + 1]) << 8));
+            uint16_t W = static_cast<uint16_t>(C ^ Slot(Key + static_cast<uint32_t>(I)));
+            if (!W) break;
+            Out.push_back(static_cast<char>(W & 0xFF));
+        }
+        return Out;
+    }
+
     std::string DecryptNameString_V808(uint64_t NameEntryPtr) {
         namespace V = ArcDecrypt::v20260808;
         if (!NameEntryPtr || !m_v808Active) return {};
@@ -2215,6 +2368,9 @@ public:
     std::string DecryptNameString(uint64_t NameEntryPtr) {
         if (!NameEntryPtr || !m_keyLoaded) return {};
 
+        if (m_v811Active)
+            return DecryptNameString_V811(NameEntryPtr);
+
         if (m_v808Active)
             return DecryptNameString_V808(NameEntryPtr);
 
@@ -2492,6 +2648,44 @@ public:
     // Transcribed from the native AngelScript binding at RVA 0x343950. The
     // slot holding NamePrivate is picked by an FNV32 hash of (Obj + 0x10), so
     // no fixed offset works — that is why offset sweeps all came up empty.
+    // UObject::GetFName @ RVA 0x5027E0. Every mask is parenthesised on
+    // purpose: `&` binds looser than `+` in C++, so `(x * P) & M + Hi + ADD`
+    // silently becomes `(x * P) & (M + Hi + ADD)` and produces a hash with
+    // zero correlation to the real slot while looking entirely reasonable.
+    uint32_t ObjSlotHashV811(uint64_t ObjPtr) const {
+        namespace V = ArcDecrypt::v20260811;
+        uint64_t Seed = ObjPtr + V::UOBJ_NAME_SEED_OFF;
+        uint32_t Lo = static_cast<uint32_t>(Seed);
+        uint32_t Hi = static_cast<uint32_t>(Seed >> 32);
+        constexpr uint32_t P = V::UOBJ_SLOT_HASH_PRIME;
+        constexpr uint32_t A = V::UOBJ_SLOT_HASH_ADD;
+
+        uint32_t H = fn_rotl32(Lo, V::UOBJ_SLOT_HASH_ROL) * P + A;
+        H = ((H >> V::UOBJ_SLOT_SHIFT_A) * P) + Hi + A;
+        H = ((H >> V::UOBJ_SLOT_SHIFT_B) * P) + A;
+        H = ((H >> V::UOBJ_SLOT_SHIFT_C) * P) + A;
+        return H ^ (H >> 16);
+    }
+
+    uint32_t ObjNameSlotIndexV811(uint64_t ObjPtr) const {
+        namespace V = ArcDecrypt::v20260811;
+        return (ObjSlotHashV811(ObjPtr) & 3u) ^ V::UOBJ_SLOT_NAME_XOR;
+    }
+
+    uint64_t GetObjFNameV811(uint64_t ObjPtr) const {
+        namespace V = ArcDecrypt::v20260811;
+        uint64_t Slot = ObjPtr + V::UOBJ_NAME_SLOT_BASE +
+                        V::UOBJ_NAME_SLOT_STRIDE * ObjNameSlotIndexV811(ObjPtr);
+        uint64_t Enc = 0;
+        if (!m_reader.Read(Slot, &Enc, 8)) return 0;
+        return fn_rotl64(AutoDiscovery::V811Detail::DecodeSlot(Enc), V::UOBJ_NAME_ROL64);
+    }
+
+    std::string GetNameV811(uint64_t ObjPtr) {
+        uint64_t F = GetObjFNameV811(ObjPtr);
+        return DecryptNameString_V811(ResolveNamePtr_V811(static_cast<int32_t>(F & 0xFFFFFFFFu)));
+    }
+
     uint32_t ObjNameSlotIndexV808(uint64_t ObjPtr) const {
         namespace V = ArcDecrypt::v20260808;
         uint64_t Seed = ObjPtr + V::UOBJ_NAME_SEED_OFF;
@@ -2530,6 +2724,11 @@ public:
 
     std::string GetName(uint64_t obj_ptr) {
         if (!obj_ptr || !m_keyLoaded) return {};
+
+        if (m_v811Active) {
+            std::string S = GetNameV811(obj_ptr);
+            if (!S.empty()) return S;
+        }
 
         if (m_v808Active) {
             std::string S = GetNameV808(obj_ptr);
@@ -2681,6 +2880,26 @@ public:
     // pre-rotation value used directly as a pointer. Slot roles are relative to
     // the hash-selected name slot — verified on 120 UFunctions: rel+2 resolved to
     // the "Function" UClass for every one, rel+3 to a plausible Outer.
+    // Class sits at (S & 3), Outer at (S + 1) & 3, Name at (S + 2) & 3 —
+    // i.e. SlotRel is measured from the class slot, not the name slot.
+    uint64_t DecodeObjSlotPtrV811(uint64_t ObjPtr, uint32_t SlotRel) const {
+        namespace V = ArcDecrypt::v20260811;
+        uint32_t Idx = (ObjSlotHashV811(ObjPtr) + SlotRel) & 3u;
+        uint64_t Enc = 0;
+        if (!m_reader.Read(ObjPtr + V::UOBJ_NAME_SLOT_BASE +
+                           V::UOBJ_NAME_SLOT_STRIDE * Idx, &Enc, 8) || !Enc)
+            return 0;
+        uint64_t Ptr = AutoDiscovery::V811Detail::DecodeSlot(Enc);
+        if (Ptr < 0x10000ULL || Ptr >= 0x800000000000ULL) return 0;
+        return Ptr;
+    }
+    uint64_t GetClassPtrV811(uint64_t ObjPtr) const {
+        return DecodeObjSlotPtrV811(ObjPtr, ArcDecrypt::v20260811::UOBJ_SLOT_CLASS_ADJ);
+    }
+    uint64_t GetOuterPtrV811(uint64_t ObjPtr) const {
+        return DecodeObjSlotPtrV811(ObjPtr, ArcDecrypt::v20260811::UOBJ_SLOT_OUTER_ADJ);
+    }
+
     uint64_t DecodeObjSlotPtrV808(uint64_t ObjPtr, uint32_t SlotRel) const {
         namespace V = ArcDecrypt::v20260808;
         uint32_t Idx = (ObjNameSlotIndexV808(ObjPtr) + SlotRel) & 3u;
@@ -2694,10 +2913,21 @@ public:
         return Ptr;
     }
     uint64_t GetClassPtrV808(uint64_t ObjPtr) const { return DecodeObjSlotPtrV808(ObjPtr, 2); }
+    // Picks whichever pipeline is live so call sites do not have to.
+    uint64_t GetClassPtrAuto(uint64_t ObjPtr) const {
+        if (m_v811Active) return GetClassPtrV811(ObjPtr);
+        if (m_v808Active) return GetClassPtrV808(ObjPtr);
+        return 0;
+    }
     uint64_t GetOuterPtrV808(uint64_t ObjPtr) const { return DecodeObjSlotPtrV808(ObjPtr, 3); }
 
     uint64_t GetOuterPtr(uint64_t obj_ptr) {
         if (!obj_ptr || !m_keyLoaded) return 0;
+
+        if (m_v811Active) {
+            uint64_t P = GetOuterPtrV811(obj_ptr);
+            if (P) return P;
+        }
 
         if (m_v808Active) {
             uint64_t P = GetOuterPtrV808(obj_ptr);
@@ -2909,6 +3139,11 @@ private:
     uint16_t       m_keyTable707[64];
     bool           m_ks707Loaded = false;
     uint16_t       m_keyTableNewPatch[64];
+    uint16_t       m_keyTable811[ArcDecrypt::v20260811::KEYSTREAM_ENTRIES] = {};
+    bool           m_v811Active  = false;
+    uint64_t       m_pool811Rva  = 0;
+    int            m_ks811Base   = ArcDecrypt::v20260811::KEYSTREAM_BASE_INDEX;
+
     uint16_t       m_keyTable808[ArcDecrypt::v20260808::KEYSTREAM_ENTRIES] = {};
     bool           m_v808Active  = false;
     uint64_t       m_pool808Rva  = 0;

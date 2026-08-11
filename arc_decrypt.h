@@ -1495,4 +1495,31 @@ namespace v20260811 {
     constexpr uint64_t FBOOLPROP_FIELDMASK   = 0x123ULL;
 } // namespace v20260811
 
+// Applied twice: once when the pipeline is adopted, and again after
+// auto_offsets runs, because the generic probes need a working FField name
+// decode to score candidates — the very thing they are trying to discover —
+// and they overwrite these values on the way out.
+inline void ApplyOffsets811() {
+    namespace V = v20260811;
+    namespace Off = Offsets;
+    Off::FField::NamePrivate        = V::FFIELD_NAME_OFF;
+    Off::FField::NameEncrypted      = V::FFIELD_NAME_OFF;
+    Off::FField::Next               = V::FFIELD_NEXT_OFF;
+    Off::FField::Owner              = V::FFIELD_OWNER_OFF;
+    Off::UStruct::ChildProperties   = V::USTRUCT_CHILDPROPS;
+    Off::UStruct::PropertiesSize    = V::USTRUCT_PROPSIZE_OFF;
+    Off::UStruct::SuperStruct       = V::USTRUCT_SUPER_OFF;
+    Off::UEnum::Names               = V::UENUM_NAMES_OFF;
+    Off::FProperty::ArrayDim        = V::FPROP_ARRAYDIM_OFF;
+    Off::FProperty::ElementSize     = V::FPROP_ELEMSIZE_OFF;
+    Off::FProperty::PropertyFlags   = V::FPROP_PROPFLAGS_OFF;
+    Off::FProperty::Offset_Internal = V::FPROP_OFFSETINT_OFF;
+    Off::FProperty::Offset_XOR      = V::FPROP_OFFSET_XOR;
+    Off::FBoolProperty::FieldSize   = V::FBOOLPROP_FIELDSIZE;
+    Off::FBoolProperty::ByteOffset  = V::FBOOLPROP_BYTEOFFSET;
+    Off::FBoolProperty::ByteMask    = V::FBOOLPROP_BYTEMASK;
+    Off::FBoolProperty::FieldMask   = V::FBOOLPROP_FIELDMASK;
+    Patch20260421::g_PropertyOffsetXor = V::FPROP_OFFSET_XOR;
+}
+
 } // namespace ArcDecrypt

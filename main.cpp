@@ -608,7 +608,20 @@ public:
         // result is checked against the FUObjectItem InternalIndex invariant,
         // which is ground truth — the structural tiers below only ever produce
         // "looks array-shaped" candidates.
-        {
+        if (m_fname.IsV811Active()) {
+            int NumChunks = 0;
+            int32_t NumElements = 0;
+            uint64_t Arr = m_gobj.DiscoverChunkArrayV811(NumChunks, NumElements);
+            if (Arr && NumChunks > 0 &&
+                m_gobj.InitFromChunksCanonical(Arr, NumChunks, NumElements))
+            {
+                std::cout << "[+] GObjectArray initialized via v811 chunks_manager ("
+                          << m_gobj.GetNumElements() << " objects)\n";
+                gobj_ok = true;
+            }
+        }
+
+        if (!gobj_ok) {
             int NumChunks = 0;
             int32_t NumElements = 0;
             uint64_t Arr = m_gobj.DiscoverChunkArrayV808(NumChunks, NumElements);
@@ -1113,6 +1126,39 @@ public:
             // score candidates, which is exactly what they are trying to find)
             // and they overwrite the values we already know. Re-assert the
             // binary-derived layout afterwards so it wins.
+            if (m_fname.IsV811Active()) {
+                ArcDecrypt::ApplyOffsets811();
+                std::printf("[v811] re-asserted FField layout after auto_offsets\n");
+
+                // The pre-object-array GWorld phase can only pattern-match and
+                // its compile-time RVA is stale every patch. Now that the
+                // object array and names are up, resolve it from the live
+                // object graph instead. The routine is pipeline-agnostic — it
+                // only needs a name and a class-pointer callback.
+                AutoDiscovery::g_DiscoveredGWorldV808 = AutoDiscovery::DiscoverGWorldV808(
+                    m_reader, MODULE_BASE, AutoDiscovery::g_DiscoveredBounds,
+                    m_gobj.GetSeedObjects(),
+                    [this](uint64_t O) { return m_fname.GetName(O); },
+                    [this](uint64_t O) { return m_fname.GetClassPtrAuto(O); },
+                    nullptr, 0);
+                if (AutoDiscovery::g_DiscoveredGWorldV808.Valid) {
+                    const auto& G = AutoDiscovery::g_DiscoveredGWorldV808;
+                    if (ArcDecrypt::RVA_GWORLD != G.Rva)
+                        std::printf("[v811] GWorld drift: 0x%llX -> 0x%llX (auto-fixed)\n",
+                            (unsigned long long)ArcDecrypt::RVA_GWORLD,
+                            (unsigned long long)G.Rva);
+                    ArcDecrypt::RVA_GWORLD = G.Rva;
+                    AutoDiscovery::g_DiscoveredWorld.GWorldRva   = G.Rva;
+                    AutoDiscovery::g_DiscoveredWorld.GWorldAbs   = MODULE_BASE + G.Rva;
+                    AutoDiscovery::g_DiscoveredWorld.DoubleDeref = G.DoubleDeref;
+                    AutoDiscovery::g_DiscoveredWorld.Valid       = true;
+                } else {
+                    std::printf("[v811] GWorld not resolved from the object graph — "
+                                "compile-time RVA 0x%llX is stale, treat it as unknown\n",
+                        (unsigned long long)ArcDecrypt::RVA_GWORLD);
+                }
+            }
+
             if (m_fname.IsV808Active()) {
                 namespace V = ArcDecrypt::v20260808;
                 namespace Off = ArcDecrypt::Offsets;
@@ -1144,7 +1190,7 @@ public:
                     m_reader, MODULE_BASE, AutoDiscovery::g_DiscoveredBounds,
                     m_gobj.GetSeedObjects(),
                     [this](uint64_t O) { return m_fname.GetName(O); },
-                    [this](uint64_t O) { return m_fname.GetClassPtrV808(O); },
+                    [this](uint64_t O) { return m_fname.GetClassPtrAuto(O); },
                     nullptr, 0);
                 if (AutoDiscovery::g_DiscoveredGWorldV808.Valid) {
                     const auto& G = AutoDiscovery::g_DiscoveredGWorldV808;
@@ -1568,6 +1614,26 @@ public:
             // older sig-scan-derived constants irrelevant instead of fighting
             // them. Both anchors are pinned by decoding "None"/"ByteProperty",
             // so a successful adopt is ground truth, not a heuristic.
+            {
+                // Phase 6.6 runs first: its anchors are fixed RVAs validated
+                // by plaintext rather than sig-scan results, so a successful
+                // adopt is ground truth and makes the older phases moot.
+                std::printf("\n=== Phase 6.6: v20260811 FName pipeline (plaintext-verified) ===\n");
+                if (AutoDiscovery::g_DiscoveredBounds.ImageSize ==
+                        ArcDecrypt::v20260811::IMAGE_SIZE &&
+                    m_fname.AdoptV811())
+                {
+                    ArcDecrypt::ApplyOffsets811();
+                    std::printf("[v811] FField/FProperty layout applied\n");
+                } else if (AutoDiscovery::g_DiscoveredBounds.ImageSize !=
+                               ArcDecrypt::v20260811::IMAGE_SIZE) {
+                    std::printf("[v811] image size 0x%llX != 0x%llX — skipped\n",
+                        (unsigned long long)AutoDiscovery::g_DiscoveredBounds.ImageSize,
+                        (unsigned long long)ArcDecrypt::v20260811::IMAGE_SIZE);
+                }
+            }
+
+            if (!m_fname.IsV811Active())
             {
                 std::printf("\n=== Phase 6.7: v20260808 FName pipeline (plaintext-verified) ===\n");
                 AutoDiscovery::g_DiscoveredV808 =
@@ -2536,7 +2602,8 @@ public:
                  << "// Game updated:  " << (SteamInfo.Updated.empty() ? "unknown" : SteamInfo.Updated) << "\n"
                  << "// Image size:    0x" << std::hex << AutoDiscovery::g_DiscoveredBounds.ImageSize
                  << std::dec << "  (module base 0x" << std::hex << MODULE_BASE << std::dec << ")\n"
-                 << "// FName pipeline: " << (m_fname.IsV808Active() ? "v20260808" : "legacy") << "\n"
+                 << "// FName pipeline: " << (m_fname.IsV811Active() ? "v20260811"
+                                     : m_fname.IsV808Active() ? "v20260808" : "legacy") << "\n"
                  << "// PID: " << m_pid << "\n"
                  << "// ============================================================\n"
                  << "//\n"

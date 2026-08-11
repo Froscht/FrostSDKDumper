@@ -1869,7 +1869,7 @@ public:
 
     uint64_t ReadClassCastFlags(uint64_t obj_ptr) {
         if (!m_fname.IsV808Active()) return 0;
-        uint64_t Cls = m_fname.GetClassPtrV808(obj_ptr);
+        uint64_t Cls = m_fname.GetClassPtrAuto(obj_ptr);
         if (Cls < 0x10000ULL || Cls >= 0x800000000000ULL) return 0;
         return Read<uint64_t>(Cls + kClassCastFlagsOff);
     }
