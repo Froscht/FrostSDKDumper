@@ -1240,7 +1240,7 @@ public:
         // Snapshot every runtime-resolved decryption constant / offset /
         // anchor to a JSON file next to sdk/SDK_Output.txt. Forensic trail for
         // patch days + consumable by external tooling.
-        AutoExport::WriteAll("decrypt_export.json", MODULE_BASE);
+        AutoExport::WriteAll("decrypt_export.json", MODULE_BASE, /*Complete=*/true);
 
         return true;
     }

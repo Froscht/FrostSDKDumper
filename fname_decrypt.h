@@ -1121,6 +1121,19 @@ public:
 
     uint64_t GetClassPrivate(uint64_t obj_base) {
         if (!obj_base || !m_keyLoaded) return 0;
+
+        // Without these the modern pipelines fall through to the legacy
+        // Build20260519 decoders, which return plausible-looking garbage.
+        // That is what left the bone dump unable to find any "Skeleton".
+        if (m_v811Active) {
+            uint64_t P = GetClassPtrV811(obj_base);
+            if (P) return P;
+        }
+        if (m_v808Active) {
+            uint64_t P = GetClassPtrV808(obj_base);
+            if (P) return P;
+        }
+
         bool Is519 = (m_pipeline == Pipeline::Build20260519 || AutoDiscovery::g_DiscoveredUObjSlot.Valid);
         uint32_t cs = Is519 ? Build20260519_ObjClassSlot(obj_base) : ObjClassSlot(obj_base);
         auto tryDecode = [&](int slot) -> uint64_t {

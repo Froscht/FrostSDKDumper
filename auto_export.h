@@ -573,7 +573,17 @@ inline void ArchiveForeignConfig(const char* Path) {
         std::printf("[autoexport] archived previous-patch config → %s\n", Archive.c_str());
 }
 
-inline bool WriteAll(const char* Path, uint64_t ModuleBase) {
+// Complete=false marks a mid-run snapshot. The loader refuses those, so a
+// run that dies before the pipeline is up can no longer leave behind a file
+// that the next run mistakes for a valid cache.
+inline bool WriteAll(const char* Path, uint64_t ModuleBase, bool Complete = false) {
+    // A run that never established module bounds has nothing worth caching,
+    // and writing image_size=0x0 poisons the next run's drift check.
+    if (AutoDiscovery::g_DiscoveredBounds.ImageSize == 0) {
+        std::printf("[autoexport] module bounds unknown — refusing to write %s\n", Path);
+        return false;
+    }
+
     ArchiveForeignConfig(Path);
 
     std::ofstream Os(Path);
@@ -585,6 +595,7 @@ inline bool WriteAll(const char* Path, uint64_t ModuleBase) {
     JsonWriter W(Os);
     W.OpenObj();
     W.KStr("schema",     "frostsdk.decrypt-export/v1");
+    W.KBool("complete",  Complete);
     W.KStr("timestamp",  IsoTimestamp());
     {
         char PatchBuf[64];
@@ -603,7 +614,8 @@ inline bool WriteAll(const char* Path, uint64_t ModuleBase) {
     Os << "\n";
     Os.close();
 
-    std::printf("[autoexport] wrote decryption snapshot → %s\n", Path);
+    std::printf("[autoexport] wrote %s snapshot → %s\n",
+        Complete ? "complete" : "partial (will not be reloaded)", Path);
     return true;
 }
 

@@ -656,6 +656,15 @@ inline LoadResult LoadDiscoveryConfig(const char* Path) {
         Path, Result.Patch.c_str(),
         Root["timestamp"].IsStr() ? Root["timestamp"].StrVal.c_str() : "?");
 
+    // A snapshot is only trustworthy if the run that wrote it got all the
+    // way through. Partial files are written by runs that died early and
+    // otherwise look identical to good ones.
+    if (!Root["complete"].Bool()) {
+        std::printf("[config] snapshot is not marked complete — the run that wrote it "
+                    "did not finish; discarding and running full auto-discovery\n");
+        return Result;
+    }
+
     const auto& ModBlock = Root["module"];
     if (ModBlock.IsObj())
         Result.ConfigImageSize = ModBlock["image_size"].Hex64();
