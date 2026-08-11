@@ -1482,6 +1482,9 @@ public:
 
     // ── Read a single FProperty chain from any FField* head pointer ─────────
     // Shared by ReadProperties (UStruct::ChildProperties) and UFunction params.
+    const char* m_lastChainBreak = "";
+    uint64_t    m_lastChainBreakVal = 0;
+
     std::vector<PropertyRecord> ReadPropertyChain(uint64_t ff_head, int max_props = 2048,
                                                    bool is_param = false,
                                                    uint64_t expected_owner = 0) {
@@ -1491,8 +1494,10 @@ public:
 
         uint64_t ff = ff_head;
         int count = 0;
+        m_lastChainBreak = "reached end (Next == 0)";
+        m_lastChainBreakVal = 0;
         while (ff && count < max_props) {
-            if (visited.count(ff)) break;
+            if (visited.count(ff)) { m_lastChainBreak = "cycle"; break; }
             visited.insert(ff);
 
             // Ghost-FField guard (patch CL-1177146):
@@ -1508,7 +1513,11 @@ public:
             {
                 uint64_t vtbl = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::VTable);
                 if (vtbl < (MODULE_BASE + 0x1000) ||
-                    vtbl >= (MODULE_BASE + 0xE9D0000ULL)) break;
+                    vtbl >= (MODULE_BASE + 0xE9D0000ULL)) {
+                    m_lastChainBreak = "vtable out of range";
+                    m_lastChainBreakVal = vtbl;
+                    break;
+                }
                 // CL-1195482: FField.ClassPrivate offset hasn't been verified —
                 // the hardcoded 0x70 reads garbage for many FFields and used to
                 // break the chain early. Relaxed: skip the cls_ptr range check.
@@ -1538,14 +1547,17 @@ public:
                 bool slot_present =
                     AnyNonZero(ArcDecrypt::Offsets::FField::NameEncrypted) ||
                     AnyNonZero(0x30);
-                if (!slot_present) break;
+                if (!slot_present) { m_lastChainBreak = "NamePrivate all-zero"; break; }
 
                 uint64_t ff_owner = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Owner);
                 uint64_t ff_owner_clean = ff_owner & ~1ULL;
-                if (ff_owner_clean != 0 && (ff_owner_clean < 0x10000ULL || ff_owner_clean >= 0x800000000000ULL))
-                    break;
-                if (ff_owner_clean == 0) break;
-                if (expected_owner && ff_owner_clean != expected_owner) break;
+                if (ff_owner_clean != 0 && (ff_owner_clean < 0x10000ULL || ff_owner_clean >= 0x800000000000ULL)) {
+                    m_lastChainBreak = "owner implausible"; m_lastChainBreakVal = ff_owner; break;
+                }
+                if (ff_owner_clean == 0) { m_lastChainBreak = "owner null"; break; }
+                if (expected_owner && ff_owner_clean != expected_owner) {
+                    m_lastChainBreak = "owner mismatch"; m_lastChainBreakVal = ff_owner_clean; break;
+                }
             }
 
             PropertyRecord pr{};
@@ -1686,6 +1698,21 @@ public:
 
             // FArrayProperty: enrich parent + add Inner sub-property
             if (is_array) {
+                if (getenv("FROST_INNER_DEBUG")) {
+                    std::printf("[inner-dbg] %s ff=0x%llX next=0x%llX |", pr.name.c_str(),
+                        (unsigned long long)ff,
+                        (unsigned long long)Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Next));
+                    for (uint64_t O = 0x100; O <= 0x148; O += 8) {
+                        uint64_t C = Read<uint64_t>(ff + O);
+                        uint32_t Es = (C > 0x10000 && C < 0x800000000000ULL)
+                            ? Read<uint32_t>(C + ArcDecrypt::Offsets::FProperty::ElementSize) : 0;
+                        uint64_t Vt = (C > 0x10000 && C < 0x800000000000ULL) ? Read<uint64_t>(C) : 0;
+                        bool Ok = Vt >= MODULE_BASE && Vt < MODULE_BASE + 0x117E9000ULL;
+                        std::printf(" +%llX=0x%llX%s(es=%u)", (unsigned long long)O,
+                            (unsigned long long)C, Ok ? "*" : "", Es);
+                    }
+                    std::printf("\n");
+                }
                 uint64_t inner_ptr = Read<uint64_t>(ff + ArcDecrypt::Offsets::FArrayProperty::Inner);
                 uint32_t inner_elem_check = inner_ptr ? Read<uint32_t>(inner_ptr + ArcDecrypt::Offsets::FProperty::ElementSize) : 0;
                 if (inner_ptr && inner_elem_check > 0 && inner_elem_check < 0x10000) {
@@ -3596,7 +3623,12 @@ public:
                 if (cpvt < MODULE_BASE || cpvt >= MODULE_BASE + 0x10000000ULL) return;
                 auto chain_props = ReadPropertyChain(chain_head);
                 for (auto& p : chain_props) {
-                    if (p.offset > 0x20000) continue;
+                    if (p.offset > 0x20000) {
+                        if (getenv("FROST_CHAIN_DEBUG") && rec.name == getenv("FROST_CHAIN_DEBUG"))
+                            std::printf("[chain-dbg]   DROP %s offset 0x%X > 0x20000\n",
+                                p.name.c_str(), p.offset);
+                        continue;
+                    }
                     auto it = best_at_ff.find(p.ff_addr);
                     if (it == best_at_ff.end()) {
                         best_at_ff[p.ff_addr] = std::move(p);
@@ -3609,6 +3641,14 @@ public:
                         bool new_tk  = (p.type_name != "FProperty_Unknown");
                         int cur_score = (cur_unk ? 0 : 2) + (cur_tk ? 1 : 0);
                         int new_score = (new_unk ? 0 : 2) + (new_tk ? 1 : 0);
+                        if (getenv("FROST_CHAIN_DEBUG") && rec.name == getenv("FROST_CHAIN_DEBUG") &&
+                            it->second.name != p.name)
+                            std::printf("[chain-dbg]   COLLISION ff=0x%llX  keep=%s(%d) drop=%s(%d)\n",
+                                (unsigned long long)p.ff_addr,
+                                (new_score > cur_score ? p.name.c_str() : it->second.name.c_str()),
+                                (new_score > cur_score ? new_score : cur_score),
+                                (new_score > cur_score ? it->second.name.c_str() : p.name.c_str()),
+                                (new_score > cur_score ? cur_score : new_score));
                         if (new_score > cur_score) best_at_ff[p.ff_addr] = std::move(p);
                     }
                 }
@@ -3621,9 +3661,33 @@ public:
             // previous "first wins" gate left native UClass walks blind to
             // PropertyLink, which carries inherited fields the reference SDK
             // counts per-class.
+            const char* ChainDbg = getenv("FROST_CHAIN_DEBUG");
+            bool DbgThis = ChainDbg && rec.name == ChainDbg;
             for (uint64_t off : kChainOffs) {
                 uint64_t head = Read<uint64_t>(obj_ptr + off);
+                size_t Before = best_at_ff.size();
                 walk_chain(head);
+                if (DbgThis) {
+                    std::printf("[chain-dbg] %s head +0x%llX = 0x%llX -> +%zu fields, "
+                                "stopped: %s (0x%llX)\n",
+                        rec.name.c_str(), (unsigned long long)off,
+                        (unsigned long long)head, best_at_ff.size() - Before,
+                        m_lastChainBreak, (unsigned long long)m_lastChainBreakVal);
+                    if (head > 0x10000) {
+                        auto Dbg = ReadPropertyChain(head);
+                        int Own = 0;
+                        for (const auto& Pp : Dbg) {
+                            uint64_t Ow = Read<uint64_t>(Pp.ff_addr +
+                                              ArcDecrypt::Offsets::FField::Owner) & ~1ULL;
+                            if (Ow == obj_ptr) ++Own;
+                        }
+                        std::printf("[chain-dbg]     %zu walked, %d owned by this struct; first: ",
+                            Dbg.size(), Own);
+                        for (size_t K = 0; K < Dbg.size() && K < 200; ++K)
+                            std::printf("%s@0x%X ", Dbg[K].name.c_str(), Dbg[K].offset);
+                        std::printf("\n");
+                    }
+                }
             }
             if (is_scriptstruct && !is_class) {
                 for (uint64_t off : kScriptStructOnlyChainOffs) {
@@ -3631,8 +3695,21 @@ public:
                     walk_chain(head);
                 }
             }
+            // best_at_ff is an unordered_map, so iterating it yields hash-bucket
+            // order — arbitrary, and it discards the offset sort ReadPropertyChain
+            // already did. Restore it here; a layout dump is unreadable when the
+            // fields are not in memory order.
             for (auto& [ff, p] : best_at_ff)
                 rec.properties.push_back(std::move(p));
+            std::sort(rec.properties.begin(), rec.properties.end(),
+                [](const PropertyRecord& A, const PropertyRecord& B) {
+                    if (A.offset != B.offset) return A.offset < B.offset;
+                    // Bitfields share a byte; order them by mask so the bits
+                    // read low-to-high instead of arbitrarily.
+                    if (A.bool_byte_mask != B.bool_byte_mask)
+                        return A.bool_byte_mask < B.bool_byte_mask;
+                    return A.name < B.name;
+                });
             // Legacy UProperty chain intentionally disabled — it corrupts output with
             // bogus entries (~3%) and the FField chain covers almost everything.
 

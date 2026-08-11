@@ -1621,6 +1621,27 @@ inline void ApplyOffsets811() {
     Off::FBoolProperty::ByteMask    = g_Sheet.BoolFieldBase + 2;
     Off::FBoolProperty::FieldMask   = g_Sheet.BoolFieldBase + 3;
     Patch20260421::g_PropertyOffsetXor = g_Sheet.PropOffsetXor;
+
+    // Subclass data starts right after the FProperty base, which is 0x120 on
+    // this patch. The inherited 0x138 came from CL-1315578 and reads past the
+    // allocation: every array's "Inner" then resolves to the NEXT field in the
+    // chain, so the pseudo __Item entry collides with that field in the
+    // ff_addr map and evicts it. That is what removed AActor::RootComponent,
+    // ParentComponent and BlueprintCreatedComponents from the dump, and what
+    // gave Tags the type of the delegate that follows it.
+    // Probed live: +0x110 and +0x118 are the link fields and both hold Next,
+    // +0x120 is the first subclass slot, and the array's element property sits
+    // at +0x128 — element sizes there come out as 8 for TArray<FName> and 32
+    // for TArray<FSoftObjectPath>, which is the check that settles it.
+    Off::FArrayProperty::Inner          = V::FPROP_SIZEOF + 8;
+    Off::FSetProperty::ElementProp      = V::FPROP_SIZEOF;
+    Off::FSoftObjectProperty::PropertyClass = V::FPROP_SIZEOF;
+    Off::FMapProperty::KeyProp          = V::FPROP_SIZEOF;
+    Off::FMapProperty::ValueProp        = V::FPROP_SIZEOF + 8;
+    Off::FStructProperty::Struct        = V::FPROP_SIZEOF;
+    Off::FObjectProperty::PropertyClass = V::FPROP_SIZEOF;
+    Off::FEnumProperty::UnderlyingProp  = V::FPROP_SIZEOF;
+    Off::FEnumProperty::Enum            = V::FPROP_SIZEOF + 8;
 }
 
 } // namespace ArcDecrypt

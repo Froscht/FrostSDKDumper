@@ -109,6 +109,33 @@ Pointer idiom: PSHUFB( ROL32( PSHUFLW(E, 0x4B) ^ 0x8387081898D8D8DD, 5 ),
                        [06 02 00 07 05 01 03 04] )
 ```
 
+### FProperty subclass data starts at +0x120, and Inner is at +0x128
+Inherited 0x138 from CL-1315578 reads past the FProperty allocation and
+lands on the NEXT field in the chain. Every array's Inner then resolved to
+the following property, so the synthetic `__Item` record collided with that
+property in the ff_addr map and evicted it. Symptoms: `AActor::RootComponent`,
+`ParentComponent` and `BlueprintCreatedComponents` missing from the dump, and
+`Tags` typed as `TArray<FMulticastSparseDelegateProperty>` — the delegate that
+follows it. Probing the live layout settles it:
+```
++0x110, +0x118   link fields, both hold Next
++0x120           first subclass slot (FSet element, FStruct, FObject class)
++0x128           FArrayProperty::Inner
+```
+The check that proves it is element size, not pointer plausibility:
+TArray<FName> gives 8 and TArray<FSoftObjectPath> gives 32 at +0x128, while
++0x110/+0x118 give the next field's size.
+
+**Properties must be sorted before emission.** `best_at_ff` is an
+`unordered_map`, so iterating it yields hash-bucket order and discards the
+offset sort `ReadPropertyChain` already did. A layout dump in arbitrary
+order looks like the offsets themselves are wrong.
+
+**All of AActor's chain heads are legitimate.** +0xD0, +0xE8 and +0x100 walk
+44 / 54 / 85 fields and every one of them is owned by the struct — they are
+UE's PropertyLink / RefLink / DestructorLink orderings of the same set, not
+foreign data. Do not "fix" the multi-head walk by dropping heads.
+
 ### Traps specific to this patch
 - **The keystream table must be read LIVE.** The module dump holds the
   at-rest form; runtime decrypts it in place. A static extraction of
