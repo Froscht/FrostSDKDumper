@@ -1,1 +1,0 @@
-./memreader.o

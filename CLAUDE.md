@@ -7,7 +7,11 @@ Build: `g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 -I KernelDriver/include
 Run: `sudo ./build_and_run.sh [PID]`
 
 ## Current Patch: Steam build 24653108 (2026-08-11)
-Image size **0x117E9000**. Dump: `module_dump_0x140000000.bin`.
+Image size **0x117E9000**. Offline work used a full module dump at
+`module_dump_0x140000000.bin`; it is not kept in-tree (280 MB, one build
+only) — re-pull it from the live process when a patch needs offline
+analysis. Remember that two regions in it are encrypted at rest: the
+keystream table and `.text 0x4BD000-0x4BDFFF`.
 **FULLY REVERSED AND LIVE-VERIFIED 2026-08-11 vs PID 53906** — 9048 sampled
 objects, 100.0% named, 0 "None", 5509 distinct names.
 

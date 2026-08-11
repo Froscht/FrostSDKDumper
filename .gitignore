@@ -1,41 +1,96 @@
-# Build artifacts
+# ── Build output ─────────────────────────────────────────────────────────
 FrostDumper
-FrostDumper_test
-probe_next
-probe_subprop
+FrostDumper_*
 build/
+*.o
+*.obj
+*.a
+*.so
+*.d
 
-# Generated output
-SDK_Output.h
+# Kernel module build artifacts. build_and_run.sh rebuilds these; the .cmd
+# and .mod files carry absolute paths from whichever machine built them.
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+modules.order
+Module.symvers
+
+# One-off probe binaries. Sources stay tracked, binaries do not.
+probe_*
+!probe_*.cpp
+!probe_*.py
+tools/extract_vtables_offline
+
+# ── Dumper output ────────────────────────────────────────────────────────
 SDK_Output.txt
+SDK_Output.h
+SDK_Output_OLD.txt
+SDK.hpp
 dump_*.txt
 vtable_map.md
+generated_decrypt.h
+
+# The live constant snapshot. Regenerated every run and patch-specific, so
+# committing it means the next patch loads stale values — see the config
+# hygiene notes in CLAUDE.md.
 decrypt_export.json
+decrypt_export.json.*
+decrypt_export_*.json*
 
-# IDE / MCP config
-.mcp.json
-
-# Kernel module build artifacts
-
-# Python
-__pycache__/
-*.pyc
-
-# Research notes (session artifacts)
-arc-*.md
-Findings.md
-*.exe
-memreader.ko
-probe_live_rvas
-probe_live_rvas
-/writeup
+# ── Reverse-engineering artifacts ────────────────────────────────────────
+# Module dumps are hundreds of MB and specific to one build.
 *.bin
-/SDK
-/sdk
-/.claude
-SDK_Output_OLD.txt
+*.exe
+*.dll
+*.pdb
+module_dump_*
+
+# IDA / Ghidra
+*.i64
+*.idb
+*.id0
+*.id1
 *.id2
 *.nam
+*.til
+*.asm
+ida_decomp/
+
+# Reference SDKs and archives
+/SDK
+/sdk
+refSDK/
 *.zip
-decrypt_export.json.imgsize-0x117E1000
-decrypt_export.json.POISONED-0x11853000
+*.7z
+*.tar.gz
+
+# ── Tooling and environment ──────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+.mcp.json
+/.claude
+.vscode/
+.idea/
+compile_commands.json
+
+# ── Editor and OS noise ──────────────────────────────────────────────────
+*.swp
+*.swo
+.*.kate-swp
+*~
+*.bak
+*.orig
+*.rej
+.DS_Store
+Thumbs.db
+
+# ── Session research notes ───────────────────────────────────────────────
+arc-*.md
+Findings.md
+/writeup
