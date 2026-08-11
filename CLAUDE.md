@@ -84,7 +84,11 @@ fail the invariant 104/104, the right one passes 104/104. Perfect separation.
 UStruct::SuperStruct      +0xA8     UStruct::ChildProperties  +0x100
 UStruct::Children         +0xF8     UStruct::PropertiesSize   +0x110
 UStruct::MinAlignment     +0xD8     UField::Next              +0x90
-UClass::ClassCastFlags    +0x1E8
+UClass::ClassCastFlags    +0x1E8   UClass::ClassFlags        +0x158
+UClass::ClassWithin       +0x150   UClass::ClassConfigName   +0x1F0
+UClass::ClassConstructor  +0x1D8   UStruct::StructBaseChain  +0x98
+UEnum::Names Data +0xA8, Num +0xB0, Max +0xB4; TPair stride 0x10 {FName@0,int64@8}
+  (INTACT on this patch - was stripped by Theia on CL-1233465)
 FField::NamePrivate       +0x70     FField::Next              +0x80
 FField salt sentinel      +0x88     FField::FlagsPrivate      +0x98
 FField::Owner             +0xA0     (tagged, bit0=1 => UObject)

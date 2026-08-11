@@ -1346,4 +1346,153 @@ namespace v20260808 {
     constexpr uint64_t FBOOLPROP_FIELDMASK   = 0x10BULL;
 } // namespace v20260808
 
+// Steam build 24653108, image size 0x117E9000.
+// Every value below is live-verified against PID 53906 (100% naming rate,
+// 9048 sampled objects, 0 "None"). See CLAUDE.md for the derivation.
+namespace v20260811 {
+    constexpr uint64_t IMAGE_SIZE            = 0x117E9000ULL;
+
+    constexpr uint64_t RVA_GNAMEPOOL         = 0xE38FA00ULL;
+    constexpr uint64_t RVA_POOL_INIT_FLAG    = 0xE38F9F8ULL;
+    constexpr uint64_t RVA_FNAME_RESOLVER    = 0x23EC40ULL;
+    // The at-rest bytes in the module dump are NOT the runtime table; it is
+    // decrypted in place at load. This RVA must be read from live memory.
+    constexpr uint64_t RVA_KEYSTREAM         = 0xE2CE7F4ULL;
+    constexpr int      KEYSTREAM_BASE_INDEX  = 80;
+    constexpr int      KEYSTREAM_ENTRIES     = 144;
+
+    constexpr uint32_t HASH_PRIME            = 0x01000193u;
+    constexpr uint32_t SHARD_HASH_ADD        = 0x6E149835u;
+    constexpr uint64_t SHARD_HASH_SEED_OFF   = 0x6550ULL;
+    constexpr uint64_t SHARD_BLOCK_BASE_OFF  = 0x6560ULL;
+    constexpr uint64_t SHARD_BLOCK_STRIDE    = 32ULL;
+    constexpr uint32_t SHARD_SEED_OR         = 0x40000000u;
+    constexpr int      SHARD_SEED_SHR        = 6;
+    constexpr int      SHARD_ROL_A           = 0x15;
+    constexpr int      SHARD_ROL_B           = 0x1A;
+    constexpr int      SHARD_SHR_C           = 0x0B;
+
+    constexpr uint8_t  BLOCK_PSHUFB[8]       = { 1, 4, 6, 0, 3, 7, 2, 5 };
+    constexpr int      BLOCK_ROL16           = 2;
+    constexpr uint64_t BLOCK_FNV_XOR         = 0x01554577E835E9F4ULL;
+
+    constexpr uint64_t FNV_PRIME             = 0x100000001B3ULL;
+    constexpr uint64_t FNV_ADD               = 0x323C186F5D5C1B15ULL;
+    constexpr int      FNV_ROL1              = 0x28;
+    constexpr int      FNV_ROL2              = 0x29;
+
+    // bswap64(0x43231D85) == 0x851D234300000000, so the four-step pointer
+    // chain is an algebraic identity. EntryPtr == RawPtr; nothing to apply.
+    constexpr bool     FNAME_PTR_CHAIN_IS_NOP = true;
+
+    constexpr uint16_t HDR_IS_WIDE_BIT       = 0x0800u;
+    constexpr uint16_t HDR_LENGTH_LO_MASK    = 0x003Fu;
+    constexpr int      HDR_LENGTH_HI_SHIFT   = 6;
+    constexpr uint32_t HDR_LENGTH_HI_MASK    = 0xFFFFFFC0u;
+    // One cyclic sequence, +1 per element. No LCG, no paired schedule.
+    constexpr uint32_t KEY_INIT_ADD          = 0x7216u;
+    constexpr uint32_t KEY_ADVANCE           = 1u;
+    constexpr uint8_t  KEY_INDEX_MASK        = 0x3Fu;
+    constexpr int      NARROW_KEY_SHIFT      = 3;
+    constexpr int      WIDE_KEY_SHIFT        = 0;
+
+    // No GUObjectArray struct on this patch: the chunks_manager is a
+    // standalone encrypted 16-byte global, rip-absolute at all 838 read
+    // sites, with zero writes and zero leas. Anchor on the absolute RVA.
+    constexpr uint64_t RVA_CHUNKMGR_GLOBAL   = 0xE64B260ULL;
+    constexpr uint64_t CHUNKMGR_XOR_RVA      = 0xB3F4030ULL;
+    constexpr uint64_t CHUNKMGR_PSHUFB_RVA   = 0xB3F4040ULL;
+    constexpr uint64_t CHUNKMGR_XOR_KEY      = 0x8387081898D8D8DDULL;
+    constexpr int      CHUNKMGR_PSHUFLW      = 0x4B;
+    constexpr int      CHUNKMGR_ROL32        = 5;
+
+    constexpr uint64_t MGR_NUMELEMENTS_OFF   = 0x30ULL;
+    constexpr uint64_t MGR_VTABLE_OFF        = 0x60ULL;
+    constexpr uint64_t MGR_BLOB_OFF          = 0x90ULL;
+    constexpr uint64_t MGR_VTABLE_SLOT       = 6ULL;
+    constexpr uint64_t NUMELEM_PSHUFB_RVA    = 0xB447380ULL;
+    constexpr int      NUMELEM_ROL16         = 2;
+    constexpr uint32_t NUMELEM_XOR           = 0xE835E9F4u;
+
+    constexpr uint32_t FUOBJECTITEM_STRIDE   = 20;
+    constexpr uint32_t ITEMS_PER_CHUNK       = 65536;
+    constexpr uint64_t UOBJECT_INTERNAL_IDX  = 0x0CULL;
+
+    // 37 consecutive 0x40-byte vtables; runtime picks one via hash % 37.
+    // 74 thunks, 73 structurally unique - interpretation is mandatory.
+    constexpr uint64_t THUNK_VTABLE_POOL_LO  = 0xB47FB80ULL;
+    constexpr uint64_t THUNK_VTABLE_POOL_HI  = 0xB4804C0ULL;
+    constexpr uint32_t THUNK_VTABLE_COUNT    = 37;
+
+    constexpr uint64_t UOBJ_NAME_SEED_OFF    = 0x10ULL;
+    constexpr uint64_t UOBJ_NAME_SLOT_BASE   = 0x20ULL;
+    constexpr uint64_t UOBJ_NAME_SLOT_STRIDE = 0x20ULL;
+    constexpr uint64_t RVA_UOBJECT_GETFNAME  = 0x5027E0ULL;
+    constexpr uint32_t UOBJ_SLOT_HASH_PRIME  = 0x01000193u;
+    constexpr uint32_t UOBJ_SLOT_HASH_ADD    = 0x21B21773u;
+    constexpr int      UOBJ_SLOT_HASH_ROL    = 0x18;
+    constexpr int      UOBJ_SLOT_SHIFT_A     = 3;
+    constexpr int      UOBJ_SLOT_SHIFT_B     = 8;
+    constexpr int      UOBJ_SLOT_SHIFT_C     = 3;
+    constexpr uint32_t UOBJ_SLOT_NAME_XOR    = 2u;
+    constexpr uint32_t UOBJ_SLOT_CLASS_ADJ   = 0u;
+    constexpr uint32_t UOBJ_SLOT_OUTER_ADJ   = 1u;
+    constexpr uint8_t  UOBJ_NAME_PSHUFB[8]   = { 1, 4, 6, 0, 3, 7, 2, 5 };
+    constexpr uint64_t UOBJ_NAME_PSHUFB_RVA  = 0xB42D360ULL;
+    constexpr int      UOBJ_NAME_ROL16       = 2;
+    constexpr uint64_t UOBJ_NAME_XOR         = 0x01554577E835E9F4ULL;
+    constexpr int      UOBJ_NAME_ROL64       = 32;
+
+    // Generic Theia pointer decrypt on this patch, same constants as the
+    // chunks_manager global.
+    constexpr uint64_t PTR_XOR_KEY           = 0x8387081898D8D8DDULL;
+    constexpr int      PTR_PSHUFLW           = 0x4B;
+    constexpr int      PTR_ROL32             = 5;
+    constexpr uint8_t  PTR_PSHUFB[8]         = { 6, 2, 0, 7, 5, 1, 3, 4 };
+
+    constexpr uint64_t USTRUCT_SUPER_OFF     = 0xA8ULL;
+    constexpr uint64_t USTRUCT_CHILDREN      = 0xF8ULL;
+    constexpr uint64_t USTRUCT_CHILDPROPS    = 0x100ULL;
+    constexpr uint64_t USTRUCT_PROPSIZE_OFF  = 0x110ULL;
+    constexpr uint64_t USTRUCT_MINALIGN_OFF  = 0xD8ULL;
+    constexpr uint64_t USTRUCT_BASECHAIN_OFF = 0x98ULL;
+    constexpr uint64_t UFIELD_NEXT_OFF       = 0x90ULL;
+    constexpr uint64_t UCLASS_CASTFLAGS_OFF  = 0x1E8ULL;
+    constexpr uint64_t UCLASS_CLASSFLAGS_OFF = 0x158ULL;
+    constexpr uint64_t UCLASS_WITHIN_OFF     = 0x150ULL;
+    constexpr uint64_t UCLASS_CONFIGNAME_OFF = 0x1F0ULL;
+
+    // Intact on this patch - Theia stripped it on CL-1233465.
+    constexpr uint64_t UENUM_NAMES_OFF       = 0xA8ULL;
+    constexpr uint64_t UENUM_NUM_OFF         = 0xB0ULL;
+    constexpr uint64_t UENUM_PAIR_STRIDE     = 0x10ULL;
+
+    // NamePrivate is key-free on this patch: no XOR constant at all.
+    constexpr uint64_t FFIELD_NAME_OFF       = 0x70ULL;
+    constexpr int      FFIELD_NAME_PSHUFLW_A = 0x8D;
+    constexpr int      FFIELD_NAME_ROL64_A   = 46;
+    constexpr int      FFIELD_NAME_PSHUFLW_B = 0x4B;
+    constexpr int      FFIELD_NAME_ROL64_B   = 32;
+
+    constexpr uint64_t FFIELD_NEXT_OFF       = 0x80ULL;
+    constexpr uint64_t FFIELD_SENTINEL_OFF   = 0x88ULL;
+    constexpr uint64_t FFIELD_FLAGS_OFF      = 0x98ULL;
+    constexpr uint64_t FFIELD_OWNER_OFF      = 0xA0ULL;
+
+    constexpr uint64_t FPROP_SENTINEL_OFF    = 0xA8ULL;
+    constexpr uint64_t FPROP_REPINDEX_OFF    = 0xB0ULL;
+    constexpr uint64_t FPROP_PROPFLAGS_OFF   = 0xB8ULL;
+    constexpr uint64_t FPROP_OFFSETINT_OFF   = 0xC4ULL;
+    constexpr uint32_t FPROP_OFFSET_XOR      = 0xEE0CA1CBu;
+    constexpr uint64_t FPROP_REPNOTIFY_OFF   = 0xE0ULL;
+    constexpr uint64_t FPROP_ARRAYDIM_OFF    = 0xF0ULL;
+    constexpr uint64_t FPROP_ELEMSIZE_OFF    = 0xF8ULL;
+    constexpr uint64_t FPROP_SIZEOF          = 0x120ULL;
+
+    constexpr uint64_t FBOOLPROP_FIELDSIZE   = 0x120ULL;
+    constexpr uint64_t FBOOLPROP_BYTEOFFSET  = 0x121ULL;
+    constexpr uint64_t FBOOLPROP_BYTEMASK    = 0x122ULL;
+    constexpr uint64_t FBOOLPROP_FIELDMASK   = 0x123ULL;
+} // namespace v20260811
+
 } // namespace ArcDecrypt
