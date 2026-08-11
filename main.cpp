@@ -1622,10 +1622,13 @@ public:
         uint64_t BestNext = 0; int BestLen = 0, SecondLen = 0;
         for (uint64_t Nx = 0x40; Nx <= 0x130; Nx += 8) {
             int Total = 0;
-            for (size_t I = 0; I < Objs.size() && I < 60; ++I) {
+            for (size_t I = 0; I < Objs.size(); ++I) {
                 uint64_t Fp = 0;
                 std::memcpy(&Fp, Objs[I].data() + BestCp, 8);
                 std::set<std::string> Seen;
+                uint32_t PrevOff = 0;
+                bool Ascending = true;
+                int Links = 0;
                 for (int Step = 0; Step < 8 && Plausible(Fp); ++Step) {
                     uint64_t Enc = 0;
                     if (!m_reader.Read(Fp + BestNm, &Enc, 8) || !Enc) break;
@@ -1638,17 +1641,25 @@ public:
                     std::string S = m_fname.DecryptNameString_V811(
                                         m_fname.ResolveNamePtr_V811(Ci));
                     if (S.size() < 3 || S.size() > 96) break;
-                    // Only names reached THROUGH Next count. The first field
-                    // decodes no matter what Nx is, so counting it gives every
-                    // candidate the same score and the probe cannot separate
-                    // anything — which is exactly what a tie with the runner-up
-                    // was telling us.
+                    // Names alone tie: the first field decodes whatever Nx is,
+                    // and beyond it a wrong Nx still lands on something
+                    // name-shaped often enough. What a wrong Nx cannot produce
+                    // is a run of fields whose Offset_Internal ascends — the
+                    // same criterion that settled ChildProperties.
                     if (Step > 0 && !Seen.insert(S).second) break;
+                    uint32_t Stored = 0;
+                    if (m_reader.Read(Fp + ArcDecrypt::g_Sheet.PropOffsetInternal, &Stored, 4)) {
+                        uint32_t Real = __builtin_bswap32(Stored) ^ ArcDecrypt::g_Sheet.PropOffsetXor;
+                        if (Real > 0x20000) { Ascending = false; break; }
+                        if (Step && Real < PrevOff) { Ascending = false; break; }
+                        PrevOff = Real;
+                    }
+                    ++Links;
                     uint64_t Nn = 0;
                     if (!m_reader.Read(Fp + Nx, &Nn, 8)) break;
                     Fp = Nn;
                 }
-                Total += (int)Seen.size();
+                if (Ascending && Links >= 5 && Seen.size() >= 4) ++Total;
             }
             if (Total > BestLen) { SecondLen = BestLen; BestLen = Total; BestNext = Nx; }
             else if (Total > SecondLen) { SecondLen = Total; }
@@ -1657,10 +1668,10 @@ public:
         // the seed sample happens to contain varies. What matters is that the
         // winner stands clear of the runner-up; a wrong offset produces almost
         // nothing, so the margin is large whenever the answer is real.
-        std::printf("[autoresolve] FField::Next probe: +0x%llX (%d chained distinct names, "
+        std::printf("[autoresolve] FField::Next probe: +0x%llX (%d ascending chains, "
                     "runner-up %d)\n",
             (unsigned long long)BestNext, BestLen, SecondLen);
-        if (BestNext && BestLen >= 8 && BestLen >= 2 * SecondLen + 4) {
+        if (BestNext && BestLen >= 5 && BestLen >= 2 * SecondLen + 2) {
             if (BestNext != V::FFIELD_NEXT_OFF)
                 std::printf("[autoresolve]   DRIFT FField::Next 0x%llX vs 0x%llX — adopting\n",
                     (unsigned long long)BestNext, (unsigned long long)V::FFIELD_NEXT_OFF);
