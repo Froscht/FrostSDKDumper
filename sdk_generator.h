@@ -32,6 +32,7 @@ struct PropertyRecord {
     bool        is_param;    // true if this is a UFunction parameter property
     uint8_t     bool_byte_mask = 0;  // FBoolProperty ByteMask (0x01..0x80)
     uint8_t     bool_field_size = 0; // FBoolProperty FieldSize (1=bitfield, 4=native)
+    int         chain_index = -1;    // position in FProperty linked list (serialization order)
 };
 
 struct FunctionRecord {
@@ -1278,6 +1279,7 @@ public:
 
             PropertyRecord pr{};
             pr.ff_addr = node;
+            pr.chain_index = count;
 
             // Name: UProperty stores its FName at +0x50 (not in the standard 4 UObject slots)
             // Use GetUPropertyName which reads the +0x50 slot with its own encrypt pipeline.
@@ -1563,6 +1565,7 @@ public:
             PropertyRecord pr{};
             pr.ff_addr   = ff;
             pr.is_param  = is_param;
+            pr.chain_index = count;
 
             // Name
             pr.name = ReadFFieldName(ff);
@@ -2113,6 +2116,8 @@ public:
             }
             if (pr.elem_size > 0)
                 oss << " // size=0x" << std::hex << pr.elem_size;
+            if (pr.chain_index >= 0)
+                oss << " // ci=" << std::dec << pr.chain_index;
             oss << "\n";
         }
         if (!GoodFns.empty()) {
