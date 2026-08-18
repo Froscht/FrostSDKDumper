@@ -59,6 +59,7 @@
 #include "fname_decrypt.h"
 using FNameDecryptor = FName::FNameDecryptor;
 #include "auto_resolve.h"
+#include "auto_resolve818.h"
 #include "theia_static.h"
 #include "auto_offsets.h"
 #include "auto_export.h"
@@ -285,6 +286,499 @@ public:
           m_gobj(MODULE_BASE, m_reader),
           m_pid(pid) {
         std::printf("[+] Module base: 0x%llX\n", (unsigned long long)MODULE_BASE);
+    }
+
+
+
+
+    // The struct offsets no static anchor reaches: ChildProperties, Next, Owner
+    // and SuperStruct. Probed against the live object graph once names work,
+    // and adopted only where the probe strictly beats what is loaded — after
+    // the +0x150 incident a weak signal must never overwrite a working offset.
+    void ProbeAndAdopt818Layout() {
+        if (!m_fname.IsV818Active()) return;
+        namespace Off = ArcDecrypt::Offsets;
+        auto& Sh = ArcDecrypt::g_Sheet;
+
+        // Sample type objects, not arbitrary ones. Never take the first N of
+        // the array: they are clone instances of one class, no field varies,
+        // and every negative result is meaningless.
+        const auto& Seeds = m_gobj.GetSeedObjects();
+        if (Seeds.size() < 512) return;
+        std::vector<uint64_t> Types;
+        size_t Step = Seeds.size() / 4000 + 1;
+        for (size_t I = 0; I < Seeds.size() && Types.size() < 300; I += Step) {
+            uint64_t Cls = m_fname.GetClassPtrAuto(Seeds[I]);
+            if (!Cls) continue;
+            std::string CN = m_fname.GetName(Cls);
+            if (CN == "Class" || CN == "ScriptStruct") Types.push_back(Seeds[I]);
+        }
+        if (Types.size() < 40) {
+            std::printf("[ar818] layout probe: only %zu type objects sampled - skipped\n",
+                        Types.size());
+            return;
+        }
+
+        auto FieldName = [this](uint64_t F) -> std::string {
+            int32_t Ci = m_fname.DecryptFFieldNameCI(F);
+            if (Ci <= 0) return {};
+            return m_fname.CompIndexToName(Ci);
+        };
+        auto PropOffset = [this](uint64_t F) -> uint32_t {
+            uint32_t Raw = 0;
+            if (!m_reader.Read(F + ArcDecrypt::g_Sheet.PropOffsetInternal, &Raw, 4))
+                return 0xFFFFFFFFu;
+            return __builtin_bswap32(Raw) ^ ArcDecrypt::g_Sheet.PropOffsetXor;
+        };
+        auto IsType = [this](uint64_t P) -> bool {
+            uint64_t Cls = m_fname.GetClassPtrAuto(P);
+            if (!Cls) return false;
+            std::string CN = m_fname.GetName(Cls);
+            return CN == "Class" || CN == "ScriptStruct" || CN == "Function";
+        };
+
+        auto Probe = AutoResolve818::ProbeLayout(m_reader, Types, FieldName,
+                                                 PropOffset, IsType);
+        if (!Probe.Valid) {
+            std::printf("[ar818] layout probe inconclusive - keeping loaded offsets\n");
+            return;
+        }
+        std::printf("[ar818] layout probe: ChildProperties +0x%llX (%d distinct names), "
+                    "Next +0x%llX (%d chains), Owner +0x%llX, SuperStruct +0x%llX\n",
+            (unsigned long long)Probe.ChildProps, Probe.Distinct,
+            (unsigned long long)Probe.Next, Probe.ChainCount,
+            (unsigned long long)Probe.Owner, (unsigned long long)Probe.Super);
+
+        struct { const char* N; uint64_t Got; uint64_t* Slot; uint64_t* Live; } Ad[] = {
+            { "ChildProperties", Probe.ChildProps, &Sh.UStruct818ChildProps, &Off::UStruct::ChildProperties },
+            { "FField::Next",    Probe.Next,       &Sh.FField818Next,        &Off::FField::Next },
+            { "FField::Owner",   Probe.Owner,      &Sh.FField818Owner,       &Off::FField::Owner },
+            { "SuperStruct",     Probe.Super,      &Sh.UStruct818Super,      &Off::UStruct::SuperStruct },
+        };
+        int Changed = 0;
+        for (const auto& A : Ad) {
+            if (!A.Got || A.Got == *A.Slot) continue;
+            std::printf("[ar818]   DRIFT %-16s probed +0x%llX != loaded +0x%llX - adopting\n",
+                A.N, (unsigned long long)A.Got, (unsigned long long)*A.Slot);
+            *A.Slot = A.Got;
+            *A.Live = A.Got;
+            ++Changed;
+        }
+        Sh.Layout818Resolved = true;
+        if (!Changed)
+            std::printf("[ar818] layout probe agrees with the loaded offsets\n");
+    }
+
+    // FROST_SABOTAGE818=chunkmgr|fname|getfname|propoff|all corrupts the
+    // compiled defaults before auto-resolve runs, so each self-healing path can
+    // be fired on demand. A path that has never fired is unproven, and the two
+    // times this dumper shipped a broken pipeline it was because a recovery
+    // route looked correct and had never been exercised.
+    void Sabotage818() {
+        const char* S = getenv("FROST_SABOTAGE818");
+        if (!S) return;
+        std::string W = S;
+        auto Hit = [&](const char* N) { return W == "all" || W == N; };
+        auto& Sh = ArcDecrypt::g_Sheet;
+
+        if (Hit("chunkmgr")) {
+            Sh.ChunkMgr818Rva = 0xDEAD000ULL;
+            Sh.ChunkMgr818Rol64 = 7;
+            Sh.ChunkMgr818Rol32 = 11;
+            Sh.Mgr818NumOff = 0x40; Sh.Mgr818NumXor = 0x11223344u;
+            Sh.Mgr818ArrOff = 0x48; Sh.Mgr818ArrXor = 0x5566778899AABBCCULL;
+            std::printf("[sabotage] chunks_manager wrecked\n");
+        }
+        if (Hit("fname")) {
+            Sh.Pool818Rva = 0xBEEF000ULL;
+            Sh.Keystream818Rva = 0xBEEF800ULL;
+            Sh.Seed818Off = 0x1234; Sh.Block818Base = 0x5678;
+            Sh.Block818Rol64 = 9; Sh.Block818Rol32 = 5;
+            Sh.BlockXor818 = 0x0123456789ABCDEFULL;
+            Sh.Fnv818Add = 0xAAAAAAAAAAAAAAAAULL;
+            Sh.Fnv818Rol1 = 11; Sh.Fnv818Rol2 = 13;
+            Sh.KeyInitAdd818 = 0x4242;
+            Sh.Hdr818LenMask = 0x7FF; Sh.Hdr818WideBit = 0x4000;
+            std::printf("[sabotage] FName pipeline wrecked\n");
+        }
+        if (Hit("layout")) {
+            Sh.UStruct818ChildProps = 0x128;
+            Sh.FField818Next  = 0xE8;
+            Sh.FField818Owner = 0x40;
+            Sh.UStruct818Super = 0x128;
+            std::printf("[sabotage] struct layout wrecked\n");
+        }
+        if (Hit("ffield")) {
+            Sh.FFieldName818Off = 0x148;
+            Sh.FFieldNameK1_818 = 0x1111111111111111ULL;
+            Sh.FFieldNameK2_818 = 0x2222222222222222ULL;
+            Sh.FFieldName818Rol32 = 7;
+            Sh.FProp818Sizeof = 0x138;
+            std::printf("[sabotage] FField name decode wrecked\n");
+        }
+        if (Hit("getfname")) {
+            Sh.Slot818SeedOff = 0x18;
+            Sh.Slot818Base = 0x40; Sh.Slot818Stride = 0x10;
+            Sh.Slot818NameXor = 1;
+            Sh.SlotClmulK1_818 = 0x1111111111111111ULL;
+            Sh.SlotClmulK2_818 = 0x2222222222222222ULL;
+            Sh.Slot818FinalRol = 16;
+            std::printf("[sabotage] GetFName slot values wrecked\n");
+        }
+        if (Hit("propoff")) {
+            Sh.PropOffsetInternal = 0x99;
+            Sh.PropOffsetXor = 0x11223344u;
+            // Marks the value as "came from somewhere else" so ApplyOffsets818
+            // leaves it alone; otherwise the re-assert quietly repairs the
+            // sabotage and the test proves nothing.
+            Sh.PropOff818Resolved = true;
+            ArcDecrypt::Offsets::FProperty::Offset_Internal = 0x99;
+            ArcDecrypt::Offsets::FProperty::Offset_XOR = 0x11223344u;
+            std::printf("[sabotage] Offset_Internal wrecked\n");
+        }
+    }
+
+    // Everything the CL-1341255 pipeline shapes need, extracted and adopted
+    // before anything consumes it. Each area validates itself: the FName
+    // pipeline against plaintext, the chunks_manager against a decoded
+    // manager whose NumElements and chunk array are in range, and the
+    // property offset against real properties once the object array is up.
+    void RunAutoResolve818() {
+        if (m_autoResolved818) return;
+        m_autoResolved818 = true;
+
+        namespace AR = AutoResolve818;
+        namespace V  = ArcDecrypt::v20260818;
+        const auto& Bd = AutoDiscovery::g_DiscoveredBounds;
+        if (!Bd.Valid || !Bd.TextSize) {
+            std::printf("\n=== Phase 0c2: auto-resolve (v20260818) ===\n");
+            std::printf("[ar818] module bounds unknown - skipped\n");
+            return;
+        }
+        std::printf("\n=== Phase 0c2: auto-resolve (v20260818) ===\n");
+
+        auto& Sh = ArcDecrypt::g_Sheet;
+        int Areas = 0;
+
+        // ── chunks_manager ────────────────────────────────────────────────
+        // Adopted straight away: the validator has already decoded the
+        // manager with the extracted shape and checked that both encoded
+        // fields come out in range, which no wrong shape survives.
+        {
+            auto Mg = AR::FindChunkMgr(m_sigScanner, Bd,
+                [this](const AR::ChunkMgrInfo& C) -> bool {
+                    uint8_t Enc[16] = {};
+                    if (!m_reader.Read(MODULE_BASE + C.GlobalRva, Enc, 16)) return false;
+                    uint64_t Lo = 0;
+                    std::memcpy(&Lo, Enc, 8);
+                    uint64_t X = AutoDiscovery::V811Detail::Rotl64(Lo, C.Rol64);
+                    X = AutoDiscovery::V811Detail::Pshufb8(X, C.Pshufb);
+                    uint32_t D0 = AutoDiscovery::V811Detail::Rotl32((uint32_t)X, C.Rol32);
+                    uint32_t D1 = AutoDiscovery::V811Detail::Rotl32((uint32_t)(X >> 32), C.Rol32);
+                    uint64_t Mgr = (uint64_t)D0 | ((uint64_t)D1 << 32);
+                    if (Mgr < 0x10000ULL || Mgr >= 0x800000000000ULL) return false;
+
+                    uint32_t NumRaw = 0; uint64_t ArrRaw = 0;
+                    if (!m_reader.Read(Mgr + C.NumOff, &NumRaw, 4)) return false;
+                    if (!m_reader.Read(Mgr + C.ArrOff, &ArrRaw, 8)) return false;
+                    uint32_t Num = __builtin_bswap32(NumRaw ^ C.NumXor);
+                    uint64_t Arr = __builtin_bswap64(ArrRaw ^ C.ArrXor);
+                    if (Num <= 1000 || Num >= 4000000) return false;
+                    if (Arr < 0x10000ULL || Arr >= 0x800000000000ULL) return false;
+                    uint64_t Chunk0 = 0;
+                    if (!m_reader.Read(Arr, &Chunk0, 8)) return false;
+                    return Chunk0 >= 0x10000ULL && Chunk0 < 0x800000000000ULL;
+                });
+            if (Mg.Valid) {
+                if (Mg.GlobalRva != V::RVA_CHUNKMGR_GLOBAL)
+                    std::printf("[ar818]   DRIFT chunks_manager 0x%llX != compiled 0x%llX\n",
+                        (unsigned long long)Mg.GlobalRva,
+                        (unsigned long long)V::RVA_CHUNKMGR_GLOBAL);
+                Sh.ChunkMgr818Rva  = Mg.GlobalRva;
+                Sh.ChunkMgr818Rol64 = Mg.Rol64;
+                Sh.ChunkMgr818Rol32 = Mg.Rol32;
+                std::memcpy(Sh.ChunkMgr818Pshufb, Mg.Pshufb, 8);
+                Sh.Mgr818NumOff = Mg.NumOff;
+                Sh.Mgr818NumXor = Mg.NumXor;
+                Sh.Mgr818ArrOff = Mg.ArrOff;
+                Sh.Mgr818ArrXor = Mg.ArrXor;
+                std::printf("[ar818] chunks_manager adopted: rol64=%d rol32=%d "
+                            "num +0x%llX ^0x%08X  arr +0x%llX ^0x%llX\n",
+                    Mg.Rol64, Mg.Rol32,
+                    (unsigned long long)Mg.NumOff, Mg.NumXor,
+                    (unsigned long long)Mg.ArrOff, (unsigned long long)Mg.ArrXor);
+                ++Areas;
+            }
+        }
+
+        // ── FName pipeline ────────────────────────────────────────────────
+        // `and r32, 0xFFFF00` is the ChunkOff step and occurs a handful of
+        // times in the whole image, all of them this family. Each candidate
+        // is installed and decided by plaintext, never by looking plausible.
+        {
+            auto Sites = AR::FindChunkOffSites(m_sigScanner, Bd);
+            std::printf("[ar818] %zu `and r32, 0xFFFF00` sites (the ChunkOff step)\n",
+                        Sites.size());
+            bool Done = false;
+            for (uint64_t S : Sites) {
+                auto P = AR::ExtractFNameResolver(m_sigScanner, Bd, S);
+                if (!P.Valid) {
+                    std::printf("[ar818]   site 0x%llX rejected: %s\n",
+                        (unsigned long long)S, P.Reject ? P.Reject : "?");
+                    continue;
+                }
+                auto A = AR::AdoptFNamePipeline(Bd, P,
+                    [this]() { return m_fname.TryV818(false); });
+                if (!A.Valid) {
+                    std::printf("[ar818]   site 0x%llX extracted but no keystream "
+                                "window decoded CI=0 to \"None\"\n",
+                        (unsigned long long)S);
+                    continue;
+                }
+                struct { const char* N; unsigned long long Got, Want; } Cmp[] = {
+                    { "pool",      P.PoolRva,   V::RVA_GNAMEPOOL },
+                    { "seed off",  P.SeedOff,   V::SHARD_HASH_SEED_OFF },
+                    { "block base",P.BlockBase, V::SHARD_BLOCK_BASE_OFF },
+                    { "block xor", P.BlockXor,  V::BLOCK_FNV_XOR },
+                    { "fnv add",   P.FnvAdd,    V::FNV_ADD },
+                    { "fnv rol1",  (unsigned)P.FnvRol1, (unsigned)V::FNV_ROL1 },
+                    { "fnv rol2",  (unsigned)P.FnvRol2, (unsigned)V::FNV_ROL2 },
+                    { "key init",  P.KeyInitAdd, V::KEY_INIT_ADD },
+                    { "keystream", A.WindowRva,
+                      V::RVA_KEYSTREAM + (uint64_t)V::KEYSTREAM_BASE_INDEX * 2 },
+                };
+                int Agree = 0;
+                for (const auto& C : Cmp) {
+                    if (C.Got == C.Want) { ++Agree; continue; }
+                    std::printf("[ar818]   DRIFT %-10s extracted 0x%llX != compiled 0x%llX\n",
+                        C.N, C.Got, C.Want);
+                }
+                std::printf("[ar818] FName pipeline adopted from 0x%llX "
+                            "(%d/%d match the compiled sheet, hash program %zu ops)\n",
+                    (unsigned long long)S, Agree, (int)(sizeof(Cmp)/sizeof(Cmp[0])),
+                    P.Hash.size());
+                ++Areas;
+                Done = true;
+                break;
+            }
+            if (!Done)
+                std::printf("[ar818] no FName pipeline candidate decoded CI=0 to \"None\"\n");
+        }
+
+        // ── FProperty::Offset_Internal ────────────────────────────────────
+        {
+            auto Po = AR::ExtractPropertyOffset(m_sigScanner, Bd);
+            if (Po.Valid) {
+                if (Po.OffsetInternal != V::FPROP_OFFSETINT_OFF || Po.Xor != V::FPROP_OFFSET_XOR)
+                    std::printf("[ar818]   DRIFT Offset_Internal +0x%llX ^0x%08X != "
+                                "compiled +0x%llX ^0x%08X\n",
+                        (unsigned long long)Po.OffsetInternal, Po.Xor,
+                        (unsigned long long)V::FPROP_OFFSETINT_OFF, V::FPROP_OFFSET_XOR);
+                // Adopted here, not merely staged. The encode shape is
+                // specific enough to trust on its own, and the layout probe
+                // below needs Offset_Internal to tell FField::Next from the
+                // property-link chains — staging it created a dependency
+                // cycle in which neither area could recover.
+                m_prev818PropOff  = Sh.PropOffsetInternal;
+                m_prev818PropXor  = Sh.PropOffsetXor;
+                Sh.PropOffsetInternal = Po.OffsetInternal;
+                Sh.PropOffsetXor      = Po.Xor;
+                Sh.PropOff818Resolved = true;
+                ArcDecrypt::Offsets::FProperty::Offset_Internal = Po.OffsetInternal;
+                ArcDecrypt::Offsets::FProperty::Offset_XOR      = Po.Xor;
+                ArcDecrypt::Patch20260421::g_PropertyOffsetXor  = Po.Xor;
+                m_resolved818PropOff = Po;
+                ++Areas;
+            }
+        }
+
+        // ── FField::NamePrivate and sizeof(FProperty) ─────────────────────
+        // Adopted straight away: the CoreUObject source-path strings name the
+        // exact function, so there is nothing to guess, and a wrong decode
+        // shows up immediately as unnamed properties.
+        {
+            auto Fn = AR::ExtractFFieldName(m_sigScanner, Bd);
+            if (Fn.Valid) {
+                struct { const char* N; unsigned long long Got, Want; } Cmp[] = {
+                    { "name off",  Fn.NameOff, V::FFIELD_NAME_OFF },
+                    { "key1",      Fn.K1,      V::FFIELD_NAME_K1 },
+                    { "key2",      Fn.K2,      V::FFIELD_NAME_K2 },
+                    { "rol32",     (unsigned)Fn.Rol32, (unsigned)V::FFIELD_NAME_ROL32 },
+                    { "rol64",     (unsigned)Fn.Rol64, (unsigned)V::FFIELD_NAME_ROL64 },
+                };
+                int Agree = 0;
+                for (const auto& C : Cmp) {
+                    if (C.Got == C.Want) { ++Agree; continue; }
+                    std::printf("[ar818]   DRIFT %-9s extracted 0x%llX != compiled 0x%llX\n",
+                        C.N, C.Got, C.Want);
+                }
+                Sh.FFieldName818Off   = Fn.NameOff;
+                Sh.FFieldNameK1_818   = Fn.K1;
+                Sh.FFieldNameK2_818   = Fn.K2;
+                Sh.FFieldName818Rol32 = Fn.Rol32;
+                Sh.FFieldName818Rol64 = Fn.Rol64;
+                Sh.FFieldName818Resolved = true;
+                if (Fn.FieldMaskOff >= 4) {
+                    uint64_t Sz = Fn.FieldMaskOff - 3;
+                    if (Sz != V::FPROP_SIZEOF)
+                        std::printf("[ar818]   DRIFT sizeof(FProperty) 0x%llX != compiled 0x%llX\n",
+                            (unsigned long long)Sz, (unsigned long long)V::FPROP_SIZEOF);
+                    Sh.FProp818Sizeof = Sz;
+                }
+                std::printf("[ar818] FField name adopted from 0x%llX: +0x%llX, "
+                            "%d/%d match, sizeof(FProperty)=0x%llX\n",
+                    (unsigned long long)Fn.Rva, (unsigned long long)Fn.NameOff,
+                    Agree, (int)(sizeof(Cmp)/sizeof(Cmp[0])),
+                    (unsigned long long)Sh.FProp818Sizeof);
+                ++Areas;
+            } else {
+                std::printf("[ar818] FField name decode not located - keeping compiled values\n");
+            }
+        }
+
+        // ── UObject::GetFName ─────────────────────────────────────────────
+        // Staged, not adopted. The slot values cannot be judged without
+        // objects, and the FName pipeline above does not depend on them, so
+        // scoring waits until the array is up.
+        {
+            auto Gf = AR::FindGetFName(m_sigScanner, Bd);
+            if (Gf.Valid) {
+                struct { const char* N; unsigned long long Got, Want; } Cmp[] = {
+                    { "seed off",  Gf.SeedOff,    V::UOBJ_NAME_SEED_OFF },
+                    { "slot base", Gf.SlotBase,   V::UOBJ_NAME_SLOT_BASE },
+                    { "slot strd", Gf.SlotStride, V::UOBJ_NAME_SLOT_STRIDE },
+                    { "slot xor",  Gf.SlotXor,    V::UOBJ_SLOT_NAME_XOR },
+                    { "clmul K1",  Gf.ClmulK1,    V::SLOT_CLMUL_K1 },
+                    { "clmul K2",  Gf.ClmulK2,    V::SLOT_CLMUL_K2 },
+                    { "final rol", (unsigned)Gf.FinalRol, (unsigned)V::UOBJ_NAME_ROL64 },
+                };
+                int Agree = 0;
+                for (const auto& C : Cmp) {
+                    if (C.Got == C.Want) { ++Agree; continue; }
+                    std::printf("[ar818]   DRIFT %-10s extracted 0x%llX != compiled 0x%llX\n",
+                        C.N, C.Got, C.Want);
+                }
+                std::printf("[ar818] GetFName: %d/%d match the compiled sheet "
+                            "(%d Name copies, hash program %zu ops) - staged for scoring\n",
+                    Agree, (int)(sizeof(Cmp)/sizeof(Cmp[0])), Gf.Copies, Gf.Hash.size());
+                m_resolved818GetFName = Gf;
+                ++Areas;
+            } else {
+                std::printf("[ar818] GetFName not located - keeping compiled slot values\n");
+            }
+        }
+
+        Sh.Resolved818 = (Areas >= 3);
+        std::printf("[ar818] %d of 5 areas resolved\n", Areas);
+    }
+
+    // Scored once objects exist: install the staged slot values, count how
+    // many sampled objects resolve to a name, and keep them only if they beat
+    // what is already loaded. A wrong hash still returns a plausible number
+    // and still picks *a* slot - it just picks the wrong one - so the only
+    // honest test is how many names come out.
+    void ScoreAndAdopt818SlotSelector() {
+        if (!m_resolved818GetFName.Valid || !m_fname.IsV818Active()) return;
+
+        const auto& Seeds = m_gobj.GetSeedObjects();
+        if (Seeds.size() < 64) return;
+
+        std::vector<uint64_t> Sample;
+        size_t Step = Seeds.size() / 400 + 1;
+        for (size_t I = 0; I < Seeds.size() && Sample.size() < 400; I += Step)
+            Sample.push_back(Seeds[I]);
+
+        auto Score = [&]() -> int {
+            int Ok = 0;
+            for (uint64_t O : Sample) {
+                std::string N = m_fname.GetName(O);
+                if (N.empty() || N.size() > 200) continue;
+                bool Clean = true;
+                for (unsigned char C : N) if (C < 32 || C > 126) { Clean = false; break; }
+                if (Clean) ++Ok;
+            }
+            return Ok;
+        };
+
+        auto& Sh = ArcDecrypt::g_Sheet;
+        const ArcDecrypt::LiveSheet Saved = Sh;
+        int Loaded = Score();
+
+        const auto& G = m_resolved818GetFName;
+        Sh.Slot818Program  = G.Hash;
+        Sh.Slot818SeedOff  = G.SeedOff;
+        Sh.Slot818Base     = G.SlotBase;
+        Sh.Slot818Stride   = G.SlotStride;
+        Sh.Slot818NameXor  = G.SlotXor;
+        Sh.SlotClmulK1_818 = G.ClmulK1;
+        Sh.SlotClmulK2_818 = G.ClmulK2;
+        Sh.Slot818FinalRol = G.FinalRol;
+        int Fresh = Score();
+
+        std::printf("[ar818] slot selector: loaded %d/%zu, auto-resolved %d/%zu\n",
+            Loaded, Sample.size(), Fresh, Sample.size());
+        if (Fresh > Loaded) {
+            std::printf("[ar818] auto-resolved slot values adopted\n");
+        } else {
+            Sh = Saved;
+            std::printf("[ar818] keeping the loaded slot values\n");
+        }
+    }
+
+    // The encode site is unambiguous but singular, so it is validated against
+    // real properties rather than by consensus: decode Offset_Internal for a
+    // sample of chain members and require the values to be in range and to
+    // ascend along the chain, which a wrong xor cannot produce.
+    void ValidateAndAdopt818PropertyOffset() {
+        if (!m_resolved818PropOff.Valid || !m_fname.IsV818Active()) return;
+        namespace Off = ArcDecrypt::Offsets;
+
+        auto Measure = [&](uint64_t OffInt, uint32_t Xor) -> int {
+            int Good = 0;
+            const auto& Seeds = m_gobj.GetSeedObjects();
+            size_t Step = Seeds.size() / 600 + 1;
+            for (size_t I = 0; I < Seeds.size(); I += Step) {
+                uint64_t Head = 0;
+                if (!m_reader.Read(Seeds[I] + Off::UStruct::ChildProperties, &Head, 8)) continue;
+                if (Head < 0x10000ULL || Head >= 0x800000000000ULL) continue;
+                uint64_t Cur = Head;
+                uint32_t Prev = 0;
+                int Run = 0;
+                for (int K = 0; K < 6 && Cur >= 0x10000ULL && Cur < 0x800000000000ULL; ++K) {
+                    uint32_t Raw = 0;
+                    if (!m_reader.Read(Cur + OffInt, &Raw, 4)) break;
+                    uint32_t Real = __builtin_bswap32(Raw) ^ Xor;
+                    if (Real > 0x100000u) break;
+                    if (K && Real < Prev) break;
+                    Prev = Real;
+                    ++Run;
+                    uint64_t Next = 0;
+                    if (!m_reader.Read(Cur + Off::FField::Next, &Next, 8)) break;
+                    Cur = Next;
+                }
+                if (Run >= 3) ++Good;
+            }
+            return Good;
+        };
+
+        int Fresh  = Measure(m_resolved818PropOff.OffsetInternal,
+                             m_resolved818PropOff.Xor);
+        int Prev   = Measure(m_prev818PropOff, m_prev818PropXor);
+        std::printf("[ar818] Offset_Internal check: auto-resolved +0x%llX gives %d "
+                    "ascending chains, the previous +0x%llX gives %d\n",
+            (unsigned long long)m_resolved818PropOff.OffsetInternal, Fresh,
+            (unsigned long long)m_prev818PropOff, Prev);
+        // Revert only on a strict loss. Ties keep the extracted value: it came
+        // from the encode site itself, while the previous one is whatever the
+        // last session or the compiled default happened to leave behind.
+        if (Prev > Fresh) {
+            ArcDecrypt::g_Sheet.PropOffsetInternal = m_prev818PropOff;
+            ArcDecrypt::g_Sheet.PropOffsetXor      = m_prev818PropXor;
+            Off::FProperty::Offset_Internal = m_prev818PropOff;
+            Off::FProperty::Offset_XOR      = m_prev818PropXor;
+            ArcDecrypt::Patch20260421::g_PropertyOffsetXor = m_prev818PropXor;
+            std::printf("[ar818] extracted Offset_Internal measured worse - reverted\n");
+        }
     }
 
     // Everything auto-resolve can recover, in one place so it can run BEFORE
@@ -763,7 +1257,9 @@ public:
         // FUObjectItem stride, CI=0 == "None"), so it does not care that every
         // RVA in the compiled sheet went stale. Runs here rather than after the
         // object array because the object array is one of its consumers.
+        Sabotage818();
         RunAutoResolve();
+        RunAutoResolve818();
 
         // With the sheet resolved, v811 can be tried immediately. The gate is
         // the plaintext self-test inside AdoptV811, not the image size: a patch
@@ -898,6 +1394,16 @@ public:
         // settled, sample objects to find which inline-handle offset works
         // best on this build. Sets the FNameDecryptor primary so GetName tries
         // it first instead of walking the legacy candidate list every call.
+        // Scored the moment objects exist, not after auto_offsets: everything
+        // between the two reads names, so a bad slot selector would degrade the
+        // vtable discovery and the naming sanity check before anyone noticed.
+        // Order matters: the slot selector needs only objects, the layout probe
+        // needs names and Offset_Internal, and the Offset_Internal check needs
+        // the layout to walk chains with.
+        if (gobj_ok) ScoreAndAdopt818SlotSelector();
+        if (gobj_ok) ProbeAndAdopt818Layout();
+        if (gobj_ok) ValidateAndAdopt818PropertyOffset();
+
         if (gobj_ok) CalibrateInlineHandleOffset();
 
         // ── Phase 0.6: FName sanity check ───────────────────────────────
@@ -1358,6 +1864,7 @@ public:
                 if (m_fname.IsV818Active()) {
                     ArcDecrypt::ApplyOffsets818();
                     std::printf("[v818] re-asserted FField layout after auto_offsets\n");
+
                 } else {
                     ArcDecrypt::ApplyOffsets811();
                     std::printf("[v811] re-asserted FField layout after auto_offsets\n");
@@ -1682,6 +2189,11 @@ public:
     // rate that looks mediocre rather than broken.
     AutoResolve::GetFNameInfo m_resolvedGetFName;
     bool m_autoResolved = false;
+    bool m_autoResolved818 = false;
+    AutoResolve818::GetFNameInfo       m_resolved818GetFName;
+    AutoResolve818::PropertyOffsetInfo m_resolved818PropOff;
+    uint64_t m_prev818PropOff = 0;
+    uint32_t m_prev818PropXor = 0;
 
     // Probe ChildProperties and FField::NamePrivate against ground truth.
     //

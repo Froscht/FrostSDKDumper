@@ -1745,6 +1745,11 @@ struct LiveSheet {
     // than overloading them: the two pipelines differ in shape, not just in
     // value, so a half-adopted mix of the two would decode plausible garbage
     // instead of failing.
+    // Anything auto_resolve818 can extract lives here, so a patch that only
+    // moves these needs no source edit. Both hash chains are stored as
+    // programs rather than fixed op slots: the shard hash has already gone
+    // SHR-form (build 24653108) and back to ROL-form (CL-1341255), and a
+    // fixed-slot representation cannot express that without a code change.
     uint64_t Pool818Rva      = v20260818::RVA_GNAMEPOOL;
     uint64_t Keystream818Rva =
         v20260818::RVA_KEYSTREAM + (uint64_t)v20260818::KEYSTREAM_BASE_INDEX * 2;
@@ -1755,6 +1760,59 @@ struct LiveSheet {
     uint64_t SlotClmulK1_818 = v20260818::SLOT_CLMUL_K1;
     uint64_t SlotClmulK2_818 = v20260818::SLOT_CLMUL_K2;
     uint32_t KeyInitAdd818   = v20260818::KEY_INIT_ADD;
+
+    std::vector<HashOp> Shard818Program;   // empty => the compiled ROL form
+    uint64_t Seed818Off      = v20260818::SHARD_HASH_SEED_OFF;
+    uint64_t Block818Base    = v20260818::SHARD_BLOCK_BASE_OFF;
+    uint64_t Block818Stride  = v20260818::SHARD_BLOCK_STRIDE;
+    int      Block818Rol64   = v20260818::BLOCK_ROL64;
+    int      Block818Rol32   = v20260818::BLOCK_ROL32;
+    uint64_t Fnv818Prime     = v20260818::FNV_PRIME;
+    uint64_t Fnv818Add       = v20260818::FNV_ADD;
+    int      Fnv818Rol1      = v20260818::FNV_ROL1;
+    int      Fnv818Rol2      = v20260818::FNV_ROL2;
+    uint16_t Hdr818LenMask   = v20260818::HDR_LENGTH_MASK;
+    uint16_t Hdr818WideBit   = v20260818::HDR_IS_WIDE_BIT;
+
+    std::vector<HashOp> Slot818Program;    // empty => the compiled ROL form
+    uint64_t Slot818SeedOff  = v20260818::UOBJ_NAME_SEED_OFF;
+    uint64_t Slot818Base     = v20260818::UOBJ_NAME_SLOT_BASE;
+    uint64_t Slot818Stride   = v20260818::UOBJ_NAME_SLOT_STRIDE;
+    uint32_t Slot818NameXor  = v20260818::UOBJ_SLOT_NAME_XOR;
+    uint32_t Slot818ClassAdj = v20260818::UOBJ_SLOT_CLASS_ADJ;
+    uint32_t Slot818OuterAdj = v20260818::UOBJ_SLOT_OUTER_ADJ;
+    int      Slot818FinalRol = v20260818::UOBJ_NAME_ROL64;
+
+    uint8_t  ChunkMgr818Pshufb[8] = { 5, 0, 4, 6, 7, 2, 3, 1 };
+    int      ChunkMgr818Rol64 = v20260818::CHUNKMGR_ROL64;
+    int      ChunkMgr818Rol32 = v20260818::CHUNKMGR_ROL32;
+    uint64_t Mgr818NumOff     = v20260818::MGR_NUMELEMENTS_OFF;
+    uint32_t Mgr818NumXor     = v20260818::MGR_NUMELEMENTS_XOR;
+    uint64_t Mgr818ArrOff     = v20260818::MGR_CHUNKARRAY_OFF;
+    uint64_t Mgr818ArrXor     = v20260818::MGR_CHUNKARRAY_XOR;
+
+    // Set once every 818 area has been extracted and the pipeline self-test
+    // passed, so a run can report whether it is standing on resolved values
+    // or on the compiled defaults.
+    bool     Resolved818      = false;
+
+    // Set once an area has been extracted and validated, so ApplyOffsets818 —
+    // which runs several times per session — re-asserts a compiled default only
+    // where nothing better is known. Without this the second call quietly undoes
+    // every adoption the first one enabled.
+    bool     PropOff818Resolved    = false;
+    bool     FFieldName818Resolved = false;
+    bool     Layout818Resolved     = false;
+
+    uint64_t FFieldName818Off     = v20260818::FFIELD_NAME_OFF;
+    int      FFieldName818Rol32   = v20260818::FFIELD_NAME_ROL32;
+    int      FFieldName818Rol64   = v20260818::FFIELD_NAME_ROL64;
+    uint64_t FProp818Sizeof       = v20260818::FPROP_SIZEOF;
+    uint64_t FField818Next        = v20260818::FFIELD_NEXT_OFF;
+    uint64_t FField818Owner       = v20260818::FFIELD_OWNER_OFF;
+    uint64_t UStruct818ChildProps = v20260818::USTRUCT_CHILDPROPS;
+    uint64_t UStruct818Super      = v20260818::USTRUCT_SUPER_OFF;
+    uint64_t UStruct818Children   = v20260818::USTRUCT_CHILDREN;
 };
 
 inline LiveSheet g_Sheet;
@@ -1813,45 +1871,48 @@ inline void ApplyOffsets811() {
 inline void ApplyOffsets818() {
     namespace V = v20260818;
     namespace Off = Offsets;
-    Off::FField::NamePrivate        = V::FFIELD_NAME_OFF;
-    Off::FField::NameEncrypted      = V::FFIELD_NAME_OFF;
-    Off::FField::Next               = V::FFIELD_NEXT_OFF;
-    Off::FField::Owner              = V::FFIELD_OWNER_OFF;
+    Off::FField::NamePrivate        = g_Sheet.FFieldName818Off;
+    Off::FField::NameEncrypted      = g_Sheet.FFieldName818Off;
+    Off::FField::Next               = g_Sheet.FField818Next;
+    Off::FField::Owner              = g_Sheet.FField818Owner;
     Off::FField::ClassPrivate       = V::FFIELD_CLASS_OFF;
-    Off::UStruct::ChildProperties   = V::USTRUCT_CHILDPROPS;
+    Off::UStruct::ChildProperties   = g_Sheet.UStruct818ChildProps;
     Off::UStruct::PropertiesSize    = V::USTRUCT_PROPSIZE_OFF;
-    Off::UStruct::SuperStruct       = V::USTRUCT_SUPER_OFF;
+    Off::UStruct::SuperStruct       = g_Sheet.UStruct818Super;
     Off::UEnum::Names               = V::UENUM_NAMES_OFF;
     Off::FProperty::ArrayDim        = V::FPROP_ARRAYDIM_OFF;
     Off::FProperty::ElementSize     = V::FPROP_ELEMSIZE_OFF;
     Off::FProperty::PropertyFlags   = V::FPROP_PROPFLAGS_OFF;
-    Off::FProperty::Offset_Internal = V::FPROP_OFFSETINT_OFF;
-    Off::FProperty::Offset_XOR      = V::FPROP_OFFSET_XOR;
-    Off::FBoolProperty::FieldSize   = V::FBOOLPROP_FIELDSIZE;
-    Off::FBoolProperty::ByteOffset  = V::FBOOLPROP_BYTEOFFSET;
-    Off::FBoolProperty::ByteMask    = V::FBOOLPROP_BYTEMASK;
-    Off::FBoolProperty::FieldMask   = V::FBOOLPROP_FIELDMASK;
-    Patch20260421::g_PropertyOffsetXor = V::FPROP_OFFSET_XOR;
+    if (!g_Sheet.PropOff818Resolved) {
+        g_Sheet.PropOffsetInternal = V::FPROP_OFFSETINT_OFF;
+        g_Sheet.PropOffsetXor      = V::FPROP_OFFSET_XOR;
+    }
+    Off::FProperty::Offset_Internal = g_Sheet.PropOffsetInternal;
+    Off::FProperty::Offset_XOR      = g_Sheet.PropOffsetXor;
+    Off::FBoolProperty::FieldSize   = g_Sheet.FProp818Sizeof;
+    Off::FBoolProperty::ByteOffset  = g_Sheet.FProp818Sizeof + 1;
+    Off::FBoolProperty::ByteMask    = g_Sheet.FProp818Sizeof + 2;
+    Off::FBoolProperty::FieldMask   = g_Sheet.FProp818Sizeof + 3;
+    Patch20260421::g_PropertyOffsetXor = g_Sheet.PropOffsetXor;
 
     // sizeof(FProperty) is 0x100 here, fixed by FBoolProperty's four bytes
     // landing at +0x100..+0x103 (the FieldMask read at +0x103 in
     // FBoolProperty::GetCPPType pins it exactly).
-    Off::FArrayProperty::Inner          = V::FPROP_SIZEOF + 8;
-    Off::FSetProperty::ElementProp      = V::FPROP_SIZEOF;
-    Off::FSoftObjectProperty::PropertyClass = V::FPROP_SIZEOF;
-    Off::FMapProperty::KeyProp          = V::FPROP_SIZEOF;
-    Off::FMapProperty::ValueProp        = V::FPROP_SIZEOF + 8;
-    Off::FStructProperty::Struct        = V::FPROP_SIZEOF;
-    Off::FObjectProperty::PropertyClass = V::FPROP_SIZEOF;
-    Off::FEnumProperty::UnderlyingProp  = V::FPROP_SIZEOF;
-    Off::FEnumProperty::Enum            = V::FPROP_SIZEOF + 8;
+    const uint64_t Sz = g_Sheet.FProp818Sizeof;
+    Off::FArrayProperty::Inner          = Sz + 8;
+    Off::FSetProperty::ElementProp      = Sz;
+    Off::FSoftObjectProperty::PropertyClass = Sz;
+    Off::FMapProperty::KeyProp          = Sz;
+    Off::FMapProperty::ValueProp        = Sz + 8;
+    Off::FStructProperty::Struct        = Sz;
+    Off::FObjectProperty::PropertyClass = Sz;
+    Off::FEnumProperty::UnderlyingProp  = Sz;
+    Off::FEnumProperty::Enum            = Sz + 8;
 
     // ClassCastFlags has no slot in Offsets; the metaclass oracle reads it
     // out of the sheet, so it is stamped there.
     g_Sheet.ClassCastFlagsOff       = V::UCLASS_CASTFLAGS_OFF;
     g_Sheet.StructPropSizeOff       = V::USTRUCT_PROPSIZE_OFF;
-    g_Sheet.PropOffsetInternal      = V::FPROP_OFFSETINT_OFF;
-    g_Sheet.PropOffsetXor           = V::FPROP_OFFSET_XOR;
-    g_Sheet.BoolFieldBase           = V::FBOOLPROP_FIELDSIZE;
+    g_Sheet.BoolFieldBase           = g_Sheet.FProp818Sizeof;
 }
 } // namespace ArcDecrypt

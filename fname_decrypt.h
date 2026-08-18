@@ -383,11 +383,18 @@ public:
     // Steam build CL-1341255. Same contract as AdoptV811 and the same single
     // acceptance test: CI=0 must decode to "None". The keystream is read LIVE —
     // the module image holds the at-rest form and shares no value with it.
-    bool AdoptV818() {
+    bool AdoptV818() { return TryV818(true); }
+
+    // Quiet form, so auto-resolve can sweep candidate keystream windows without
+    // printing a rejection per attempt. Reverts cleanly on failure, which is
+    // what makes it safe to call in a loop.
+    bool TryV818(bool Verbose) {
         const auto& Sh = ArcDecrypt::g_Sheet;
+        m_v818Active = false;
         if (!m_reader.Read(m_base + Sh.Keystream818Rva, m_keyTable818, sizeof(m_keyTable818))) {
-            std::printf("[fname] v818 keystream read failed @ 0x%llX\n",
-                (unsigned long long)(m_base + Sh.Keystream818Rva));
+            if (Verbose)
+                std::printf("[fname] v818 keystream read failed @ 0x%llX\n",
+                    (unsigned long long)(m_base + Sh.Keystream818Rva));
             return false;
         }
         m_pool818Rva = Sh.Pool818Rva;
@@ -396,8 +403,9 @@ public:
 
         std::string Probe = DecryptNameString_V818(ResolveNamePtr_V818(0));
         if (Probe != "None") {
-            std::printf("[fname] v818 self-test failed (CI=0 gave \"%s\", expected \"None\") - not adopting\n",
-                Probe.c_str());
+            if (Verbose)
+                std::printf("[fname] v818 self-test failed (CI=0 gave \"%s\", expected \"None\") - not adopting\n",
+                    Probe.c_str());
             m_v818Active = false;
             return false;
         }
@@ -412,9 +420,22 @@ public:
                 if (!std::isalnum(C) && C != '_') { Clean = false; break; }
             if (Clean) Second = S;
         }
-        std::printf("[fname] Pipeline = v20260818 (pool 0x%llX, keystream window 0x%llX) - CI=0 -> \"None\" OK%s%s\n",
-            (unsigned long long)Sh.Pool818Rva, (unsigned long long)Sh.Keystream818Rva,
-            Second.empty() ? "" : ", 2nd plaintext: ", Second.c_str());
+        // A second, longer plaintext is required, not merely reported: "None"
+        // is four bytes and a wrong constant can still land on it, while no
+        // wrong constant survives both tests.
+        if (Second.empty()) {
+            if (Verbose)
+                std::printf("[fname] v818 self-test: CI=0 gave \"None\" but no second "
+                            "plaintext decoded - not adopting\n");
+            m_v818Active = false;
+            return false;
+        }
+        if (Verbose)
+            std::printf("[fname] Pipeline = v20260818 (pool 0x%llX, keystream window 0x%llX%s) "
+                        "- CI=0 -> \"None\" OK, 2nd plaintext: %s\n",
+                (unsigned long long)Sh.Pool818Rva, (unsigned long long)Sh.Keystream818Rva,
+                ArcDecrypt::g_Sheet.Resolved818 ? ", auto-resolved" : "",
+                Second.c_str());
         return true;
     }
 
@@ -463,7 +484,8 @@ public:
     uint64_t DecodeObjSlot16_V818(uint64_t ObjPtr, uint32_t Idx) const {
         namespace V = ArcDecrypt::v20260818;
         uint64_t Raw[2] = { 0, 0 };
-        uint64_t Slot = ObjPtr + V::UOBJ_NAME_SLOT_BASE + V::UOBJ_NAME_SLOT_STRIDE * Idx;
+        const auto& Sh = ArcDecrypt::g_Sheet;
+        uint64_t Slot = ObjPtr + Sh.Slot818Base + Sh.Slot818Stride * Idx;
         if (!m_reader.Read(Slot, Raw, 16)) return 0;
         if (!Raw[0] && !Raw[1]) return 0;
         return AutoDiscovery::V818Detail::DecodeSlot16(Raw[0], Raw[1]);
@@ -474,7 +496,7 @@ public:
         uint32_t Idx = AutoDiscovery::V818Detail::NameSlotIndex(ObjPtr);
         uint64_t Vv = DecodeObjSlot16_V818(ObjPtr, Idx);
         if (!Vv) return 0;
-        return fn_rotl64(Vv, V::UOBJ_NAME_ROL64);
+        return fn_rotl64(Vv, ArcDecrypt::g_Sheet.Slot818FinalRol);
     }
 
     std::string GetNameV818(uint64_t ObjPtr) {
@@ -497,16 +519,17 @@ public:
         return Ptr;
     }
     uint64_t GetClassPtrV818(uint64_t ObjPtr) const {
-        return DecodeObjSlotPtrV818(ObjPtr, ArcDecrypt::v20260818::UOBJ_SLOT_CLASS_ADJ);
+        return DecodeObjSlotPtrV818(ObjPtr, ArcDecrypt::g_Sheet.Slot818ClassAdj);
     }
     uint64_t GetOuterPtrV818(uint64_t ObjPtr) const {
-        return DecodeObjSlotPtrV818(ObjPtr, ArcDecrypt::v20260818::UOBJ_SLOT_OUTER_ADJ);
+        return DecodeObjSlotPtrV818(ObjPtr, ArcDecrypt::g_Sheet.Slot818OuterAdj);
     }
 
     int32_t DecryptFFieldNameCI_V818(uint64_t FieldAddr) const {
         namespace V = ArcDecrypt::v20260818;
         uint64_t Enc = 0;
-        if (!m_reader.Read(FieldAddr + V::FFIELD_NAME_OFF, &Enc, 8) || !Enc) return 0;
+        if (!m_reader.Read(FieldAddr + ArcDecrypt::g_Sheet.FFieldName818Off, &Enc, 8) || !Enc)
+            return 0;
         uint64_t Vv = AutoDiscovery::V818Detail::DecodeFFieldName(Enc);
         return (int32_t)(Vv & 0xFFFFFFFFu);
     }

@@ -924,13 +924,14 @@ namespace gobjects
                 return 0;
             }
 
+            const auto& Sh = ArcDecrypt::g_Sheet;
             uint32_t NumRaw = 0;
             uint64_t ArrRaw = 0;
-            if (!m_reader.Read(Mgr + V::MGR_NUMELEMENTS_OFF, &NumRaw, 4)) return 0;
-            if (!m_reader.Read(Mgr + V::MGR_CHUNKARRAY_OFF, &ArrRaw, 8)) return 0;
+            if (!m_reader.Read(Mgr + Sh.Mgr818NumOff, &NumRaw, 4)) return 0;
+            if (!m_reader.Read(Mgr + Sh.Mgr818ArrOff, &ArrRaw, 8)) return 0;
 
-            uint32_t Num = __builtin_bswap32(NumRaw ^ V::MGR_NUMELEMENTS_XOR);
-            uint64_t Arr = __builtin_bswap64(ArrRaw ^ V::MGR_CHUNKARRAY_XOR);
+            uint32_t Num = __builtin_bswap32(NumRaw ^ Sh.Mgr818NumXor);
+            uint64_t Arr = __builtin_bswap64(ArrRaw ^ Sh.Mgr818ArrXor);
 
             std::printf("[gobj-v818] chunks_manager=0x%llX NumElements=%u chunk_array=0x%llX\n",
                 (unsigned long long)Mgr, Num, (unsigned long long)Arr);

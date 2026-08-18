@@ -4016,6 +4016,11 @@ inline uint32_t ShardHash(uint64_t SeedAddr) {
     namespace V = ArcDecrypt::v20260818;
     uint32_t Lo = (uint32_t)SeedAddr;
     uint32_t Hi = (uint32_t)(SeedAddr >> 32);
+    const auto& Sh = ArcDecrypt::g_Sheet;
+    if (!Sh.Shard818Program.empty()) {
+        uint32_t Hp = ArcDecrypt::RunHashProgram(Sh.Shard818Program, Lo, Hi);
+        return Hp ^ (Hp >> 16);
+    }
     const uint32_t P = V::HASH_PRIME, A = V::SHARD_HASH_ADD;
     uint32_t H = (Rotl32(Lo, V::SHARD_ROL_A) * P) + A;
     H = (Rotl32(H, V::SHARD_ROL_B) * P) + Hi + A;
@@ -4026,10 +4031,10 @@ inline uint32_t ShardHash(uint64_t SeedAddr) {
 
 // ROL64 then XOR then per-dword ROL32. No shuffle stage at all on this build.
 inline uint64_t DecodeBlock(uint64_t Raw) {
-    namespace V = ArcDecrypt::v20260818;
-    uint64_t X = Rotl64(Raw, V::BLOCK_ROL64) ^ ArcDecrypt::g_Sheet.BlockXor818;
-    uint32_t D0 = Rotl32((uint32_t)X, V::BLOCK_ROL32);
-    uint32_t D1 = Rotl32((uint32_t)(X >> 32), V::BLOCK_ROL32);
+    const auto& S = ArcDecrypt::g_Sheet;
+    uint64_t X = Rotl64(Raw, S.Block818Rol64) ^ S.BlockXor818;
+    uint32_t D0 = Rotl32((uint32_t)X, S.Block818Rol32);
+    uint32_t D1 = Rotl32((uint32_t)(X >> 32), S.Block818Rol32);
     return (uint64_t)D0 | ((uint64_t)D1 << 32);
 }
 
@@ -4040,22 +4045,23 @@ inline uint64_t ResolveEntry(IMemoryReader& Reader, uint64_t Base, int32_t CompI
     uint64_t NameOff  = Ci & 0xFFFFu;
     uint64_t ChunkOff = (uint64_t)((Ci >> 8) & 0xFFFF00u);
 
-    uint64_t ChunkAddr = Base + ArcDecrypt::g_Sheet.Pool818Rva + ChunkOff;
-    uint32_t S = ShardHash(ChunkAddr + V::SHARD_HASH_SEED_OFF);
+    const auto& Sh = ArcDecrypt::g_Sheet;
+    uint64_t ChunkAddr = Base + Sh.Pool818Rva + ChunkOff;
+    uint32_t S = ShardHash(ChunkAddr + Sh.Seed818Off);
     uint32_t B1 = S & 7u;
     uint32_t B2 = (S + 1u) & 7u;
 
-    uint64_t BlockAddr = ChunkAddr + V::SHARD_BLOCK_BASE_OFF;
+    uint64_t BlockAddr = ChunkAddr + Sh.Block818Base;
     uint64_t Raw1 = 0, Raw2 = 0;
-    if (!Reader.Read(BlockAddr + V::SHARD_BLOCK_STRIDE * B1, &Raw1, 8)) return 0;
-    if (!Reader.Read(BlockAddr + V::SHARD_BLOCK_STRIDE * B2, &Raw2, 8)) return 0;
+    if (!Reader.Read(BlockAddr + Sh.Block818Stride * B1, &Raw1, 8)) return 0;
+    if (!Reader.Read(BlockAddr + Sh.Block818Stride * B2, &Raw2, 8)) return 0;
     if (!Raw1 && !Raw2) return 0;
 
     uint64_t V13 = DecodeBlock(Raw1);
     uint64_t V15 = DecodeBlock(Raw2);
 
-    uint64_t Fv = V::FNV_PRIME * Rotl64(V13, V::FNV_ROL1) + V::FNV_ADD;
-    Fv = V::FNV_PRIME * Rotl64(Fv, V::FNV_ROL2) + V::FNV_ADD;
+    uint64_t Fv = Sh.Fnv818Prime * Rotl64(V13, Sh.Fnv818Rol1) + Sh.Fnv818Add;
+    Fv = Sh.Fnv818Prime * Rotl64(Fv, Sh.Fnv818Rol2) + Sh.Fnv818Add;
 
     uint64_t Entry = V13 + (V15 ^ Fv) + 2ULL * NameOff;
     if (Entry < 0x10000ULL || Entry >= 0x800000000000ULL) return 0;
@@ -4074,8 +4080,8 @@ inline bool ReadHeader(IMemoryReader& Reader, uint64_t Entry, EntryHeader& Out) 
     uint16_t Hdr = 0;
     if (!Reader.Read(Entry, &Hdr, 2) || !Hdr) return false;
     Out.Raw    = Hdr;
-    Out.Length = (int)(Hdr & V::HDR_LENGTH_MASK);
-    Out.IsWide = (Hdr & V::HDR_IS_WIDE_BIT) != 0;
+    Out.Length = (int)(Hdr & ArcDecrypt::g_Sheet.Hdr818LenMask);
+    Out.IsWide = (Hdr & ArcDecrypt::g_Sheet.Hdr818WideBit) != 0;
     Out.Bytes  = Out.IsWide ? Out.Length * 2 : Out.Length;
     return Out.Length > 0 && Out.Length <= 1023;
 }
@@ -4123,9 +4129,14 @@ inline std::string DecryptWide(const std::vector<uint8_t>& Cipher, int Length,
 // folded in on the second — no SHR steps, unlike build 24653108.
 inline uint32_t SlotHash(uint64_t ObjPtr) {
     namespace V = ArcDecrypt::v20260818;
-    uint64_t Seed = ObjPtr + V::UOBJ_NAME_SEED_OFF;
+    const auto& S = ArcDecrypt::g_Sheet;
+    uint64_t Seed = ObjPtr + S.Slot818SeedOff;
     uint32_t Lo = (uint32_t)Seed;
     uint32_t Hi = (uint32_t)(Seed >> 32);
+    if (!S.Slot818Program.empty()) {
+        uint32_t Hp = ArcDecrypt::RunHashProgram(S.Slot818Program, Lo, Hi);
+        return Hp ^ (Hp >> 16);
+    }
     const uint32_t P = V::UOBJ_SLOT_HASH_PRIME, A = V::UOBJ_SLOT_HASH_ADD;
     uint32_t H = (Rotl32(Lo, V::UOBJ_SLOT_ROL_A) * P) + A;
     H = (Rotl32(H, V::UOBJ_SLOT_ROL_B) * P) + Hi + A;
@@ -4135,8 +4146,7 @@ inline uint32_t SlotHash(uint64_t ObjPtr) {
 }
 
 inline uint32_t NameSlotIndex(uint64_t ObjPtr) {
-    namespace V = ArcDecrypt::v20260818;
-    return (SlotHash(ObjPtr) & 3u) ^ V::UOBJ_SLOT_NAME_XOR;
+    return (SlotHash(ObjPtr) & 3u) ^ ArcDecrypt::g_Sheet.Slot818NameXor;
 }
 
 // The slot is 16 bytes, and both halves take part: the pandn blend in the
@@ -4151,25 +4161,24 @@ inline uint64_t DecodeSlot16(uint64_t Lo, uint64_t Hi) {
 // FField::NamePrivate. Second stage is a per-dword ADD, not an XOR — reading it
 // as an XOR gives names that decode for short strings and diverge for long ones.
 inline uint64_t DecodeFFieldName(uint64_t Lo) {
-    namespace V = ArcDecrypt::v20260818;
     const auto& S = ArcDecrypt::g_Sheet;
     uint64_t X = Lo ^ S.FFieldNameK1_818;
-    uint32_t D0 = Rotl32((uint32_t)X, V::FFIELD_NAME_ROL32);
-    uint32_t D1 = Rotl32((uint32_t)(X >> 32), V::FFIELD_NAME_ROL32);
+    uint32_t D0 = Rotl32((uint32_t)X, S.FFieldName818Rol32);
+    uint32_t D1 = Rotl32((uint32_t)(X >> 32), S.FFieldName818Rol32);
     D0 += (uint32_t)S.FFieldNameK2_818;
     D1 += (uint32_t)(S.FFieldNameK2_818 >> 32);
     uint64_t V2 = (uint64_t)D0 | ((uint64_t)D1 << 32);
-    return Rotl64(V2, V::FFIELD_NAME_ROL64);
+    return Rotl64(V2, S.FFieldName818Rol64);
 }
 
 // chunks_manager. No vtable and no thunk on this build: the decoded manager
 // carries NumElements and the chunk array directly, each xor+bswap encoded.
 inline uint64_t DecodeChunkMgr(uint64_t Enc) {
-    namespace V = ArcDecrypt::v20260818;
-    uint64_t X = Rotl64(Enc, V::CHUNKMGR_ROL64);
-    X = Pshufb8(X, V::CHUNKMGR_PSHUFB);
-    uint32_t D0 = Rotl32((uint32_t)X, V::CHUNKMGR_ROL32);
-    uint32_t D1 = Rotl32((uint32_t)(X >> 32), V::CHUNKMGR_ROL32);
+    const auto& S = ArcDecrypt::g_Sheet;
+    uint64_t X = Rotl64(Enc, S.ChunkMgr818Rol64);
+    X = Pshufb8(X, S.ChunkMgr818Pshufb);
+    uint32_t D0 = Rotl32((uint32_t)X, S.ChunkMgr818Rol32);
+    uint32_t D1 = Rotl32((uint32_t)(X >> 32), S.ChunkMgr818Rol32);
     return (uint64_t)D0 | ((uint64_t)D1 << 32);
 }
 

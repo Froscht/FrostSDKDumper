@@ -179,14 +179,77 @@ instead of asking what the pipeline can do:
   Every class header read `/Script/Actor.Actor`. Now it walks `GetOuterPtr` —
   which dispatches per pipeline — and takes the first name starting with `/`.
 
-### Auto-resolve status on this patch
-It found the chunks_manager global correctly and nothing else: the GetFName and
-FName-pipeline extractors are written against the v811 instruction shapes and
-report `0 slot-accessor copies` / `no candidate decoded CI=0 to "None"` here.
-That is honest failure rather than a wrong answer, which is the intended
-behaviour, but it means **the v818 constants are compile-time, not resolved**.
-Teaching the extractors the new shapes (PCLMULQDQ slot decode, ROL-form hash,
-shuffle-free block decode) is the open item before the next patch.
+### Auto-resolve on this patch: 5/5 areas, all sabotage-verified
+`auto_resolve818.h` + Phase 0c2. Everything the pipeline needs is extracted from
+the binary and validated, so the next patch should need no source edit:
+```
+chunks_manager   global RVA, ROL64/PSHUFB/ROL32 shape, and BOTH encoded fields
+                 (NumElements off+xor, chunk array off+xor). Anchored on the
+                 stride-20 index idiom; validated by decoding the manager and
+                 requiring the count in range and chunk[0] readable.
+FName pipeline   pool, seed off, block base/stride, the whole shard hash as a
+                 PROGRAM, block ROL64/ROL32/xor, FNV-64 add and both rotates,
+                 key init, header masks, keystream window. Anchored on
+                 `and r32, 0xFFFF00`; decided by CI=0 -> "None" plus a second
+                 longer plaintext.
+FField name      NamePrivate offset, both key constants, ROL32, ROL64 and
+                 sizeof(FProperty). Anchored on the PropertyBool.cpp assert.
+Offset_Internal  offset and xor, from the `movzx ; xor imm32 ; bswap ;
+                 mov [reg+disp32]` encode site.
+GetFName         seed off, hash program, slot base/stride/xor, both clmul
+                 polynomials, final rotate. Anchored on the FNV-32 prime,
+                 consensus over the Name-role copies.
+struct layout    ChildProperties, FField::Next, FField::Owner, SuperStruct —
+                 probed live, since no static anchor reaches them.
+```
+
+**Both hash chains are recorded as HashOp programs, not fixed op slots.** The
+shard hash has been ROL-form (CL-1325322), SHR-form (24653108) and ROL-form
+again (CL-1341255). A fixed-slot representation cannot express that without a
+source edit, and expressing it as a program costs nothing.
+
+**`FROST_SABOTAGE818=chunkmgr|fname|ffield|getfname|propoff|layout|all`** wrecks
+the compiled defaults before auto-resolve runs, so every recovery path can be
+fired on demand. Verified 2026-08-18 against PID 190094: each area individually,
+and all six at once, recover to the identical dump —
+```
+                 clean            all six sabotaged
+Classes          14979            14979
+Structs          8562             8562
+Properties       246509           246487
+FProperty_Unknown 0.0%            0.0%
+slot selector    400/400          loaded 6/400 -> auto-resolved 400/400 -> adopted
+layout probe     agrees           +0x128/+0xE8/+0x40/+0x128 -> +0xF8/+0x60/+0x80/+0xB0
+Offset_Internal  +0xA4 44 chains  previous +0x99 gives 0 -> extracted kept
+```
+A self-healing path that has never fired is unproven. Re-run this matrix after
+touching any of it.
+
+`FROST_AR818_DEBUG=<hex func rva>` prints why one specific candidate was
+rejected. Reject histograms tell you the shape of the failure; this tells you
+whether the function you care about reaches the extractor at all, which is a
+different question and usually the one that matters.
+
+### Four traps hit while building the 818 extractors
+- **`||` short-circuit.** `IsCall = (In.type == INSN_CALL_RIP) || ReadCallRel32(...)`
+  never ran the byte check, because the decoder already reports a relative call
+  as INSN_CALL_RIP with `hasRipRel` clear. Every other GetFName field came out
+  correct and only `DecoderRva` was zero — a shape check that is *almost* right
+  returns a fully populated record with one zero in it. Evaluate the byte form
+  first and unconditionally.
+- **`ApplyOffsets818` re-asserting over adoptions.** It runs several times per
+  session, so writing compiled defaults into the sheet silently undid whatever
+  the earlier call had enabled. It now writes a default only where nothing
+  better is known, gated on per-area `*818Resolved` flags.
+- **A dependency cycle between two probes.** The Offset_Internal check walks
+  chains and so needs the layout; the layout probe separates FField::Next from
+  the property-link chains by ascending offsets and so needs Offset_Internal.
+  With both sabotaged neither recovered. Broken by adopting the extracted
+  offset in Phase 0c2 outright — the encode shape is specific enough to trust —
+  and demoting the live check to a revert-on-strict-loss verification.
+- **`Detail::ReadMovabs`.** The decoder does not report the destination register
+  for `movabs r64, imm64`, and the destination is exactly what tells the two
+  slot-decoder polynomials apart. Read it off the opcode.
 
 ### SDK output (2026-08-18)
 ```
@@ -1036,6 +1099,8 @@ Previous patch (CL-1201801): 99.85% naming, ~298K properties, 33200 classes, 111
 | `fname_decrypt.h` | FName/FField name resolution pipeline |
 | `gobjects.h` | GUObjectArray walk, chunk table, seed objects |
 | `sdk_generator.h` | SDK file generation, property type table, enum bodies |
+| `auto_resolve.h` | Patch-day extraction for the v20260811 shapes |
+| `auto_resolve818.h` | Patch-day extraction for the CL-1341255 shapes (Phase 0c2) |
 | `auto_offsets.h` | FField/FProperty sub-pointer offset auto-probing |
 | `sig_scan.h` / `sig_scan_v2.h` | AOB pattern scanner (page-aware, VMP-tolerant) |
 | `emu_fname.h` | Unicorn-based FName emulation (EMU mode, slower fallback) |
