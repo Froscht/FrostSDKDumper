@@ -366,6 +366,78 @@ ClassCastFlags: 23514 records decided, 154240 instances dropped, 33931 non-types
 ```
 
 
+## Signature sheet — cross-checked over 13 builds (2026-04-02 .. 2026-08-18)
+
+Every pattern below was run against all 13 images in `ArcBinaryDumps/Steam`, and
+where CLAUDE.md already records the answer for a patch, the extracted value was
+compared against it. Hit counts are measured, not estimated. IDA byte order,
+`??` = wildcard.
+
+**Durable — found on all 13 builds:**
+```
+FProperty::SetupOffset          0F B7 ?? ?? 35 ?? ?? ?? ?? 0F C8 89 ?? ?? ?? ?? ??
+  movzx r32,word[src+X] ; xor r32,KEY ; bswap r32 ; mov [dst+disp32],r32
+  EXACTLY 1 hit on every build. imm32 = Offset_XOR, disp32 = Offset_Internal.
+  Verified against the recorded values: CL-1299607 0x057F15E5/+0x94,
+  CL-1325322 0x76C317A2/+0xB4, CL-1315578 0xA271DBC5/+0xE4,
+  24653108 0xEE0CA1CB/+0xC4, CL-1341255 0x7BDAAA72/+0xA4, CL-1177146 +0xC4.
+  6 of 6 documented cases exact. This is the sharpest signature in the image.
+
+FName resolver / GNamePool      81 ?? 00 FF FF 00        (and r32, 0x00FFFF00)
+                                25 00 FF FF 00           (and eax form)
+  The ChunkOff = (CI >> 8) & 0xFFFF00 step. 5-10 raw hits per build; filtering
+  to "followed within 40 bytes by a rip-lea into .data, with an FNV-32 imul
+  inside the next 0x120 bytes" leaves EXACTLY ONE candidate on every build, and
+  its lea target is GNamePool. Verified: CL-1299607 0xE4A3A00, CL-1315578
+  0xE4F2A00, CL-1325322 0xE431980, 24653108 0xE38FA00, CL-1341255 0xE35AB00 —
+  5 of 5 exact.
+
+chunks_manager                  [48-4F] 8D [04|0C|14|1C|24|2C|34|3C]
+                                        [80|89|92|9B|AD|B6|BF]
+  `lea r64,[r + r*4]` with index == base — the FUObjectItem stride-20 index
+  computation. 8.5k-16k sites per build; take the containing region, vote on
+  the first `movdqa xmm,[rip+X]` into .data. Verified: CL-1341255 0xE616340,
+  24653108 0xE64B260, CL-1195482-era 0xDDCB420 exact, CL-1325322 0xE6ED2A0
+  which is the documented 0xE6ED190 + 0x110 (the blob, not the struct base).
+  NOTE the SIB scale: it is 0x80|(X<<3)|X, not 0x00|(X<<3)|X. Getting that
+  wrong finds thousands of sites and votes for the wrong global.
+
+"FName GetName() const"         AngelScript binding string -> UObject::GetFName
+  Present on all 13 builds, 2 rip-refs (1 on the two oldest). The `lea` right
+  above the second ref loads the native function pointer.
+
+".\\Runtime/CoreUObject/Private/UObject/PropertyBool.cpp"
+  Present on all 13 builds with EXACTLY 3 rip-refs every time. Leads to
+  FBoolProperty::GetCPPType, whose assert path carries the FField::NamePrivate
+  offset, both key constants, the rotate, and — via its FieldMask test —
+  sizeof(FProperty).
+```
+
+**Invariants, not signatures.** These occur everywhere and only serve to
+generate candidates:
+```
+FNV-32 prime   69 ?? 93 01 00 01              78k-139k hits per build
+FNV-64 prime   B3 01 00 00 00 01 00 00        7.5k-14k hits per build
+```
+
+**Build-specific — do NOT carry these forward:**
+```
+PCLMULQDQ  66 0F 3A 44        33 hits on every build BEFORE CL-1341255 (CRT
+                              code), 242 on CL-1341255. Theia only moved the
+                              slot decode to carry-less multiply on this patch.
+FField PADDD decode           223 hits on CL-1341255, ZERO on all 12 older
+                              builds. Pure v818 shape.
+chunkarray xor+bswap          1 hit on CL-1341255, zero elsewhere.
+FName block decode            2 on CL-1341255, 2 on CL-1299607/CL-1325322,
+                              1 on CL-1195482, 0 on the rest.
+```
+
+The lesson the table makes concrete: **signatures that describe a SHAPE Theia
+owns die within one patch; signatures that describe something the ENGINE needs
+survive.** SetupOffset's encode idiom, the ChunkOff mask, the stride-20 index
+and the two source strings are all the latter, which is why auto_resolve anchors
+on those and never on a SIMD op sequence.
+
 ## Previous Patch: Steam build 24653108 (2026-08-11)
 Image size **0x117E9000**. Offline work used a full module dump at
 `module_dump_0x140000000.bin`; it is not kept in-tree (280 MB, one build
