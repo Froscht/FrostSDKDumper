@@ -12,7 +12,7 @@
 | Dec_FIndex | `48 C7 07 00 00 00 00 48 83` | 11 x | 13 x | 17 x | 15 x | 18 x | 20 x | 19 x | 18 x | 17 x | 16 x | 15 x | 16 x | 17 x | 17 x | 10 x | **0/15** | nie eindeutig (10-20 Treffer) - als Kandidatengenerator gedacht, nicht als Locator |
 | Dec_GName_Index2Name | `48 8D 4C 24 28 48 8D 94 24 30 08 00 00 E8 ?? ?? ?? ?? 89 C6 48 8D 4C 24 20 48 8D 54 24 30 E8` | JA | JA | JA | JA | JA | JA | JA | JA | JA | JA | JA | JA | JA | NEIN | JA | **14/15** | bricht genau auf CL-1341255; Stack-Displacements maskieren repariert es |
 | Dec_GName_Index2Name RELAXED | `48 8D 4C 24 ?? 48 8D 94 24 ?? ?? 00 00 E8 ?? ?? ?? ?? 89 C6 48 8D 4C 24 ?? 48 8D 54 24 ?? E8` | JA | JA | JA | JA | JA | JA | JA | JA | JA | JA | JA | JA | JA | JA | JA | **15/15** | eindeutig auf allen 15 - empfohlene Ersatzform |
-| Dec_PlayerNamePrivate | `48 89 ?? ?? ?? E8 ?? ?? ?? ?? 48 8D 54 ?? ?? 48 89 F1 E8 ?? ?? ?? ?? 83 7C` | JA | JA | JA | NEIN | JA | JA | JA | JA | NEIN | NEIN | NEIN | NEIN | NEIN | NEIN | NEIN | **7/15** | bricht ab 07.07; relaxiert 15-18 Treffer, nicht rettbar. DecryptPlayerName nehmen |
+| Dec_PlayerNamePrivate | `48 89 ?? ?? ?? E8 ?? ?? ?? ?? 48 8D 54 ?? ?? 48 89 F1 E8 ?? ?? ?? ?? 83 7C` | JA | JA | JA | NEIN | JA | JA | JA | JA | NEIN | NEIN | NEIN | NEIN | NEIN | NEIN | NEIN | **7/15** | DIESELBE Funktion wie DecryptPlayerName (7/7 geprueft), nur ueber eine Aufrufstelle. Bricht ab 07.07 - direkte Signatur nehmen |
 
 ## Befunde
 
@@ -25,10 +25,16 @@
    `24 30 08 00 00`, `24 20`, `24 30`). Maskiert man sie, ist die Signatur auf
    allen 15 Builds wieder eindeutig. Die RELAXED-Zeile ist die Ersatzform.
 
-3. **`Dec_PlayerNamePrivate` ist ab 07.07.2026 tot** und laesst sich nicht
-   relaxieren: jede Lockerung bringt 15-18 Treffer. Sie sucht ohnehin nur eine
-   Aufrufstelle - `APlayerState::DecryptPlayerName` findet die Funktion selbst
-   und ist 15/15.
+3. **`Dec_PlayerNamePrivate` und `APlayerState::DecryptPlayerName` finden
+   DIESELBE Funktion.** Auf allen 7 Builds, auf denen beide greifen, landet das
+   `E8` hinter `48 89 F1` exakt auf der Adresse, die die direkte Signatur
+   liefert (02.04 0x37339E0, 09.04 0x37588D0, 14.04 0x37753D0, 28.04 0x374EA50,
+   30.04 0x372A800, 05.05 0x374D410, 19.05 0x3745690).
+
+   Der Unterschied ist nur der Weg: die eine matcht eine AUFRUFSTELLE, die
+   andere den PROLOG. Die Aufrufstelle ist ab 07.07 tot und laesst sich nicht
+   relaxieren - jede Lockerung bringt 15-18 Treffer. Die direkte Signatur ist
+   15/15. Ergo: `Dec_PlayerNamePrivate` ersatzlos streichen.
 
 4. **`Dec_FIndex` war nie eindeutig** (10-20 Treffer pro Build). Passt zur
    Anmerkung des Autors "you need to move up i think to find it": gedacht als

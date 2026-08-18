@@ -13,7 +13,7 @@ NOTE={
  "Dec_FIndex":"nie eindeutig (10-20 Treffer) - als Kandidatengenerator gedacht, nicht als Locator",
  "Dec_GName_Index2Name":"bricht genau auf CL-1341255; Stack-Displacements maskieren repariert es",
  "Dec_GName_Index2Name RELAXED":"eindeutig auf allen 15 - empfohlene Ersatzform",
- "Dec_PlayerNamePrivate":"bricht ab 07.07; relaxiert 15-18 Treffer, nicht rettbar. DecryptPlayerName nehmen",
+ "Dec_PlayerNamePrivate":"DIESELBE Funktion wie DecryptPlayerName (7/7 geprueft), nur ueber eine Aufrufstelle. Bricht ab 07.07 - direkte Signatur nehmen",
 }
 rows=[]
 for s in J["sigs"]:
@@ -44,10 +44,16 @@ out.append("""
    `24 30 08 00 00`, `24 20`, `24 30`). Maskiert man sie, ist die Signatur auf
    allen 15 Builds wieder eindeutig. Die RELAXED-Zeile ist die Ersatzform.
 
-3. **`Dec_PlayerNamePrivate` ist ab 07.07.2026 tot** und laesst sich nicht
-   relaxieren: jede Lockerung bringt 15-18 Treffer. Sie sucht ohnehin nur eine
-   Aufrufstelle - `APlayerState::DecryptPlayerName` findet die Funktion selbst
-   und ist 15/15.
+3. **`Dec_PlayerNamePrivate` und `APlayerState::DecryptPlayerName` finden
+   DIESELBE Funktion.** Auf allen 7 Builds, auf denen beide greifen, landet das
+   `E8` hinter `48 89 F1` exakt auf der Adresse, die die direkte Signatur
+   liefert (02.04 0x37339E0, 09.04 0x37588D0, 14.04 0x37753D0, 28.04 0x374EA50,
+   30.04 0x372A800, 05.05 0x374D410, 19.05 0x3745690).
+
+   Der Unterschied ist nur der Weg: die eine matcht eine AUFRUFSTELLE, die
+   andere den PROLOG. Die Aufrufstelle ist ab 07.07 tot und laesst sich nicht
+   relaxieren - jede Lockerung bringt 15-18 Treffer. Die direkte Signatur ist
+   15/15. Ergo: `Dec_PlayerNamePrivate` ersatzlos streichen.
 
 4. **`Dec_FIndex` war nie eindeutig** (10-20 Treffer pro Build). Passt zur
    Anmerkung des Autors "you need to move up i think to find it": gedacht als
