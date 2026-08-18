@@ -305,6 +305,55 @@ It never needed that function, only module bounds. Hoisted into
   This is the *third* incident of this exact class. When the oracle can run, its
   verdict is final — including its zero.
 
+### Native (unreflected) fields are now emitted
+Reflection only knows UPROPERTYs. `ULevel::Actors`, `APlayerCameraManager::LockedFOV`
+and everything like them are plain C++ members with no markup, so no
+reflection-driven dumper can see them — and they are exactly the fields worth
+having. They are recovered from the HOLES between reflected offsets and typed by
+reading the same address across live instances:
+```
+16B, 8-aligned, {ptr, num, max} sane and elements carry module vtables -> TArray<UObject*>
+8B,  8-aligned, non-null in every instance and target has a module vtable -> <Class>*
+4B,  finite and |v| in [1e-4, 1e9] across every instance                 -> float
+4B,  all zero                                                            -> "?" (see below)
+```
+Sampling pools SUBCLASS instances too, since a subclass instance is layout
+compatible for everything the base declares — without that, abstract and
+near-singleton classes are unreachable: `APlayerCameraManager` has exactly one
+live instance. Every entry carries `n=<samples>`; one sample is enough to prove
+the offset exists and not enough to type it, and the output says so.
+
+**All-zero is reported as `?`, never as `uint32_t`.** It is evidence of nothing,
+and `LockedFOV` is precisely the trap: a float that reads zero whenever the FOV
+is not locked. Printing a confident integer type there is worse than printing
+nothing.
+
+Yield on CL-1341255: **3072 classes carrying 149058 native fields.** Verified
+against the two cases that motivated it —
+```
+ULevel                 +0x108 TArray<UObject*>   (Actors, live num=564 max=744)
+                       +0x118 TArray<UObject*>   (ActorsForGC)
+APlayerCameraManager   +0x3EC ?                  (LockedFOV)
+                       +0x3F4 ?                  (LockedOrthoWidth)
+```
+`FROST_NO_NATIVE_FIELDS=1` turns the pass off.
+
+**The names are NOT recoverable and no attempt is made to guess them.** They
+exist nowhere in the binary. Deriving them from UE source field order is how
+`LockedFOV` gets placed one field too far: the order is
+`DefaultFOV, LockedFOV, DefaultOrthoWidth, LockedOrthoWidth`, so with
+`DefaultFOV` at +0x3E8 and `DefaultOrthoWidth` at +0x3F0 reflected, LockedFOV is
+the 4-byte hole at **+0x3EC**, not the one at +0x3F4. What settles it is the
+disassembly, not the source order:
+```
+APlayerCameraManager::GetFOVAngle  (vtable +0x818)
+  movss   xmm0, [rcx + 0x3EC]        ; LockedFOV
+  ucomiss xmm0, 0 ; ja ret           ; return LockedFOV when > 0
+  call    [rax + 0x790] ; movss xmm0, [rax + 0x58]   ; else CameraCache.POV.FOV
+```
+Use the emitted gap list to find the candidates, then read the function that
+uses one to settle which is which.
+
 ### SDK output (2026-08-18)
 ```
 Classes 14983   Structs 8534   Enums 2778   Functions 50615

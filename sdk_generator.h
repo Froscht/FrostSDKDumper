@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -45,6 +46,19 @@ struct FunctionRecord {
     std::vector<PropertyRecord> params;     // UFunction ChildProperties (parameters)
 };
 
+// A field that exists in memory but not in the reflection data. UE marks plenty
+// of members without UPROPERTY — ULevel::Actors, APlayerCameraManager::LockedFOV
+// — and those are invisible to any reflection-driven dumper. They are recovered
+// here from the GAPS between reflected properties and typed by sampling live
+// instances, which is the same evidence a human would use.
+struct NativeField {
+    uint32_t    offset  = 0;
+    uint32_t    size    = 0;
+    uint32_t    samples = 0;
+    std::string type;
+    std::string note;
+};
+
 struct StructRecord {
     std::string              name;
     std::string              package;
@@ -54,6 +68,7 @@ struct StructRecord {
     uint32_t                 props_size;    // sizeof(struct) from UStruct::PropertiesSize
     std::vector<PropertyRecord>  properties;
     std::vector<FunctionRecord>  functions;
+    std::vector<NativeField>     natives;
     bool                     is_class;      // UClass (vs UScriptStruct)
     bool                     drop = false;  // set by the ClassCastFlags reclass pass
 };
@@ -2056,6 +2071,238 @@ public:
     }
 
     // ── Dump a single UStruct/UClass to string ──────────────────────────────────
+
+    // ── Native (unreflected) fields ──────────────────────────────────────────
+    //
+    // Reflection only knows UPROPERTYs. Everything else — ULevel::Actors,
+    // APlayerCameraManager::LockedFOV — is a hole between two reflected
+    // offsets, and those holes are exactly where the interesting fields live.
+    //
+    // The names cannot be recovered: they exist nowhere in the binary. The
+    // OFFSETS and TYPES can, by reading the same address across many live
+    // instances of the class and asking what shape holds up. A pointer that is
+    // a pointer in every instance is a pointer; four bytes that read as a sane
+    // float in every instance are a float. One instance proves nothing, which
+    // is why nothing is emitted below kMinInstances.
+    std::unordered_map<uint64_t, std::vector<uint64_t>> m_class_instances;
+
+    static constexpr size_t kMaxInstances  = 8;
+    static constexpr size_t kMinInstances  = 1;
+
+    // class addr -> direct subclasses. A subclass instance is layout-compatible
+    // for everything the base declares, so pooling them is what makes abstract
+    // and near-singleton classes reachable at all: APlayerCameraManager has
+    // exactly one live instance and would otherwise never be sampled.
+    std::unordered_map<uint64_t, std::vector<uint64_t>> m_subclasses;
+
+    void BuildSubclassIndex(const std::vector<StructRecord>& Structs) {
+        for (const auto& R : Structs)
+            if (R.is_class && R.super_addr)
+                m_subclasses[R.super_addr].push_back(R.addr);
+    }
+
+    void CollectInstances(uint64_t Cls, std::vector<uint64_t>& Out, int Depth = 0) {
+        if (Out.size() >= kMaxInstances || Depth > 6) return;
+        auto It = m_class_instances.find(Cls);
+        if (It != m_class_instances.end())
+            for (uint64_t O : It->second) {
+                Out.push_back(O);
+                if (Out.size() >= kMaxInstances) return;
+            }
+        auto Sit = m_subclasses.find(Cls);
+        if (Sit == m_subclasses.end()) return;
+        for (uint64_t Sub : Sit->second) {
+            CollectInstances(Sub, Out, Depth + 1);
+            if (Out.size() >= kMaxInstances) return;
+        }
+    }
+    static constexpr size_t kMaxNatives    = 256;
+    static constexpr size_t kMaxProbeBytes = 0x8000;
+
+    void BuildClassInstanceIndex(const std::vector<std::pair<int32_t, uint64_t>>& ObjectPtrs) {
+        size_t Indexed = 0;
+        for (const auto& [Idx, Obj] : ObjectPtrs) {
+            (void)Idx;
+            if (!Obj) continue;
+            uint64_t Cls = m_fname.GetClassPtrAuto(Obj);
+            if (Cls < 0x10000ULL || Cls >= 0x800000000000ULL) continue;
+            auto& V = m_class_instances[Cls];
+            if (V.size() >= kMaxInstances) continue;
+            // CDOs carry constructor defaults, mostly zero, which is the worst
+            // possible sample for deciding whether four bytes are a float.
+            const std::string* Nm = nullptr;
+            if (m_addr_to_name) {
+                auto It = m_addr_to_name->find(Obj);
+                if (It != m_addr_to_name->end()) Nm = &It->second;
+            }
+            if (Nm && Nm->rfind("Default__", 0) == 0) continue;
+            V.push_back(Obj);
+            ++Indexed;
+        }
+        std::printf("[sdk-native] instance index: %zu classes, %zu instances\n",
+                    m_class_instances.size(), Indexed);
+    }
+
+    bool LooksLikeHeapPtr(uint64_t P) const {
+        return P >= 0x10000ULL && P < 0x800000000000ULL &&
+               !(P >= MODULE_BASE && P < MODULE_BASE + 0x12000000ULL);
+    }
+    bool HasModuleVtable(uint64_t P) {
+        if (!LooksLikeHeapPtr(P)) return false;
+        uint64_t Vt = Read<uint64_t>(P);
+        return Vt >= MODULE_BASE && Vt < MODULE_BASE + 0x12000000ULL;
+    }
+    static bool LooksLikeFloat(uint32_t U) {
+        if (U == 0) return true;
+        float F;
+        std::memcpy(&F, &U, 4);
+        if (!std::isfinite(F)) return false;
+        float A = std::fabs(F);
+        return A >= 1e-4f && A <= 1e9f;
+    }
+
+    void DiscoverNativeFields(StructRecord& Rec) {
+        if (!Rec.props_size || Rec.props_size > 0x40000) return;
+        std::vector<uint64_t> Inst;
+        CollectInstances(Rec.addr, Inst);
+        if (Inst.size() < kMinInstances) return;
+
+        // Everything below the parent's size belongs to the parent, so start
+        // there; without this every class re-reports its whole inherited block.
+        uint32_t Lo = 0;
+        if (Rec.super_addr) {
+            uint32_t SuperSize = Read<uint32_t>(
+                Rec.super_addr + ArcDecrypt::Offsets::UStruct::PropertiesSize);
+            if (SuperSize && SuperSize < Rec.props_size) Lo = SuperSize;
+        }
+        if (Lo >= Rec.props_size) return;
+        if (Rec.props_size - Lo > kMaxProbeBytes) return;
+
+        std::vector<uint8_t> Covered(Rec.props_size - Lo, 0);
+        for (const auto& Pr : Rec.properties) {
+            if (Pr.is_param) continue;
+            uint64_t Beg = Pr.offset;
+            uint64_t Sz  = (uint64_t)std::max<uint32_t>(Pr.elem_size, 1) *
+                           std::max<uint32_t>(Pr.array_dim, 1);
+            if (Pr.is_bool) Sz = 1;
+            for (uint64_t B = Beg; B < Beg + Sz && B < Rec.props_size; ++B)
+                if (B >= Lo) Covered[B - Lo] = 1;
+        }
+
+        std::vector<std::vector<uint8_t>> Snap;
+        Snap.reserve(Inst.size());
+        for (uint64_t O : Inst) {
+            std::vector<uint8_t> Buf(Rec.props_size - Lo, 0);
+            if (m_reader.Read(O + Lo, Buf.data(), Buf.size())) Snap.push_back(std::move(Buf));
+        }
+        if (Snap.size() < kMinInstances) return;
+
+        auto U64 = [&](const std::vector<uint8_t>& B, uint32_t Off) {
+            uint64_t V = 0; std::memcpy(&V, B.data() + Off, 8); return V;
+        };
+        auto U32 = [&](const std::vector<uint8_t>& B, uint32_t Off) {
+            uint32_t V = 0; std::memcpy(&V, B.data() + Off, 4); return V;
+        };
+
+        uint32_t Pos = Lo;
+        while (Pos + 4 <= Rec.props_size && Rec.natives.size() < kMaxNatives) {
+            if (Covered[Pos - Lo]) { ++Pos; continue; }
+            // Only look at whole uncovered slots.
+            auto Free = [&](uint32_t At, uint32_t N) {
+                if (At + N > Rec.props_size) return false;
+                for (uint32_t K = 0; K < N; ++K) if (Covered[At + K - Lo]) return false;
+                return true;
+            };
+
+            NativeField NF;
+            NF.offset  = Pos;
+            NF.samples = (uint32_t)Snap.size();
+
+            if ((Pos % 8) == 0 && Free(Pos, 16)) {
+                int Ok = 0, NonEmpty = 0, ObjElems = 0;
+                for (const auto& B : Snap) {
+                    uint64_t P = U64(B, Pos - Lo);
+                    int32_t  N = (int32_t)U32(B, Pos - Lo + 8);
+                    int32_t  M = (int32_t)U32(B, Pos - Lo + 12);
+                    if (N == 0 && M == 0 && P == 0) { ++Ok; continue; }
+                    if (!LooksLikeHeapPtr(P) || N < 0 || M < N || M > (1 << 22)) continue;
+                    ++Ok;
+                    if (N > 0) {
+                        ++NonEmpty;
+                        uint64_t E = Read<uint64_t>(P);
+                        if (HasModuleVtable(E)) ++ObjElems;
+                    }
+                }
+                if (NonEmpty >= 2 && Ok * 5 >= (int)Snap.size() * 4) {
+                    NF.size = 16;
+                    NF.type = (ObjElems * 2 >= NonEmpty) ? "TArray<UObject*>" : "TArray<...>";
+                    NF.note = "array";
+                    Rec.natives.push_back(NF);
+                    Pos += 16;
+                    continue;
+                }
+            }
+
+            if ((Pos % 8) == 0 && Free(Pos, 8)) {
+                int Valid = 0, NonNull = 0;
+                std::string PointeeClass;
+                for (const auto& B : Snap) {
+                    uint64_t P = U64(B, Pos - Lo);
+                    if (!P) { ++Valid; continue; }
+                    if (!HasModuleVtable(P)) continue;
+                    ++Valid; ++NonNull;
+                    if (PointeeClass.empty()) {
+                        uint64_t C = m_fname.GetClassPtrAuto(P);
+                        if (C >= 0x10000ULL && C < 0x800000000000ULL)
+                            PointeeClass = GetNameTheia(C);
+                    }
+                }
+                if (NonNull >= 2 && Valid == (int)Snap.size()) {
+                    NF.size = 8;
+                    NF.type = PointeeClass.empty() ? "UObject*" : (PointeeClass + "*");
+                    NF.note = "pointer";
+                    Rec.natives.push_back(NF);
+                    Pos += 8;
+                    continue;
+                }
+            }
+
+            if (Free(Pos, 4)) {
+                int FloatLike = 0, Zero = 0;
+                bool AnyFrac = false;
+                for (const auto& B : Snap) {
+                    uint32_t U = U32(B, Pos - Lo);
+                    if (!U) { ++Zero; ++FloatLike; continue; }
+                    if (LooksLikeFloat(U)) {
+                        ++FloatLike;
+                        float F; std::memcpy(&F, &U, 4);
+                        if (F != (float)(int)F) AnyFrac = true;
+                    }
+                }
+                NF.size = 4;
+                // All-zero is NOT evidence of an integer — it is evidence of
+                // nothing. Saying so beats printing a confident uint32_t over
+                // a field like LockedFOV, which is a float that happens to be
+                // zero whenever the FOV is not locked.
+                if (Zero == (int)Snap.size()) {
+                    NF.type = "?";
+                    NF.note = "always zero in the sample";
+                } else if (FloatLike == (int)Snap.size() && AnyFrac) {
+                    NF.type = "float";
+                } else if (FloatLike == (int)Snap.size()) {
+                    NF.type = "float";
+                    NF.note = "no fractional value seen";
+                } else {
+                    NF.type = "int32_t";
+                }
+                Rec.natives.push_back(NF);
+                Pos += 4;
+                continue;
+            }
+            ++Pos;
+        }
+    }
+
     std::string DumpStruct(const StructRecord& rec) {
         if (rec.name.rfind("Class_0x", 0) == 0) return "";
         if (IsJunkClassRecord(rec)) return "";
@@ -2078,7 +2325,7 @@ public:
         }
 
         // Skip namespaces that have nothing useful after filtering.
-        if (GoodProps.empty() && GoodFns.empty()) return "";
+        if (GoodProps.empty() && GoodFns.empty() && rec.natives.empty()) return "";
 
         std::ostringstream oss;
         const std::string& pkg = rec.package;
@@ -2145,6 +2392,24 @@ public:
             if (pr.chain_index >= 0)
                 oss << " // ci=" << std::dec << pr.chain_index;
             oss << "\n";
+        }
+        if (!rec.natives.empty()) {
+            oss << "\n// === Native fields (" << rec.natives.size()
+                << ", not reflected - offsets and types recovered from live "
+                   "instances, names are not recoverable) ===\n";
+            for (const auto& nf : rec.natives) {
+                std::ostringstream nm;
+                nm << "Native_0x" << std::hex << nf.offset;
+                std::string np = nm.str();
+                if (np.size() < 40) np.append(40 - np.size(), ' ');
+                oss << "constexpr uint32_t " << np << " = 0x" << std::hex << nf.offset
+                    << ";  // " << nf.type << " // size=0x" << std::hex << nf.size
+                    << " // native // n=" << std::dec << nf.samples;
+                if (!nf.note.empty() && nf.note != "scalar" &&
+                    nf.note != "array" && nf.note != "pointer")
+                    oss << " // " << nf.note;
+                oss << "\n";
+            }
         }
         if (!GoodFns.empty()) {
             oss << "\n// === Functions (" << GoodFns.size() << ") ===\n";
@@ -4352,6 +4617,22 @@ public:
         // Final emit-order sort (after dedup so renamed entries stay grouped).
         std::sort(result.structs.begin(), result.structs.end(), sort_by_pkg_name);
         std::sort(result.enums.begin(),   result.enums.end(),   sort_by_pkg_name);
+
+        // Native (unreflected) fields, last: it needs the final record set and
+        // the reclass verdicts, and it is the only pass that reads live
+        // instances rather than reflection data.
+        if (std::getenv("FROST_NO_NATIVE_FIELDS") == nullptr) {
+            BuildClassInstanceIndex(object_ptrs);
+            BuildSubclassIndex(result.structs);
+            size_t WithNatives = 0, Total = 0;
+            for (auto& Rec : result.structs) {
+                if (!Rec.is_class) continue;
+                DiscoverNativeFields(Rec);
+                if (!Rec.natives.empty()) { ++WithNatives; Total += Rec.natives.size(); }
+            }
+            std::printf("[sdk-native] %zu classes carry %zu native fields\n",
+                        WithNatives, Total);
+        }
 
         return result;
     }
