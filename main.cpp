@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cassert>
 #include <chrono>
+#include <tuple>
 #include <iomanip>
 #include <fcntl.h>
 #include <unistd.h>
@@ -406,6 +407,77 @@ public:
                          PeFallback.empty() ? nullptr : PeFallback.c_str());
     }
 
+
+    // The FField name decode was the one area adopted without a check. The
+    // extractor is specific enough that a shape change usually makes it decline
+    // rather than answer wrongly, but "usually" is not a test - and a wrong
+    // decode here does not fail loudly, it renames every property in the SDK.
+    // Verified the same way as the others: measure against live fields, keep
+    // the extracted values only while they are not worse.
+    void ValidateAndAdopt818FFieldName() {
+        if (!m_fname.IsV818Active() || !ArcDecrypt::g_Sheet.FFieldName818Resolved) return;
+        const auto& Seeds = m_gobj.GetSeedObjects();
+        if (Seeds.size() < 256) return;
+        namespace Off = ArcDecrypt::Offsets;
+
+        auto Measure = [&]() -> int {
+            std::unordered_set<std::string> Distinct;
+            size_t Step = Seeds.size() / 800 + 1;
+            for (size_t I = 0; I < Seeds.size(); I += Step) {
+                uint64_t Head = 0;
+                if (!m_reader.Read(Seeds[I] + Off::UStruct::ChildProperties, &Head, 8)) continue;
+                if (Head < 0x10000ULL || Head >= 0x800000000000ULL) continue;
+                uint64_t Cur = Head;
+                for (int K = 0; K < 4 && Cur >= 0x10000ULL && Cur < 0x800000000000ULL; ++K) {
+                    int32_t Ci = m_fname.DecryptFFieldNameCI(Cur);
+                    if (Ci > 0) {
+                        std::string N = m_fname.CompIndexToName(Ci);
+                        if (N.size() >= 2 && N.size() <= 64) {
+                            bool Clean = true;
+                            for (unsigned char C : N) if (C < 32 || C > 126) { Clean = false; break; }
+                            // Distinct names, never hit count: scoring by hits
+                            // is what once picked the wrong FField pair with a
+                            // confident 80/80 and cut properties from 281k to 7k.
+                            if (Clean) Distinct.insert(N);
+                        }
+                    }
+                    uint64_t Next = 0;
+                    if (!m_reader.Read(Cur + Off::FField::Next, &Next, 8)) break;
+                    Cur = Next;
+                }
+            }
+            return (int)Distinct.size();
+        };
+
+        auto& Sh = ArcDecrypt::g_Sheet;
+        int Fresh = Measure();
+        const auto Cur = std::make_tuple(Sh.FFieldName818Off, Sh.FFieldNameK1_818,
+                                         Sh.FFieldNameK2_818, Sh.FFieldName818Rol32);
+        Sh.FFieldName818Off   = std::get<0>(m_prev818FFName);
+        Sh.FFieldNameK1_818   = std::get<1>(m_prev818FFName);
+        Sh.FFieldNameK2_818   = std::get<2>(m_prev818FFName);
+        Sh.FFieldName818Rol32 = std::get<3>(m_prev818FFName);
+        Off::FField::NamePrivate   = Sh.FFieldName818Off;
+        Off::FField::NameEncrypted = Sh.FFieldName818Off;
+        int Prev = Measure();
+
+        std::printf("[ar818] FField name check: extracted +0x%llX gives %d distinct "
+                    "names, the previous +0x%llX gives %d\n",
+            (unsigned long long)std::get<0>(Cur), Fresh,
+            (unsigned long long)std::get<0>(m_prev818FFName), Prev);
+
+        if (Prev > Fresh) {
+            std::printf("[ar818] extracted FField name decode measured worse - reverted\n");
+            return;
+        }
+        Sh.FFieldName818Off   = std::get<0>(Cur);
+        Sh.FFieldNameK1_818   = std::get<1>(Cur);
+        Sh.FFieldNameK2_818   = std::get<2>(Cur);
+        Sh.FFieldName818Rol32 = std::get<3>(Cur);
+        Off::FField::NamePrivate   = Sh.FFieldName818Off;
+        Off::FField::NameEncrypted = Sh.FFieldName818Off;
+    }
+
     // FROST_SABOTAGE818=chunkmgr|fname|getfname|propoff|all corrupts the
     // compiled defaults before auto-resolve runs, so each self-healing path can
     // be fired on demand. A path that has never fired is unproven, and the two
@@ -649,6 +721,8 @@ public:
                     std::printf("[ar818]   DRIFT %-9s extracted 0x%llX != compiled 0x%llX\n",
                         C.N, C.Got, C.Want);
                 }
+                m_prev818FFName = { Sh.FFieldName818Off, Sh.FFieldNameK1_818,
+                                    Sh.FFieldNameK2_818, Sh.FFieldName818Rol32 };
                 Sh.FFieldName818Off   = Fn.NameOff;
                 Sh.FFieldNameK1_818   = Fn.K1;
                 Sh.FFieldNameK2_818   = Fn.K2;
@@ -1441,6 +1515,7 @@ public:
         // the layout to walk chains with.
         if (gobj_ok) ScoreAndAdopt818SlotSelector();
         if (gobj_ok) ProbeAndAdopt818Layout();
+        if (gobj_ok) ValidateAndAdopt818FFieldName();
         if (gobj_ok) ValidateAndAdopt818PropertyOffset();
 
         if (gobj_ok) CalibrateInlineHandleOffset();
@@ -2232,6 +2307,7 @@ public:
     AutoResolve818::GetFNameInfo       m_resolved818GetFName;
     AutoResolve818::PropertyOffsetInfo m_resolved818PropOff;
     uint64_t m_prev818PropOff = 0;
+    std::tuple<uint64_t,uint64_t,uint64_t,int> m_prev818FFName{0,0,0,0};
     uint32_t m_prev818PropXor = 0;
 
     // Probe ChildProperties and FField::NamePrivate against ground truth.

@@ -203,6 +203,22 @@ struct layout    ChildProperties, FField::Next, FField::Owner, SuperStruct —
                  probed live, since no static anchor reaches them.
 ```
 
+**Jeder der sechs Bereiche validiert sich jetzt, keiner wird blind adoptiert:**
+```
+FName-Pipeline    CI=0 -> "None" PLUS ein zweiter langer Klartext; sonst Revert
+chunks_manager    dekodiert, NumElements im Bereich, chunk[0] lesbar
+GetFName          gestaged, an lebenden Objekten gescort, nur bei Verbesserung
+Offset_Internal   extrahiert adoptiert, danach Ketten-Check, Revert bei Verlust
+Layout            live geprobt, nur bei striktem Gewinn uebernommen
+FField-Name       extrahiert adoptiert, danach DISTINCT-Namen gemessen, Revert
+                  bei Verlust  <- war die letzte Luecke, geschlossen 2026-08-18
+```
+Der FField-Name-Bereich war der einzige ohne Test. Die Begruendung damals war,
+die Quelltextstrings benennen die Funktion exakt, also gaebe es nichts zu raten.
+Das stimmt fuer die ADRESSE, nicht fuer die DECODE-FORM - und ein falscher Decode
+faellt hier nicht laut aus, er benennt jede Property im SDK um. Gemessen mit
+`FROST_SABOTAGE818=ffield`: extrahiert 133 distinct names, sabotierter Stand 0.
+
 **Both hash chains are recorded as HashOp programs, not fixed op slots.** The
 shard hash has been ROL-form (CL-1325322), SHR-form (24653108) and ROL-form
 again (CL-1341255). A fixed-slot representation cannot express that without a
