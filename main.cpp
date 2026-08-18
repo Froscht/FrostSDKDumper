@@ -59,6 +59,7 @@
 #include "fname_decrypt.h"
 using FNameDecryptor = FName::FNameDecryptor;
 #include "auto_resolve.h"
+#include "theia_static.h"
 #include "auto_offsets.h"
 #include "auto_export.h"
 #include "config_loader.h"
@@ -83,21 +84,27 @@ static const std::string& GetPEBinaryPath() {
         };
         std::string best;
         time_t bestMtime = 0;
-        for (const char* pat : patterns) {
-            std::string fullPat = std::string(dir) + "/" + pat;
-            glob_t g{};
-            if (glob(fullPat.c_str(), 0, nullptr, &g) == 0) {
-                for (size_t i = 0; i < g.gl_pathc; ++i) {
-                    std::string p = g.gl_pathv[i];
-                    struct stat st{};
-                    if (stat(p.c_str(), &st) != 0) continue;
-                    if (st.st_mtime > bestMtime) {
-                        bestMtime = st.st_mtime;
-                        best = p;
+        // The sibling EasyDump directory holds the externally produced full
+        // module images; they are the only source that closes the .text pages
+        // Theia leaves unmapped, which Phase 6.4 needs.
+        const char* dirs[] = { dir, "/media/frost/Coding Stuf/Linux/EasyDump" };
+        for (const char* d : dirs) {
+            for (const char* pat : patterns) {
+                std::string fullPat = std::string(d) + "/" + pat;
+                glob_t g{};
+                if (glob(fullPat.c_str(), 0, nullptr, &g) == 0) {
+                    for (size_t i = 0; i < g.gl_pathc; ++i) {
+                        std::string p = g.gl_pathv[i];
+                        struct stat st{};
+                        if (stat(p.c_str(), &st) != 0) continue;
+                        if (st.st_mtime > bestMtime) {
+                            bestMtime = st.st_mtime;
+                            best = p;
+                        }
                     }
                 }
+                globfree(&g);
             }
-            globfree(&g);
         }
         if (!best.empty())
             std::printf("[pe] PE binary auto-selected: %s\n", best.c_str());
@@ -278,6 +285,183 @@ public:
           m_gobj(MODULE_BASE, m_reader),
           m_pid(pid) {
         std::printf("[+] Module base: 0x%llX\n", (unsigned long long)MODULE_BASE);
+    }
+
+    // Everything auto-resolve can recover, in one place so it can run BEFORE
+    // the pieces that depend on it. The old call site sat after the object
+    // array was up, which made it useless on the one day it matters: a patch
+    // that moves the chunks_manager global cannot bootstrap at all.
+    void RunAutoResolve() {
+        if (m_autoResolved) return;
+        m_autoResolved = true;
+        std::printf("\n=== Phase 6.5: auto-resolve (advisory) ===\n");
+        auto Gf = AutoResolve::FindGetFName(m_sigScanner,
+                                            AutoDiscovery::g_DiscoveredBounds);
+        if (Gf.Valid) {
+            namespace V = ArcDecrypt::v20260811;
+            // The RVA is deliberately not compared: Theia ships many
+            // identical copies and which one is found first carries no
+            // information. Only the extracted constants matter.
+            struct { const char* Name; unsigned long long Got, Want; } Cmp[] = {
+                { "add",        Gf.Add,            V::UOBJ_SLOT_HASH_ADD      },
+                { "rol",        (unsigned)Gf.Rol,  (unsigned)V::UOBJ_SLOT_HASH_ROL },
+                { "shiftA",     (unsigned)Gf.ShiftA, (unsigned)V::UOBJ_SLOT_SHIFT_A },
+                { "shiftB",     (unsigned)Gf.ShiftB, (unsigned)V::UOBJ_SLOT_SHIFT_B },
+                { "shiftC",     (unsigned)Gf.ShiftC, (unsigned)V::UOBJ_SLOT_SHIFT_C },
+                { "slot xor",   Gf.SlotXor,        V::UOBJ_SLOT_NAME_XOR      },
+                { "slot base",  Gf.SlotBase,       V::UOBJ_NAME_SLOT_BASE     },
+                { "pshufb",     Gf.PshufbMaskRva,  V::UOBJ_NAME_PSHUFB_RVA    },
+                { "rol16",      (unsigned)Gf.Rol16, (unsigned)V::UOBJ_NAME_ROL16 },
+                { "xor64",      Gf.Xor64,          V::UOBJ_NAME_XOR           },
+                { "final rol",  (unsigned)Gf.FinalRol64, (unsigned)V::UOBJ_NAME_ROL64 },
+            };
+            int Agree = 0;
+            for (const auto& C : Cmp) {
+                if (C.Got == C.Want) { ++Agree; continue; }
+                std::printf("[autoresolve]   DRIFT %-10s extracted 0x%llX != compiled 0x%llX\n",
+                    C.Name, C.Got, C.Want);
+            }
+            std::printf("[autoresolve] GetFName: %d/%d values match the compiled sheet\n",
+                Agree, (int)(sizeof(Cmp) / sizeof(Cmp[0])));
+            // Staged, not adopted: the slot values cannot be checked
+            // until objects exist. Phase 7.5 scores them and swaps
+            // them in only if they beat what is already loaded.
+            m_resolvedGetFName = Gf;
+        }
+
+        {
+            namespace V = ArcDecrypt::v20260811;
+            auto Fp = AutoResolve::ResolveFNamePipeline(
+                m_sigScanner, AutoDiscovery::g_DiscoveredBounds, MODULE_BASE,
+                [this](uint64_t A, void* B, size_t N) { return m_reader.Read(A, B, N); },
+                ArcDecrypt::g_Sheet.KeyInitAdd, V::NARROW_KEY_SHIFT);
+            if (Fp.Valid) {
+                struct { const char* Name; unsigned long long Got, Want; } C2[] = {
+                    { "pool",       Fp.Res.PoolRva,     V::RVA_GNAMEPOOL          },
+                    { "seed off",   Fp.Res.SeedOff,     V::SHARD_HASH_SEED_OFF    },
+                    { "block base", Fp.Res.BlockBase,   V::SHARD_BLOCK_BASE_OFF   },
+                    { "block xor",  Fp.Res.BlockXor,    V::BLOCK_FNV_XOR          },
+                    { "fnv add",    Fp.Res.FnvAdd,      V::FNV_ADD                },
+                    { "fnv rol1",   (unsigned)Fp.Res.FnvRol1, (unsigned)V::FNV_ROL1 },
+                    { "fnv rol2",   (unsigned)Fp.Res.FnvRol2, (unsigned)V::FNV_ROL2 },
+                    { "keystream",  Fp.KeystreamWindowRva,
+                      V::RVA_KEYSTREAM + (uint64_t)V::KEYSTREAM_BASE_INDEX * 2    },
+                };
+                int A2 = 0;
+                for (const auto& C : C2) {
+                    if (C.Got == C.Want) { ++A2; continue; }
+                    std::printf("[autoresolve]   DRIFT %-10s extracted 0x%llX != compiled 0x%llX\n",
+                        C.Name, C.Got, C.Want);
+                }
+                std::printf("[autoresolve] FName: %d/%d values match the compiled sheet\n",
+                    A2, (int)(sizeof(C2) / sizeof(C2[0])));
+
+                // Safe to adopt outright: the candidate only got here
+                // by decoding CI=0 to "None" and a second, longer name
+                // cleanly. No single wrong constant survives both.
+                auto& Sh = ArcDecrypt::g_Sheet;
+                Sh.PoolRva     = Fp.Res.PoolRva;
+                Sh.SeedOff     = Fp.Res.SeedOff;
+                Sh.BlockBase   = Fp.Res.BlockBase;
+                Sh.ShardHashProgram = Fp.Res.Hash;
+                Sh.BlockRol16  = Fp.Res.BlockRol16;
+                Sh.BlockXor    = Fp.Res.BlockXor;
+                Sh.FnvPrime    = Fp.Res.FnvPrime;
+                Sh.FnvAdd      = Fp.Res.FnvAdd;
+                Sh.FnvRol1     = Fp.Res.FnvRol1;
+                Sh.FnvRol2     = Fp.Res.FnvRol2;
+                Sh.KeystreamWindowRva = Fp.KeystreamWindowRva;
+                if (const uint8_t* Bm = m_sigScanner.GetLocalPtr(Fp.Res.BlockMaskRva))
+                    std::memcpy(Sh.BlockPshufb, Bm, 8);
+                Sh.Resolved = true;
+                std::printf("[autoresolve] FName pipeline adopted into the live sheet\n");
+
+                uint32_t Ka = AutoResolve::ExtractKeyInitAdd(
+                    m_sigScanner, AutoDiscovery::g_DiscoveredBounds,
+                    Fp.KeystreamWindowRva);
+                if (Ka && (Ka & 0x3F) != (V::KEY_INIT_ADD & 0x3F))
+                    std::printf("[autoresolve]   DRIFT key init  extracted 0x%X "
+                                "(mod 64 = %u) != compiled 0x%X (mod 64 = %u)\n",
+                        Ka, Ka & 0x3F, V::KEY_INIT_ADD, V::KEY_INIT_ADD & 0x3F);
+                else if (Ka)
+                    std::printf("[autoresolve]   key init 0x%X matches the compiled sheet\n", Ka);
+                if (Ka) Sh.KeyInitAdd = Ka;
+
+                uint64_t Bb = AutoResolve::ExtractBoolFieldBase(
+                    m_sigScanner, AutoDiscovery::g_DiscoveredBounds,
+                    Sh.PropOffsetInternal);
+                if (Bb && Bb != V::FBOOLPROP_FIELDSIZE)
+                    std::printf("[autoresolve]   DRIFT bool bytes extracted 0x%llX "
+                                "!= compiled 0x%llX\n",
+                        (unsigned long long)Bb,
+                        (unsigned long long)V::FBOOLPROP_FIELDSIZE);
+                else if (Bb)
+                    std::printf("[autoresolve]   bool bytes match the compiled sheet\n");
+                if (Bb) Sh.BoolFieldBase = Bb;
+            }
+        }
+
+        {
+            namespace V = ArcDecrypt::v20260811;
+            auto Pl = AutoResolve::ExtractPropertyLayout(
+                m_sigScanner, AutoDiscovery::g_DiscoveredBounds);
+            if (Pl.Valid) {
+                struct { const char* Name; unsigned long long Got, Want; } C3[] = {
+                    { "offset",     Pl.OffsetInternal, V::FPROP_OFFSETINT_OFF    },
+                    { "offset xor", Pl.OffsetXor,      V::FPROP_OFFSET_XOR       },
+                    { "cast flags", Pl.CastFlagsOff,   V::UCLASS_CASTFLAGS_OFF   },
+                    { "prop size",  Pl.PropSizeOff,    V::USTRUCT_PROPSIZE_OFF   },
+                };
+                int A3 = 0;
+                for (const auto& C : C3) {
+                    if (C.Got == C.Want) { ++A3; continue; }
+                    std::printf("[autoresolve]   DRIFT %-10s extracted 0x%llX != compiled 0x%llX\n",
+                        C.Name, C.Got, C.Want);
+                }
+                std::printf("[autoresolve] FProperty: %d/%d values match the compiled sheet\n",
+                    A3, (int)(sizeof(C3) / sizeof(C3[0])));
+
+                auto& Sh = ArcDecrypt::g_Sheet;
+                Sh.PropOffsetInternal = Pl.OffsetInternal;
+                Sh.PropOffsetXor      = Pl.OffsetXor;
+                if (Pl.CastFlagsOff) Sh.ClassCastFlagsOff = Pl.CastFlagsOff;
+                if (Pl.PropSizeOff)  Sh.StructPropSizeOff = Pl.PropSizeOff;
+                std::printf("[autoresolve] FProperty layout adopted into the live sheet\n");
+            }
+        }
+
+        auto Mg = AutoResolve::FindChunkMgrGlobal(
+            m_sigScanner, AutoDiscovery::g_DiscoveredBounds,
+            [this](uint64_t Rva) -> bool {
+                namespace V = ArcDecrypt::v20260811;
+                uint8_t Enc[16] = {};
+                if (!m_reader.Read(MODULE_BASE + Rva, Enc, 16)) return false;
+                uint64_t Lo = 0;
+                std::memcpy(&Lo, Enc, 8);
+                uint64_t Mgr = AutoDiscovery::V811Detail::DecodePointer(Lo);
+                if (Mgr < 0x10000ULL || Mgr >= 0x800000000000ULL) return false;
+                uint64_t Vt = 0, Thunk = 0;
+                if (!m_reader.Read(Mgr + V::MGR_VTABLE_OFF, &Vt, 8)) return false;
+                uint64_t VtRva = Vt - MODULE_BASE;
+                if (Vt < MODULE_BASE || VtRva >= AutoDiscovery::g_DiscoveredBounds.ImageSize)
+                    return false;
+                if (!m_reader.Read(Vt + 8ULL * V::MGR_VTABLE_SLOT, &Thunk, 8)) return false;
+                uint64_t TRva = Thunk - MODULE_BASE;
+                return Thunk > MODULE_BASE &&
+                       TRva >= AutoDiscovery::g_DiscoveredBounds.TextRva &&
+                       TRva <  AutoDiscovery::g_DiscoveredBounds.TextEnd();
+            });
+        // The global is safe to adopt straight away: the validator
+        // already decrypted it and confirmed the vtable lands in the
+        // module with a thunk in .text.
+        if (Mg.Valid) ArcDecrypt::g_Sheet.ChunkMgrRva = Mg.GlobalRva;
+
+        if (Mg.Valid && Mg.GlobalRva != ArcDecrypt::v20260811::RVA_CHUNKMGR_GLOBAL)
+            std::printf("[autoresolve]   DRIFT chunks_manager 0x%llX != compiled 0x%llX\n",
+                (unsigned long long)Mg.GlobalRva,
+                (unsigned long long)ArcDecrypt::v20260811::RVA_CHUNKMGR_GLOBAL);
+        else if (Mg.Valid)
+            std::printf("[autoresolve] chunks_manager matches the compiled sheet\n");
     }
 
     bool Init() {
@@ -513,7 +697,12 @@ public:
                         name, (unsigned long long)dyn, (unsigned long long)slot);
                 }
             };
-            applyTrusted("GObjectArray", ArcDecrypt::RVA_GOBJECT_ARRAY_BASE, scan.FindGObjectArrayRVA());
+            // chunks_manager is pinned in arc_decrypt.h to the value the v811
+            // sheet uses. The legacy sig-scan finds a plausible but wrong
+            // sibling global on build 24653108 (0xE3B6250 vs 0xE64B260) and
+            // applyTrusted's 16 MiB tolerance lets it through; applyStrict
+            // reports the divergence and keeps the pinned value.
+            applyStrict("GObjectArray", ArcDecrypt::RVA_GOBJECT_ARRAY_BASE, scan.FindGObjectArrayRVA());
             // GWorld auto-discovery moved to Phase 0.5 — the legacy sigscan
             // here picks a sibling global within tolerance and silently
             // overwrites the working RVA. Phase 0.5 sigscans for the canonical
@@ -569,6 +758,31 @@ public:
         // Captures auto-discovery output even when later phases bail out.
         AutoExport::WriteAll("decrypt_export.json", MODULE_BASE);
 
+        // ── Phase 0c: auto-resolve, ahead of everything that consumes it ──
+        // Anchored on invariants Theia has never moved (the FNV primes, the
+        // FUObjectItem stride, CI=0 == "None"), so it does not care that every
+        // RVA in the compiled sheet went stale. Runs here rather than after the
+        // object array because the object array is one of its consumers.
+        RunAutoResolve();
+
+        // With the sheet resolved, v811 can be tried immediately. The gate is
+        // the plaintext self-test inside AdoptV811, not the image size: a patch
+        // changes the image size by definition, so gating on it guarantees the
+        // pipeline is off exactly when it is needed.
+        {
+            std::printf("\n=== Phase 0d: modern FName pipelines (plaintext-verified) ===\n");
+            // Newest first. Each self-tests by decoding CI=0 to "None", so a
+            // wrong pipeline declines instead of producing plausible garbage,
+            // and no version or image-size gate is needed to order them.
+            if (m_fname.AdoptV818()) {
+                ArcDecrypt::ApplyOffsets818();
+                std::printf("[v818] active; FField/FProperty layout applied\n");
+            } else if (m_fname.AdoptV811()) {
+                ArcDecrypt::ApplyOffsets811();
+                std::printf("[v811] active; FField/FProperty layout applied\n");
+            }
+        }
+
         // Init FName key table + SIMD tables
         if (!m_fname.Init()) {
             std::cerr << "[-] Failed to read FName key table / SIMD tables\n";
@@ -609,7 +823,20 @@ public:
         // result is checked against the FUObjectItem InternalIndex invariant,
         // which is ground truth — the structural tiers below only ever produce
         // "looks array-shaped" candidates.
-        if (m_fname.IsV811Active()) {
+        if (m_fname.IsV818Active()) {
+            int NumChunks = 0;
+            int32_t NumElements = 0;
+            uint64_t Arr = m_gobj.DiscoverChunkArrayV818(NumChunks, NumElements);
+            if (Arr && NumChunks > 0 &&
+                m_gobj.InitFromChunksCanonical(Arr, NumChunks, NumElements))
+            {
+                std::cout << "[+] GObjectArray initialized via v818 chunks_manager ("
+                          << m_gobj.GetNumElements() << " objects)\n";
+                gobj_ok = true;
+            }
+        }
+
+        if (!gobj_ok && m_fname.IsV811Active()) {
             int NumChunks = 0;
             int32_t NumElements = 0;
             uint64_t Arr = m_gobj.DiscoverChunkArrayV811(NumChunks, NumElements);
@@ -1127,12 +1354,20 @@ public:
             // score candidates, which is exactly what they are trying to find)
             // and they overwrite the values we already know. Re-assert the
             // binary-derived layout afterwards so it wins.
-            if (m_fname.IsV811Active()) {
-                ArcDecrypt::ApplyOffsets811();
-                std::printf("[v811] re-asserted FField layout after auto_offsets\n");
+            if (m_fname.IsV818Active() || m_fname.IsV811Active()) {
+                if (m_fname.IsV818Active()) {
+                    ArcDecrypt::ApplyOffsets818();
+                    std::printf("[v818] re-asserted FField layout after auto_offsets\n");
+                } else {
+                    ArcDecrypt::ApplyOffsets811();
+                    std::printf("[v811] re-asserted FField layout after auto_offsets\n");
 
-                ScoreAndAdoptSlotSelector();
-                ProbeAndAdoptFFieldLayout();
+                    // Both of these score candidates against the v811 shapes,
+                    // so running them under v818 would grade the right layout
+                    // with the wrong yardstick.
+                    ScoreAndAdoptSlotSelector();
+                    ProbeAndAdoptFFieldLayout();
+                }
 
                 // The pre-object-array GWorld phase can only pattern-match and
                 // its compile-time RVA is stale every patch. Now that the
@@ -1148,7 +1383,7 @@ public:
                 if (AutoDiscovery::g_DiscoveredGWorldV808.Valid) {
                     const auto& G = AutoDiscovery::g_DiscoveredGWorldV808;
                     if (ArcDecrypt::RVA_GWORLD != G.Rva)
-                        std::printf("[v811] GWorld drift: 0x%llX -> 0x%llX (auto-fixed)\n",
+                        std::printf("[gworld] drift: 0x%llX -> 0x%llX (auto-fixed)\n",
                             (unsigned long long)ArcDecrypt::RVA_GWORLD,
                             (unsigned long long)G.Rva);
                     ArcDecrypt::RVA_GWORLD = G.Rva;
@@ -1157,7 +1392,7 @@ public:
                     AutoDiscovery::g_DiscoveredWorld.DoubleDeref = G.DoubleDeref;
                     AutoDiscovery::g_DiscoveredWorld.Valid       = true;
                 } else {
-                    std::printf("[v811] GWorld not resolved from the object graph — "
+                    std::printf("[gworld] not resolved from the object graph — "
                                 "compile-time RVA 0x%llX is stale, treat it as unknown\n",
                         (unsigned long long)ArcDecrypt::RVA_GWORLD);
                 }
@@ -1446,6 +1681,7 @@ public:
     // it returns a number, it selects a slot, and the sole symptom is a naming
     // rate that looks mediocre rather than broken.
     AutoResolve::GetFNameInfo m_resolvedGetFName;
+    bool m_autoResolved = false;
 
     // Probe ChildProperties and FField::NamePrivate against ground truth.
     //
@@ -1919,197 +2155,58 @@ public:
             // has never moved. Purely advisory this run — it prints what it
             // finds next to the compile-time values so drift is visible the
             // moment a patch lands, without risking a working pipeline.
-            {
-                std::printf("\n=== Phase 6.5: auto-resolve (advisory) ===\n");
-                auto Gf = AutoResolve::FindGetFName(m_sigScanner,
-                                                    AutoDiscovery::g_DiscoveredBounds);
-                if (Gf.Valid) {
-                    namespace V = ArcDecrypt::v20260811;
-                    // The RVA is deliberately not compared: Theia ships many
-                    // identical copies and which one is found first carries no
-                    // information. Only the extracted constants matter.
-                    struct { const char* Name; unsigned long long Got, Want; } Cmp[] = {
-                        { "add",        Gf.Add,            V::UOBJ_SLOT_HASH_ADD      },
-                        { "rol",        (unsigned)Gf.Rol,  (unsigned)V::UOBJ_SLOT_HASH_ROL },
-                        { "shiftA",     (unsigned)Gf.ShiftA, (unsigned)V::UOBJ_SLOT_SHIFT_A },
-                        { "shiftB",     (unsigned)Gf.ShiftB, (unsigned)V::UOBJ_SLOT_SHIFT_B },
-                        { "shiftC",     (unsigned)Gf.ShiftC, (unsigned)V::UOBJ_SLOT_SHIFT_C },
-                        { "slot xor",   Gf.SlotXor,        V::UOBJ_SLOT_NAME_XOR      },
-                        { "slot base",  Gf.SlotBase,       V::UOBJ_NAME_SLOT_BASE     },
-                        { "pshufb",     Gf.PshufbMaskRva,  V::UOBJ_NAME_PSHUFB_RVA    },
-                        { "rol16",      (unsigned)Gf.Rol16, (unsigned)V::UOBJ_NAME_ROL16 },
-                        { "xor64",      Gf.Xor64,          V::UOBJ_NAME_XOR           },
-                        { "final rol",  (unsigned)Gf.FinalRol64, (unsigned)V::UOBJ_NAME_ROL64 },
-                    };
-                    int Agree = 0;
-                    for (const auto& C : Cmp) {
-                        if (C.Got == C.Want) { ++Agree; continue; }
-                        std::printf("[autoresolve]   DRIFT %-10s extracted 0x%llX != compiled 0x%llX\n",
-                            C.Name, C.Got, C.Want);
-                    }
-                    std::printf("[autoresolve] GetFName: %d/%d values match the compiled sheet\n",
-                        Agree, (int)(sizeof(Cmp) / sizeof(Cmp[0])));
-                    // Staged, not adopted: the slot values cannot be checked
-                    // until objects exist. Phase 7.5 scores them and swaps
-                    // them in only if they beat what is already loaded.
-                    m_resolvedGetFName = Gf;
-                }
-
-                {
-                    namespace V = ArcDecrypt::v20260811;
-                    auto Fp = AutoResolve::ResolveFNamePipeline(
-                        m_sigScanner, AutoDiscovery::g_DiscoveredBounds, MODULE_BASE,
-                        [this](uint64_t A, void* B, size_t N) { return m_reader.Read(A, B, N); },
-                        ArcDecrypt::g_Sheet.KeyInitAdd, V::NARROW_KEY_SHIFT);
-                    if (Fp.Valid) {
-                        struct { const char* Name; unsigned long long Got, Want; } C2[] = {
-                            { "pool",       Fp.Res.PoolRva,     V::RVA_GNAMEPOOL          },
-                            { "seed off",   Fp.Res.SeedOff,     V::SHARD_HASH_SEED_OFF    },
-                            { "block base", Fp.Res.BlockBase,   V::SHARD_BLOCK_BASE_OFF   },
-                            { "block xor",  Fp.Res.BlockXor,    V::BLOCK_FNV_XOR          },
-                            { "fnv add",    Fp.Res.FnvAdd,      V::FNV_ADD                },
-                            { "fnv rol1",   (unsigned)Fp.Res.FnvRol1, (unsigned)V::FNV_ROL1 },
-                            { "fnv rol2",   (unsigned)Fp.Res.FnvRol2, (unsigned)V::FNV_ROL2 },
-                            { "keystream",  Fp.KeystreamWindowRva,
-                              V::RVA_KEYSTREAM + (uint64_t)V::KEYSTREAM_BASE_INDEX * 2    },
-                        };
-                        int A2 = 0;
-                        for (const auto& C : C2) {
-                            if (C.Got == C.Want) { ++A2; continue; }
-                            std::printf("[autoresolve]   DRIFT %-10s extracted 0x%llX != compiled 0x%llX\n",
-                                C.Name, C.Got, C.Want);
-                        }
-                        std::printf("[autoresolve] FName: %d/%d values match the compiled sheet\n",
-                            A2, (int)(sizeof(C2) / sizeof(C2[0])));
-
-                        // Safe to adopt outright: the candidate only got here
-                        // by decoding CI=0 to "None" and a second, longer name
-                        // cleanly. No single wrong constant survives both.
-                        auto& Sh = ArcDecrypt::g_Sheet;
-                        Sh.PoolRva     = Fp.Res.PoolRva;
-                        Sh.SeedOff     = Fp.Res.SeedOff;
-                        Sh.BlockBase   = Fp.Res.BlockBase;
-                        Sh.ShardHashProgram = Fp.Res.Hash;
-                        Sh.BlockRol16  = Fp.Res.BlockRol16;
-                        Sh.BlockXor    = Fp.Res.BlockXor;
-                        Sh.FnvPrime    = Fp.Res.FnvPrime;
-                        Sh.FnvAdd      = Fp.Res.FnvAdd;
-                        Sh.FnvRol1     = Fp.Res.FnvRol1;
-                        Sh.FnvRol2     = Fp.Res.FnvRol2;
-                        Sh.KeystreamWindowRva = Fp.KeystreamWindowRva;
-                        if (const uint8_t* Bm = m_sigScanner.GetLocalPtr(Fp.Res.BlockMaskRva))
-                            std::memcpy(Sh.BlockPshufb, Bm, 8);
-                        Sh.Resolved = true;
-                        std::printf("[autoresolve] FName pipeline adopted into the live sheet\n");
-
-                        uint32_t Ka = AutoResolve::ExtractKeyInitAdd(
-                            m_sigScanner, AutoDiscovery::g_DiscoveredBounds,
-                            Fp.KeystreamWindowRva);
-                        if (Ka && (Ka & 0x3F) != (V::KEY_INIT_ADD & 0x3F))
-                            std::printf("[autoresolve]   DRIFT key init  extracted 0x%X "
-                                        "(mod 64 = %u) != compiled 0x%X (mod 64 = %u)\n",
-                                Ka, Ka & 0x3F, V::KEY_INIT_ADD, V::KEY_INIT_ADD & 0x3F);
-                        else if (Ka)
-                            std::printf("[autoresolve]   key init 0x%X matches the compiled sheet\n", Ka);
-                        if (Ka) Sh.KeyInitAdd = Ka;
-
-                        uint64_t Bb = AutoResolve::ExtractBoolFieldBase(
-                            m_sigScanner, AutoDiscovery::g_DiscoveredBounds,
-                            Sh.PropOffsetInternal);
-                        if (Bb && Bb != V::FBOOLPROP_FIELDSIZE)
-                            std::printf("[autoresolve]   DRIFT bool bytes extracted 0x%llX "
-                                        "!= compiled 0x%llX\n",
-                                (unsigned long long)Bb,
-                                (unsigned long long)V::FBOOLPROP_FIELDSIZE);
-                        else if (Bb)
-                            std::printf("[autoresolve]   bool bytes match the compiled sheet\n");
-                        if (Bb) Sh.BoolFieldBase = Bb;
-                    }
-                }
-
-                {
-                    namespace V = ArcDecrypt::v20260811;
-                    auto Pl = AutoResolve::ExtractPropertyLayout(
-                        m_sigScanner, AutoDiscovery::g_DiscoveredBounds);
-                    if (Pl.Valid) {
-                        struct { const char* Name; unsigned long long Got, Want; } C3[] = {
-                            { "offset",     Pl.OffsetInternal, V::FPROP_OFFSETINT_OFF    },
-                            { "offset xor", Pl.OffsetXor,      V::FPROP_OFFSET_XOR       },
-                            { "cast flags", Pl.CastFlagsOff,   V::UCLASS_CASTFLAGS_OFF   },
-                            { "prop size",  Pl.PropSizeOff,    V::USTRUCT_PROPSIZE_OFF   },
-                        };
-                        int A3 = 0;
-                        for (const auto& C : C3) {
-                            if (C.Got == C.Want) { ++A3; continue; }
-                            std::printf("[autoresolve]   DRIFT %-10s extracted 0x%llX != compiled 0x%llX\n",
-                                C.Name, C.Got, C.Want);
-                        }
-                        std::printf("[autoresolve] FProperty: %d/%d values match the compiled sheet\n",
-                            A3, (int)(sizeof(C3) / sizeof(C3[0])));
-
-                        auto& Sh = ArcDecrypt::g_Sheet;
-                        Sh.PropOffsetInternal = Pl.OffsetInternal;
-                        Sh.PropOffsetXor      = Pl.OffsetXor;
-                        if (Pl.CastFlagsOff) Sh.ClassCastFlagsOff = Pl.CastFlagsOff;
-                        if (Pl.PropSizeOff)  Sh.StructPropSizeOff = Pl.PropSizeOff;
-                        std::printf("[autoresolve] FProperty layout adopted into the live sheet\n");
-                    }
-                }
-
-                auto Mg = AutoResolve::FindChunkMgrGlobal(
-                    m_sigScanner, AutoDiscovery::g_DiscoveredBounds,
-                    [this](uint64_t Rva) -> bool {
-                        namespace V = ArcDecrypt::v20260811;
-                        uint8_t Enc[16] = {};
-                        if (!m_reader.Read(MODULE_BASE + Rva, Enc, 16)) return false;
-                        uint64_t Lo = 0;
-                        std::memcpy(&Lo, Enc, 8);
-                        uint64_t Mgr = AutoDiscovery::V811Detail::DecodePointer(Lo);
-                        if (Mgr < 0x10000ULL || Mgr >= 0x800000000000ULL) return false;
-                        uint64_t Vt = 0, Thunk = 0;
-                        if (!m_reader.Read(Mgr + V::MGR_VTABLE_OFF, &Vt, 8)) return false;
-                        uint64_t VtRva = Vt - MODULE_BASE;
-                        if (Vt < MODULE_BASE || VtRva >= AutoDiscovery::g_DiscoveredBounds.ImageSize)
-                            return false;
-                        if (!m_reader.Read(Vt + 8ULL * V::MGR_VTABLE_SLOT, &Thunk, 8)) return false;
-                        uint64_t TRva = Thunk - MODULE_BASE;
-                        return Thunk > MODULE_BASE &&
-                               TRva >= AutoDiscovery::g_DiscoveredBounds.TextRva &&
-                               TRva <  AutoDiscovery::g_DiscoveredBounds.TextEnd();
-                    });
-                // The global is safe to adopt straight away: the validator
-                // already decrypted it and confirmed the vtable lands in the
-                // module with a thunk in .text.
-                if (Mg.Valid) ArcDecrypt::g_Sheet.ChunkMgrRva = Mg.GlobalRva;
-
-                if (Mg.Valid && Mg.GlobalRva != ArcDecrypt::v20260811::RVA_CHUNKMGR_GLOBAL)
-                    std::printf("[autoresolve]   DRIFT chunks_manager 0x%llX != compiled 0x%llX\n",
-                        (unsigned long long)Mg.GlobalRva,
-                        (unsigned long long)ArcDecrypt::v20260811::RVA_CHUNKMGR_GLOBAL);
-                else if (Mg.Valid)
-                    std::printf("[autoresolve] chunks_manager matches the compiled sheet\n");
-            }
-
-            {
-                // Phase 6.6 runs first: its anchors are fixed RVAs validated
-                // by plaintext rather than sig-scan results, so a successful
-                // adopt is ground truth and makes the older phases moot.
-                std::printf("\n=== Phase 6.6: v20260811 FName pipeline (plaintext-verified) ===\n");
-                if (AutoDiscovery::g_DiscoveredBounds.ImageSize ==
-                        ArcDecrypt::v20260811::IMAGE_SIZE &&
-                    m_fname.AdoptV811())
-                {
-                    ArcDecrypt::ApplyOffsets811();
-                    std::printf("[v811] FField/FProperty layout applied\n");
-                } else if (AutoDiscovery::g_DiscoveredBounds.ImageSize !=
-                               ArcDecrypt::v20260811::IMAGE_SIZE) {
-                    std::printf("[v811] image size 0x%llX != 0x%llX — skipped\n",
-                        (unsigned long long)AutoDiscovery::g_DiscoveredBounds.ImageSize,
-                        (unsigned long long)ArcDecrypt::v20260811::IMAGE_SIZE);
+            // ── Phase 6.4: static reflection from Z_Construct_* descriptors ──
+            // Theia's NameUTF8 cipher is a PRNG stream seeded with zero, so the
+            // generated descriptor tables decrypt offline. Reaches enums,
+            // structs, functions and delegates including ones that are never
+            // instantiated and therefore absent from GUObjectArray. UClass
+            // descriptors are not reachable — their name pointers are passed as
+            // encrypted blobs, never as rip-relative leas. Advisory: writes a
+            // report, changes nothing in the live pipeline.
+            if (getenv("FROST_NO_THEIA_STATIC") == nullptr) {
+                std::printf("\n=== Phase 6.4: static reflection (Z_Construct descriptors) ===\n");
+                const auto& Bd = AutoDiscovery::g_DiscoveredBounds;
+                if (Bd.Valid && Bd.RDataSize) {
+                    // Live reads miss the pages Theia keeps unmapped, and a
+                    // zero-filled page destroys every descriptor in it, so the
+                    // module dump the sig scanner already wrote fills the gaps.
+                    char DumpPath[128];
+                    std::snprintf(DumpPath, sizeof(DumpPath),
+                        "module_dump_0x%llX.bin", (unsigned long long)MODULE_BASE);
+                    // The module dump is itself made from live reads, so it has
+                    // the same holes. An externally produced full image closes
+                    // them; TheiaStatic handles both dumped images (offset ==
+                    // RVA) and real PEs (section table) so either can be given.
+                    const std::string& PeFallback = GetPEBinaryPath();
+                    TheiaStatic::Run(m_reader, MODULE_BASE,
+                                     Bd.TextRva, Bd.TextSize,
+                                     Bd.RDataRva, Bd.RDataSize,
+                                     "static_reflect.txt", DumpPath,
+                                     PeFallback.empty() ? nullptr : PeFallback.c_str());
+                } else {
+                    std::printf("[theia-static] module bounds unavailable; skipped\n");
                 }
             }
 
-            if (!m_fname.IsV811Active())
+            RunAutoResolve();
+
+            {
+                // The image-size gate this used to carry made the pipeline
+                // unavailable on exactly the day it is needed. AdoptV811
+                // self-tests against plaintext (CI=0 must give "None"), which
+                // is a stronger check than a version stamp and works on a
+                // sheet auto-resolve just rewrote. Usually a no-op: Phase 0d
+                // already adopted.
+                if (!m_fname.IsV811Active() && !m_fname.IsV818Active()) {
+                    std::printf("\n=== Phase 6.6: v20260811 FName pipeline (plaintext-verified) ===\n");
+                    if (m_fname.AdoptV811()) {
+                        ArcDecrypt::ApplyOffsets811();
+                        std::printf("[v811] FField/FProperty layout applied\n");
+                    }
+                }
+            }
+
+            if (!m_fname.IsV811Active() && !m_fname.IsV818Active())
             {
                 std::printf("\n=== Phase 6.7: v20260808 FName pipeline (plaintext-verified) ===\n");
                 AutoDiscovery::g_DiscoveredV808 =
@@ -3078,7 +3175,8 @@ public:
                  << "// Game updated:  " << (SteamInfo.Updated.empty() ? "unknown" : SteamInfo.Updated) << "\n"
                  << "// Image size:    0x" << std::hex << AutoDiscovery::g_DiscoveredBounds.ImageSize
                  << std::dec << "  (module base 0x" << std::hex << MODULE_BASE << std::dec << ")\n"
-                 << "// FName pipeline: " << (m_fname.IsV811Active() ? "v20260811"
+                 << "// FName pipeline: " << (m_fname.IsV818Active() ? "v20260818"
+                                     : m_fname.IsV811Active() ? "v20260811"
                                      : m_fname.IsV808Active() ? "v20260808" : "legacy") << "\n"
                  << "// PID: " << m_pid << "\n"
                  << "// ============================================================\n"

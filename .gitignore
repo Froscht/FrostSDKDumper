@@ -31,6 +31,7 @@ SDK.hpp
 dump_*.txt
 vtable_map.md
 generated_decrypt.h
+static_reflect.txt
 
 # The live constant snapshot. Regenerated every run and patch-specific, so
 # committing it means the next patch loads stale values — see the config

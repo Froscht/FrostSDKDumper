@@ -378,6 +378,140 @@ public:
     // are plaintext-verified rather than sig-scanned.
     bool IsV811Active() const { return m_v811Active; }
 
+    bool IsV818Active() const { return m_v818Active; }
+
+    // Steam build CL-1341255. Same contract as AdoptV811 and the same single
+    // acceptance test: CI=0 must decode to "None". The keystream is read LIVE —
+    // the module image holds the at-rest form and shares no value with it.
+    bool AdoptV818() {
+        const auto& Sh = ArcDecrypt::g_Sheet;
+        if (!m_reader.Read(m_base + Sh.Keystream818Rva, m_keyTable818, sizeof(m_keyTable818))) {
+            std::printf("[fname] v818 keystream read failed @ 0x%llX\n",
+                (unsigned long long)(m_base + Sh.Keystream818Rva));
+            return false;
+        }
+        m_pool818Rva = Sh.Pool818Rva;
+        m_v818Active = true;
+        m_keyLoaded  = true;
+
+        std::string Probe = DecryptNameString_V818(ResolveNamePtr_V818(0));
+        if (Probe != "None") {
+            std::printf("[fname] v818 self-test failed (CI=0 gave \"%s\", expected \"None\") - not adopting\n",
+                Probe.c_str());
+            m_v818Active = false;
+            return false;
+        }
+        // Entries sit several CompIndex steps apart, so CI=1 lands mid-string.
+        // Sweep for the first genuine name instead of probing a fixed index.
+        std::string Second;
+        for (int32_t Ci = 1; Ci < 512 && Second.empty(); ++Ci) {
+            std::string S = DecryptNameString_V818(ResolveNamePtr_V818(Ci));
+            if (S.size() < 3) continue;
+            bool Clean = true;
+            for (unsigned char C : S)
+                if (!std::isalnum(C) && C != '_') { Clean = false; break; }
+            if (Clean) Second = S;
+        }
+        std::printf("[fname] Pipeline = v20260818 (pool 0x%llX, keystream window 0x%llX) - CI=0 -> \"None\" OK%s%s\n",
+            (unsigned long long)Sh.Pool818Rva, (unsigned long long)Sh.Keystream818Rva,
+            Second.empty() ? "" : ", 2nd plaintext: ", Second.c_str());
+        return true;
+    }
+
+    uint64_t ResolveNamePtr_V818(int32_t CompIndex) const {
+        if (CompIndex < 0 || !m_v818Active) return 0;
+        return AutoDiscovery::V818Detail::ResolveEntry(m_reader, m_base, CompIndex);
+    }
+
+    std::string DecryptNameString_V818(uint64_t NameEntryPtr) {
+        namespace V = ArcDecrypt::v20260818;
+        namespace X = AutoDiscovery::V818Detail;
+        if (!NameEntryPtr || !m_v818Active) return {};
+
+        X::EntryHeader H;
+        if (!X::ReadHeader(m_reader, NameEntryPtr, H)) return {};
+        if (H.Bytes <= 0 || H.Bytes > 2048) return {};
+
+        std::vector<uint8_t> Buf((size_t)H.Bytes, 0);
+        if (!m_reader.Read(NameEntryPtr + 2, Buf.data(), (size_t)H.Bytes)) return {};
+
+        uint32_t Key = (uint32_t)H.Length + ArcDecrypt::g_Sheet.KeyInitAdd818;
+        auto Slot = [&](uint32_t K) -> uint16_t {
+            return m_keyTable818[K & V::KEY_INDEX_MASK];
+        };
+
+        std::string Out;
+        Out.reserve(H.Length);
+        if (!H.IsWide) {
+            for (int I = 0; I < H.Length; ++I) {
+                uint8_t C = Buf[I] ^ (uint8_t)(Slot(Key + (uint32_t)I) >> V::NARROW_KEY_SHIFT);
+                if (!C) break;
+                Out.push_back((char)C);
+            }
+            return Out;
+        }
+        for (int I = 0; I < H.Length; ++I) {
+            uint16_t C = (uint16_t)(Buf[I * 2] | ((uint16_t)Buf[I * 2 + 1] << 8));
+            uint16_t W = (uint16_t)(C ^ Slot(Key + (uint32_t)I));
+            if (!W) break;
+            Out.push_back((char)(W & 0xFF));
+        }
+        return Out;
+    }
+
+    // The slot is 16 bytes on this build, not 8: the decoder mixes both halves.
+    uint64_t DecodeObjSlot16_V818(uint64_t ObjPtr, uint32_t Idx) const {
+        namespace V = ArcDecrypt::v20260818;
+        uint64_t Raw[2] = { 0, 0 };
+        uint64_t Slot = ObjPtr + V::UOBJ_NAME_SLOT_BASE + V::UOBJ_NAME_SLOT_STRIDE * Idx;
+        if (!m_reader.Read(Slot, Raw, 16)) return 0;
+        if (!Raw[0] && !Raw[1]) return 0;
+        return AutoDiscovery::V818Detail::DecodeSlot16(Raw[0], Raw[1]);
+    }
+
+    uint64_t GetObjFNameV818(uint64_t ObjPtr) const {
+        namespace V = ArcDecrypt::v20260818;
+        uint32_t Idx = AutoDiscovery::V818Detail::NameSlotIndex(ObjPtr);
+        uint64_t Vv = DecodeObjSlot16_V818(ObjPtr, Idx);
+        if (!Vv) return 0;
+        return fn_rotl64(Vv, V::UOBJ_NAME_ROL64);
+    }
+
+    std::string GetNameV818(uint64_t ObjPtr) {
+        uint64_t F = GetObjFNameV818(ObjPtr);
+        if (!F) return {};
+        std::string S = DecryptNameString_V818(
+            ResolveNamePtr_V818((int32_t)(F & 0xFFFFFFFFu)));
+        uint32_t Number = (uint32_t)(F >> 32);
+        if (S.empty() || Number == 0) return S;
+        return S + "_" + std::to_string(Number - 1);
+    }
+
+    // Class sits at (S & 3), Outer at (S + 1) & 3 — measured from the raw hash,
+    // exactly as on build 24653108. Verified live over 198 sampled objects:
+    // rel 0 named Package/Function/SoundWave/ASClass, rel 1 named the outers.
+    uint64_t DecodeObjSlotPtrV818(uint64_t ObjPtr, uint32_t SlotRel) const {
+        uint32_t Idx = (AutoDiscovery::V818Detail::SlotHash(ObjPtr) + SlotRel) & 3u;
+        uint64_t Ptr = DecodeObjSlot16_V818(ObjPtr, Idx);
+        if (Ptr < 0x10000ULL || Ptr >= 0x800000000000ULL) return 0;
+        return Ptr;
+    }
+    uint64_t GetClassPtrV818(uint64_t ObjPtr) const {
+        return DecodeObjSlotPtrV818(ObjPtr, ArcDecrypt::v20260818::UOBJ_SLOT_CLASS_ADJ);
+    }
+    uint64_t GetOuterPtrV818(uint64_t ObjPtr) const {
+        return DecodeObjSlotPtrV818(ObjPtr, ArcDecrypt::v20260818::UOBJ_SLOT_OUTER_ADJ);
+    }
+
+    int32_t DecryptFFieldNameCI_V818(uint64_t FieldAddr) const {
+        namespace V = ArcDecrypt::v20260818;
+        uint64_t Enc = 0;
+        if (!m_reader.Read(FieldAddr + V::FFIELD_NAME_OFF, &Enc, 8) || !Enc) return 0;
+        uint64_t Vv = AutoDiscovery::V818Detail::DecodeFFieldName(Enc);
+        return (int32_t)(Vv & 0xFFFFFFFFu);
+    }
+
+
     // Steam build 24653108. Both anchors are fixed RVAs rather than sig-scan
     // results, so the only thing that can validate them is plaintext: CI=0
     // must decode to "None". The keystream MUST be read from live memory —
@@ -1083,6 +1217,16 @@ public:
         std::array<uint64_t, 4> out{};
         if (!obj_base || !m_keyLoaded) return out;
 
+        if (m_v818Active) {
+            int n = 0;
+            for (uint32_t Rel = 0; Rel < 4; ++Rel) {
+                uint64_t P = DecodeObjSlotPtrV818(obj_base, Rel);
+                if (P) out[n++] = P;
+                if (n == 4) break;
+            }
+            return out;
+        }
+
         if (m_v811Active) {
             int n = 0;
             for (uint32_t Rel = 0; Rel < 4; ++Rel) {
@@ -1129,6 +1273,10 @@ public:
         // Without these the modern pipelines fall through to the legacy
         // Build20260519 decoders, which return plausible-looking garbage.
         // That is what left the bone dump unable to find any "Skeleton".
+        if (m_v818Active) {
+            uint64_t P = GetClassPtrV818(obj_base);
+            if (P) return P;
+        }
         if (m_v811Active) {
             uint64_t P = GetClassPtrV811(obj_base);
             if (P) return P;
@@ -1220,6 +1368,9 @@ public:
         // same ciphertext through eight wrong-patch transforms whose acceptance
         // window (ci < 0x06A00000) is far wider than ours, so a bogus decode
         // would win and latch m_ffieldNameOff on the way out.
+        if (m_v818Active)
+            return DecryptFFieldNameCI_V818(ff_addr);
+
         if (m_v811Active)
             return DecryptFFieldNameCI_V811(ff_addr);
 
@@ -1488,6 +1639,9 @@ public:
     // FName-fn rip-rel scan (we already collect candidates in
     // g_DiscoveredFName.AllRDataLeas; just need the role-binding pass).
     uint64_t ResolveNamePtrFull(int32_t CompIndex) {
+        if (m_v818Active)
+            return (CompIndex < 0) ? 0 : ResolveNamePtr_V818(CompIndex);
+
         if (m_v811Active)
             return (CompIndex < 0) ? 0 : ResolveNamePtr_V811(CompIndex);
 
@@ -2389,6 +2543,9 @@ public:
     std::string DecryptNameString(uint64_t NameEntryPtr) {
         if (!NameEntryPtr || !m_keyLoaded) return {};
 
+        if (m_v818Active)
+            return DecryptNameString_V818(NameEntryPtr);
+
         if (m_v811Active)
             return DecryptNameString_V811(NameEntryPtr);
 
@@ -2735,6 +2892,11 @@ public:
     std::string GetName(uint64_t obj_ptr) {
         if (!obj_ptr || !m_keyLoaded) return {};
 
+        if (m_v818Active) {
+            std::string S = GetNameV818(obj_ptr);
+            if (!S.empty()) return S;
+        }
+
         if (m_v811Active) {
             std::string S = GetNameV811(obj_ptr);
             if (!S.empty()) return S;
@@ -2786,6 +2948,21 @@ public:
     std::string CompIndexToName(int32_t comp_index) {
         std::string s = StaticResolve(comp_index);
         return IsStrictName(s) ? s : std::string{};
+    }
+
+    // ── FName::Number suffix ─────────────────────────────────────────────
+    // An FName is {ComparisonIndex, Number}, and UE splits a trailing number
+    // off the literal when it interns one: "H5_5" is stored as the entry "H5"
+    // with Number 6. Resolving the CompIndex alone therefore silently truncates
+    // every such name, which is how EEmbarkUITextType came out with H5 twice.
+    // UE's own ToString appends `_(Number - 1)`.
+    static std::string ApplyNameNumber(const std::string& Base, uint32_t Number) {
+        if (Base.empty() || Number == 0) return Base;
+        return Base + "_" + std::to_string(Number - 1);
+    }
+
+    std::string CompIndexToNameNumbered(int32_t comp_index, uint32_t number) {
+        return ApplyNameNumber(CompIndexToNameLenient(comp_index), number);
     }
 
     std::string CompIndexToNameLenient(int32_t comp_index) {
@@ -2926,6 +3103,7 @@ public:
     uint64_t GetClassPtrV808(uint64_t ObjPtr) const { return DecodeObjSlotPtrV808(ObjPtr, 2); }
     // Picks whichever pipeline is live so call sites do not have to.
     uint64_t GetClassPtrAuto(uint64_t ObjPtr) const {
+        if (m_v818Active) return GetClassPtrV818(ObjPtr);
         if (m_v811Active) return GetClassPtrV811(ObjPtr);
         if (m_v808Active) return GetClassPtrV808(ObjPtr);
         return 0;
@@ -2934,6 +3112,11 @@ public:
 
     uint64_t GetOuterPtr(uint64_t obj_ptr) {
         if (!obj_ptr || !m_keyLoaded) return 0;
+
+        if (m_v818Active) {
+            uint64_t P = GetOuterPtrV818(obj_ptr);
+            if (P) return P;
+        }
 
         if (m_v811Active) {
             uint64_t P = GetOuterPtrV811(obj_ptr);
@@ -3021,6 +3204,24 @@ public:
 
     uint64_t GetPackagePtr(uint64_t obj_ptr) {
         if (!obj_ptr || !m_keyLoaded) return 0;
+
+        // The walk below decodes slots with DecryptUObjSlotNew, which is the
+        // legacy decoder: on a modern pipeline it returns noise, every step
+        // fails the UPackage vtable test, and the caller falls back to
+        // synthesising "/Script/<ClassName>" from the type's own name. Walk
+        // the Outer chain with whichever decoder is live instead, and take
+        // the first object whose name reads as a package path.
+        if (m_v818Active || m_v811Active || m_v808Active) {
+            uint64_t Cur = obj_ptr;
+            for (int Depth = 0; Depth < 24; ++Depth) {
+                uint64_t Next = GetOuterPtr(Cur);
+                if (!Next || Next == Cur) break;
+                std::string N = GetName(Next);
+                if (!N.empty() && N[0] == '/') return Next;
+                Cur = Next;
+            }
+            return 0;
+        }
         const uint64_t upkg_vt = m_base + UPackageVtRva();
         const uint64_t mod_lo  = m_base;
         const uint64_t mod_hi  = m_base + 0x10000000ULL;
@@ -3152,6 +3353,9 @@ private:
     uint16_t       m_keyTableNewPatch[64];
     uint16_t       m_keyTable811[ArcDecrypt::v20260811::KEYSTREAM_ENTRIES] = {};
     bool           m_v811Active  = false;
+    uint16_t       m_keyTable818[64] = {};
+    bool           m_v818Active  = false;
+    uint64_t       m_pool818Rva  = ArcDecrypt::v20260818::RVA_GNAMEPOOL;
     uint64_t       m_pool811Rva  = 0;
     int            m_ks811Base   = ArcDecrypt::v20260811::KEYSTREAM_BASE_INDEX;
 

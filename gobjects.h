@@ -874,6 +874,92 @@ namespace gobjects
             return Arr;
         }
 
+        // UObject::InternalIndex moved to +0x90 on CL-1341255, so the invariant
+        // has to be checked at the build's own offset. Reading it at the old
+        // +0x0C returns zero for every object and rejects a correct array.
+        bool ChunkArrayPassesIndexInvariant818(uint64_t ChunkArray) {
+            namespace V = ArcDecrypt::v20260818;
+            uint64_t Chunk0 = 0;
+            if (!m_reader.Read(ChunkArray, &Chunk0, 8)) return false;
+            if (Chunk0 < 0x10000ULL || Chunk0 >= 0x800000000000ULL) return false;
+
+            constexpr uint32_t kProbe = 256;
+            std::vector<uint8_t> Buf((size_t)kProbe * V::FUOBJECTITEM_STRIDE);
+            if (!m_reader.Read(Chunk0, Buf.data(), Buf.size())) return false;
+
+            int Checked = 0, Match = 0;
+            for (uint32_t I = 0; I < kProbe; ++I) {
+                uint64_t Obj = 0;
+                std::memcpy(&Obj, Buf.data() + (size_t)I * V::FUOBJECTITEM_STRIDE, 8);
+                if (Obj < 0x10000ULL || Obj >= 0x800000000000ULL) continue;
+                uint32_t Idx = 0;
+                if (!m_reader.Read(Obj + V::UOBJECT_INTERNAL_IDX, &Idx, 4)) continue;
+                ++Checked;
+                if (Idx == I) ++Match;
+            }
+            if (Checked < 32) return false;
+            return Match * 100 >= Checked * 90;
+        }
+
+        // CL-1341255. The chunks_manager global is still standalone and
+        // encrypted, but the vtable-and-thunk indirection that build 24653108
+        // used is gone: the decoded manager carries NumElements and the chunk
+        // array directly, each xor+bswap encoded. No PEB salt is involved, so
+        // this path needs neither the PEB sweep nor the thunk interpreter.
+        uint64_t DiscoverChunkArrayV818(int& OutNumChunks, int32_t& OutNumElements) {
+            namespace V = ArcDecrypt::v20260818;
+            namespace X = AutoDiscovery::V818Detail;
+            OutNumChunks = 0;
+            OutNumElements = 0;
+
+            uint8_t Enc[16] = {};
+            if (!m_reader.Read(m_base + ArcDecrypt::g_Sheet.ChunkMgr818Rva, Enc, 16)) return 0;
+            uint64_t EncLo = 0;
+            std::memcpy(&EncLo, Enc, 8);
+
+            uint64_t Mgr = X::DecodeChunkMgr(EncLo);
+            if (Mgr < 0x10000ULL || Mgr >= 0x800000000000ULL) {
+                std::printf("[gobj-v818] chunks_manager decrypt gave implausible 0x%llX\n",
+                    (unsigned long long)Mgr);
+                return 0;
+            }
+
+            uint32_t NumRaw = 0;
+            uint64_t ArrRaw = 0;
+            if (!m_reader.Read(Mgr + V::MGR_NUMELEMENTS_OFF, &NumRaw, 4)) return 0;
+            if (!m_reader.Read(Mgr + V::MGR_CHUNKARRAY_OFF, &ArrRaw, 8)) return 0;
+
+            uint32_t Num = __builtin_bswap32(NumRaw ^ V::MGR_NUMELEMENTS_XOR);
+            uint64_t Arr = __builtin_bswap64(ArrRaw ^ V::MGR_CHUNKARRAY_XOR);
+
+            std::printf("[gobj-v818] chunks_manager=0x%llX NumElements=%u chunk_array=0x%llX\n",
+                (unsigned long long)Mgr, Num, (unsigned long long)Arr);
+
+            if (Num <= 1000 || Num >= 4000000) {
+                std::printf("[gobj-v818] NumElements %u out of range — rejected\n", Num);
+                return 0;
+            }
+            if (Arr < 0x10000ULL || Arr >= 0x800000000000ULL) return 0;
+
+            if (!ChunkArrayPassesIndexInvariant818(Arr)) {
+                std::printf("[gobj-v818] chunk array failed the InternalIndex invariant — rejected\n");
+                return 0;
+            }
+
+            OutNumElements = (int32_t)Num;
+            for (int I = 0; I < 128; ++I) {
+                uint64_t C = 0;
+                if (!m_reader.Read(Arr + 8ULL * I, &C, 8)) break;
+                if (C < 0x10000ULL || C >= 0x800000000000ULL) break;
+                ++OutNumChunks;
+            }
+
+            std::printf("[gobj-v818] verified: %d chunks, NumElements=%d (stride %u, %u/chunk)\n",
+                OutNumChunks, OutNumElements, V::FUOBJECTITEM_STRIDE, V::ITEMS_PER_CHUNK);
+            return Arr;
+        }
+
+
         uint64_t DiscoverChunkArrayV808(int& OutNumChunks, int32_t& OutNumElements) {
             namespace V = ArcDecrypt::v20260808;
             OutNumChunks = 0;
@@ -3831,32 +3917,18 @@ namespace gobjects
         uint64_t ScanHeapForObjectArray() {
             if (m_pid <= 0) return 0;
 
-            char path[64];
-            snprintf(path, sizeof(path), "/proc/%d/maps", m_pid);
-            FILE* f = fopen(path, "r");
-            if (!f) {
-                std::printf("[!] Cannot open %s for heap scan\n", path);
-                return 0;
+            // Reuse EnumerateRwHeapRegions instead of a second maps parser:
+            // same semantics (committed rw- regions >= 1 MiB, module range
+            // excluded), one implementation to port per platform.
+            std::vector<Region> raw;
+            EnumerateRwHeapRegions(0x100000, 0xFFFFFFFFFFFFULL, raw);
+            struct Region2 { uint64_t start, end; };
+            std::vector<Region2> regions;
+            regions.reserve(raw.size());
+            for (const auto& r : raw) {
+                if (r.lo < 0x10000 || r.lo > 0x7FFFFFFFFFFFULL) continue;
+                regions.push_back({r.lo, r.hi});
             }
-
-            // Collect rw- anonymous regions (heap candidates)
-            struct Region { uint64_t start, end; };
-            std::vector<Region> regions;
-            char line[512];
-            while (fgets(line, sizeof(line), f)) {
-                uint64_t start = 0, end = 0;
-                char perms[5] = {};
-                sscanf(line, "%llx-%llx %4s", (unsigned long long*)&start, (unsigned long long*)&end, perms);
-                if (perms[0] != 'r' || perms[1] != 'w') continue;
-                uint64_t size = end - start;
-                // Only large anonymous regions (likely heap/mmap)
-                if (size < 0x100000) continue;
-                if (start < 0x10000 || start > 0x7FFFFFFFFFFFULL) continue;
-                // Skip module range
-                if (start >= m_base && start < m_base + 0x10000000ULL) continue;
-                regions.push_back({start, end});
-            }
-            fclose(f);
 
             std::printf("[*] Heap scan: %zu regions to probe\n", regions.size());
 

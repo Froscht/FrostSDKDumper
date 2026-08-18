@@ -232,7 +232,13 @@ constexpr uint64_t MODULE_BASE = 0x140000000;
 inline uint64_t RVA_GWORLD              = 0xE83FC58;   // CL-1233465 (was 0xE706C58 on CL-1201801)
 inline uint64_t RVA_GNAMES_BASE         = 0xE0ED7D0;   // CL-1201801 live (was 0xE23DA00; CL-1177146: 0xDBB3F80, 20260428: 0xDB5BE80)
 inline uint64_t RVA_FNAME_KEY_TABLE     = 0xDE5B6E0;   // CL-1201801 (= SIMD consts block 0xDE5B6D8 + 8); 20260519: 0xE17C7FC; CL-1177146: 0xDAF88EC
-inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xE4F8F60;   // CL-1195482 (Steam 19.05 evening; was 0xE4F8ED0 in pre-CL-1195482 morning build)
+// Build 24653108: chunks_manager is a standalone encrypted 16-byte global, so
+// this legacy slot now carries the same value as v20260811::RVA_CHUNKMGR_GLOBAL
+// (it cannot reference it — that namespace is declared further down). The v811
+// hot path reads g_Sheet.ChunkMgrRva; this keeps the legacy fallbacks and the
+// exported config from carrying a CL-1195482 address.
+inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xE64B260;   // == v20260811::RVA_CHUNKMGR_GLOBAL
+//inline uint64_t RVA_GOBJECT_ARRAY_BASE  = 0xE4F8F60; // CL-1195482 (Steam 19.05 evening; was 0xE4F8ED0 pre-CL-1195482)
 constexpr uint64_t GOBJ_ENCRYPTED_OFF   = 0x30;        // legacy pipeline offset (unused on 20260428: NumElements is plain at +0x38)
 
 // SIMD runtime tables (GUObjectArray decrypt — patch 20260414)
@@ -1497,6 +1503,146 @@ namespace v20260811 {
     constexpr uint64_t FBOOLPROP_FIELDMASK   = 0x123ULL;
 } // namespace v20260811
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Steam build CL-1341255 (1.42.x, 2026-08-18). Image size 0x116E7000.
+//
+// Theia changed shape here, it did not merely move: the UObject slot decode is
+// now PCLMULQDQ over GF(2) instead of a shuffle/rotate chain, the chunks_manager
+// lost its vtable-and-thunk indirection entirely, and UObject::InternalIndex
+// moved from +0x0C to +0x90. Every RVA moved with the section layout as well
+// (.text shrank 0x6F000, .data 0x35000).
+// ─────────────────────────────────────────────────────────────────────────────
+namespace v20260818 {
+    constexpr uint64_t IMAGE_SIZE            = 0x116E7000ULL;
+
+    constexpr uint64_t RVA_GNAMEPOOL         = 0xE35AB00ULL;
+    constexpr uint64_t RVA_FNAME_RESOLVER    = 0x236220ULL;
+    // Decrypted in place at load, so the module image holds the at-rest form.
+    // This must be read from live memory.
+    constexpr uint64_t RVA_KEYSTREAM         = 0xE2997F4ULL;
+    constexpr int      KEYSTREAM_BASE_INDEX  = 80;
+    constexpr int      KEYSTREAM_ENTRIES     = 144;
+
+    constexpr uint32_t HASH_PRIME            = 0x01000193u;
+    constexpr uint32_t SHARD_HASH_ADD        = 0x30091BB7u;
+    constexpr uint64_t SHARD_HASH_SEED_OFF   = 0x6FD0ULL;
+    constexpr uint64_t SHARD_BLOCK_BASE_OFF  = 0x6FE0ULL;
+    constexpr uint64_t SHARD_BLOCK_STRIDE    = 32ULL;
+    // ROL-based again, unlike the SHR-based first step on build 24653108.
+    constexpr int      SHARD_ROL_A           = 0x17;
+    constexpr int      SHARD_ROL_B           = 0x15;
+    constexpr int      SHARD_ROL_C           = 0x17;
+    constexpr int      SHARD_SHR_D           = 0x0B;
+
+    // No PSHUFB in the block decode on this patch: ROL64 then XOR then ROL32.
+    constexpr int      BLOCK_ROL64           = 4;
+    constexpr int      BLOCK_ROL32           = 2;
+    constexpr uint64_t BLOCK_FNV_XOR         = 0xF31D220392B6800BULL;
+    constexpr uint64_t BLOCK_XOR_RVA         = 0xB3BEC30ULL;
+
+    constexpr uint64_t FNV_PRIME             = 0x100000001B3ULL;
+    constexpr uint64_t FNV_ADD               = 0x6463CD794F959557ULL;
+    constexpr int      FNV_ROL1              = 0x30;
+    constexpr int      FNV_ROL2              = 0x2E;
+
+    // The whole pointer-xor chain is gone; the FNV result IS the entry.
+    constexpr bool     FNAME_PTR_CHAIN_IS_NOP = true;
+
+    // Header moved: the length is a plain 10-bit field and the wide flag is
+    // the sign bit, where build 24653108 split the length across two ranges
+    // and used 0x800 for wide.
+    constexpr uint16_t HDR_IS_WIDE_BIT       = 0x8000u;
+    constexpr uint16_t HDR_LENGTH_MASK       = 0x03FFu;
+    constexpr uint32_t KEY_INIT_ADD          = 0xD917u;
+    constexpr uint32_t KEY_ADVANCE           = 1u;
+    constexpr uint8_t  KEY_INDEX_MASK        = 0x3Fu;
+    constexpr int      NARROW_KEY_SHIFT      = 3;
+    constexpr int      WIDE_KEY_SHIFT        = 0;
+
+    // Standalone encrypted 16-byte global, as on build 24653108, but the
+    // vtable/thunk indirection is gone: NumElements and the chunk array are
+    // xor+bswap fields on the decoded manager itself.
+    constexpr uint64_t RVA_CHUNKMGR_GLOBAL   = 0xE616340ULL;
+    constexpr uint64_t CHUNKMGR_PSHUFB_RVA   = 0xB3850F0ULL;
+    constexpr uint8_t  CHUNKMGR_PSHUFB[8]    = { 5, 0, 4, 6, 7, 2, 3, 1 };
+    constexpr int      CHUNKMGR_ROL64        = 50;
+    constexpr int      CHUNKMGR_ROL32        = 22;
+
+    constexpr uint64_t MGR_NUMELEMENTS_OFF   = 0x0CULL;
+    constexpr uint32_t MGR_NUMELEMENTS_XOR   = 0xC460461Fu;
+    constexpr uint64_t MGR_CHUNKARRAY_OFF    = 0x20ULL;
+    constexpr uint64_t MGR_CHUNKARRAY_XOR    = 0xED46031B00000000ULL;
+
+    constexpr uint32_t FUOBJECTITEM_STRIDE   = 20;
+    constexpr uint32_t ITEMS_PER_CHUNK       = 65536;
+    constexpr uint64_t FUOBJECTITEM_FLAGS    = 0x08ULL;
+    constexpr uint64_t UOBJECT_INTERNAL_IDX  = 0x90ULL;
+
+    constexpr uint64_t RVA_UOBJECT_GETFNAME  = 0x364780ULL;
+    constexpr uint64_t RVA_SLOT_DECODER      = 0x3550C0ULL;
+    constexpr uint64_t UOBJ_NAME_SEED_OFF    = 0x10ULL;
+    constexpr uint64_t UOBJ_NAME_SLOT_BASE   = 0x20ULL;
+    constexpr uint64_t UOBJ_NAME_SLOT_STRIDE = 0x20ULL;
+    constexpr uint32_t UOBJ_SLOT_HASH_PRIME  = 0x01000193u;
+    constexpr uint32_t UOBJ_SLOT_HASH_ADD    = 0xD4C2DB3Au;
+    constexpr int      UOBJ_SLOT_ROL_A       = 0x19;
+    constexpr int      UOBJ_SLOT_ROL_B       = 0x0E;
+    constexpr int      UOBJ_SLOT_ROL_C       = 0x19;
+    constexpr int      UOBJ_SLOT_ROL_D       = 0x0E;
+    constexpr uint32_t UOBJ_SLOT_NAME_XOR    = 2u;
+    constexpr uint32_t UOBJ_SLOT_CLASS_ADJ   = 0u;
+    constexpr uint32_t UOBJ_SLOT_OUTER_ADJ   = 1u;
+    constexpr int      UOBJ_NAME_ROL64       = 32;
+
+    // The slot decoder is a shared leaf function; each call site passes its
+    // own pair of 64-bit polynomials. The pandn blend around the first product
+    // cancels — both halves xor the same rip constant — so what remains is
+    // two carry-less multiplies.
+    //   A = slot[0..8), B = slot[8..16)
+    //   T = B ^ clmul_lo(K1, A)
+    //   V = clmul_lo(K2, T) ^ A
+    constexpr uint64_t SLOT_CLMUL_K1         = 0x0B6641A64F1B214DULL;
+    constexpr uint64_t SLOT_CLMUL_K2         = 0x8FA21A13D9179A47ULL;
+
+    constexpr uint64_t USTRUCT_SUPER_OFF     = 0xB0ULL;
+    constexpr uint64_t USTRUCT_CHILDREN      = 0xE0ULL;
+    constexpr uint64_t USTRUCT_CHILDPROPS    = 0xF8ULL;
+    constexpr uint64_t USTRUCT_PROPSIZE_OFF  = 0x108ULL;
+    constexpr uint64_t UCLASS_CASTFLAGS_OFF  = 0x130ULL;
+    constexpr uint64_t UCLASS_WITHIN_OFF     = 0x128ULL;
+    constexpr uint64_t UENUM_NAMES_OFF       = 0xB0ULL;
+    constexpr uint64_t UENUM_NUM_OFF         = 0xB8ULL;
+
+    // NamePrivate carries a key again, and the second stage is a per-dword ADD
+    // rather than an XOR.
+    //   V = ROL32_perdword(enc ^ K1, 29) ; V = PADDD(V, K2) ; ROL64(V.lo, 32)
+    constexpr uint64_t FFIELD_NAME_OFF       = 0x50ULL;
+    constexpr uint64_t FFIELD_NAME_K1        = 0xFDF20AE0DF1B2EFBULL;
+    constexpr uint64_t FFIELD_NAME_K2        = 0x020DF52020E4D105ULL;
+    constexpr uint64_t FFIELD_NAME_K1_RVA    = 0xB3DB830ULL;
+    constexpr uint64_t FFIELD_NAME_K2_RVA    = 0xB3DB840ULL;
+    constexpr int      FFIELD_NAME_ROL32     = 29;
+    constexpr int      FFIELD_NAME_ROL64     = 32;
+
+    constexpr uint64_t FFIELD_NEXT_OFF       = 0x60ULL;
+    constexpr uint64_t FFIELD_CLASS_OFF      = 0x70ULL;
+    constexpr uint64_t FFIELD_FLAGS_OFF      = 0x78ULL;
+    constexpr uint64_t FFIELD_OWNER_OFF      = 0x80ULL;
+
+    constexpr uint64_t FPROP_PROPFLAGS_OFF   = 0xC0ULL;
+    constexpr uint64_t FPROP_OFFSETINT_OFF   = 0xA4ULL;
+    constexpr uint32_t FPROP_OFFSET_XOR      = 0x7BDAAA72u;
+    constexpr uint64_t FPROP_ARRAYDIM_OFF    = 0xD0ULL;
+    constexpr uint64_t FPROP_ELEMSIZE_OFF    = 0xD8ULL;
+    constexpr uint64_t FPROP_SIZEOF          = 0x100ULL;
+
+    constexpr uint64_t FBOOLPROP_FIELDSIZE   = 0x100ULL;
+    constexpr uint64_t FBOOLPROP_BYTEOFFSET  = 0x101ULL;
+    constexpr uint64_t FBOOLPROP_BYTEMASK    = 0x102ULL;
+    constexpr uint64_t FBOOLPROP_FIELDMASK   = 0x103ULL;
+} // namespace v20260818
+
+
 // Applied twice: once when the pipeline is adopted, and again after
 // auto_offsets runs, because the generic probes need a working FField name
 // decode to score candidates — the very thing they are trying to discover —
@@ -1594,6 +1740,21 @@ struct LiveSheet {
     // Table address plus base index, so indexing is simply idx*2 from here.
     uint64_t KeystreamWindowRva =
         v20260811::RVA_KEYSTREAM + (uint64_t)v20260811::KEYSTREAM_BASE_INDEX * 2;
+
+    // The v20260818 anchors. Kept separate from the v811 fields above rather
+    // than overloading them: the two pipelines differ in shape, not just in
+    // value, so a half-adopted mix of the two would decode plausible garbage
+    // instead of failing.
+    uint64_t Pool818Rva      = v20260818::RVA_GNAMEPOOL;
+    uint64_t Keystream818Rva =
+        v20260818::RVA_KEYSTREAM + (uint64_t)v20260818::KEYSTREAM_BASE_INDEX * 2;
+    uint64_t ChunkMgr818Rva  = v20260818::RVA_CHUNKMGR_GLOBAL;
+    uint64_t BlockXor818     = v20260818::BLOCK_FNV_XOR;
+    uint64_t FFieldNameK1_818 = v20260818::FFIELD_NAME_K1;
+    uint64_t FFieldNameK2_818 = v20260818::FFIELD_NAME_K2;
+    uint64_t SlotClmulK1_818 = v20260818::SLOT_CLMUL_K1;
+    uint64_t SlotClmulK2_818 = v20260818::SLOT_CLMUL_K2;
+    uint32_t KeyInitAdd818   = v20260818::KEY_INIT_ADD;
 };
 
 inline LiveSheet g_Sheet;
@@ -1644,4 +1805,53 @@ inline void ApplyOffsets811() {
     Off::FEnumProperty::Enum            = V::FPROP_SIZEOF + 8;
 }
 
+
+// The CL-1341255 layout. Same role as ApplyOffsets811 and applied at the same
+// two points: once on adoption, and again after auto_offsets runs, because the
+// generic probes need a working FField name decode to score candidates and
+// overwrite these on their way out.
+inline void ApplyOffsets818() {
+    namespace V = v20260818;
+    namespace Off = Offsets;
+    Off::FField::NamePrivate        = V::FFIELD_NAME_OFF;
+    Off::FField::NameEncrypted      = V::FFIELD_NAME_OFF;
+    Off::FField::Next               = V::FFIELD_NEXT_OFF;
+    Off::FField::Owner              = V::FFIELD_OWNER_OFF;
+    Off::FField::ClassPrivate       = V::FFIELD_CLASS_OFF;
+    Off::UStruct::ChildProperties   = V::USTRUCT_CHILDPROPS;
+    Off::UStruct::PropertiesSize    = V::USTRUCT_PROPSIZE_OFF;
+    Off::UStruct::SuperStruct       = V::USTRUCT_SUPER_OFF;
+    Off::UEnum::Names               = V::UENUM_NAMES_OFF;
+    Off::FProperty::ArrayDim        = V::FPROP_ARRAYDIM_OFF;
+    Off::FProperty::ElementSize     = V::FPROP_ELEMSIZE_OFF;
+    Off::FProperty::PropertyFlags   = V::FPROP_PROPFLAGS_OFF;
+    Off::FProperty::Offset_Internal = V::FPROP_OFFSETINT_OFF;
+    Off::FProperty::Offset_XOR      = V::FPROP_OFFSET_XOR;
+    Off::FBoolProperty::FieldSize   = V::FBOOLPROP_FIELDSIZE;
+    Off::FBoolProperty::ByteOffset  = V::FBOOLPROP_BYTEOFFSET;
+    Off::FBoolProperty::ByteMask    = V::FBOOLPROP_BYTEMASK;
+    Off::FBoolProperty::FieldMask   = V::FBOOLPROP_FIELDMASK;
+    Patch20260421::g_PropertyOffsetXor = V::FPROP_OFFSET_XOR;
+
+    // sizeof(FProperty) is 0x100 here, fixed by FBoolProperty's four bytes
+    // landing at +0x100..+0x103 (the FieldMask read at +0x103 in
+    // FBoolProperty::GetCPPType pins it exactly).
+    Off::FArrayProperty::Inner          = V::FPROP_SIZEOF + 8;
+    Off::FSetProperty::ElementProp      = V::FPROP_SIZEOF;
+    Off::FSoftObjectProperty::PropertyClass = V::FPROP_SIZEOF;
+    Off::FMapProperty::KeyProp          = V::FPROP_SIZEOF;
+    Off::FMapProperty::ValueProp        = V::FPROP_SIZEOF + 8;
+    Off::FStructProperty::Struct        = V::FPROP_SIZEOF;
+    Off::FObjectProperty::PropertyClass = V::FPROP_SIZEOF;
+    Off::FEnumProperty::UnderlyingProp  = V::FPROP_SIZEOF;
+    Off::FEnumProperty::Enum            = V::FPROP_SIZEOF + 8;
+
+    // ClassCastFlags has no slot in Offsets; the metaclass oracle reads it
+    // out of the sheet, so it is stamped there.
+    g_Sheet.ClassCastFlagsOff       = V::UCLASS_CASTFLAGS_OFF;
+    g_Sheet.StructPropSizeOff       = V::USTRUCT_PROPSIZE_OFF;
+    g_Sheet.PropOffsetInternal      = V::FPROP_OFFSETINT_OFF;
+    g_Sheet.PropOffsetXor           = V::FPROP_OFFSET_XOR;
+    g_Sheet.BoolFieldBase           = V::FBOOLPROP_FIELDSIZE;
+}
 } // namespace ArcDecrypt

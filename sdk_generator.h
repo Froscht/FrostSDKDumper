@@ -20,6 +20,8 @@
 
 namespace SDKGen {
 
+inline uint32_t g_InstanceDropped = 0;
+
 struct PropertyRecord {
     std::string name;
     std::string type_name;   // from FFieldClass
@@ -1901,12 +1903,36 @@ public:
         // Was gated on v808 alone, which silently disabled the metaclass
         // oracle on every later pipeline: GetClassPtrAuto still resolved, but
         // this returned 0 before ever reading the flags.
-        if (!m_fname.IsV811Active() && !m_fname.IsV808Active()) return 0;
+        // Every pipeline newer than v808 keeps the offset in the sheet, so a
+        // new pipeline has to be listed here as well. Leaving one out turns
+        // the oracle off silently, and the weaker vtable heuristics then
+        // promote ordinary asset instances back into class blocks.
+        if (!m_fname.IsV818Active() && !m_fname.IsV811Active() && !m_fname.IsV808Active()) return 0;
         uint64_t Cls = m_fname.GetClassPtrAuto(obj_ptr);
         if (Cls < 0x10000ULL || Cls >= 0x800000000000ULL) return 0;
-        uint64_t Off = m_fname.IsV811Active()
+        uint64_t Off = (m_fname.IsV811Active() || m_fname.IsV818Active())
                      ? ArcDecrypt::g_Sheet.ClassCastFlagsOff : kClassCastFlagsOff;
         return Read<uint64_t>(Cls + Off);
+    }
+
+    // Same read, but distinguishing "the oracle could not run" from "the flags
+    // really are zero". ReadClassCastFlags conflates them by returning 0 for
+    // both, and callers then treat a zero-flag object as undecided instead of
+    // as what it is: an ordinary instance. That is how 472 SoundCues, 2347
+    // NiagaraEmitters, 204 AnimSequences and friends ended up emitted as
+    // classes — their metaclass carries no CASTCLASS bit, so the oracle
+    // returned 0 and the weaker vtable/reference heuristics took over.
+    bool ReadClassCastFlagsChecked(uint64_t obj_ptr, uint64_t& OutFlags) {
+        OutFlags = 0;
+        if (!m_fname.IsV818Active() && !m_fname.IsV811Active() && !m_fname.IsV808Active()) return false;
+        uint64_t Cls = m_fname.GetClassPtrAuto(obj_ptr);
+        if (Cls < 0x10000ULL || Cls >= 0x800000000000ULL) return false;
+        uint64_t Off = (m_fname.IsV811Active() || m_fname.IsV818Active())
+                     ? ArcDecrypt::g_Sheet.ClassCastFlagsOff : kClassCastFlagsOff;
+        uint64_t Vt = Read<uint64_t>(Cls);
+        if (Vt < MODULE_BASE || Vt >= MODULE_BASE + 0x10000000ULL) return false;
+        OutFlags = Read<uint64_t>(Cls + Off);
+        return true;
     }
 
     std::vector<FunctionRecord> ReadFunctionsFromMap(uint64_t owner_addr) {
@@ -2815,7 +2841,11 @@ public:
             auto IsCastFlagsLike = [](uint64_t v) {
                 if (v == 0 || v >= 0x100000000ULL) return false;
                 // CastFlags has at most a few bits set among the low 32.
+#if defined(_MSC_VER)
+                int bits = (int)__popcnt64(v);
+#else
                 int bits = __builtin_popcountll(v);
+#endif
                 return bits >= 1 && bits <= 6;
             };
             std::vector<uint64_t> ffSamples;
@@ -3312,6 +3342,20 @@ public:
                     cast_flags_decided = true;
                 }
             }
+            // A metaclass that reads cleanly and carries no CASTCLASS bit at
+            // all is an ordinary instance, not an undecided case. Letting it
+            // fall through to the vtable/reference heuristics is what put
+            // asset objects in the class list. Gated on FROST_KEEP_INSTANCES
+            // so the old behaviour is one env var away.
+            if (!cast_flags_decided) {
+                static const bool KeepInstances = getenv("FROST_KEEP_INSTANCES") != nullptr;
+                uint64_t Probe = 0;
+                if (!KeepInstances && ReadClassCastFlagsChecked(obj_ptr, Probe) && Probe == 0 &&
+                    !m_known_structs.count(obj_ptr) && !m_known_enums.count(obj_ptr)) {
+                    ++g_InstanceDropped;
+                    continue;
+                }
+            }
             if (m_known_structs.count(obj_ptr)) is_scriptstruct = true;
             if (m_known_enums.count(obj_ptr))   is_enum = true;
             uint64_t enum_cls = 0, ss_cls = 0, class_cls = 0;
@@ -3530,8 +3574,9 @@ public:
                     for (uint32_t j = 0; j < names_cnt; ++j) {
                         uint64_t ep  = names_ptr + (uint64_t)j * 16;
                         int32_t  ci  = Read<int32_t>(ep + 0);
+                        uint32_t num = Read<uint32_t>(ep + 4);
                         int64_t  val = Read<int64_t>(ep + 8);
-                        std::string ev = m_fname.CompIndexToNameLenient(ci);
+                        std::string ev = m_fname.CompIndexToNameNumbered(ci, num);
                         if (ev.empty()) continue;
                         if (ev.find('?') != std::string::npos) continue;
                         size_t cc = ev.find("::");
@@ -3616,8 +3661,14 @@ public:
             // Ghost-FField guard (module-range vtable + non-zero NamePrivate
             // slot at +0x50/+0x30), so bogus offsets fail fast and only real
             // FField chain heads contribute properties.
+            // +0xE0 was missing and it is the densest head on this build: over
+            // 250 sampled healthy types it yields a chain on 232 of them where
+            // +0x100 manages 189, and against the union of all the other heads
+            // it still contributes 72 offsets on 23 of 244 objects. Found by
+            // comparing against an independent dumper that uses it as its sole
+            // ChildProperties offset.
             static constexpr uint64_t kChainOffs[] = {
-                0xB0, 0xB8, 0xC8, 0xD0, 0xE8, 0xF0, 0xF8,
+                0xB0, 0xB8, 0xC8, 0xD0, 0xE0, 0xE8, 0xF0, 0xF8,
                 0x100, 0x108, 0x110, 0x118, 0x120,
             };
             // +0xC0 is a UScriptStruct-only FField chain head on newer patches
@@ -3730,7 +3781,9 @@ public:
         {
             size_t PreRcClass = 0, PreRcStruct = 0;
             for (const auto& R : result.structs) { if (R.is_class) ++PreRcClass; else ++PreRcStruct; }
-            std::printf("[sdk] Loop stats: total=%u null/seen=%u slash=%u func=%u cdo=%u\n",
+            std::printf("[sdk-cast] instances dropped (metaclass has no CASTCLASS bit): %u\n",
+            g_InstanceDropped);
+        std::printf("[sdk] Loop stats: total=%u null/seen=%u slash=%u func=%u cdo=%u\n",
                 LoopTotal, SkipNull, SkipSlash, SkipFunc, SkipCdo);
             std::printf("[sdk] After main loop: %zu class, %zu struct, m_known_structs=%zu m_known_enums=%zu\n",
                 PreRcClass, PreRcStruct, m_known_structs.size(), m_known_enums.size());
@@ -3998,6 +4051,59 @@ public:
         // that are NOT in our 70K object set (engine UScriptStructs / UEnums
         // that live in chunks the structural scan doesn't reach). For each,
         // resolve name live and emit a minimal record.
+        //
+        // Before that loop runs, widen m_known_structs by two cheap graph
+        // sweeps. Both only ADD candidates for pass 3, which is gated on
+        // `seen` and on the ClassCastFlags oracle, so nothing already
+        // classified can be reclassified by this and non-types are still
+        // dropped. Ported from the Windows tree (2026-08-17).
+        //
+        // (1) Super chains of every collected record. m_known_structs only
+        // tracks FStructProperty targets, so an abstract base that nothing
+        // holds a property of never lands in it even though every derived
+        // record names it as its super.
+        {
+            size_t supers_added = 0, supers_seen = 0, supers_bad = 0;
+            std::unordered_set<uint64_t> chain_seen;
+            for (const auto& rec : result.structs) {
+                uint64_t sp = rec.super_addr;
+                for (int hop = 0; hop < 32 && sp; ++hop) {
+                    if (sp <= 0x10000 || sp >= 0x800000000000ULL) { ++supers_bad; break; }
+                    if (!chain_seen.insert(sp).second) { ++supers_seen; break; }
+                    if (m_known_structs.insert(sp).second) ++supers_added;
+                    sp = Read<uint64_t>(sp + ArcDecrypt::Offsets::UStruct::SuperStruct);
+                }
+            }
+            std::printf("[sdk] super-chain aggregation: +%zu new structs (seen=%zu bad=%zu, m_known_structs=%zu)\n",
+                supers_added, supers_seen, supers_bad, m_known_structs.size());
+        }
+
+        // (2) Cls pointers of every enumerated UObject. Terminal asset classes
+        // (UStaticMesh, UTexture2D, USkeletalMesh, UAnimSequence, …) have no
+        // subclasses, so the super-chain sweep never reaches them — but every
+        // asset instance in the world points at them via its Cls slot.
+        {
+            size_t cls_seen = 0, cls_added = 0;
+            std::unordered_set<uint64_t> unique_cls;
+            for (const auto& [idx, obj_ptr] : object_ptrs) {
+                if (obj_ptr <= 0x10000 || obj_ptr >= 0x800000000000ULL) continue;
+                uint64_t Cls = m_fname.GetClassPtrAuto(obj_ptr);
+                if (Cls <= 0x10000 || Cls >= 0x800000000000ULL) continue;
+                if (!unique_cls.insert(Cls).second) continue;
+                ++cls_seen;
+                if (m_known_structs.insert(Cls).second) ++cls_added;
+                uint64_t sp = Read<uint64_t>(Cls + ArcDecrypt::Offsets::UStruct::SuperStruct);
+                for (int hop = 0; hop < 16 && sp; ++hop) {
+                    if (sp <= 0x10000 || sp >= 0x800000000000ULL) break;
+                    if (!unique_cls.insert(sp).second) break;
+                    if (m_known_structs.insert(sp).second) ++cls_added;
+                    sp = Read<uint64_t>(sp + ArcDecrypt::Offsets::UStruct::SuperStruct);
+                }
+            }
+            std::printf("[sdk] cls-pointer aggregation: %zu unique Cls sampled, +%zu new structs (m_known_structs=%zu)\n",
+                cls_seen, cls_added, m_known_structs.size());
+        }
+
         size_t extra_structs_added = 0, extra_enums_added = 0;
         size_t diag_s_seen = 0, diag_s_range = 0, diag_s_noname = 0, diag_s_slash = 0, diag_s_notatype = 0;
         for (uint64_t sp : m_known_structs) {

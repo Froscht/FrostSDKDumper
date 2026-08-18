@@ -6,7 +6,201 @@ External SDK dumper for ARC Raiders (Unreal Engine 5, Theia-obfuscated). Reads g
 Build: `g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 -I KernelDriver/include -o FrostDumper main.cpp build/Zydis.o -lcapstone -lunicorn -lm`
 Run: `sudo ./build_and_run.sh [PID]`
 
-## Current Patch: Steam build 24653108 (2026-08-11)
+## Current Patch: Steam build 24710327 / CL-1341255 (2026-08-18)
+Image size **0x116E7000**, game version 1.42.x. Offline work used the EasyDump
+image `pioneer_steam_1.42.x-CL-1341255_2026_08_18__11_32_82pct.exe` (flat, so
+file offset == RVA); IDA instance `vv9q`, **base 0x140000000**.
+**FULLY REVERSED AND LIVE-VERIFIED 2026-08-18 vs PID 190094** — 297644 / 297663
+objects named (0 failed, 0 empty), 181516 distinct names, 0.0% FProperty_Unknown.
+
+### Theia changed SHAPE here, not just addresses
+This is the important thing to internalise before triaging the next patch. Every
+previous patch moved constants; this one replaced primitives:
+- the UObject slot decode is now **PCLMULQDQ** (carry-less multiply over GF(2)),
+  where every earlier build used shuffle/rotate/xor chains
+- the chunks_manager lost its **vtable-and-thunk indirection entirely** — no PEB
+  salt, no thunk interpreter, no 37-vtable pool
+- **UObject::InternalIndex moved from +0x0C to +0x90**
+- the FNameEntry header changed field layout (plain 10-bit length, wide = sign bit)
+- FField::NamePrivate gained a key again, and its second stage is a per-dword
+  **PADDD**, not an XOR
+
+Consequence: a pipeline built from the previous shape does not fail loudly, it
+returns plausible numbers. Every stage therefore self-tests against plaintext
+(`CI=0 == "None"`) or an invariant, and the v818 code path is kept separate from
+v811 rather than parameterised into it.
+
+### Verified constant sheet (v20260818)
+```
+GNamePool          RVA 0xE35AB00
+FName resolver     RVA 0x236220        (the only 4 sites of `and r32, 0xFFFF00`
+                                        in .text are this family — best anchor)
+keystream table    RVA 0xE2997F4, decrypt window at +0xA0 (0xE299894)
+KEY_INIT_ADD       0xD917
+chunks_manager     RVA 0xE616340       standalone encrypted 16B global
+UObject::GetFName  RVA 0x364780
+slot decoder       RVA 0x3550C0        shared leaf; constants passed per site
+
+CI decode: identity.  NameOff = CI & 0xFFFF ; ChunkOff = (CI >> 8) & 0xFFFF00
+
+Shard hash (P = 0x1000193, ADD = 0x30091BB7), SeedAddr = ChunkAddr + 0x6FD0:
+  H = ROL32(Lo, 0x17) * P + ADD          ; ROL-based again, not SHR-based
+  H = ROL32(H, 0x15) * P + Hi + ADD
+  H = ROL32(H, 0x17) * P + ADD
+  H = (H >> 0x0B) * P + ADD
+  S = H ^ (H >> 16) ; B1 = S & 7 ; B2 = (S + 1) & 7
+
+Block decode (8 blocks at ChunkAddr + 0x6FE0, stride 32) — no shuffle stage:
+  D = ROL32_perdword( ROL64(raw, 4) ^ 0xF31D220392B6800B, 2 )
+  block xor constant at RVA 0xB3BEC30
+FNV64 (P64 = 0x100000001B3, ADD64 = 0x6463CD794F959557):
+  Fv1 = ROL64(V13, 0x30) * P64 + ADD64
+  Fv2 = ROL64(Fv1, 0x2E) * P64 + ADD64
+  EntryPtr = V13 + (V15 ^ Fv2) + 2*NameOff      <-- no pointer-xor chain at all
+
+FNameEntry header (uint16 at EntryPtr, string at EntryPtr+2):
+  length = h & 0x3FF        ; wide = (h & 0x8000) != 0
+String decrypt (single cyclic sequence, +1 per element):
+  K = length + 0xD917 ; index (K + i) & 0x3F
+  narrow: buf[i] ^= (uint8)(KS[(K+i) & 0x3F] >> 3)
+  wide  : buf[i] ^= KS[(K+i) & 0x3F]
+
+UObject::GetFName (P = 0x1000193, ADD = 0xD4C2DB3A), Seed = Obj + 0x10 (ADDRESS):
+  H = ROL32(Lo, 0x19) * P + ADD
+  H = ROL32(H, 0x0E) * P + Hi + ADD
+  H = ROL32(H, 0x19) * P + ADD
+  H = ROL32(H, 0x0E) * P + ADD
+  S = H ^ (H >> 16)
+  Name = Obj + 0x20 + ((S & 3) ^ 2) * 0x20 ; Class = S & 3 ; Outer = (S + 1) & 3
+  A = slot[0..8) , B = slot[8..16)
+  T = B ^ clmul_lo(0x0B6641A64F1B214D, A)
+  V = clmul_lo(0x8FA21A13D9179A47, T) ^ A
+  FName = ROL64(V, 32)   -> CompIndex = lo32, Number = hi32
+```
+
+### GUObjectArray (verified: NumElements 312137, 5 chunks, invariant 430/430)
+Still a standalone encrypted 16-byte global — but the vtable indirection is gone,
+so this build needs **neither the PEB sweep nor the thunk interpreter**.
+```
+Mgr = lo64( ROL32_perdword( PSHUFB( ROL64(xmmword[0xE616340], 50),
+                                    [05 00 04 06 07 02 03 01] ), 22 ) )
+  pshufb mask @ RVA 0xB3850F0
+NumElements = bswap32( u32[Mgr + 0x0C] ^ 0xC460461F )
+ChunkArray  = bswap64( u64[Mgr + 0x20] ^ 0xED46031B00000000 )
+Chunk = ChunkArray[Idx >> 16] ; Item = Chunk + 20 * (Idx & 0xFFFF)
+Object = *(Item + 0) ; FUObjectItem::Flags = u32[Item + 8]
+UObject::InternalIndex = +0x90          <-- moved from +0x0C
+```
+The two clearest read sites are `sub_14032F845` and `sub_1402E8C5D`; both are
+small, both carry the whole scheme inline, and they agree exactly.
+
+### Layout (all live-verified)
+```
+UStruct::SuperStruct   +0xB0    UStruct::Children (UField)  +0xE0
+UStruct::ChildProps    +0xF8    UStruct::PropertiesSize     +0x108
+UClass::ClassCastFlags +0x130   UClass::ClassWithin         +0x128
+UEnum::Names           +0xB0
+
+FField::NamePrivate    +0x50    FField::Next        +0x60
+FField::ClassPrivate   +0x70    FField::FlagsPrivate +0x78
+FField::Owner          +0x80    (tagged, bit0=1 => UObject)
+
+FProperty::Offset_Internal +0xA4   xor 0x7BDAAA72
+FProperty::PropertyFlags   +0xC0
+FProperty::ArrayDim        +0xD0   FProperty::ElementSize  +0xD8
+sizeof(FProperty)          +0x100
+FBoolProperty FieldSize/ByteOffset/ByteMask/FieldMask = +0x100..+0x103
+
+Offset_Internal = bswap32(stored) ^ 0x7BDAAA72
+FField::NamePrivate:  V = ROL32_perdword(enc ^ 0xFDF20AE0DF1B2EFB, 29)
+                      V = PADDD(V, 0x020DF52020E4D105)      <-- ADD, not XOR
+                      CompIndex = lo32( ROL64(V.lo64, 32) )
+  key constants @ RVA 0xB3DB830 and 0xB3DB840
+```
+
+### How each piece was found — reuse this order on the next patch
+1. **chunks_manager**: auto-resolve's stride-20 vote already named it
+   (0xE616340, 399 of 767 sites, nothing else close). It only failed *validation*
+   because the validator assumed the v811 vtable shape. Take the vote, then read
+   the containing function instead of trusting the compiled decode.
+2. **GetFName**: the AngelScript binding string `"FName GetName() const"` still
+   works and is still the fastest route. It sits at RVA 0xBF7BD95, has exactly
+   two rip-relative references in .text, and the `lea` immediately above the
+   second one loads the native function pointer (RVA 0x364780).
+3. **FName resolver**: scan .text for `and r32, 0xFFFF00`. That is the
+   `ChunkOff = (CI >> 8) & 0xFFFF00` step and it occurs **4 times in the whole
+   image**, all four in this family. Far sharper than any FNV-prime scan
+   (10317 hits for the FNV-64 immediate alone on this build).
+4. **FField / FBoolProperty**: the `PropertyBool.cpp` assert path again — three
+   references, all in `FBoolProperty::GetCPPType`-style functions. The decompiled
+   form reads the name at `a1 + 5` (+0x50), the size at `a1[13].m128i_i32[2]`
+   (+0xD8) and the field mask at `a1[16].m128i_i8[3]` (+0x103), which pins
+   sizeof(FProperty) at 0x100 without any probing.
+5. **FProperty::SetupOffset**: `xor eax, imm32 ; bswap eax ; mov [rsi+disp]`.
+   122 xor+bswap sites exist but only one stores through a `mov [reg+0xA4]`
+   right after a `movzx eax, word [rdi+0x32]` — that is the site (RVA 0x432E44).
+6. **Everything else was probed live** once names worked: SuperStruct by walking
+   the hierarchy to Object -> 0, PropertiesSize by `FVector == 24`,
+   ClassCastFlags by `Field == 1 && Struct == 9 && Class == 0x29`,
+   Next by requiring ascending `Offset_Internal` along the chain.
+
+### FField::Next was decisive this time
+The trap documented for build 24653108 (Next ties with the UField/PropertyLink
+list) did not bite here, because the ascending-offset test separated them
+cleanly over 250 sampled chain heads:
+```
++0x60   104 chains   104 ascending (100%)   334 distinct names   <- FField::Next
++0xF8   176 chains    98 ascending ( 56%)   482 distinct names   <- a link chain
++0xE8    69 chains    28 ascending ( 41%)
+```
+Hit count alone would have picked +0xF8 and been wrong. The ratio is the signal.
+
+### Structural bugs this patch exposed in the dumper itself
+Three were latent and only a shape change made them visible. All are fixed, and
+all three are the same class of mistake — a gate that names pipelines explicitly
+instead of asking what the pipeline can do:
+- **Auto-resolve ran after the object array.** Phase 6.5 resolves the
+  chunks_manager, and Phase 6.5 sat *after* GObjectArray init — so on the one
+  day it matters it could not run at all. It is now `RunAutoResolve()`, called
+  from Phase 0c before anything consumes it, and idempotent so the old call site
+  is a no-op.
+- **`AdoptV811` was gated on `ImageSize == v20260811::IMAGE_SIZE`.** A patch
+  changes the image size by definition, so that gate guaranteed the pipeline was
+  off exactly when it was needed. The gate is now the plaintext self-test the
+  function already performs.
+- **`ReadClassCastFlags` listed v811 and v808 by name.** v818 was not in the
+  list, so the metaclass oracle was silently off and the weak vtable heuristics
+  promoted asset instances to classes: 24634/55433 classes/structs instead of
+  14983/8534, and 33931 fewer records dropped as non-types. This is the *second*
+  time this exact gate has gone stale — when adding a pipeline, grep for
+  `IsV8..Active` and update every site.
+- **`GetPackagePtr` still decoded slots with the legacy decoder**, so every
+  package resolved to nothing and the emitter synthesised `/Script/<ClassName>`.
+  Every class header read `/Script/Actor.Actor`. Now it walks `GetOuterPtr` —
+  which dispatches per pipeline — and takes the first name starting with `/`.
+
+### Auto-resolve status on this patch
+It found the chunks_manager global correctly and nothing else: the GetFName and
+FName-pipeline extractors are written against the v811 instruction shapes and
+report `0 slot-accessor copies` / `no candidate decoded CI=0 to "None"` here.
+That is honest failure rather than a wrong answer, which is the intended
+behaviour, but it means **the v818 constants are compile-time, not resolved**.
+Teaching the extractors the new shapes (PCLMULQDQ slot decode, ROL-form hash,
+shuffle-free block decode) is the open item before the next patch.
+
+### SDK output (2026-08-18)
+```
+Classes 14983   Structs 8534   Enums 2778   Functions 50615
+Properties 246612 (246144 named)   FProperty_Unknown 0.0%
+struct_props 174583   param_props 72029
+Objects 297644/297663 named   unique names 181516
+Skeletons 88   bones 2771
+GWorld RVA 0xE782D78 (double-deref)
+ClassCastFlags: 23514 records decided, 154240 instances dropped, 33931 non-types
+```
+
+
+## Previous Patch: Steam build 24653108 (2026-08-11)
 Image size **0x117E9000**. Offline work used a full module dump at
 `module_dump_0x140000000.bin`; it is not kept in-tree (280 MB, one build
 only) — re-pull it from the live process when a patch needs offline
@@ -339,6 +533,218 @@ plausible number and still picks *a* slot — it just picks the wrong one.
 The AngelScript binding signature strings and the CoreUObject source-path
 assert strings both still work and remain the fastest route to any
 script-visible native function. Use them first on the next patch.
+
+### Theia's descriptor-literal cipher — BROKEN (2026-08-17, theia_static.h)
+Every `NameUTF8` in the generated `Z_Construct_*` descriptor tables is
+encrypted at rest, and the ciphertext is identical in the module dump and in
+live memory (they are decrypted on demand into a 255-byte stack buffer, not in
+place at load). The cipher is a **PRNG stream seeded with zero** — decode loop
+inside `ConstructU*` at RVA 0x4ED320, seed set by `xor ecx, ecx` @ 0x4ED3BF:
+```
+State' = ROL32(State * 0x1000193 + 0xA7A3FF6B, 0x13)
+State  = (State' + State) * 0x1000193
+V      = (State & 0x1F) ^ (int8)Cipher          ; only 5 bits of key
+Out    = Wrap(V)          ; branch-free cascade, keeps the result an identifier
+  A = ((V-0x50) <u 0x2F) ? -47 : 0 ; if ((V-0x21) <u 0x2F) A =  47 ;  X = V+A
+  F = ((X-53)  >=u 5)
+  B = ((X-48)  <u 5)    ?   5 : F*5-5                                ;  Y = X+B
+  C = ((Y-110) <u 13)   ? -13 : 0 ; if ((Y-97)  <u 13)   C =  13     ;  Z = Y+C
+  D = ((Z-78)  <u 13)   ? -13 : 0 ; if ((Z-65)  <u 13)   D =  13     ;  W = Z+D
+  E = ((W-80)  <u 0x2F) ? 209 : 0 ; if ((W-33)  <u 0x2F) E =  47     ;  Out = W+E
+```
+The **plaintext** NUL terminates; the ciphertext is NOT NUL-terminated, which
+is why the game decrypts a fixed 254 bytes and then relies on strlen. Seed 0
+means no PEB, no address salt, no live state: everything decrypts offline.
+`TheiaStr::Encrypt` inverts it by searching the 256 candidate bytes per
+position, which lets you *search* the binary for a known name's ciphertext.
+
+Two dead ends that look right and are not:
+- It is **not** the FNameEntry keystream cipher. Feeding the live keystream
+  table through `KS[(K+i)&0x3F]>>3` produces garbage; there is no table here.
+- The key is **not** positional. Identical ciphertext prefixes across strings
+  of different length come from the stream restarting at State=0 per string,
+  not from a position-indexed key. Both a purely positional key and every
+  periodic key (4/8/16/32/64) are provably inconsistent with the data.
+
+### Static descriptor layouts (build 24653108)
+```
+FPackageParams      +0x00 NameUTF8 (PLAINTEXT "/Script/X", stored inline at
+                          params+0x20)      +0x08 SingletonFuncArray
+                    +0x10 NumSingletons     +0x14 PackageFlags (0x10 CompiledIn)
+                    +0x18 BodyCRC           +0x1C DeclarationsCRC
+FEnumParams         +0x00 OuterFunc  +0x08 DisplayNameFunc  +0x10 NameUTF8
+                    +0x18 CppTypeUTF8  +0x20 EnumeratorParams  +0x28 ObjectFlags
+                    +0x2C NumEnumerators (u16) ; FEnumeratorParam = {char*, i64}
+FFunctionParams     +0x00 OuterFunc  +0x08 SuperFunc  +0x10 NameUTF8
+                    +0x28 PropertyArray  +0x30 NumProperties (u16)
+                    +0x32 StructureSize  +0x38 FunctionFlags  +0x3A flag byte
+FStructParams       name at +0x18 (Outer/Super/StructOps precede it)
+FPropertyParams     sizeof 0x38
+                    +0x00 NameUTF8      +0x08 RepNotifyFuncUTF8
+                    +0x10 PropertyFlags (u64)
+                    +0x18 EPropertyGenFlags  <-- the usmap type enum
+                    +0x1C ObjectFlags   +0x20 SetterFunc  +0x28 GetterFunc
+                    +0x30 ArrayDim      +0x38 typed extension
+                      e.g. FObjectPropertyParams: ClassFunc (Z_Construct_*_NoRegister)
+```
+`EPropertyGenFlags`: type in the low 6 bits (Int=0x03, Bool=0x0C, Object=0x12,
+Array=0x16, Struct=0x19, Enum=0x1E, …), modifiers above (0x40 seen on bools =
+NativeBool and on objects).
+
+**Classes are NOT statically reachable and this looks structural.** Class names
+do exist as ciphertext (`Encrypt("StaticMeshComponent")` finds 9 copies), but
+nothing in .rdata points at the class-name copy and no `lea` in .text does
+either: Theia passes those pointers as encrypted 16-byte blobs
+(`ROL16(PSHUFLW(ROL64(p,55),0xB1),1)` to encode, inverse in the char*→FName
+helper at RVA 0x232EC0). `FClassRegisterCompiledInInfo` tables are gone too — a
+scan for {textptr, textptr, name, size, crc} yields 2 coincidences. This is the
+same reason xref ranking never works on this target. The live pipeline resolves
+classes at 100%, so the two routes are complementary.
+
+### What the static sweep produced (verified against the live dump)
+`theia_static.h`, Phase 6.4, advisory, writes `static_reflect.txt`. 0.5 s over
+the whole image, no live state needed beyond a reader for the module bytes.
+Against a COMPLETE module image (offline, e.g. the EasyDump `*pct.exe`):
+```
+359 package wrappers  15222 descriptors  13878 types
+  2059 enums (10736 values)   5961 structs/functions (27147 members)
+  5858 bare (no member array)  1344 no-name
+```
+In-process it now reaches the same numbers, but only because of an explicit
+workaround, and the diagnosis took three wrong turns worth recording:
+- `.rdata` reads live with **zero** gaps and is byte-identical to the offline
+  image (313 FPackageParams and 174063 code pointers either way). Every
+  descriptor is therefore reachable live. Only `.text` is a problem, and
+  `.text` is needed *solely* to put a NAME on a package wrapper.
+- The 28.5k unreadable `.text` pages are **not** the cause. Filling them from
+  `module_dump_0x140000000.bin` changed nothing: 146 of 359 wrappers either
+  way. The real cause is that live `.text` pages which read *successfully*
+  still hold different bytes than an externally unpacked image — the wrapper
+  prologue with `lea rdx,[rip+FPackageParams]` simply is not there yet.
+- So `Run()` reloads `.text` wholesale from a full image when the wrapper yield
+  falls below 80% of the FPackageParams count. `module_dump_*.bin` is useless
+  for this (the sig scanner builds it from the same live reads — it yields 0
+  wrappers); the EasyDump `*pct.exe` yields all 359. With that, a live run
+  produces exactly the offline result: 359 / 15222 / 13878 / 27147.
+
+Two traps in the fallback plumbing:
+- A successful read of an all-zero page is not a fill. Accepting it retires the
+  gap and starves the next fallback, so `FillFromImage` rejects zero pages.
+- A flat memory dump keeps the ORIGINAL section table, whose
+  `PointerToRawData` describes the on-disk layout, not the dump. Deciding
+  offset==RVA by comparing `VirtualAddress` with `PointerToRawData` therefore
+  picks the wrong mapping and yields 0 wrappers. Decide by size instead: a
+  dump spans the whole `SizeOfImage`.
+Cross-check against `SDK_Output.txt`: **2049 of 2049 comparable enums match
+exactly**, names and values. It started at 2048/2049, and the one disagreement
+turned out to be a live-side bug that the static route exposed — see
+FName::Number below. That is the payoff of having two independent routes: the
+static one is ground truth for names, so it can audit the live one.
+
+### Asset instances were being emitted as classes (fixed 2026-08-17)
+`ReadClassCastFlags` returns 0 both when the oracle cannot run and when the
+metaclass genuinely carries no CASTCLASS bit, and every caller read that as
+"undecided" rather than "ordinary instance". The weaker vtable/reference
+heuristics then promoted the object to a class. `ReadClassCastFlagsChecked`
+separates the two cases (it also verifies the metaclass has an in-module
+vtable) and the main loop drops a clean zero-flag object. `FROST_KEEP_INSTANCES`
+restores the old behaviour.
+```
+emitted blocks              25314 -> 20290      records with size outside
+types with no properties     6116 -> 1259         [0x28,0x100000]: 1012 -> 0
+metaclass is not a type     12337 -> 7361
+```
+What went out: 4930 class blocks and 102 struct blocks — NiagaraEmitter 1503,
+CharacterVisualPartOnlineItemDataAsset 261, SoundCue 184, NiagaraScript 178,
+AnimSequence 126, SoundWave 97, StaticMesh 38 and so on. The 7361 that remain
+"not a type" are all legitimate type metaclasses: ASClass 4956, ASStruct 2121,
+SMBlueprintGeneratedClass 175, RigVM*/ControlRig* generated classes.
+**Do not judge a dropped record by its name.** `AimAssistManagerComponent` and
+`ACLAnimBoneCompressionSettings` read like classes and are not: the first is an
+instance of `PioneerAimAssistManagerComponent`, the second an instance of
+`AnimBoneCompressionSettings`. `dump_classes.txt` prints the real metaclass per
+address and is the fastest way to settle such a question.
+
+**Beware the header counts.** The `Classes:` / `Structs:` lines count records
+before emission, not emitted blocks: 19716/28152 was printed for a file holding
+25314 blocks. After this change the header reads 14647/8358 while the file
+actually lost only 102 struct blocks. Measure the file, not the banner.
+
+### UStruct chain head +0xE0 was missing (fixed 2026-08-17)
+`kChainOffs` listed 0xB0, 0xB8, 0xC8, 0xD0, 0xE8, 0xF0, 0xF8, 0x100, 0x108,
+0x110, 0x118, 0x120 — but not 0xE0, which is the densest head on this build.
+Over 250 sampled healthy types, walking each candidate and decoding
+`Offset_Internal`:
+```
+head    chains  fields  ascending          head    chains  fields  ascending
++0xE0    232     2203     229              +0xE8     55     1358      40
++0x100   189     1316     189              +0xF0     54      376      54
++0xD0    160     1815     156              +0xF8     59       59      59
+```
+Against the union of all twelve other heads it still contributes 72 offsets on
+23 of 244 objects. Live effect on the dump: member lines 225720 -> 234977
+(+4.1%) and 112 fewer types with no properties at all. Found by diffing against
+an independent dumper (`Analyze/anothersdk.txt`) that uses 0xE0 as its *only*
+ChildProperties offset.
+
+That dumper is also a warning about comparing raw counts: it flattens
+inheritance, so `StaticMeshComponent` re-lists `ActorComponent`'s fields even
+though it declares `: public MeshComponent`. Of its 126088 member lines only
+40823 are own properties (offset >= its `Inherited:` value). On the 9797 shared
+type names, own-vs-own, this dumper has more members on 4922 types and it has
+more on 13.
+
+### FName::Number was being dropped (fixed 2026-08-17)
+An FName is `{ComparisonIndex, Number}` and UE splits a trailing number off the
+literal when interning it: `H5_5` is stored as the entry `H5` with Number 6,
+and `ToString` re-appends `_(Number - 1)`. `ReadEnumEntries` read only
+`Read<int32_t>(ep + 0)` and threw the Number at `ep + 4` away, so every such
+name came out truncated — `EEmbarkUITextType` had `H5` twice, at 4 and at 5.
+Fixed via `FNameDecryptor::CompIndexToNameNumbered`. Effect on the dump:
+```
+duplicate entry names within an enum   10 across 5 enums  ->  0
+entry names carrying a number suffix    2                 ->  20
+```
+The 18 recovered names are all genuine: `PF_PLATFORM_HDR_0/1/2`, `CP_1`..`CP_7`,
+`ACLRF_Quat_128`, `ACLVF_Vector3_96`, `Limited_24_8`, `MP_Bink_Sound_51/71`,
+`PCM_16`, `H5_5`. Only the enum-entry path is fixed; the general object and
+property name paths still resolve a bare CompIndex, which is harmless for types
+(their Number is 0) but would truncate instance names the same way.
+
+For structs/functions: 5254 of 5956 static types also appear as live
+class/struct blocks, and 1175 members across 1015 types are missing from the
+live output. The 702 "only static" types are NOT missing live — they are
+delegate signatures that the live dump emits as *functions* instead of blocks,
+so a Class/Struct-block comparison undercounts. Do not read that number as
+coverage.
+
+**Loose descriptor discovery is noise — measured, not assumed.** Accepting any
+.rdata position whose +0x00 is a code pointer raises struct/func records from
+5961 to 33875, but exact member agreement against the live dump stays flat
+(4239 -> 4237 types) while missing members climb 1175 -> 6412 and 8452 names
+duplicate. A middle road that recovers wrappers by voting on OuterFunc values
+seen in .rdata (>= 3 valid-looking descriptors each) gives 1803 wrappers and
+26163 records, still with 2130 missing members and 3212 duplicates. So the
+sweep stays keyed on the .text-derived wrapper set; the vote lives behind
+`FROST_THEIA_VOTE=1`. Judge any change here by member agreement, never by
+record count.
+
+**Open item before this can feed a usmap: property ORDER differs between the
+two routes.** `InstancePointDamageSignature__DelegateSignature` is
+`InstanceIndex, Damage, InstigatedBy, HitLocation, ShotFromDirection,
+DamageType, DamageCauser` in the descriptor's PropertyArray and
+`InstigatedBy, HitLocation, ShotFromDirection, DamageType, DamageCauser,
+InstanceIndex, Damage` live (the SDK sorts by offset). Neither is the reverse
+of the other, so which one matches UE's unversioned-serialization schema order
+is still unproven — settle that before trusting either for a usmap.
+
+### Asset extraction: the paks are neither encrypted nor compressed (2026-08-17)
+All 28 `.utoc` in `PioneerGame/Content/Paks` (TOC version 5, header 0x90):
+`ContainerFlags` = 0x04 on global.utoc (Signed) and 0x0C on the other 27
+(Signed|Indexed) — `Encrypted` (0x02) is never set and `EncryptionKeyGuid` is
+all zero. `CompressionMethodNameCount` is 0, so chunks are stored raw: no AES
+key to recover and no Oodle dependency. The only missing piece for
+mesh/material/texture extraction is a `.usmap`, and none ships with the game.
 
 ## Previous Patch: CL-1325322 (2026-08-08)
 Image size 0x11853000. IDA instance `qe3o` (`pioneer_steam_1.39.x-CL-1325322_2026_08_08__22_23_83pct.exe`), IDA base 0x140000000 (NOT 0 like older instances).
@@ -977,22 +1383,22 @@ Bool-specific field init. FieldSize/ByteOffset/ByteMask/FieldMask setup.
 7. **If GObjectArray count wrong**: NumElements offset moved (+0x30 vs +0xFC); probed as u32, range [10000,2M]
 
 ### Offset drift history
-| Field | CL-1177146 | CL-1177678 | CL-1201801 | CL-1233465 | CL-1299607 | CL-1315578 |
-|-------|-----------|-----------|-----------|-----------|-----------|-----------|
-| FField::NamePrivate | +0x70 | +0x30 | +0x40 | +0x90 | +0x40 | +0xA0 |
-| FField::Next | +0x80 | +0x48 | +0x50 | +0xB0 | +0x60 | +0x78 |
-| FField::ClassPrivate | +0x90 | +0x50 | +0x60 | +0xC0 | +0x70 | +0xB8 |
-| FField::Owner | +0x10 | +0x10 | +0x70 | +0xA8 | +0x58 | +0x80 |
-| FProperty::Offset_Internal | +0xC4 | +0x88 | +0x94 | +0xE4 | +0x94 | +0xE4 |
-| FProperty::ElementSize | — | — | +0xC8 | +0x118 | +0x7C | +0xD0 |
-| FProperty::ArrayDim | — | — | +0xC0 | +0x110 | +0xC0 | +0x110 |
-| FStructProperty::Struct | +0x108 | +0xC8 | +0xE8 | +0x130 | +0xE8 | +0x138 |
-| FArrayProperty::Inner | +0xF0 | +0xC8 | +0xF8 | +0x140 | +0xE8 | +0x138 |
-| FBoolProperty::FieldSize | — | — | +0xF0 | +0x138 | +0xE8 | +0x138 |
-| UStruct::ChildProperties | +0x168 | +0xB0 | +0x108 | +0x118 | +0xC8 | +0xF0 |
-| UStruct::PropertiesSize | — | — | +0x110 | +0xE0 | +0x90 | +0xD0 |
-| PropertyOffsetXor | — | — | 0xBAB939DB | 0xEAABEC11 | 0x057F15E5 | 0xA271DBC5 |
-| USkeleton::BoneInfo | — | — | — | — | — | +0xE8 (auto-probed) |
+| Field | CL-1177146 | CL-1177678 | CL-1201801 | CL-1233465 | CL-1299607 | CL-1315578 | 24653108 | CL-1341255 |
+|-------|-----------|-----------|-----------|-----------|-----------|-----------|----------|------------|
+| FField::NamePrivate | +0x70 | +0x30 | +0x40 | +0x90 | +0x40 | +0xA0 | +0x70 | +0x50 |
+| FField::Next | +0x80 | +0x48 | +0x50 | +0xB0 | +0x60 | +0x78 | +0x80 | +0x60 |
+| FField::ClassPrivate | +0x90 | +0x50 | +0x60 | +0xC0 | +0x70 | +0xB8 | — | +0x70 |
+| FField::Owner | +0x10 | +0x10 | +0x70 | +0xA8 | +0x58 | +0x80 | +0xA0 | +0x80 |
+| FProperty::Offset_Internal | +0xC4 | +0x88 | +0x94 | +0xE4 | +0x94 | +0xE4 | +0xC4 | +0xA4 |
+| FProperty::ElementSize | — | — | +0xC8 | +0x118 | +0x7C | +0xD0 | +0xF8 | +0xD8 |
+| FProperty::ArrayDim | — | — | +0xC0 | +0x110 | +0xC0 | +0x110 | +0xF0 | +0xD0 |
+| FStructProperty::Struct | +0x108 | +0xC8 | +0xE8 | +0x130 | +0xE8 | +0x138 | +0x120 | +0x100 |
+| FArrayProperty::Inner | +0xF0 | +0xC8 | +0xF8 | +0x140 | +0xE8 | +0x138 | +0x128 | +0x108 |
+| FBoolProperty::FieldSize | — | — | +0xF0 | +0x138 | +0xE8 | +0x138 | +0x120 | +0x100 |
+| UStruct::ChildProperties | +0x168 | +0xB0 | +0x108 | +0x118 | +0xC8 | +0xF0 | +0x100 | +0xF8 |
+| UStruct::PropertiesSize | — | — | +0x110 | +0xE0 | +0x90 | +0xD0 | +0x110 | +0x108 |
+| PropertyOffsetXor | — | — | 0xBAB939DB | 0xEAABEC11 | 0x057F15E5 | 0xA271DBC5 | 0xEE0CA1CB | 0x7BDAAA72 |
+| USkeleton::BoneInfo | — | — | — | — | — | +0xE8 (auto-probed) | +0xE8 | +0xE8 |
 
 ## Critical Rules (Learned from Past Bugs)
 
@@ -1024,7 +1430,7 @@ Bool-specific field init. FieldSize/ByteOffset/ByteMask/FieldMask setup.
 ## Environment
 - Wine module base: 0x140000000 (memfd)
 - Find PID: `pgrep "GameThread"`, filter out CrashReportClient via `/proc/pid/cmdline`
-- IDA instances: `jat2` (CL-1325322, **base 0x140000000** — IDA addr = 0x140000000 + RVA),
+- IDA instances: `vv9q` (CL-1341255, **base 0x140000000**), `jat2` (CL-1325322, **base 0x140000000** — IDA addr = 0x140000000 + RVA),
   `oo5g` (older PioneerGame-e_dumped.exe), `3q7c` (CL-1195482)
 - ⚠️ IDA base differs per instance. `oo5g`/`3q7c` are based at 0 (subtract
   0x140000000 from live RVAs); `jat2` is based at 0x140000000 (add nothing).
