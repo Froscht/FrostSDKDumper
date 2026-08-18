@@ -413,6 +413,25 @@ chunks_manager                  [48-4F] 8D [04|0C|14|1C|24|2C|34|3C]
   sizeof(FProperty).
 ```
 
+**FName-Index-Decrypt (Ersatz fuer das kaputte `Dec_FIndex`).** Die kursierende
+Signatur `48 C7 07 00 00 00 00 48 83` trifft auf keinem Build eine FName-Funktion.
+Was funktioniert, ueber 14 Builds gemessen (213-509 Treffer, davon 10-43 in der
+Name-Rolle, nie null):
+```
+48 8D 4? ?? 48 89 C2 48 C1 EA 20 C1 ?? ?? 69 ?? 93 01 00 01 05
+  lea r,[rcx+Seed] ; mov rdx,rax ; shr rdx,32 ; rol/shr ; imul FNV32 ; add imm32
+Bestaetigung: `83 E? 03` innerhalb 0x80, direkt gefolgt von `83 F? ??` = Name-Rolle
+Danach rueckwaerts bis 0xCC = Funktionsanfang.
+```
+Auf CL-1341255 ist die erste Fundstelle 0x36477D, also exakt das live-verifizierte
+GetFName; 19 der 31 Funde liefern seed +0x10, slot +0x20 und beide clmul-Polynome.
+Der Seed-Offset kommt auf allen 14 Builds als +0x10 heraus.
+
+Der KOPF ist portabel, das ENDE nicht: eine Signatur auf die Slot-Auswahl
+(`89 C2 C1 EA 10 31 C2 83 E2 03 ...`) schwankt zwischen 5 und 1125 Treffern, weil
+CL-1325322 sie als `((((~S | 0x565AFC0) & 0x565AFC1) | (S & 2)) ^ 0x565AFC3) & 3`
+verschleiert. Die FNV-Kette braucht die Engine, die Slot-Algebra gehoert Theia.
+
 **Invariants, not signatures.** These occur everywhere and only serve to
 generate candidates:
 ```
