@@ -369,6 +369,43 @@ public:
             std::printf("[ar818] layout probe agrees with the loaded offsets\n");
     }
 
+    // Phase 6.4, hoisted out of DiscoverFNameConsts. That function returns
+    // early when the LEGACY FName decrypt cannot be located, which on any
+    // modern patch is always — so everything after that point silently stopped
+    // running, this phase included. It never needed the legacy function: only
+    // module bounds and a reader.
+    //
+    // Theia's NameUTF8 cipher is a PRNG stream seeded with zero, so the
+    // generated descriptor tables decrypt offline. Reaches enums, structs,
+    // functions and delegates including ones that are never instantiated and
+    // therefore absent from GUObjectArray. UClass descriptors are not
+    // reachable - their name pointers are passed as encrypted blobs, never as
+    // rip-relative leas. Advisory: writes a report, changes nothing live.
+    void RunTheiaStatic() {
+        if (getenv("FROST_NO_THEIA_STATIC") != nullptr) return;
+        std::printf("\n=== Phase 6.4: static reflection (Z_Construct descriptors) ===\n");
+        const auto& Bd = AutoDiscovery::g_DiscoveredBounds;
+        if (!Bd.Valid || !Bd.RDataSize) {
+            std::printf("[theia-static] module bounds unavailable; skipped\n");
+            return;
+        }
+        // Live reads miss the pages Theia keeps unmapped, and a zero-filled
+        // page destroys every descriptor in it, so the module dump the sig
+        // scanner already wrote fills the gaps. That dump is itself made from
+        // live reads and has the same holes; an externally produced full image
+        // closes them, and TheiaStatic handles both flat dumps (offset == RVA)
+        // and real PEs (section table) so either can be given.
+        char DumpPath[128];
+        std::snprintf(DumpPath, sizeof(DumpPath),
+            "module_dump_0x%llX.bin", (unsigned long long)MODULE_BASE);
+        const std::string& PeFallback = GetPEBinaryPath();
+        TheiaStatic::Run(m_reader, MODULE_BASE,
+                         Bd.TextRva, Bd.TextSize,
+                         Bd.RDataRva, Bd.RDataSize,
+                         "static_reflect.txt", DumpPath,
+                         PeFallback.empty() ? nullptr : PeFallback.c_str());
+    }
+
     // FROST_SABOTAGE818=chunkmgr|fname|getfname|propoff|all corrupts the
     // compiled defaults before auto-resolve runs, so each self-healing path can
     // be fired on demand. A path that has never fired is unproven, and the two
@@ -1278,6 +1315,8 @@ public:
                 std::printf("[v811] active; FField/FProperty layout applied\n");
             }
         }
+
+        RunTheiaStatic();
 
         // Init FName key table + SIMD tables
         if (!m_fname.Init()) {
@@ -2657,48 +2696,6 @@ public:
                 }
             }
 
-            // ── Phase 6.7: CL-1325322 plaintext-verified pipeline ────────
-            // Runs before Phase 5.5 so that a confirmed v808 adoption makes the
-            // older sig-scan-derived constants irrelevant instead of fighting
-            // them. Both anchors are pinned by decoding "None"/"ByteProperty",
-            // so a successful adopt is ground truth, not a heuristic.
-            // Patch-day automation: relocate and re-extract the two pieces
-            // that cost the most manual reversing, using the invariants Theia
-            // has never moved. Purely advisory this run — it prints what it
-            // finds next to the compile-time values so drift is visible the
-            // moment a patch lands, without risking a working pipeline.
-            // ── Phase 6.4: static reflection from Z_Construct_* descriptors ──
-            // Theia's NameUTF8 cipher is a PRNG stream seeded with zero, so the
-            // generated descriptor tables decrypt offline. Reaches enums,
-            // structs, functions and delegates including ones that are never
-            // instantiated and therefore absent from GUObjectArray. UClass
-            // descriptors are not reachable — their name pointers are passed as
-            // encrypted blobs, never as rip-relative leas. Advisory: writes a
-            // report, changes nothing in the live pipeline.
-            if (getenv("FROST_NO_THEIA_STATIC") == nullptr) {
-                std::printf("\n=== Phase 6.4: static reflection (Z_Construct descriptors) ===\n");
-                const auto& Bd = AutoDiscovery::g_DiscoveredBounds;
-                if (Bd.Valid && Bd.RDataSize) {
-                    // Live reads miss the pages Theia keeps unmapped, and a
-                    // zero-filled page destroys every descriptor in it, so the
-                    // module dump the sig scanner already wrote fills the gaps.
-                    char DumpPath[128];
-                    std::snprintf(DumpPath, sizeof(DumpPath),
-                        "module_dump_0x%llX.bin", (unsigned long long)MODULE_BASE);
-                    // The module dump is itself made from live reads, so it has
-                    // the same holes. An externally produced full image closes
-                    // them; TheiaStatic handles both dumped images (offset ==
-                    // RVA) and real PEs (section table) so either can be given.
-                    const std::string& PeFallback = GetPEBinaryPath();
-                    TheiaStatic::Run(m_reader, MODULE_BASE,
-                                     Bd.TextRva, Bd.TextSize,
-                                     Bd.RDataRva, Bd.RDataSize,
-                                     "static_reflect.txt", DumpPath,
-                                     PeFallback.empty() ? nullptr : PeFallback.c_str());
-                } else {
-                    std::printf("[theia-static] module bounds unavailable; skipped\n");
-                }
-            }
 
             RunAutoResolve();
 

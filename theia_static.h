@@ -45,12 +45,11 @@ inline uint32_t Rol32(uint32_t V, int N) {
     return (V << N) | (V >> (32 - N));
 }
 
-inline uint8_t StepDecrypt(uint8_t Cipher, uint32_t& State) {
-    uint32_t T = Rol32(State * kPrime + kAdd, 0x13);
-    State = (T + State) * kPrime;
-    int32_t C = (int32_t)(int8_t)Cipher;
-    uint32_t V = (State & 0x1Fu) ^ (uint32_t)C;
-
+// The range-correction cascade. Split out of the PRNG step because the solved
+// keystream needs it too — it is the only part of the cipher that has survived
+// unchanged, and it is a bijection over 0..255, so the plaintext NUL still
+// terminates the string.
+inline uint8_t WrapByte(uint32_t V) {
     int32_t A = ((V - 0x50u) < 0x2Fu) ? -47 : 0;
     if ((V - 0x21u) < 0x2Fu) A = 47;
     uint32_t X = V + (uint32_t)A;
@@ -73,11 +72,52 @@ inline uint8_t StepDecrypt(uint8_t Cipher, uint32_t& State) {
     return (uint8_t)(W + (uint32_t)E);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The keystream, solved from the image instead of generated.
+//
+// CL-1341255 changed the PRNG's additive constant — 0xA7A3FF6B does not occur
+// anywhere in that image — and a hardcoded constant is exactly the thing that
+// goes stale every patch. It does not need to be known: the stream is seeded
+// with zero and therefore identical for every string, and only FIVE bits of it
+// reach each position, so the whole schedule can be recovered by asking, per
+// position, which of the 32 candidate keys turns the most ciphertexts into
+// identifier characters. Measured on CL-1341255 the correct key scores 96.8%
+// at position 0 against 98451 candidate buffers; nothing else comes close.
+//
+// This survives any change to the PRNG. It only assumes WrapByte is unchanged,
+// and a failed solve is loud rather than silent — see SolveKeystream.
+// ─────────────────────────────────────────────────────────────────────────────
+inline uint8_t g_Keystream[256] = {};
+inline int     g_KeystreamLen   = 0;
+
+inline uint8_t StepDecryptPrng(uint8_t Cipher, uint32_t& State) {
+    uint32_t T = Rol32(State * kPrime + kAdd, 0x13);
+    State = (T + State) * kPrime;
+    return WrapByte((State & 0x1Fu) ^ (uint32_t)(int32_t)(int8_t)Cipher);
+}
+
+inline uint8_t StepDecrypt(uint8_t Cipher, uint32_t& State) {
+    return StepDecryptPrng(Cipher, State);
+}
+
+inline uint8_t DecryptAt(uint8_t Cipher, size_t Pos) {
+    return WrapByte((uint32_t)g_Keystream[Pos] ^ (uint32_t)(int32_t)(int8_t)Cipher);
+}
+
 inline std::string Decrypt(const uint8_t* Buf, size_t Max) {
     std::string Out;
+    if (g_KeystreamLen) {
+        size_t N = (Max < (size_t)g_KeystreamLen) ? Max : (size_t)g_KeystreamLen;
+        for (size_t I = 0; I < N; ++I) {
+            uint8_t Ch = DecryptAt(Buf[I], I);
+            if (Ch == 0) break;
+            Out.push_back((char)Ch);
+        }
+        return Out;
+    }
     uint32_t State = 0;
     for (size_t I = 0; I < Max; ++I) {
-        uint8_t Ch = StepDecrypt(Buf[I], State);
+        uint8_t Ch = StepDecryptPrng(Buf[I], State);
         if (Ch == 0) break;
         Out.push_back((char)Ch);
     }
@@ -91,8 +131,15 @@ inline bool Encrypt(const std::string& Plain, std::vector<uint8_t>& Out) {
         uint8_t Want = (I < Plain.size()) ? (uint8_t)Plain[I] : 0;
         bool Found = false;
         for (int Cand = 0; Cand < 256; ++Cand) {
+            if (g_KeystreamLen) {
+                if (I >= (size_t)g_KeystreamLen) return false;
+                if (DecryptAt((uint8_t)Cand, I) != Want) continue;
+                Out.push_back((uint8_t)Cand);
+                Found = true;
+                break;
+            }
             uint32_t Probe = State;
-            if (StepDecrypt((uint8_t)Cand, Probe) == Want) {
+            if (StepDecryptPrng((uint8_t)Cand, Probe) == Want) {
                 Out.push_back((uint8_t)Cand);
                 State = Probe;
                 Found = true;
@@ -235,6 +282,7 @@ public:
     }
 
     Result Run(const char* ImageA = nullptr, const char* ImageB = nullptr) {
+        SolveKeystream();
         Result Out;
         FindPackages();
         // Live .text can be *behind* an externally unpacked image: those pages
@@ -244,7 +292,15 @@ public:
         // byte-identical (313 FPackageParams, 174k code pointers either way).
         // .text only ever supplies wrapper NAMES, so reloading it wholesale
         // from a full image costs nothing and recovers the rest.
-        if (m_PkgParamCount && m_PkgByFn.size() * 5 < m_PkgParamCount * 4) {
+        //
+        // Every image is tried and the best wrapper set wins, rather than
+        // stopping at the first one that clears a threshold. How much live
+        // .text happens to be readable varies run to run, so a "good enough"
+        // gate made the result flaky: one run stopped at 283 wrappers and
+        // 10570 descriptors, the next reloaded and got 358 and 15533 from the
+        // same binary.
+        {
+            auto Best = m_PkgByFn;
             for (const char* Img : { ImageA, ImageB }) {
                 if (!Img || !*Img) continue;
                 if (!ReloadTextFromImage(Img)) continue;
@@ -252,8 +308,9 @@ public:
                 FindPackages();
                 std::printf("[theia-static] .text reloaded from %s -> %zu wrappers\n",
                     Img, m_PkgByFn.size());
-                if (m_PkgByFn.size() * 5 >= m_PkgParamCount * 4) break;
+                if (m_PkgByFn.size() > Best.size()) Best = m_PkgByFn;
             }
+            m_PkgByFn = std::move(Best);
         }
         size_t Named = m_PkgByFn.size();
         // The .rdata vote recovers wrappers when .text is unreadable, but it
@@ -621,6 +678,186 @@ private:
             Out.emplace_back(m_RDataRva + Off, V);
         }
     }
+
+
+    // Recover the literal keystream from the image. Runs before anything reads
+    // a name, and needs no descriptor structure at all: every .rdata qword that
+    // points into .rdata is treated as a candidate ciphertext, and the correct
+    // key per position is the one that turns the most of them into identifier
+    // characters. Wrong candidates are near-uniform noise and favour no key, so
+    // they only raise the floor.
+    //
+    // Falls back to the compiled PRNG when the signal is weak, and says which
+    // one it is using — a silent fallback here would show up much later as
+    // thousands of nameless descriptors.
+    void SolveKeystream() {
+        TheiaStr::g_KeystreamLen = 0;
+
+        std::vector<const uint8_t*> Bufs;
+        Bufs.reserve(65536);
+        for (size_t I = 0; I + 8 <= m_RData.size(); I += 8) {
+            uint64_t V = 0;
+            std::memcpy(&V, m_RData.data() + I, 8);
+            if (V < m_Base + m_RDataRva) continue;
+            uint64_t Rva = V - m_Base;
+            if (!InSection(Rva, m_RDataRva, m_RDataSize)) continue;
+            size_t Off = (size_t)(Rva - m_RDataRva);
+            if (Off + kSolveLen > m_RData.size()) continue;
+            const uint8_t* P = m_RData.data() + Off;
+            // A name ciphertext is never NUL-padded at the front; skipping the
+            // ones that are drops most of the non-string pointer targets.
+            bool HasZero = false;
+            for (int K = 0; K < 8; ++K) if (!P[K]) { HasZero = true; break; }
+            if (HasZero) continue;
+            Bufs.push_back(P);
+        }
+        if (Bufs.size() < 2000) {
+            std::printf("[theia-static] keystream: only %zu candidate buffers - "
+                        "using the compiled PRNG\n", Bufs.size());
+            return;
+        }
+
+        std::vector<uint8_t> Alive(Bufs.size(), 1);
+        uint8_t Key[kSolveLen] = {};
+        int     FirstHits = 0, FirstTotal = 0;
+        int     Solved = 0;
+
+        for (size_t Pos = 0; Pos < kSolveLen; ++Pos) {
+            int Total = 0;
+            for (size_t J = 0; J < Bufs.size(); ++J) if (Alive[J]) ++Total;
+            if (Total < 8) break;
+
+            // Scored by identifier character FREQUENCY, not by a yes/no
+            // identifier test. The binary test does pick the right key, but by
+            // a 1% margin — many wrong keys also land inside the alphabet — and
+            // a 1% margin is not something to stand a decoder on. Weighting by
+            // how often each character actually occurs in UE identifiers widens
+            // the same decision to ~1.6 nats.
+            double BestW = -1e300, Runner = -1e300;
+            int    BestKey = 0, BestHits = 0;
+            for (int K = 0; K < 32; ++K) {
+                double W = 0.0;
+                int Hits = 0;
+                for (size_t J = 0; J < Bufs.size(); ++J) {
+                    if (!Alive[J]) continue;
+                    uint8_t Ch = TheiaStr::WrapByte(
+                        (uint32_t)K ^ (uint32_t)(int32_t)(int8_t)Bufs[J][Pos]);
+                    W += CharWeight(Ch, Pos == 0);
+                    if (IsNameChar(Ch, Pos == 0)) ++Hits;
+                }
+                W /= Total;
+                if (W > BestW) { Runner = BestW; BestW = W; BestKey = K; BestHits = Hits; }
+                else if (W > Runner) { Runner = W; }
+            }
+
+            // Stop while the winner is still a winner. A wrong tail key
+            // corrupts long names rather than truncating them, which is the
+            // worse of the two failures.
+            if (Pos && (BestW - Runner) < 0.15) break;
+
+            Key[Pos] = (uint8_t)BestKey;
+            Solved = (int)Pos + 1;
+            if (Pos == 0) { FirstHits = BestHits; FirstTotal = Total; }
+
+            for (size_t J = 0; J < Bufs.size(); ++J) {
+                if (!Alive[J]) continue;
+                uint8_t Ch = TheiaStr::WrapByte(
+                    (uint32_t)BestKey ^ (uint32_t)(int32_t)(int8_t)Bufs[J][Pos]);
+                if (!IsAliveChar(Ch, Pos == 0)) Alive[J] = 0;
+            }
+        }
+
+        // The correct key is overwhelming at position 0, where the sample is
+        // the whole set: 96.8% on CL-1341255. Anything near chance means
+        // WrapByte itself moved, and a half-right keystream is worse than none.
+        if (Solved < 16 || FirstTotal < 2000 || FirstHits * 4 < FirstTotal * 3) {
+            std::printf("[theia-static] keystream solve weak (%d positions, %d/%d at "
+                        "position 0) - using the compiled PRNG\n",
+                Solved, FirstHits, FirstTotal);
+            return;
+        }
+        std::memcpy(TheiaStr::g_Keystream, Key, sizeof(Key));
+        TheiaStr::g_KeystreamLen = Solved;
+
+        // Cross-check against the compiled PRNG, so a patch that did NOT touch
+        // the cipher shows up as agreement rather than as a silent re-solve.
+        uint32_t State = 0;
+        int Agree = 0;
+        for (int I = 0; I < Solved; ++I) {
+            uint32_t T = TheiaStr::Rol32(State * TheiaStr::kPrime + TheiaStr::kAdd, 0x13);
+            State = (T + State) * TheiaStr::kPrime;
+            if ((uint8_t)(State & 0x1Fu) == Key[I]) ++Agree;
+        }
+        std::printf("[theia-static] keystream solved: %d positions, %d/%d (%.1f%%) at "
+                    "position 0, %d/%d agree with the compiled PRNG\n",
+            Solved, FirstHits, FirstTotal,
+            100.0 * FirstHits / (FirstTotal ? FirstTotal : 1), Agree, Solved);
+    }
+
+    // Log-probability (x100) of each identifier character, measured over the
+    // live SDK. A scoring heuristic, not a patch constant: the letter
+    // distribution of C++ identifiers does not move when Theia rekeys.
+    static double CharWeight(uint8_t C, bool First) {
+        static const struct { char C; int16_t W; } kFreq[] = {
+            {'a',-288}, {'b',-474}, {'c',-346}, {'d',-414}, {'e',-234}, {'f',-476}, {'g',-460},
+            {'h',-463}, {'i',-286}, {'j',-692}, {'k',-553}, {'l',-362}, {'m',-379}, {'n',-279},
+            {'o',-300}, {'p',-352}, {'q',-707}, {'r',-299}, {'s',-300}, {'t',-251}, {'u',-373},
+            {'v',-526}, {'w',-674}, {'x',-431}, {'y',-448}, {'z',-443}, {'A',-424}, {'B',-464},
+            {'C',-425}, {'D',-474}, {'E',-443}, {'F',-484}, {'G',-496}, {'H',-707}, {'I',-478},
+            {'J',-928}, {'K',-632}, {'L',-594}, {'M',-477}, {'N',-502}, {'O',-585}, {'P',-475},
+            {'Q',-716}, {'R',-480}, {'S',-435}, {'T',-492}, {'U',-584}, {'V',-561}, {'W',-615},
+            {'X',-751}, {'Y',-938}, {'Z',-823}, {'0',-550}, {'1',-522}, {'2',-424}, {'3',-437},
+            {'4',-489}, {'5',-560}, {'6',-513}, {'7',-567}, {'8',-550}, {'9',-555}, {'_',-312},
+        };
+        static double Tbl[256];
+        static bool Init = false;
+        if (!Init) {
+            for (int I = 0; I < 256; ++I) Tbl[I] = -16.0;
+            for (const auto& E : kFreq) Tbl[(uint8_t)E.C] = E.W / 100.0;
+            // Legal but rare in names. Left at the -16 floor they would make
+            // the CORRECT key look wrong at every '::' position.
+            Tbl[(uint8_t)':'] = -6.0;
+            Tbl[(uint8_t)'<'] = -7.5; Tbl[(uint8_t)'>'] = -7.5;
+            Tbl[(uint8_t)','] = -7.5; Tbl[(uint8_t)'.'] = -7.5;
+            Tbl[(uint8_t)'/'] = -7.5; Tbl[(uint8_t)' '] = -7.5;
+            Init = true;
+        }
+        if (First && C >= '0' && C <= '9') return -16.0;
+        if (First) {
+            switch (C) {
+                case ':': case '<': case '>': case ',': case '.': case '/': case ' ':
+                    return -16.0;
+                default: break;
+            }
+        }
+        return Tbl[C];
+    }
+
+    static bool IsNameChar(uint8_t C, bool First) {
+        if (C >= 'A' && C <= 'Z') return true;
+        if (C >= 'a' && C <= 'z') return true;
+        if (C == '_') return true;
+        if (!First && C >= '0' && C <= '9') return true;
+        return false;
+    }
+
+    // What keeps a buffer in the sample, as opposed to what counts as a name
+    // character. Enum entries are stored FULLY QUALIFIED ("EnumName::Entry")
+    // and CppType strings carry angle brackets and commas, so the identifier
+    // alphabet kills exactly the long buffers the tail of the keystream depends
+    // on: it died at the '::' around position 44 and the solve stalled at 60,
+    // truncating every qualified name longer than that.
+    static bool IsAliveChar(uint8_t C, bool First) {
+        if (IsNameChar(C, First)) return true;
+        switch (C) {
+            case ':': case '<': case '>': case ',': case '.': case '/': case ' ':
+                return !First;
+            default:
+                return false;
+        }
+    }
+
+    static constexpr size_t kSolveLen = 192;
 
     bool TypeName(uint64_t DescRva, std::string& Out, uint64_t& OffOut) {
         static const uint64_t kOffsets[] = { 0x10, 0x18, 0x20, 0x28, 0x08 };

@@ -3909,11 +3909,20 @@ public:
                     PropagateDown(Rec.addr);
 
             size_t Promoted = 0, Demoted = 0, VtLocked = 0, CastLocked = 0, CastDropped = 0;
+            const bool KeepInstances = std::getenv("FROST_KEEP_INSTANCES") != nullptr;
             for (auto& Rec : result.structs) {
                 // ClassCastFlags is exact; the vtable sets and the
                 // inheritance propagation below are heuristics. Let the
                 // oracle decide whenever it has an opinion.
-                if (uint64_t Cf = ReadClassCastFlags(Rec.addr)) {
+                // Use the CHECKED read, which separates "the oracle could not
+                // run" from "the flags really are zero". Conflating them is
+                // what let the vtable heuristics take over: on a run where the
+                // vtable clustering failed to find a Class vtable at all, 62208
+                // records were decided by vtable instead of 0, and the class
+                // count went from 15338 to 68403 against the same process.
+                uint64_t Cf = 0;
+                bool OracleRan = ReadClassCastFlagsChecked(Rec.addr, Cf);
+                if (OracleRan && Cf) {
                     if (Cf & CASTCLASS_UClass) {
                         if (!Rec.is_class) ++Promoted;
                         Rec.is_class = true;  ++CastLocked;  continue;
@@ -3927,10 +3936,12 @@ public:
                     // test that got them collected in the first place.
                     Rec.drop = true;  ++CastDropped;  continue;
                 }
-                // Flags of 0 means the object's class carries no cast bits,
-                // i.e. it is an ordinary instance. Measured: every such record
-                // here is a CDO. Only drop those, so a record whose class ptr
-                // failed to decode is still classified by the fallbacks below.
+                // The oracle ran and the metaclass carries no CASTCLASS bit,
+                // so this is an ordinary instance however class-shaped it
+                // looks. FROST_KEEP_INSTANCES restores the old behaviour.
+                if (OracleRan && !KeepInstances) {
+                    Rec.drop = true;  ++CastDropped;  continue;
+                }
                 if (Rec.name.rfind("Default__", 0) == 0) {
                     Rec.drop = true;  ++CastDropped;  continue;
                 }

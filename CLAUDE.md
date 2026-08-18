@@ -251,6 +251,60 @@ different question and usually the one that matters.
   for `movabs r64, imm64`, and the destination is exactly what tells the two
   slot-decoder polynomials apart. Read it off the opcode.
 
+### Theia's descriptor-literal cipher is now SOLVED, not decoded
+CL-1341255 changed the PRNG's additive constant — 0xA7A3FF6B does not occur
+anywhere in the image — so the hardcoded stream produced 10544 nameless
+descriptors out of 10554. It is no longer hardcoded, and does not need to be:
+```
+the stream is seeded with ZERO, so it is identical for every string
+only FIVE bits of it reach each position
+=> per position, try all 32 keys and keep the one that turns the most
+   ciphertexts into name characters
+```
+Candidates are every .rdata qword pointing into .rdata — no descriptor
+structure required, so this survives a layout change too. Measured on
+CL-1341255: **97.5% at position 0 over 174101 buffers, and only 3 of 84
+positions agree with the compiled PRNG.** Result: 358 wrappers, 15533
+descriptors, **14014 types / 27659 members / 10838 enum values**, and
+**2054 of 2078 comparable enums match the live dump exactly** (the rest are
+`_Max` spelling, one 91-char name past the keystream, and one `bone`/`Bone`).
+
+Three things this took, each worth keeping:
+- **Score by character FREQUENCY, not by a yes/no identifier test.** The binary
+  test picks the right key, but by a 1% margin — many wrong keys also land
+  inside the alphabet. Weighting by how often each character actually occurs in
+  UE identifiers widens the same decision to ~1.6 nats. The frequency table is a
+  heuristic, not a patch constant: C++ identifier statistics do not move when
+  Theia rekeys.
+- **The "still alive" alphabet is WIDER than the name alphabet.** Enum entries
+  are stored fully qualified (`EnumName::Entry`) and CppType strings carry
+  `<>,.`. Killing a buffer at its first non-identifier character killed exactly
+  the long buffers the tail depends on: the solve stalled at 60 positions and
+  silently truncated every qualified name longer than that —
+  `ExecuteAndResetPeriod` came out as `ExecuteAndRese`. With `:<>,./ ` allowed
+  the solve reaches 84.
+- **Stop while the winner is still winning.** A wrong tail key corrupts long
+  names instead of truncating them, which is the worse failure. Pushing past the
+  margin gate to 82 positions produced `CustomizationItemWrap*ad`.
+
+### Phase 6.4 had silently stopped running
+`DiscoverFNameConsts()` returns early when the LEGACY FName decrypt function
+cannot be located — which on any modern patch is always — and everything after
+that point in the function went with it, the static-reflection phase included.
+It never needed that function, only module bounds. Hoisted into
+`RunTheiaStatic()` and called from Phase 0d. Two smaller fixes fell out:
+- The `.text` reload tried fallback images only until one cleared an 80%
+  threshold. How much live `.text` is readable varies run to run, so one run
+  stopped at 283 wrappers / 10570 descriptors and the next reloaded and got
+  358 / 15533 from the same binary. It now tries every image and keeps the best.
+- **`ReadClassCastFlags` was used where `ReadClassCastFlagsChecked` belongs.**
+  The unchecked read conflates "the oracle could not run" with "the flags really
+  are zero", so on a run where the vtable clustering failed to find a Class
+  vtable at all, 62208 records were decided by the weak vtable heuristic instead
+  of 0, and the class count went 15338 -> 68403 against the same live process.
+  This is the *third* incident of this exact class. When the oracle can run, its
+  verdict is final — including its zero.
+
 ### SDK output (2026-08-18)
 ```
 Classes 14983   Structs 8534   Enums 2778   Functions 50615
