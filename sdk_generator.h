@@ -55,6 +55,7 @@ struct NativeField {
     uint32_t    offset  = 0;
     uint32_t    size    = 0;
     uint32_t    samples = 0;
+    uint8_t     bit_mask = 0;   // 0 => not a bitfield; otherwise single-bit mask
     std::string type;
     std::string note;
 };
@@ -2184,7 +2185,7 @@ public:
             uint64_t Beg = Pr.offset;
             uint64_t Sz  = (uint64_t)std::max<uint32_t>(Pr.elem_size, 1) *
                            std::max<uint32_t>(Pr.array_dim, 1);
-            if (Pr.is_bool) Sz = 1;
+            if (Pr.is_bool) Sz = Pr.bool_field_size ? Pr.bool_field_size : 1;
             for (uint64_t B = Beg; B < Beg + Sz && B < Rec.props_size; ++B)
                 if (B >= Lo) Covered[B - Lo] = 1;
         }
@@ -2267,7 +2268,7 @@ public:
                 }
             }
 
-            if (Free(Pos, 4)) {
+            if ((Pos % 4) == 0 && Free(Pos, 4)) {
                 int FloatLike = 0, Zero = 0;
                 bool AnyFrac = false;
                 for (const auto& B : Snap) {
@@ -2300,6 +2301,58 @@ public:
                 continue;
             }
             ++Pos;
+        }
+
+        // Native bitfield pass: bytes with reflected bool bits usually have
+        // unreflected bits in the same byte. Sample those free bits across
+        // instances — varying == real hidden bool, constant == padding/unset.
+        // Do NOT gate on Lo — reflection sometimes places subclass bools
+        // inside parent-declared space (AActor's bNetTemporary at 0x98 sits
+        // below UObject's props_size on this build), and we still want their
+        // sibling bits scanned.
+        if (Snap.size() >= 3) {
+            std::map<uint32_t, uint8_t> UsedBitsByByte;
+            for (const auto& Pr : Rec.properties) {
+                if (Pr.is_param) continue;
+                if (!Pr.is_bool || Pr.bool_field_size != 1 || !Pr.bool_byte_mask)
+                    continue;
+                if (Pr.offset >= Rec.props_size) continue;
+                UsedBitsByByte[Pr.offset] |= Pr.bool_byte_mask;
+            }
+            std::vector<std::vector<uint8_t>> BitSnap;
+            BitSnap.reserve(Inst.size());
+            for (uint64_t O : Inst) {
+                std::vector<uint8_t> Buf(Rec.props_size, 0);
+                if (m_reader.Read(O, Buf.data(), Buf.size()))
+                    BitSnap.push_back(std::move(Buf));
+            }
+            if (BitSnap.size() >= 3) {
+                for (auto& [ByteOff, Used] : UsedBitsByByte) {
+                    uint8_t Free = (uint8_t)(~Used);
+                    for (int b = 0; b < 8; ++b) {
+                        uint8_t Mask = (uint8_t)(1 << b);
+                        if (!(Free & Mask)) continue;
+                        if (Rec.natives.size() >= kMaxNatives) break;
+                        int Ones = 0;
+                        for (const auto& B : BitSnap) {
+                            if (B[ByteOff] & Mask) ++Ones;
+                        }
+                        NativeField NF;
+                        NF.offset   = ByteOff;
+                        NF.size     = 1;
+                        NF.samples  = (uint32_t)BitSnap.size();
+                        NF.bit_mask = Mask;
+                        if (Ones == 0) {
+                            NF.type = "?"; NF.note = "bitfield hole, always zero";
+                        } else if (Ones == (int)BitSnap.size()) {
+                            NF.type = "?"; NF.note = "bitfield hole, always one";
+                        } else {
+                            NF.type = "bool"; NF.note = "bitfield hole, varies";
+                        }
+                        Rec.natives.push_back(NF);
+                    }
+                }
+            }
         }
     }
 
@@ -2400,10 +2453,18 @@ public:
             for (const auto& nf : rec.natives) {
                 std::ostringstream nm;
                 nm << "Native_0x" << std::hex << nf.offset;
+                if (nf.bit_mask) {
+                    int bit_idx = 0;
+                    for (uint8_t m = nf.bit_mask; m > 1; m >>= 1) ++bit_idx;
+                    nm << "_bit" << std::dec << bit_idx;
+                }
                 std::string np = nm.str();
                 if (np.size() < 40) np.append(40 - np.size(), ' ');
                 oss << "constexpr uint32_t " << np << " = 0x" << std::hex << nf.offset
-                    << ";  // " << nf.type << " // size=0x" << std::hex << nf.size
+                    << ";  // " << nf.type;
+                if (nf.bit_mask)
+                    oss << " // mask=0x" << std::hex << (int)nf.bit_mask;
+                oss << " // size=0x" << std::hex << nf.size
                     << " // native // n=" << std::dec << nf.samples;
                 if (!nf.note.empty() && nf.note != "scalar" &&
                     nf.note != "array" && nf.note != "pointer")
