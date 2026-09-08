@@ -3617,30 +3617,13 @@ private:
         return true;
     }
 
-    // Lenient: mostly-printable ASCII (≥75% printable). Additionally, reject
-    // decodes dominated by characters that never appear in real UE names —
-    // '?', '"', '$', '@', '!', '^', '{', '}', '\\', '|', '`', '~' — because a
-    // wrong-slot decode routinely produces long runs of those when the
-    // XOR-key differences happen to land in punctuation. UE identifiers are
-    // [A-Za-z0-9_/.:-] plus space/paren/brace in package/asset paths, so >10%
-    // of the "junk-only" set means the decode is not a real name.
+    // Lenient: mostly-printable ASCII (≥75% printable).
     static bool IsLenientName(const std::string& s) {
         if (s.empty() || s.size() > 256) return false;
-        int bad = 0, junk = 0;
-        for (unsigned char c : s) {
-            if (c < 32 || c > 126) { ++bad; continue; }
-            switch (c) {
-                case '?': case '"': case '$': case '@': case '!':
-                case '^': case '{': case '}': case '\\': case '|':
-                case '`': case '~':
-                    ++junk;
-                    break;
-                default: break;
-            }
-        }
-        if (bad * 4 > static_cast<int>(s.size())) return false;
-        if (junk * 10 > static_cast<int>(s.size())) return false;
-        return true;
+        int bad = 0;
+        for (unsigned char c : s)
+            if (c < 32 || c > 126) ++bad;
+        return bad * 4 <= static_cast<int>(s.size());
     }
 
     uint64_t       m_base;

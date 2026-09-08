@@ -2450,11 +2450,38 @@ public:
         // Skip namespaces that have nothing useful after filtering.
         if (GoodProps.empty() && GoodFns.empty() && rec.natives.empty()) return "";
 
+        // If the record's own name is decode garbage — heavy on characters
+        // that UE identifiers never carry ('?', '"', '$', '@', '!', '^', '{',
+        // '}', '\\', '|', '`', '~') — substitute a synthetic address-based
+        // name so the emitted block stays valid C++ and does not paste
+        // hundreds of question marks into every downstream file.
+        auto JunkRatio = [](const std::string& S) {
+            if (S.empty()) return 0;
+            int Junk = 0;
+            for (unsigned char C : S) {
+                switch (C) {
+                    case '?': case '"': case '$': case '@': case '!':
+                    case '^': case '{': case '}': case '\\': case '|':
+                    case '`': case '~':
+                        ++Junk; break;
+                    default: break;
+                }
+            }
+            return Junk * 100 / static_cast<int>(S.size());
+        };
+        std::string emit_name = rec.name;
+        if (JunkRatio(emit_name) > 10) {
+            std::ostringstream sub;
+            sub << (rec.is_class ? "UnnamedClass_0x" : "UnnamedStruct_0x")
+                << std::hex << std::uppercase << rec.addr;
+            emit_name = sub.str();
+        }
+
         std::ostringstream oss;
         const std::string& pkg = rec.package;
         oss << "// " << (rec.is_class ? "Class" : "Struct") << " "
             << (!pkg.empty() && pkg[0] == '/' ? pkg : "/Script/" + pkg)
-            << "." << rec.name << "\n";
+            << "." << emit_name << "\n";
         oss << "// Address: 0x" << std::hex << rec.addr << "\n";
         oss << "// Size: 0x" << std::hex << rec.props_size
             << " (" << std::dec << rec.props_size << " bytes)\n";
@@ -2485,7 +2512,7 @@ public:
                 ++depth;
             }
         }
-        oss << "namespace " << rec.name << " {\n";
+        oss << "namespace " << emit_name << " {\n";
         std::unordered_map<std::string, int> NameCount;
         const bool EmitPadding = std::getenv("FROST_NO_PADDING") == nullptr;
         uint32_t PrevEnd = 0;
@@ -2572,25 +2599,45 @@ public:
             for (const auto* fn : GoodFns)
                 oss << FormatFunction(*fn);
         }
-        oss << "} // namespace " << rec.name << "  // size=0x" << std::hex << rec.props_size << "\n\n";
+        oss << "} // namespace " << emit_name << "  // size=0x" << std::hex << rec.props_size << "\n\n";
         return oss.str();
     }
 
     // ── Dump a UEnum to string ────────────────────────────────────────────────────────
     std::string DumpEnum(const EnumRecord& rec) {
+        auto JunkRatio = [](const std::string& S) {
+            if (S.empty()) return 0;
+            int Junk = 0;
+            for (unsigned char C : S) {
+                switch (C) {
+                    case '?': case '"': case '$': case '@': case '!':
+                    case '^': case '{': case '}': case '\\': case '|':
+                    case '`': case '~':
+                        ++Junk; break;
+                    default: break;
+                }
+            }
+            return Junk * 100 / static_cast<int>(S.size());
+        };
+        std::string emit_name = rec.name;
+        if (JunkRatio(emit_name) > 10) {
+            std::ostringstream sub;
+            sub << "UnnamedEnum_0x" << std::hex << std::uppercase << rec.addr;
+            emit_name = sub.str();
+        }
         std::ostringstream oss;
         const std::string& pkg = rec.package;
         oss << "// Enum "
             << (!pkg.empty() && pkg[0] == '/' ? pkg : "/Script/" + pkg)
-            << "." << rec.name << "\n";
-        oss << "namespace " << rec.name << " {\n";
+            << "." << emit_name << "\n";
+        oss << "namespace " << emit_name << " {\n";
         for (const auto& e : rec.entries) {
             std::string padded = e.name;
             if (padded.size() < 40)
                 padded.append(40 - padded.size(), ' ');
             oss << "    constexpr int64_t " << padded << " = " << std::dec << e.value << ";\n";
         }
-        oss << "} // namespace " << rec.name << "\n\n";
+        oss << "} // namespace " << emit_name << "\n\n";
         return oss.str();
     }
 
