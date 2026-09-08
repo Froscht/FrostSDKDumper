@@ -1554,6 +1554,13 @@ public:
     int32_t DecryptFFieldNameCI(uint64_t ff_addr) {
         if (!ff_addr) return 0;
 
+        // v908 is authoritative — falling through re-runs the ciphertext
+        // through 8 wrong-patch transforms whose acceptance windows are
+        // wider than ours, so a bogus decode wins and the caller ends up
+        // naming every property "Prop_CI0_OffXX".
+        if (m_v908Active)
+            return DecryptFFieldNameCI_V908(ff_addr);
+
         // On v808 this is authoritative. Falling through would re-run the very
         // same ciphertext through eight wrong-patch transforms whose acceptance
         // window (ci < 0x06A00000) is far wider than ours, so a bogus decode
@@ -1829,6 +1836,9 @@ public:
     // FName-fn rip-rel scan (we already collect candidates in
     // g_DiscoveredFName.AllRDataLeas; just need the role-binding pass).
     uint64_t ResolveNamePtrFull(int32_t CompIndex) {
+        if (m_v908Active)
+            return (CompIndex < 0) ? 0 : ResolveNamePtr_V908(CompIndex);
+
         if (m_v818Active)
             return (CompIndex < 0) ? 0 : ResolveNamePtr_V818(CompIndex);
 
@@ -2732,6 +2742,9 @@ public:
     //   because both compute byte[i] ^= keystream[(key+i)&0x3F] >> bitshift.
     std::string DecryptNameString(uint64_t NameEntryPtr) {
         if (!NameEntryPtr || !m_keyLoaded) return {};
+
+        if (m_v908Active)
+            return DecryptNameString_V908(NameEntryPtr);
 
         if (m_v818Active)
             return DecryptNameString_V818(NameEntryPtr);
