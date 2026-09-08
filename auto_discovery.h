@@ -4186,6 +4186,326 @@ inline uint64_t DecodeChunkMgr(uint64_t Enc) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CL-1372005 (v20260908) — UE 5.7 pipeline routines.
+//
+// Same layering as V818Detail: pure decoders here, memory reads live on
+// FNameDecryptor. Constants come from ArcDecrypt::g_Sheet, so a patch that
+// only moves them (once auto_resolve for v908 exists) needs no source edit.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace V908Detail {
+
+using V811Detail::Rotl64;
+using V811Detail::Rotl32;
+using V811Detail::Pshufb8;
+
+// 16-bit lane shuffle immediate (PSHUFLW imm8): shuffles the four low words
+// per the imm[7:0] which encodes 4 × 2-bit lane indices. High 64 bits pass
+// through unchanged. We only need the low 64 bits here.
+inline uint64_t Pshuflw(uint64_t Lo, uint8_t Imm) {
+    uint16_t W[4];
+    for (int I = 0; I < 4; ++I) W[I] = (uint16_t)(Lo >> (I * 16));
+    uint64_t Out = 0;
+    for (int I = 0; I < 4; ++I) {
+        int Src = (Imm >> (I * 2)) & 3;
+        Out |= (uint64_t)W[Src] << (I * 16);
+    }
+    return Out;
+}
+
+// ROL16 per-word (psllw/psrlw + por on the low 64 bits).
+inline uint64_t Rol16x4(uint64_t V, int N) {
+    N &= 15;
+    uint64_t R = 0;
+    for (int I = 0; I < 4; ++I) {
+        uint16_t W = (uint16_t)(V >> (I * 16));
+        uint16_t Rw = (uint16_t)((W << N) | (W >> (16 - N)));
+        R |= (uint64_t)Rw << (I * 16);
+    }
+    return R;
+}
+
+// ROL32 per-dword (psrld / pslld / por).
+inline uint64_t Rol32x2(uint64_t V, int N) {
+    uint32_t D0 = Rotl32((uint32_t)V, N);
+    uint32_t D1 = Rotl32((uint32_t)(V >> 32), N);
+    return (uint64_t)D0 | ((uint64_t)D1 << 32);
+}
+
+// Per-dword ADD (broadcast the low half of a qword to both dwords when the
+// constant is loaded via paddd from a memory operand of qword width).
+inline uint64_t Padd32x2(uint64_t V, uint64_t Broadcast) {
+    uint32_t Lo = (uint32_t)Broadcast;
+    uint32_t Hi = (uint32_t)(Broadcast >> 32);
+    uint32_t A0 = (uint32_t)V + Lo;
+    uint32_t A1 = (uint32_t)(V >> 32) + Hi;
+    return (uint64_t)A0 | ((uint64_t)A1 << 32);
+}
+
+// FNamePool shard hash. 3 IMULs + final ROL32(13), then `-109*v9 + 102`
+// XOR `(P*v9+ADD) >> 16`, masked to 7 — the CL-1315578-style block-index
+// selector (NOT `H ^ (H>>16)`, which was wrong in the first attempt).
+// Returns the ROL32-finalized `v9` value; callers derive Bidx from it.
+inline uint32_t ShardHashV9(uint64_t SeedAddr) {
+    namespace V = ArcDecrypt::v20260908;
+    uint32_t Lo = (uint32_t)SeedAddr;
+    uint32_t Hi = (uint32_t)(SeedAddr >> 32);
+    const uint32_t P = V::SHARD_HASH_PRIME;
+    const uint32_t A = V::SHARD_HASH_ADD;
+    uint32_t step1 = P * Rotl32(Lo, V::SHARD_HASH_ROL_A) + A;
+    uint32_t step2 = P * Rotl32(step1, V::SHARD_HASH_ROL_B) + Hi + A;
+    uint32_t step3 = P * Rotl32(step2, V::SHARD_HASH_ROL_A) + A;
+    return Rotl32(step3, V::SHARD_HASH_ROL_B);
+}
+
+inline uint32_t BlockIndex(uint32_t V9) {
+    namespace V = ArcDecrypt::v20260908;
+    const uint32_t P = V::SHARD_HASH_PRIME;
+    const uint32_t A = V::SHARD_HASH_ADD;
+    uint8_t Pa = (uint8_t)((uint32_t)(-109) * V9 + 102);
+    uint8_t Pb = (uint8_t)((P * V9 + A) >> 16);
+    return (uint32_t)(Pa ^ Pb) & 7u;
+}
+
+// Block decrypt. On this build, the `(x & K1_C90) | (~x & K2_C80)` blend
+// collapses to `x XOR K2_C80` because K2 == ~K1. And it turns out that
+// `K2_C80 XOR K3_CA0 == K_BB0` — the Block1 and Block2 decodes reduce to
+// the SAME effective XOR key. Neither the AND-blend nor the double XOR
+// pull them apart.
+//
+//   effective_XOR = 0xD4B99879D4B99879 XOR 0x9B9D24BF5D56B7D8
+//                 = 0x4F24BCC689EF2FA1     (== the Block2 XOR key)
+//
+// Then ROL32-per-dword(3) and per-dword ADD with the broadcast constant.
+inline uint64_t DecodeBlock(uint64_t Raw) {
+    namespace V = ArcDecrypt::v20260908;
+    uint64_t X = Raw ^ V::BLOCK2_XOR;   // == K2_C80 XOR K3_CA0
+    X = Rol32x2(X, V::BLOCK_ROL32);
+    return Padd32x2(X, V::BLOCK_ADD);
+}
+
+inline uint64_t DecodeBlock1(uint64_t Raw) { return DecodeBlock(Raw); }
+inline uint64_t DecodeBlock2(uint64_t Raw) { return DecodeBlock(Raw); }
+
+// Legacy ShardHash for external callers — returns the block index directly.
+inline uint32_t ShardHash(uint64_t SeedAddr) {
+    return BlockIndex(ShardHashV9(SeedAddr));
+}
+
+// The 3-step bswap64 XOR chain, spanning DA260/DA4A0/BF200. The final result
+// is the FNameEntry* into the chunk.
+inline uint64_t ApplyPointerChain(uint64_t Raw) {
+    namespace V = ArcDecrypt::v20260908;
+    // Step 1 (DA260 tail): S1 = bswap64(raw XOR PTR_XOR1)
+    uint64_t S1 = __builtin_bswap64(Raw ^ V::PTR_XOR1);
+    // Step 2 (DA4A0):      S2 = PTR_XOR2 XOR S1
+    uint64_t S2 = V::PTR_XOR2 ^ S1;
+    // Step 3 (BF200 tail): EntryPtr = bswap64(PTR_XOR3 XOR S2)
+    return __builtin_bswap64(V::PTR_XOR3 ^ S2);
+}
+
+inline uint64_t ResolveEntry(IMemoryReader& Reader, uint64_t Base, int32_t CompIndex) {
+    namespace V = ArcDecrypt::v20260908;
+    if (CompIndex < 0) return 0;
+    uint32_t Ci       = (uint32_t)CompIndex;
+    uint64_t NameOff  = Ci & 0xFFFFu;
+    uint64_t ChunkOff = (uint64_t)((Ci >> 8) & 0xFFFF00u);
+
+    // We bypass the pool-state chase (sub_1402DA260 head reads CI from the
+    // pool wrapper struct) — external self-tests / diagnostics pass their
+    // own CI and want it consumed as-is. Callers that need to walk the pool
+    // itself would call a separate helper.
+    const auto& Sh = ArcDecrypt::g_Sheet;
+    uint64_t ChunkAddr = Base + Sh.Pool908Rva + ChunkOff;
+
+    uint32_t V9 = ShardHashV9(ChunkAddr + Sh.Seed908Off);
+    uint32_t B1 = BlockIndex(V9);
+    uint32_t B2 = (B1 + 1u) & 7u;
+
+    uint64_t BlockAddr = ChunkAddr + Sh.Block908Base;
+    uint64_t Raw1 = 0, Raw2 = 0;
+    if (!Reader.Read(BlockAddr + Sh.Block908Stride * B1, &Raw1, 8)) return 0;
+    if (!Reader.Read(BlockAddr + Sh.Block908Stride * B2, &Raw2, 8)) return 0;
+    if (!Raw1 && !Raw2) return 0;
+
+    uint64_t V14 = DecodeBlock(Raw1);
+    uint64_t V15 = DecodeBlock(Raw2);
+
+    // FNV64 fold over V14, then combine with V15.
+    uint64_t Fv = V::FNV_PRIME * Rotl64(V14, V::FNV_ROL1) + V::FNV_ADD;
+    Fv = V::FNV_PRIME * Rotl64(Fv, V::FNV_ROL2) + V::FNV_ADD;
+
+    uint64_t Raw = V14 + (V15 ^ Fv) + 2ULL * NameOff;
+    uint64_t Entry = ApplyPointerChain(Raw);
+    if (Entry < 0x10000ULL || Entry >= 0x800000000000ULL) return 0;
+    return Entry;
+}
+
+struct EntryHeader {
+    uint16_t Raw    = 0;
+    int      Length = 0;
+    bool     IsWide = false;
+    int      Bytes  = 0;
+};
+
+// 10-bit length split: bits 8-14 → 3-9 of length, bits 0-2 → 0-2. bits 3-4
+// unused (probably reserved). Sign bit = wide flag.
+//
+// The 10-bit `length` field encodes the RAW BYTE COUNT of the string data,
+// NOT the character count. For narrow strings, chars == bytes. For wide
+// strings the game divides by 2 (verified in disasm at 0x1402BF331:
+// `shr r15d, 1`) — so char count = bytes / 2. We normalize `Out.Length`
+// to CHAR count so downstream Decrypt{Narrow,Wide} loops iterate correctly
+// (they read `Bytes` cipher bytes but produce `Length` output chars).
+inline bool ReadHeader(IMemoryReader& Reader, uint64_t Entry, EntryHeader& Out) {
+    namespace V = ArcDecrypt::v20260908;
+    uint16_t Hdr = 0;
+    if (!Reader.Read(Entry, &Hdr, 2) || !Hdr) return false;
+    Out.Raw    = Hdr;
+    int RawBytes = (int)(((Hdr >> 5) & 0x3F8u) | (Hdr & 7u));
+    Out.IsWide = (Hdr & V::HDR_IS_WIDE_BIT) != 0;
+    if (Out.IsWide) {
+        // Header carries byte count; wide strings are uint16 units so char
+        // count = bytes / 2. Game rounds down on odd (does not reject).
+        if (RawBytes < 2) return false;
+        Out.Length = RawBytes / 2;
+        Out.Bytes  = RawBytes;
+    } else {
+        Out.Length = RawBytes;
+        Out.Bytes  = RawBytes;
+    }
+    return Out.Length > 0 && Out.Length <= 1023;
+}
+
+// String decrypt: paired key schedule. key = length + INIT; per pair the paired
+// index is (key-1); after the pair, key += 0x67E. Narrow uses (word >> 3),
+// wide uses the full 16-bit key.
+inline std::string DecryptNarrow(const std::vector<uint8_t>& Cipher, int Length,
+                                 const uint16_t* Table, int BaseIdx)
+{
+    namespace V = ArcDecrypt::v20260908;
+    std::string Out;
+    Out.reserve(Length);
+    uint32_t Key = (uint32_t)Length + V::KEY_INIT_ADD;
+    int I = 0;
+    for (; I + 1 < Length && (I + 1) < (int)Cipher.size(); I += 2) {
+        uint32_t Idx1 = Key & V::KEY_INDEX_MASK;
+        uint32_t Idx2 = (Key - 1u) & V::KEY_INDEX_MASK;
+        uint8_t K1 = (uint8_t)(Table[Idx1 + BaseIdx] >> V::NARROW_KEY_SHIFT);
+        uint8_t K2 = (uint8_t)(Table[Idx2 + BaseIdx] >> V::NARROW_KEY_SHIFT);
+        Out.push_back((char)(Cipher[I]     ^ K1));
+        Out.push_back((char)(Cipher[I + 1] ^ K2));
+        Key += V::KEY_STEP_PAIR;
+    }
+    if (I < Length && I < (int)Cipher.size()) {
+        // Odd tail (single byte).
+        uint32_t Idx = Key & V::KEY_INDEX_MASK;
+        uint8_t K = (uint8_t)(Table[Idx + BaseIdx] >> V::NARROW_KEY_SHIFT);
+        Out.push_back((char)(Cipher[I] ^ K));
+    }
+    return Out;
+}
+
+inline std::string DecryptWide(const std::vector<uint8_t>& Cipher, int Length,
+                               const uint16_t* Table, int BaseIdx)
+{
+    namespace V = ArcDecrypt::v20260908;
+    std::string Out;
+    Out.reserve(Length);
+    uint32_t Key = (uint32_t)Length + V::KEY_INIT_ADD;
+    int I = 0;
+    for (; I + 1 < Length && ((I + 1) * 2 + 1) < (int)Cipher.size(); I += 2) {
+        uint32_t Idx1 = Key & V::KEY_INDEX_MASK;
+        uint32_t Idx2 = (Key - 1u) & V::KEY_INDEX_MASK;
+        uint16_t C1 = (uint16_t)(Cipher[I * 2]           | ((uint16_t)Cipher[I * 2 + 1]           << 8));
+        uint16_t C2 = (uint16_t)(Cipher[(I + 1) * 2]     | ((uint16_t)Cipher[(I + 1) * 2 + 1]     << 8));
+        uint16_t W1 = (uint16_t)(C1 ^ Table[Idx1 + BaseIdx]);
+        uint16_t W2 = (uint16_t)(C2 ^ Table[Idx2 + BaseIdx]);
+        Out.push_back((char)(W1 & 0xFF));
+        Out.push_back((char)(W2 & 0xFF));
+        Key += V::KEY_STEP_PAIR;
+    }
+    if (I < Length && (I * 2 + 1) < (int)Cipher.size()) {
+        uint32_t Idx = Key & V::KEY_INDEX_MASK;
+        uint16_t C = (uint16_t)(Cipher[I * 2] | ((uint16_t)Cipher[I * 2 + 1] << 8));
+        uint16_t W = (uint16_t)(C ^ Table[Idx + BaseIdx]);
+        Out.push_back((char)(W & 0xFF));
+    }
+    return Out;
+}
+
+// UObject::GetFName slot hash. NOTE: this pipeline SUBTRACTS ADD rather than
+// adding — the disasm shows `step1 = P * ROL32(Lo, 13) - ADD` etc. The final
+// index is `((u8)v3 ^ (u8)((v3 + 209796) >> 16)) & 3`.
+inline uint32_t SlotHash(uint64_t ObjPtr) {
+    namespace V = ArcDecrypt::v20260908;
+    uint64_t Seed = ObjPtr + V::UOBJ_NAME_SEED_OFF;
+    uint32_t Lo   = (uint32_t)Seed;
+    uint32_t Hi   = (uint32_t)(Seed >> 32);
+    const uint32_t P = V::UOBJ_SLOT_HASH_PRIME;
+    const uint32_t A = V::UOBJ_SLOT_HASH_ADD;
+
+    uint32_t step1 = P * Rotl32(Lo, V::UOBJ_SLOT_ROL_A) - A;
+    uint32_t step2 = P * Rotl32(step1, V::UOBJ_SLOT_ROL_B);
+    uint32_t step3 = Rotl32(Hi + step2 - A, V::UOBJ_SLOT_ROL_C);
+    uint32_t T     = P * step3 - A;
+    uint32_t v3    = P * (T >> V::UOBJ_SLOT_SHR);
+    return v3;
+}
+
+inline uint32_t NameSlotIndex(uint64_t ObjPtr) {
+    namespace V = ArcDecrypt::v20260908;
+    uint32_t v3 = SlotHash(ObjPtr);
+    uint32_t Idx = ((uint8_t)v3 ^ (uint8_t)((v3 + V::UOBJ_SLOT_IDX_ADD) >> 16)) & 3u;
+    return Idx ^ V::UOBJ_SLOT_NAME_XOR;
+}
+
+inline uint32_t ClassSlotIndex(uint64_t ObjPtr) {
+    namespace V = ArcDecrypt::v20260908;
+    uint32_t v3 = SlotHash(ObjPtr);
+    uint32_t Idx = ((uint8_t)v3 ^ (uint8_t)((v3 + V::UOBJ_SLOT_IDX_ADD) >> 16)) & 3u;
+    return (Idx + V::UOBJ_SLOT_CLASS_ADJ) & 3u;
+}
+
+inline uint32_t OuterSlotIndex(uint64_t ObjPtr) {
+    namespace V = ArcDecrypt::v20260908;
+    uint32_t v3 = SlotHash(ObjPtr);
+    uint32_t Idx = ((uint8_t)v3 ^ (uint8_t)((v3 + V::UOBJ_SLOT_IDX_ADD) >> 16)) & 3u;
+    return (Idx + V::UOBJ_SLOT_OUTER_ADJ) & 3u;
+}
+
+// Slot decode: PSHUFLW(30) → XOR → ROL64(17) → PSHUFB → ROL64(32).
+// Only the low 64 bits are extracted at each stage (`movq rax, xmm0`).
+inline uint64_t DecodeSlot16(uint64_t Lo, uint64_t /*Hi*/) {
+    namespace V = ArcDecrypt::v20260908;
+    uint64_t X = Pshuflw(Lo, V::UOBJ_SLOT_PSHUFLW_IMM) ^ V::SLOT_XOR_KEY_LO64;
+    X = Rotl64(X, V::UOBJ_SLOT_ROL64);
+    X = Pshufb8(X, V::SLOT_PSHUF_MASK);
+    return Rotl64(X, V::UOBJ_NAME_ROL64);
+}
+
+// FField::NamePrivate: PSHUFB(mask) → XOR(key) → ROL16(13) → ROL64(32).
+inline uint64_t DecodeFFieldName(uint64_t Lo) {
+    namespace V = ArcDecrypt::v20260908;
+    uint64_t X = Pshufb8(Lo, V::FFIELD_NAME_PSHUF_MASK) ^ V::FFIELD_NAME_KEY_LO64;
+    X = Rol16x4(X, V::FFIELD_NAME_ROL16);
+    return Rotl64(X, V::FFIELD_NAME_ROL64);
+}
+
+// chunks_manager 16-byte global decrypt.
+// step1 = blob XOR key
+// step2 = ROL16(step1, 13)         (psllw 0xD | psrlw 3)
+// result = PSHUFLW(step2, 27).lo64
+inline uint64_t DecodeChunkMgr(uint64_t BlobLo, uint64_t KeyLo) {
+    namespace V = ArcDecrypt::v20260908;
+    uint64_t X = BlobLo ^ KeyLo;
+    X = Rol16x4(X, V::CHUNKMGR_ROL16);
+    return Pshuflw(X, (uint8_t)V::CHUNKMGR_PSHUFLW_IMM);
+}
+
+} // namespace V908Detail
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GWorld, resolved from the live object graph (CL-1325322)
 //
 // The pre-object-array GWorld phase can only pattern-match, and its compile-time

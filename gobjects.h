@@ -1062,28 +1062,37 @@ namespace gobjects
             }
 
             uint32_t Stride = 0x18;
+            uint32_t ObjOff = 0;
             {
                 constexpr uint32_t kProbeCount = 256;
-                constexpr uint32_t kCandStrides[] = { 16, 20, 24, 32 };
+                // (stride, obj_off) pairs. UE 5.7 (v908) sits at (24, 8):
+                // FUObjectItem grew to 24 bytes and the object pointer moved
+                // from +0 to +8. Getting either wrong drops the object count
+                // by an order of magnitude, so probe both dimensions.
+                constexpr std::pair<uint32_t, uint32_t> kCand[] = {
+                    { 16, 0 }, { 20, 0 }, { 24, 0 }, { 24, 8 }, { 32, 0 }, { 32, 8 }
+                };
                 int BestHits = 0;
-                for (uint32_t S : kCandStrides) {
+                for (auto [S, Off] : kCand) {
+                    if (Off + 8 > S) continue;
                     uint64_t BufSize = (uint64_t)kProbeCount * S;
                     std::vector<uint8_t> ProbeBuf(BufSize);
                     if (!m_reader.Read(Chunk0Ptr, ProbeBuf.data(), BufSize)) continue;
                     int Hits = 0;
                     for (uint32_t I = 0; I < kProbeCount; ++I) {
                         uint64_t Obj = 0;
-                        std::memcpy(&Obj, ProbeBuf.data() + (uint64_t)I * S, 8);
+                        std::memcpy(&Obj, ProbeBuf.data() + (uint64_t)I * S + Off, 8);
                         if (!IsHeapObj(Obj)) continue;
                         uint64_t Vt = 0;
                         if (!m_reader.Read(Obj, &Vt, 8)) continue;
                         if (Vt >= vt_lo && Vt < vt_hi) ++Hits;
                     }
-                    std::printf("[canon] stride=%u: %d/%u valid UObjects in chunk[0] sample\n",
-                        S, Hits, kProbeCount);
-                    if (Hits > BestHits) { BestHits = Hits; Stride = S; }
+                    std::printf("[canon] stride=%u obj_off=%u: %d/%u valid UObjects in chunk[0] sample\n",
+                        S, Off, Hits, kProbeCount);
+                    if (Hits > BestHits) { BestHits = Hits; Stride = S; ObjOff = Off; }
                 }
-                std::printf("[canon] auto-detected item stride = %u\n", Stride);
+                std::printf("[canon] auto-detected item stride = %u, obj_off = %u\n", Stride, ObjOff);
+                m_itemObjOff = ObjOff;
             }
 
             std::vector<uint64_t> Objs;
@@ -1101,7 +1110,7 @@ namespace gobjects
                 uint32_t NonNull = 0, Valid = 0;
                 for (uint32_t I = 0; I < ITEMS_PER_CHUNK; ++I) {
                     uint64_t Obj = 0;
-                    std::memcpy(&Obj, Buf.data() + (uint64_t)I * Stride, 8);
+                    std::memcpy(&Obj, Buf.data() + (uint64_t)I * Stride + ObjOff, 8);
                     if (!Obj) continue;
                     ++NonNull;
                     uint64_t Vt = 0;
@@ -1110,8 +1119,8 @@ namespace gobjects
                     ++Valid;
                     if (Seen.insert(Obj).second) Objs.push_back(Obj);
                 }
-                std::printf("[canon] chunk[%d] @ 0x%llX: %u non-null, %u valid-vtable (stride=%u)\n",
-                    Ci, (unsigned long long)ChunkPtr, NonNull, Valid, Stride);
+                std::printf("[canon] chunk[%d] @ 0x%llX: %u non-null, %u valid-vtable (stride=%u obj_off=%u)\n",
+                    Ci, (unsigned long long)ChunkPtr, NonNull, Valid, Stride, ObjOff);
             }
 
             std::printf("[canon] canonical enumeration: %zu unique UObjects (expected ~%d)\n",
@@ -1148,7 +1157,7 @@ namespace gobjects
             }
 
             uint64_t obj = 0;
-            m_reader.Read(chunk + (uint64_t)m_itemStride * item_idx + FUOBJECTITEM_OBJ, &obj, 8);
+            m_reader.Read(chunk + (uint64_t)m_itemStride * item_idx + m_itemObjOff, &obj, 8);
             return obj;
         }
 
@@ -1249,6 +1258,11 @@ namespace gobjects
         bool           m_useWorldFallback;
         bool           m_chunkEntriesIndirect;
         int            m_itemStride;
+        // UE 5.7 (CL-1372005) moved the UObject pointer inside FUObjectItem
+        // from +0 to +8; the first 8 bytes hold flags there. Every FUObjectItem
+        // read must go through this offset — using 0 unconditionally reads the
+        // flags dword instead and drops the object count from 313k to ~40k.
+        uint32_t       m_itemObjOff = FUOBJECTITEM_OBJ;
         std::vector<uint64_t> m_worldFallbackObjects;
 
         // Pre-captured SIMD chunk_table-decrypt XOR key. When set (by

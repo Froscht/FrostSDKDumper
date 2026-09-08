@@ -1381,7 +1381,10 @@ public:
             // Newest first. Each self-tests by decoding CI=0 to "None", so a
             // wrong pipeline declines instead of producing plausible garbage,
             // and no version or image-size gate is needed to order them.
-            if (m_fname.AdoptV818()) {
+            if (m_fname.AdoptV908()) {
+                ArcDecrypt::ApplyOffsets908();
+                std::printf("[v908] active; FField/FProperty layout applied\n");
+            } else if (m_fname.AdoptV818()) {
                 ArcDecrypt::ApplyOffsets818();
                 std::printf("[v818] active; FField/FProperty layout applied\n");
             } else if (m_fname.AdoptV811()) {
@@ -1974,8 +1977,11 @@ public:
             // score candidates, which is exactly what they are trying to find)
             // and they overwrite the values we already know. Re-assert the
             // binary-derived layout afterwards so it wins.
-            if (m_fname.IsV818Active() || m_fname.IsV811Active()) {
-                if (m_fname.IsV818Active()) {
+            if (m_fname.IsV908Active() || m_fname.IsV818Active() || m_fname.IsV811Active()) {
+                if (m_fname.IsV908Active()) {
+                    ArcDecrypt::ApplyOffsets908();
+                    std::printf("[v908] re-asserted FField layout after auto_offsets\n");
+                } else if (m_fname.IsV818Active()) {
                     ArcDecrypt::ApplyOffsets818();
                     std::printf("[v818] re-asserted FField layout after auto_offsets\n");
 
@@ -3760,7 +3766,8 @@ public:
                  << "// Game updated:  " << (SteamInfo.Updated.empty() ? "unknown" : SteamInfo.Updated) << "\n"
                  << "// Image size:    0x" << std::hex << AutoDiscovery::g_DiscoveredBounds.ImageSize
                  << std::dec << "  (module base 0x" << std::hex << MODULE_BASE << std::dec << ")\n"
-                 << "// FName pipeline: " << (m_fname.IsV818Active() ? "v20260818"
+                 << "// FName pipeline: " << (m_fname.IsV908Active() ? "v20260908"
+                                     : m_fname.IsV818Active() ? "v20260818"
                                      : m_fname.IsV811Active() ? "v20260811"
                                      : m_fname.IsV808Active() ? "v20260808" : "legacy") << "\n"
                  << "// PID: " << m_pid << "\n"

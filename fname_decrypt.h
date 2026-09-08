@@ -535,6 +535,145 @@ public:
     }
 
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Steam CL-1372005 (UE 5.7, 2026-09-08). Same self-test contract as v818:
+    // the pipeline is installed against the compiled anchors, then CI=0 is
+    // required to decode to "None", followed by a second printable name.
+    // If either check fails, m_v908Active is reset and the caller falls through
+    // to older pipelines.
+    // ─────────────────────────────────────────────────────────────────────────
+    bool IsV908Active() const { return m_v908Active; }
+
+    bool AdoptV908() { return TryV908(true); }
+
+    bool TryV908(bool Verbose) {
+        namespace V = ArcDecrypt::v20260908;
+        const auto& Sh = ArcDecrypt::g_Sheet;
+        m_v908Active = false;
+
+        // Keystream lives at (base + Keystream908Rva); the window covers the
+        // decryptable range. Read the full table so the +BaseIdx form works.
+        size_t Bytes = sizeof(m_keyTable908);
+        if (!m_reader.Read(m_base + Sh.Keystream908Rva, m_keyTable908, Bytes)) {
+            if (Verbose)
+                std::printf("[fname] v908 keystream read failed @ 0x%llX\n",
+                    (unsigned long long)(m_base + Sh.Keystream908Rva));
+            return false;
+        }
+        m_pool908Rva = Sh.Pool908Rva;
+        m_v908Active = true;
+        m_keyLoaded  = true;
+
+        std::string Probe = DecryptNameString_V908(ResolveNamePtr_V908(0));
+        if (Probe != "None") {
+            if (Verbose)
+                std::printf("[fname] v908 self-test failed (CI=0 gave \"%s\", expected \"None\") - not adopting\n",
+                    Probe.c_str());
+            m_v908Active = false;
+            return false;
+        }
+        std::string Second;
+        for (int32_t Ci = 1; Ci < 512 && Second.empty(); ++Ci) {
+            std::string S = DecryptNameString_V908(ResolveNamePtr_V908(Ci));
+            if (S.size() < 3) continue;
+            bool Clean = true;
+            for (unsigned char C : S)
+                if (!std::isalnum(C) && C != '_') { Clean = false; break; }
+            if (Clean) Second = S;
+        }
+        if (Second.empty()) {
+            if (Verbose)
+                std::printf("[fname] v908 self-test: CI=0 gave \"None\" but no second "
+                            "plaintext decoded - not adopting\n");
+            m_v908Active = false;
+            return false;
+        }
+        if (Verbose)
+            std::printf("[fname] Pipeline = v20260908 (pool 0x%llX, keystream window 0x%llX) "
+                        "- CI=0 -> \"None\" OK, 2nd plaintext: %s\n",
+                (unsigned long long)Sh.Pool908Rva,
+                (unsigned long long)Sh.Keystream908Rva,
+                Second.c_str());
+        return true;
+    }
+
+    uint64_t ResolveNamePtr_V908(int32_t CompIndex) const {
+        if (CompIndex < 0 || !m_v908Active) return 0;
+        return AutoDiscovery::V908Detail::ResolveEntry(m_reader, m_base, CompIndex);
+    }
+
+    std::string DecryptNameString_V908(uint64_t NameEntryPtr) {
+        namespace V = ArcDecrypt::v20260908;
+        namespace X = AutoDiscovery::V908Detail;
+        if (!NameEntryPtr || !m_v908Active) return {};
+
+        X::EntryHeader H;
+        if (!X::ReadHeader(m_reader, NameEntryPtr, H)) return {};
+        if (H.Bytes <= 0 || H.Bytes > 2048) return {};
+
+        std::vector<uint8_t> Buf((size_t)H.Bytes, 0);
+        if (!m_reader.Read(NameEntryPtr + 2, Buf.data(), (size_t)H.Bytes)) return {};
+
+        // Keystream is indexed from base 0 because we loaded from the window
+        // start (Keystream908Rva already carries the +0xF0 offset).
+        if (!H.IsWide) return X::DecryptNarrow(Buf, H.Length, m_keyTable908, 0);
+        return X::DecryptWide(Buf, H.Length, m_keyTable908, 0);
+    }
+
+    // 16-byte slot decode. Only lo64 is used by the decoder itself, but the
+    // signature mirrors DecodeObjSlot16_V818 to keep call sites uniform.
+    uint64_t DecodeObjSlot16_V908(uint64_t ObjPtr, uint32_t Idx) const {
+        namespace V = ArcDecrypt::v20260908;
+        uint64_t Raw[2] = { 0, 0 };
+        uint64_t Slot = ObjPtr + V::UOBJ_NAME_SLOT_BASE + V::UOBJ_NAME_SLOT_STRIDE * Idx;
+        if (!m_reader.Read(Slot, Raw, 16)) return 0;
+        if (!Raw[0] && !Raw[1]) return 0;
+        return AutoDiscovery::V908Detail::DecodeSlot16(Raw[0], Raw[1]);
+    }
+
+    uint64_t GetObjFNameV908(uint64_t ObjPtr) const {
+        uint32_t Idx = AutoDiscovery::V908Detail::NameSlotIndex(ObjPtr);
+        return DecodeObjSlot16_V908(ObjPtr, Idx);
+    }
+
+    std::string GetNameV908(uint64_t ObjPtr) {
+        uint64_t F = GetObjFNameV908(ObjPtr);
+        if (!F) return {};
+        std::string S = DecryptNameString_V908(
+            ResolveNamePtr_V908((int32_t)(F & 0xFFFFFFFFu)));
+        uint32_t Number = (uint32_t)(F >> 32);
+        if (S.empty() || Number == 0) return S;
+        return S + "_" + std::to_string(Number - 1);
+    }
+
+    uint64_t DecodeObjSlotPtrV908(uint64_t ObjPtr, uint32_t /*SlotRel*/, uint32_t Which) const {
+        // Which: 0 = Name (Idx ^ 2), 1 = Class ((Idx+1)&3), 2 = Outer (Idx)
+        uint32_t Idx;
+        switch (Which) {
+            case 0: Idx = AutoDiscovery::V908Detail::NameSlotIndex(ObjPtr); break;
+            case 1: Idx = AutoDiscovery::V908Detail::ClassSlotIndex(ObjPtr); break;
+            default: Idx = AutoDiscovery::V908Detail::OuterSlotIndex(ObjPtr); break;
+        }
+        uint64_t Ptr = DecodeObjSlot16_V908(ObjPtr, Idx);
+        if (Ptr < 0x10000ULL || Ptr >= 0x800000000000ULL) return 0;
+        return Ptr;
+    }
+    uint64_t GetClassPtrV908(uint64_t ObjPtr) const {
+        return DecodeObjSlotPtrV908(ObjPtr, 0, 1);
+    }
+    uint64_t GetOuterPtrV908(uint64_t ObjPtr) const {
+        return DecodeObjSlotPtrV908(ObjPtr, 0, 2);
+    }
+
+    int32_t DecryptFFieldNameCI_V908(uint64_t FieldAddr) const {
+        namespace V = ArcDecrypt::v20260908;
+        uint64_t Enc = 0;
+        if (!m_reader.Read(FieldAddr + V::FFIELD_NAME_OFF, &Enc, 8) || !Enc) return 0;
+        uint64_t Vv = AutoDiscovery::V908Detail::DecodeFFieldName(Enc);
+        return (int32_t)(Vv & 0xFFFFFFFFu);
+    }
+
+
     // Steam build 24653108. Both anchors are fixed RVAs rather than sig-scan
     // results, so the only thing that can validate them is plaintext: CI=0
     // must decode to "None". The keystream MUST be read from live memory —
@@ -3379,6 +3518,12 @@ private:
     uint16_t       m_keyTable818[64] = {};
     bool           m_v818Active  = false;
     uint64_t       m_pool818Rva  = ArcDecrypt::v20260818::RVA_GNAMEPOOL;
+    // v908 (CL-1372005, UE 5.7). The keystream table entry count is the same
+    // 160-uint16 shape as CL-1325322/v20260808; the effective decrypt window
+    // starts at byte offset +0xA0 above KEYSTREAM_RVA.
+    uint16_t       m_keyTable908[ArcDecrypt::v20260908::KEYSTREAM_ENTRIES] = {};
+    bool           m_v908Active  = false;
+    uint64_t       m_pool908Rva  = ArcDecrypt::v20260908::RVA_GNAMEPOOL;
     uint64_t       m_pool811Rva  = 0;
     int            m_ks811Base   = ArcDecrypt::v20260811::KEYSTREAM_BASE_INDEX;
 

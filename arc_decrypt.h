@@ -1643,6 +1643,259 @@ namespace v20260818 {
 } // namespace v20260818
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Steam build CL-1372005 (1.45.x, UE 5.7, 2026-09-08). Image size 0x14091000.
+//
+// UE 5.7 change: FUObjectItem grew to 24 bytes and the UObject pointer moved
+// from +0 to +8 (first 8 bytes are flags now). ITEMS_PER_CHUNK stays 65536.
+//
+// Theia changes on this patch:
+//   - Slot decoder is again a shared leaf, but the pair of 64-bit polynomials
+//     changed (both K1 and K2 point at 0x14D4DF8D0 / 0x14D4DF910 in .rdata).
+//   - FName resolver is split across three functions instead of two — a new
+//     "middle" layer wraps the inner resolver. All three pointer XORs collapse
+//     to identity like on v20260818, so EntryPtr = FNV_out + 2*NameOff.
+//   - FField NamePrivate now decodes via PSHUFB + XOR + per-word ROL16(13) +
+//     final ROL64(32), NOT the ROL32/PADDD chain used on CL-1341255.
+//   - Block decode uses (pand/pandn)+pxor blend, per-dword ROL32(3), and a
+//     per-dword PADDD constant — none of ROL64+XOR+ROL32 from v818.
+//   - Shard hash goes back to a rotate-heavy FNV-32 (rols 19,13,19,13) with
+//     a slot selector `(-109*T + 102) ^ ((P*T + ADD) >> 16) & 7`, like the
+//     CL-1315578 shape rather than v818's `S = H^(H>>16); B = S & 7`.
+//   - chunks_manager is still a standalone encrypted 16-byte global. Its
+//     concrete decode shape is not extracted yet — set below to zero and gated
+//     off until Auto-Resolve provides it.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace v20260908 {
+    constexpr uint64_t IMAGE_SIZE            = 0x14091000ULL;
+
+    // Pool address is 0x150AB5DC0 in IDA (RVA 0x10AB5DC0). Verified against
+    // the .rdata bytes at rest — 0x150AB5DC0 shows the expected FNamePool
+    // block header while heap-probe candidates like 0x150A36B08 are runs of
+    // 0xFF bytes and are NOT pools.
+    constexpr uint64_t RVA_GNAMEPOOL         = 0x10AB5DC0ULL;
+    constexpr uint64_t RVA_POOL_INIT_FLAG    = 0x10AB5D98ULL;
+    constexpr uint64_t RVA_GNAMEPOOL_INIT    = 0x10AB5D98ULL; // legacy alias
+
+    // Keystream window: uint16 table at RVA_KEYSTREAM. Decryptable entries
+    // start at index KEYSTREAM_BASE_INDEX (byte-offset +0xF0 -> u16 idx 120).
+    // Decrypted in place at load, so it MUST be read from live memory.
+    constexpr uint64_t RVA_KEYSTREAM         = 0x1095926CULL;
+    constexpr int      KEYSTREAM_BASE_INDEX  = 0x78;
+    constexpr int      KEYSTREAM_ENTRIES     = 0x80;
+    // Legacy alias.
+    constexpr int      KEYSTREAM_BASE_OFF    = 0xF0;
+
+    // FName entry function anchors.
+    constexpr uint64_t RVA_FNAME_TOSTRING    = 0x2BF200ULL;
+    constexpr uint64_t RVA_FNAME_STEP2       = 0x2DA4A0ULL;
+    constexpr uint64_t RVA_FNAME_INNER       = 0x2DA260ULL;
+    constexpr uint64_t RVA_POOL_INIT         = 0x2C7D20ULL;
+    constexpr uint64_t RVA_FNAME_RESOLVER    = 0x2D5F40ULL; // sub_1402D5F40 (legacy alias)
+
+    // Shard hash: 3 IMULs + final ROL32(13), then the CL-1315578-style slot
+    // selector `(-109*v9 + 102) ^ ((P*v9+ADD) >> 16) & 7`. NOT `H ^ (H>>16)`.
+    constexpr uint32_t HASH_PRIME            = 0x01000193u;
+    constexpr uint32_t SHARD_HASH_PRIME      = 0x01000193u;
+    constexpr uint32_t SHARD_HASH_ADD        = 0x902D0766u;
+    constexpr int      SHARD_HASH_ROL_A      = 19;
+    constexpr int      SHARD_HASH_ROL_B      = 13;
+    constexpr uint64_t SHARD_HASH_SEED_OFF   = 0x2490ULL;
+    constexpr uint64_t SHARD_BLOCK_BASE_OFF  = 0x24A0ULL;
+    constexpr uint64_t SHARD_BLOCK_STRIDE    = 0x20ULL;
+    // Legacy aliases so old references still compile.
+    constexpr int      SHARD_ROL_A           = 19;
+    constexpr int      SHARD_ROL_B           = 13;
+    constexpr int      SHARD_ROL_C           = 19;
+    constexpr int      SHARD_ROL_D           = 13;
+    constexpr uint32_t SHARD_SLOT_M          = 0xFFFFFF93u;
+    constexpr uint32_t SHARD_SLOT_ADD        = 102u;
+    constexpr int      SHARD_SLOT_ROL        = 13;
+
+    // Block decrypt. Blend `(x & K1) | (~x & K2)` collapses to `x ^ K2`
+    // because K2 == ~K1, and `K2_C80 ^ K3_CA0 == K_BB0`, so both blocks
+    // reduce to the SAME effective XOR key = BLOCK2_XOR.
+    constexpr uint64_t BLOCK1_BLEND_K1_RVA   = 0xD4D3C80ULL;
+    constexpr uint64_t BLOCK1_BLEND_K2_RVA   = 0xD4D3C90ULL;
+    constexpr uint64_t BLOCK1_XOR_RVA        = 0xD4D3CA0ULL;
+    constexpr uint64_t BLOCK_ADD_RVA         = 0xD4D3BC0ULL;
+    constexpr uint64_t BLOCK2_XOR_RVA        = 0xD4D3BB0ULL;
+    constexpr uint64_t BLOCK1_BLEND_K2       = 0x2B4667862B466786ULL;
+    constexpr uint64_t BLOCK1_XOR            = 0x9B9D24BF5D56B7D8ULL;
+    constexpr uint64_t BLOCK_ADD             = 0xB0DB433A7610D05FULL;
+    constexpr uint64_t BLOCK2_XOR            = 0x4F24BCC689EF2FA1ULL;
+    constexpr int      BLOCK_ROL32           = 3;
+    // Legacy aliases.
+    constexpr uint64_t BLOCK1_BLEND_K_A      = 0x2B4667862B466786ULL;
+    constexpr uint64_t BLOCK1_BLEND_K_B      = 0xD4B99879D4B99879ULL;
+
+    // FNV64 chain.
+    constexpr uint64_t FNV_PRIME             = 0x100000001B3ULL;
+    constexpr uint64_t FNV_ADD               = 0x6292C37EFA7F5FA6ULL;
+    constexpr int      FNV_ROL1              = 37;
+    constexpr int      FNV_ROL2              = 48;
+
+    // Pointer chain (3 steps across sub_1402DA260 / DA4A0 / BF200).
+    // Applied explicitly for correctness (algebraically it collapses to
+    // identity because K1_i == K2_(7-i) ^ K3_(7-i)), but keeping the three
+    // steps means any future change to the chain flows through automatically.
+    constexpr uint64_t PTR_XOR1              = 0x5D4B82B8ULL;
+    constexpr uint64_t PTR_XOR2              = 0x0000516500000000ULL;
+    constexpr uint64_t PTR_XOR3              = 0xB8821A3800000000ULL;
+    // Legacy aliases.
+    constexpr uint64_t FNAME_PTR_XOR_INNER   = 0x000000005D4B82B8ULL;
+    constexpr uint64_t FNAME_PTR_XOR_MIDDLE  = 0x0000516500000000ULL;
+    constexpr uint64_t FNAME_PTR_XOR_OUTER   = 0xB8821A3800000000ULL;
+    constexpr bool     FNAME_PTR_CHAIN_IS_NOP = true;
+
+    // CI transform at head of sub_1402BF200 (used by the pool wrapper, not
+    // by external CI passers — ResolveEntry consumes CI as-is).
+    constexpr uint64_t RVA_CI_TRANSFORM_KEY  = 0xD4D38A0ULL;
+    constexpr uint64_t CI_TRANSFORM_KEY_LO64 = 0x878588013124D57FULL;
+    constexpr int      CI_TRANSFORM_ROL32    = 0x19;
+
+    // FNameEntry header: 10-bit RAW-BYTE-COUNT length. Wide-flag sign bit.
+    constexpr uint16_t HDR_IS_WIDE_BIT       = 0x8000u;
+    constexpr uint16_t HDR_LENGTH_MASK       = 0x03FFu;
+    // Legacy split-mask aliases.
+    constexpr uint16_t HDR_LEN_LOW_MASK      = 0x0007u;
+    constexpr uint16_t HDR_LEN_HIGH_MASK     = 0x03F8u;
+    constexpr int      HDR_LEN_HIGH_SHIFT    = 5;
+
+    // String decrypt (paired key schedule): idx1 = key & 0x3F, idx2 =
+    // (key-1) & 0x3F. narrow shifts u16 by 3 to get byte key; wide XORs
+    // full u16. After each pair, key += KEY_STEP_PAIR. Odd tail advances
+    // by KEY_STEP_SINGLE.
+    constexpr uint32_t KEY_INIT_ADD          = 0x2E0u;
+    constexpr uint32_t KEY_STEP_PAIR         = 0x67Eu;
+    constexpr uint32_t KEY_STEP_SINGLE       = 0x33Fu;
+    constexpr uint8_t  KEY_INDEX_MASK        = 0x3Fu;
+    constexpr int      NARROW_KEY_SHIFT      = 3;
+    constexpr int      WIDE_KEY_SHIFT        = 0;
+    // Legacy aliases.
+    constexpr uint32_t KEY_ADVANCE_NARROW    = 0x33Fu;
+    constexpr uint32_t KEY_ADVANCE_WIDE      = 0x3F0u;
+
+    // chunks_manager (encrypted 16-byte global in .data). Decrypt:
+    //   step1 = blob ^ MGR_KEY
+    //   step2 = ROL16(step1, 13)
+    //   mgr_ptr = PSHUFLW(step2, 27).lo64
+    // Then on the decoded manager:
+    //   NumElements = bswap32(*(u32*)(mgr + 4)  ^ MGR_NUMELEMENTS_XOR)
+    //   ChunkArray  = bswap64(*(u64*)(mgr + 48) ^ MGR_CHUNKARRAY_XOR)
+    // The RVA leading byte is 0x10 (chunkmgr sits in .data at 0x10D853F0),
+    // NOT 0xD853F0 — losing that nibble was the first-port bug.
+    constexpr uint64_t RVA_CHUNKMGR_GLOBAL   = 0x10D853F0ULL;
+    constexpr uint64_t RVA_CHUNKMGR_KEY      = 0xD4B22B0ULL;
+    constexpr int      CHUNKMGR_ROL16        = 13;
+    constexpr int      CHUNKMGR_PSHUFLW_IMM  = 27;
+    constexpr uint64_t MGR_NUMELEMENTS_OFF   = 0x04ULL;
+    constexpr uint32_t MGR_NUMELEMENTS_XOR   = 0xBD497AA1u;
+    constexpr uint64_t MGR_CHUNKARRAY_OFF    = 0x30ULL;
+    constexpr uint64_t MGR_CHUNKARRAY_XOR    = 0x6BC7FB8600000000ULL;
+    // Legacy aliases.
+    constexpr uint64_t CHUNKMGR_XOR_KEY_RVA  = 0xD4B22B0ULL;
+    constexpr uint64_t CHUNKMGR_XOR_KEY_LO64 = 0xD4A8B60E86179E4EULL;
+
+    // FUObjectItem (UE 5.7): stride 24, UObject* at +8 (flags at +0..+7).
+    // Still 65536 items per chunk despite the class-comment note about 8192 —
+    // live probes confirm 65536.
+    constexpr uint32_t FUOBJECTITEM_STRIDE   = 24;
+    constexpr uint32_t ITEMS_PER_CHUNK       = 65536;
+    constexpr int      CHUNK_INDEX_SHIFT     = 16;
+    constexpr uint64_t CHUNK_INDEX_MASK      = 0xFFFFULL;
+    constexpr uint64_t FUOBJECTITEM_OBJ_OFF  = 0x08ULL;
+    constexpr uint64_t FUOBJECTITEM_FLAGS    = 0x00ULL;
+    constexpr uint64_t UOBJECT_INTERNAL_IDX  = 0x90ULL;
+
+    // UObject::GetFName. Anchored via AngelScript "FName GetName() const"
+    // string. Slot decode:
+    //   V = PSHUFLW(*Slot, 30) ^ SLOT_XOR_KEY_LO64
+    //   V = ROL64(V, 17)
+    //   V = PSHUFB(V, SLOT_PSHUF_MASK)
+    //   FName = ROL64(V.lo64, 32)
+    // Slot hash: uses SUBTRACT ADD not add, and a distinct IDX-ADD constant.
+    constexpr uint64_t RVA_UOBJECT_GETFNAME  = 0x51A1928ULL;
+    constexpr uint64_t RVA_GETFNAME          = 0x51A1928ULL;
+    constexpr uint64_t RVA_SLOT_DECODER      = 0x5E7490ULL;
+    constexpr uint64_t UOBJ_NAME_SEED_OFF    = 0x10ULL;
+    constexpr uint64_t UOBJ_NAME_SLOT_BASE   = 0x20ULL;
+    constexpr uint64_t UOBJ_NAME_SLOT_STRIDE = 0x20ULL;
+    constexpr uint32_t UOBJ_SLOT_HASH_PRIME  = 0x01000193u;
+    constexpr uint32_t UOBJ_SLOT_HASH_ADD    = 0x99C193C4u; // -1724173436
+    constexpr uint32_t UOBJ_SLOT_IDX_ADD     = 209796u;      // 0x33384
+    constexpr int      UOBJ_SLOT_ROL_A       = 13;
+    constexpr int      UOBJ_SLOT_ROL_B       = 22;
+    constexpr int      UOBJ_SLOT_ROL_C       = 13;
+    constexpr int      UOBJ_SLOT_SHR         = 10;
+    constexpr int      UOBJ_SLOT_SHR_D       = 10; // legacy
+    // Slot role adjustments: Name = Idx ^ 2, Class = (Idx + 1) & 3, Outer = Idx.
+    constexpr uint32_t UOBJ_SLOT_NAME_XOR    = 2u;
+    constexpr uint32_t UOBJ_SLOT_CLASS_ADJ   = 1u;
+    constexpr uint32_t UOBJ_SLOT_OUTER_ADJ   = 0u;
+    constexpr int      UOBJ_SLOT_PSHUFLW_IMM = 30;
+    constexpr int      UOBJ_SLOT_ROL64       = 17;
+    constexpr int      UOBJ_NAME_ROL64       = 32;
+    constexpr uint64_t RVA_SLOT_XOR_KEY      = 0xD4DF910ULL;
+    constexpr uint64_t RVA_SLOT_XOR_KEY_ALT  = 0xD4DF8D0ULL;
+    constexpr uint64_t RVA_SLOT_SHUF_MASK    = 0xD4DF8E0ULL;
+    constexpr uint64_t SLOT_XOR_KEY_LO64     = 0x06CC58E720047BF7ULL;
+    constexpr uint8_t  SLOT_PSHUF_MASK[8]    = { 0x02, 0x05, 0x04, 0x06, 0x00, 0x07, 0x01, 0x03 };
+    // Legacy aliases.
+    constexpr uint64_t SLOT_KEY_A            = 0x06CC58E720047BF7ULL;
+    constexpr uint64_t SLOT_KEY_B            = 0x06CC58E720047BF7ULL;
+    constexpr uint8_t  SLOT_PSHUFB[8]        = { 2, 5, 4, 6, 0, 7, 1, 3 };
+
+    // FField NamePrivate: PSHUFB(mask) -> XOR(key) -> ROL16(13) -> ROL64(32).
+    constexpr uint64_t FFIELD_NAME_OFF       = 0x90ULL;
+    constexpr uint64_t RVA_FFIELD_NAME_MASK  = 0xD4DF950ULL;
+    constexpr uint64_t RVA_FFIELD_NAME_KEY   = 0xD4DF960ULL;
+    constexpr uint64_t FFIELD_NAME_KEY_LO64  = 0x0D58B9970DD2BBAFULL;
+    constexpr uint8_t  FFIELD_NAME_PSHUF_MASK[8] = { 0x05, 0x06, 0x01, 0x04, 0x03, 0x07, 0x02, 0x00 };
+    constexpr int      FFIELD_NAME_ROL16     = 13;
+    constexpr int      FFIELD_NAME_ROL64     = 32;
+    // Legacy aliases.
+    constexpr uint8_t  FFIELD_NAME_PSHUFB[8] = { 5, 6, 1, 4, 3, 7, 2, 0 };
+    constexpr uint64_t FFIELD_NAME_XOR_KEY   = 0x0D58B9970DD2BBAFULL;
+
+    // FField layout (verified 2026-09-08 via live probing).
+    constexpr uint64_t FFIELD_OWNER_OFF      = 0x68ULL;
+    constexpr uint64_t FFIELD_CLASS_OFF      = 0x70ULL;
+    constexpr uint64_t FFIELD_FLAGS_OFF      = 0x78ULL;
+    constexpr uint64_t FFIELD_NEXT_OFF       = 0x108ULL;
+
+    // FProperty layout.
+    constexpr uint64_t FPROP_OFFSETINT_OFF   = 0xB0ULL;
+    constexpr uint32_t FPROP_OFFSET_XOR      = 0xC2CEEE92u;
+    constexpr uint64_t FPROP_ELEMSIZE_OFF    = 0xB8ULL;
+    constexpr uint64_t FPROP_ARRAYDIM_OFF    = 0xBCULL;
+    constexpr uint64_t FPROP_PROPFLAGS_OFF   = 0xC0ULL;
+    constexpr uint64_t FPROP_SIZEOF          = 0x100ULL;
+
+    // FBoolProperty extended slot (base is 0x118, not sizeof).
+    constexpr uint64_t FBOOLPROP_FIELDSIZE   = 0x118ULL;
+    constexpr uint64_t FBOOLPROP_BYTEOFFSET  = 0x119ULL;
+    constexpr uint64_t FBOOLPROP_BYTEMASK    = 0x11AULL;
+    constexpr uint64_t FBOOLPROP_FIELDMASK   = 0x11BULL;
+
+    // UStruct layout.
+    constexpr uint64_t USTRUCT_SUPER_OFF     = 0xA8ULL; // provisional
+    constexpr uint64_t USTRUCT_CHILDPROPS    = 0x108ULL;
+    constexpr uint64_t USTRUCT_PROPSIZE_OFF  = 0xD0ULL;
+    constexpr uint64_t USTRUCT_BASECHAIN     = 0xA0ULL;
+    constexpr uint64_t USTRUCT_BASECHAIN_DEPTH = 0xA8ULL;
+    constexpr uint64_t USTRUCT_MINALIGN      = 0xD8ULL; // provisional
+
+    // UClass / UFunction / UEnum (provisional).
+    constexpr uint64_t UCLASS_CASTFLAGS_OFF  = 0x1E8ULL;
+    constexpr uint64_t UCLASS_FLAGS_OFF      = 0x158ULL;
+    constexpr uint64_t UCLASS_WITHIN_OFF     = 0x150ULL;
+    constexpr uint64_t UFUNCTION_NATIVEFUNC  = 0x150ULL;
+    constexpr uint64_t UENUM_NAMES_OFF       = 0xB0ULL;
+    constexpr uint64_t UENUM_NUM_OFF         = 0xB8ULL;
+} // namespace v20260908
+
+
 // Applied twice: once when the pipeline is adopted, and again after
 // auto_offsets runs, because the generic probes need a working FField name
 // decode to score candidates — the very thing they are trying to discover —
@@ -1813,6 +2066,84 @@ struct LiveSheet {
     uint64_t UStruct818ChildProps = v20260818::USTRUCT_CHILDPROPS;
     uint64_t UStruct818Super      = v20260818::USTRUCT_SUPER_OFF;
     uint64_t UStruct818Children   = v20260818::USTRUCT_CHILDREN;
+
+    // The v20260908 anchors. Same rule as the 818 fields above: separate from
+    // 811/818 rather than overloaded, so a half-adopted mix cannot silently
+    // decode garbage. Shape differences on v908:
+    //   - Block decode uses per-dword ROL32(3) + PADDD, with a
+    //     pand/pandn/por blend on block 1 keyed by two different constants
+    //   - FField name decode is PSHUFB + XOR + ROL16(13) + ROL64(32)
+    //   - Slot decoder is a shared leaf again but with new K1/K2 polynomials
+    //   - Chunks-manager decrypt shape is not extracted yet; the array init
+    //     path falls back to the 818 shape (and will fail) until Auto-Resolve
+    //     supplies the v908 decode.
+    uint64_t Pool908Rva          = v20260908::RVA_GNAMEPOOL;
+    // Keystream window: KEYSTREAM_RVA + KEYSTREAM_BASE_INDEX*2 bytes.
+    uint64_t Keystream908Rva     =
+        v20260908::RVA_KEYSTREAM + (uint64_t)v20260908::KEYSTREAM_BASE_INDEX * 2;
+    uint64_t ChunkMgr908Rva      = v20260908::RVA_CHUNKMGR_GLOBAL;
+    uint64_t ChunkMgr908KeyRva   = v20260908::RVA_CHUNKMGR_KEY;
+    uint32_t Mgr908NumOff        = (uint32_t)v20260908::MGR_NUMELEMENTS_OFF;
+    uint32_t Mgr908NumXor        = v20260908::MGR_NUMELEMENTS_XOR;
+    uint64_t Mgr908ArrOff        = v20260908::MGR_CHUNKARRAY_OFF;
+    uint64_t Mgr908ArrXor        = v20260908::MGR_CHUNKARRAY_XOR;
+
+    std::vector<HashOp> Shard908Program;   // empty => the compiled ROL form
+    uint64_t Seed908Off        = v20260908::SHARD_HASH_SEED_OFF;
+    uint64_t Block908Base      = v20260908::SHARD_BLOCK_BASE_OFF;
+    uint64_t Block908Stride    = v20260908::SHARD_BLOCK_STRIDE;
+    uint64_t Block1BlendKa908  = v20260908::BLOCK1_BLEND_K_A;
+    uint64_t Block1BlendKb908  = v20260908::BLOCK1_BLEND_K_B;
+    uint64_t Block1Xor908      = v20260908::BLOCK1_XOR;
+    uint64_t Block2Xor908      = v20260908::BLOCK2_XOR;
+    uint64_t BlockAdd908       = v20260908::BLOCK_ADD;
+    int      BlockRol32_908    = v20260908::BLOCK_ROL32;
+    uint64_t Fnv908Prime       = v20260908::FNV_PRIME;
+    uint64_t Fnv908Add         = v20260908::FNV_ADD;
+    int      Fnv908Rol1        = v20260908::FNV_ROL1;
+    int      Fnv908Rol2        = v20260908::FNV_ROL2;
+    uint16_t Hdr908WideBit     = v20260908::HDR_IS_WIDE_BIT;
+    uint16_t Hdr908LenLoMask   = v20260908::HDR_LEN_LOW_MASK;
+    uint16_t Hdr908LenHiMask   = v20260908::HDR_LEN_HIGH_MASK;
+    int      Hdr908LenHiShift  = v20260908::HDR_LEN_HIGH_SHIFT;
+    uint32_t KeyInitAdd908     = v20260908::KEY_INIT_ADD;
+    uint32_t KeyAdvanceNarrow908 = v20260908::KEY_ADVANCE_NARROW;
+    uint32_t KeyAdvanceWide908 = v20260908::KEY_ADVANCE_WIDE;
+
+    std::vector<HashOp> Slot908Program;    // empty => compiled ROL/SHR form
+    uint64_t Slot908SeedOff    = v20260908::UOBJ_NAME_SEED_OFF;
+    uint64_t Slot908Base       = v20260908::UOBJ_NAME_SLOT_BASE;
+    uint64_t Slot908Stride     = v20260908::UOBJ_NAME_SLOT_STRIDE;
+    uint32_t Slot908NameXor    = v20260908::UOBJ_SLOT_NAME_XOR;
+    uint32_t Slot908ClassAdj   = v20260908::UOBJ_SLOT_CLASS_ADJ;
+    uint32_t Slot908OuterAdj   = v20260908::UOBJ_SLOT_OUTER_ADJ;
+    int      Slot908FinalRol   = v20260908::UOBJ_NAME_ROL64;
+    uint64_t SlotKeyA_908      = v20260908::SLOT_KEY_A;
+    uint64_t SlotKeyB_908      = v20260908::SLOT_KEY_B;
+    uint8_t  SlotPshufb908[8]  = { 2, 5, 4, 6, 0, 7, 1, 3 };
+
+    bool     Resolved908           = false;
+    bool     PropOff908Resolved    = false;
+    bool     FFieldName908Resolved = false;
+    bool     Layout908Resolved     = false;
+    bool     ChunkMgr908Resolved   = false;
+
+    uint64_t FFieldName908Off        = v20260908::FFIELD_NAME_OFF;
+    uint64_t FFieldNameKey908        = v20260908::FFIELD_NAME_XOR_KEY;
+    uint8_t  FFieldNamePshufb908[8]  = { 5, 6, 1, 4, 3, 7, 2, 0 };
+    int      FFieldName908Rol16      = v20260908::FFIELD_NAME_ROL16;
+    int      FFieldName908Rol64      = v20260908::FFIELD_NAME_ROL64;
+    uint64_t FProp908Sizeof          = v20260908::FPROP_SIZEOF;
+    uint64_t FField908Next           = v20260908::FFIELD_NEXT_OFF;
+    uint64_t FField908Owner          = v20260908::FFIELD_OWNER_OFF;
+    uint64_t FField908Class          = v20260908::FFIELD_CLASS_OFF;
+    uint64_t FField908Flags          = v20260908::FFIELD_FLAGS_OFF;
+    uint64_t UStruct908ChildProps    = v20260908::USTRUCT_CHILDPROPS;
+    uint64_t UStruct908Super         = v20260908::USTRUCT_SUPER_OFF;
+    uint64_t UStruct908BaseChain     = v20260908::USTRUCT_BASECHAIN;
+    uint32_t FUObjectItemStride908   = v20260908::FUOBJECTITEM_STRIDE;
+    uint64_t FUObjectItemObjOff908   = v20260908::FUOBJECTITEM_OBJ_OFF;
+    uint64_t UObjectInternalIdx908   = v20260908::UOBJECT_INTERNAL_IDX;
 };
 
 inline LiveSheet g_Sheet;
@@ -1914,5 +2245,60 @@ inline void ApplyOffsets818() {
     g_Sheet.ClassCastFlagsOff       = V::UCLASS_CASTFLAGS_OFF;
     g_Sheet.StructPropSizeOff       = V::USTRUCT_PROPSIZE_OFF;
     g_Sheet.BoolFieldBase           = g_Sheet.FProp818Sizeof;
+}
+
+
+// The CL-1372005 (UE 5.7) layout. Same rule as ApplyOffsets818 — applied on
+// adoption and again after auto_offsets runs, since the generic probes need a
+// working FField name decode to score candidates and overwrite these on the way
+// out.
+inline void ApplyOffsets908() {
+    namespace V = v20260908;
+    namespace Off = Offsets;
+    Off::FField::NamePrivate        = g_Sheet.FFieldName908Off;
+    Off::FField::NameEncrypted      = g_Sheet.FFieldName908Off;
+    Off::FField::Next               = g_Sheet.FField908Next;
+    Off::FField::Owner              = g_Sheet.FField908Owner;
+    Off::FField::ClassPrivate       = g_Sheet.FField908Class;
+    Off::UStruct::ChildProperties   = g_Sheet.UStruct908ChildProps;
+    Off::UStruct::PropertiesSize    = V::USTRUCT_PROPSIZE_OFF;
+    Off::UStruct::SuperStruct       = g_Sheet.UStruct908Super;
+    Off::UEnum::Names               = V::UENUM_NAMES_OFF;
+    Off::FProperty::ArrayDim        = V::FPROP_ARRAYDIM_OFF;
+    Off::FProperty::ElementSize     = V::FPROP_ELEMSIZE_OFF;
+    Off::FProperty::PropertyFlags   = V::FPROP_PROPFLAGS_OFF;
+    if (!g_Sheet.PropOff908Resolved) {
+        g_Sheet.PropOffsetInternal = V::FPROP_OFFSETINT_OFF;
+        g_Sheet.PropOffsetXor      = V::FPROP_OFFSET_XOR;
+    }
+    Off::FProperty::Offset_Internal = g_Sheet.PropOffsetInternal;
+    Off::FProperty::Offset_XOR      = g_Sheet.PropOffsetXor;
+    Off::FBoolProperty::FieldSize   = V::FBOOLPROP_FIELDSIZE;
+    Off::FBoolProperty::ByteOffset  = V::FBOOLPROP_BYTEOFFSET;
+    Off::FBoolProperty::ByteMask    = V::FBOOLPROP_BYTEMASK;
+    Off::FBoolProperty::FieldMask   = V::FBOOLPROP_FIELDMASK;
+    Patch20260421::g_PropertyOffsetXor = g_Sheet.PropOffsetXor;
+
+    // Subclass data starts right after the FProperty base (sizeof=0x100).
+    // Inner sits at +0x108 (KeyProp at +0x100) — probed live on the Windows
+    // port; TArray<FName> element size at +0x108 came out at 8 and TArray
+    // <FSoftObjectPath> at 32, which is the check that settles it.
+    const uint64_t Sz = g_Sheet.FProp908Sizeof;
+    Off::FArrayProperty::Inner          = Sz + 8;
+    Off::FSetProperty::ElementProp      = Sz;
+    Off::FSoftObjectProperty::PropertyClass = Sz;
+    Off::FMapProperty::KeyProp          = Sz;
+    Off::FMapProperty::ValueProp        = Sz + 8;
+    Off::FStructProperty::Struct        = Sz;
+    Off::FObjectProperty::PropertyClass = Sz;
+    Off::FEnumProperty::UnderlyingProp  = Sz;
+    Off::FEnumProperty::Enum            = Sz + 8;
+
+    // Not yet extracted for v908 — leave the metaclass oracle off until then.
+    // Callers must use ReadClassCastFlagsChecked so a zero verdict does not
+    // silently promote instances to classes.
+    g_Sheet.ClassCastFlagsOff       = 0;
+    g_Sheet.StructPropSizeOff       = V::USTRUCT_PROPSIZE_OFF;
+    g_Sheet.BoolFieldBase           = V::FBOOLPROP_FIELDSIZE;
 }
 } // namespace ArcDecrypt
