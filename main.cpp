@@ -2262,6 +2262,32 @@ public:
                 }
                 dumped_sample = true;
             }
+            // v908 debug: dump each raw slot's decoded value for the first
+            // few objects so we can distinguish name-slots (small FName
+            // handle values) from class-slots (real pointers).
+            static int v908_dbg_ctr = 0;
+            if (m_fname.IsV908Active() && v908_dbg_ctr < 8) {
+                std::string n = m_fname.GetName(obj);
+                std::printf("[v908-dbg] obj[%d]=0x%llX name='%s'\n",
+                    i, (unsigned long long)obj, n.c_str());
+                for (uint32_t Slot = 0; Slot < 4; ++Slot) {
+                    uint64_t Dec = m_fname.DecodeObjSlot16_V908(obj, Slot);
+                    // Try treat as ptr → get name
+                    std::string cn;
+                    if (Dec >= 0x10000ULL && Dec < 0x800000000000ULL) {
+                        cn = m_fname.GetName(Dec);
+                    }
+                    // Also try treat as {CI, Number} → look up name via pool
+                    int32_t Ci = (int32_t)(Dec & 0xFFFFFFFFu);
+                    std::string ni;
+                    if (Ci >= 0 && Ci < 1000000) {
+                        ni = m_fname.DecryptNameString_V908(m_fname.ResolveNamePtr_V908(Ci));
+                    }
+                    std::printf("[v908-dbg]   slot[%u] raw_dec=0x%016llX  as_ptr='%s'  as_ci[%d]='%s'\n",
+                        Slot, (unsigned long long)Dec, cn.c_str(), Ci, ni.c_str());
+                }
+                ++v908_dbg_ctr;
+            }
             for (uint64_t off = 0x10; off <= 0x80; off += 8) {
                 std::string s = m_fname.GetNameByHandle(obj, off);
                 if (isSaneName(s)) hits[off]++;

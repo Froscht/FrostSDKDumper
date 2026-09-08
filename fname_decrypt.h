@@ -637,8 +637,11 @@ public:
     }
 
     std::string GetNameV908(uint64_t ObjPtr) {
+        // F=0 is a legitimate CI value (== "None"), so we do NOT bail on it.
+        // Only bail if the slot decode itself failed (Raw[0]==Raw[1]==0) — but
+        // in that case DecryptNameString_V908 will return empty and the caller
+        // falls through to older pipelines.
         uint64_t F = GetObjFNameV908(ObjPtr);
-        if (!F) return {};
         std::string S = DecryptNameString_V908(
             ResolveNamePtr_V908((int32_t)(F & 0xFFFFFFFFu)));
         uint32_t Number = (uint32_t)(F >> 32);
@@ -654,7 +657,12 @@ public:
             case 1: Idx = AutoDiscovery::V908Detail::ClassSlotIndex(ObjPtr); break;
             default: Idx = AutoDiscovery::V908Detail::OuterSlotIndex(ObjPtr); break;
         }
-        uint64_t Ptr = DecodeObjSlot16_V908(ObjPtr, Idx);
+        uint64_t Raw = DecodeObjSlot16_V908(ObjPtr, Idx);
+        // Slot decode's final ROL64(32) puts the FName {CI, Number} in the
+        // right order for name slots, but leaves POINTER slots halves-swapped
+        // (a real 0x7FFFXXXXXXXX pointer appears as 0xXXXXXXXX00007FFF).
+        // Un-swap here to recover the raw pointer.
+        uint64_t Ptr = ((Raw << 32) | (Raw >> 32)) & 0xFFFFFFFFFFFFFFFFULL;
         if (Ptr < 0x10000ULL || Ptr >= 0x800000000000ULL) return 0;
         return Ptr;
     }
@@ -1379,6 +1387,22 @@ public:
         std::array<uint64_t, 4> out{};
         if (!obj_base || !m_keyLoaded) return out;
 
+        if (m_v908Active) {
+            // Iterate all 4 raw slots at obj+0x20+i*0x20. The slot decoder
+            // leaves pointers halves-swapped, so ROL64(32) to recover them
+            // (same fix as DecodeObjSlotPtrV908).
+            int n = 0;
+            for (uint32_t Slot = 0; Slot < 4; ++Slot) {
+                uint64_t Raw = DecodeObjSlot16_V908(obj_base, Slot);
+                uint64_t P = ((Raw << 32) | (Raw >> 32)) & 0xFFFFFFFFFFFFFFFFULL;
+                if (P >= 0x10000ULL && P < 0x800000000000ULL) {
+                    out[n++] = P;
+                }
+                if (n == 4) break;
+            }
+            return out;
+        }
+
         if (m_v818Active) {
             int n = 0;
             for (uint32_t Rel = 0; Rel < 4; ++Rel) {
@@ -1435,6 +1459,10 @@ public:
         // Without these the modern pipelines fall through to the legacy
         // Build20260519 decoders, which return plausible-looking garbage.
         // That is what left the bone dump unable to find any "Skeleton".
+        if (m_v908Active) {
+            // v908 is authoritative: do NOT fall through on a zero result.
+            return GetClassPtrV908(obj_base);
+        }
         if (m_v818Active) {
             uint64_t P = GetClassPtrV818(obj_base);
             if (P) return P;
@@ -3054,6 +3082,15 @@ public:
     std::string GetName(uint64_t obj_ptr) {
         if (!obj_ptr || !m_keyLoaded) return {};
 
+        // v908 is authoritative: an object with a valid slot but no name
+        // (e.g. the metaclass singletons whose name-slot decrypts to 0/None)
+        // must NOT fall through to legacy paths — those return plausible
+        // garbage which pollutes downstream classification with names like
+        // '>ƪ��_3590549823'.
+        if (m_v908Active) {
+            return GetNameV908(obj_ptr);
+        }
+
         if (m_v818Active) {
             std::string S = GetNameV818(obj_ptr);
             if (!S.empty()) return S;
@@ -3265,6 +3302,7 @@ public:
     uint64_t GetClassPtrV808(uint64_t ObjPtr) const { return DecodeObjSlotPtrV808(ObjPtr, 2); }
     // Picks whichever pipeline is live so call sites do not have to.
     uint64_t GetClassPtrAuto(uint64_t ObjPtr) const {
+        if (m_v908Active) return GetClassPtrV908(ObjPtr);
         if (m_v818Active) return GetClassPtrV818(ObjPtr);
         if (m_v811Active) return GetClassPtrV811(ObjPtr);
         if (m_v808Active) return GetClassPtrV808(ObjPtr);
@@ -3274,6 +3312,11 @@ public:
 
     uint64_t GetOuterPtr(uint64_t obj_ptr) {
         if (!obj_ptr || !m_keyLoaded) return 0;
+
+        if (m_v908Active) {
+            // v908 is authoritative — no fall-through.
+            return GetOuterPtrV908(obj_ptr);
+        }
 
         if (m_v818Active) {
             uint64_t P = GetOuterPtrV818(obj_ptr);
