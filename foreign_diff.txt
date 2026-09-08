@@ -1,0 +1,2937 @@
+=== Foreign SDK diff report ===
+foreign root: /home/frost/Downloads/SDK
+our SDK:      /media/frost/Coding Stuf/Linux/FrostSDKDumper/SDK_Output.txt
+
+== Type coverage ==
+  both:            20439
+  only foreign:    2625
+  only ours:       1127
+
+== Types only in foreign SDK (2625) ==
+  UABP_Apollo_Trader_Face_C
+  UABP_Celeste_Cin_Trader_Face_C
+  UABP_Customization_C
+  UABP_Customize_Hack_C
+  UABP_Goldfinch_C
+  UABP_MainMenu_Raiders_C
+  UABP_Shani_Trader_Face_C
+  UABP_Tian_Trader_Face_C
+  UABP_Trader_Generic_C
+  FADDDerivedData
+  UAGVConditionProxy
+  UAGVPrimitiveComponentProxy
+  UAIGenericTransitionRule_Base
+  UAIHotSpotManager
+  UAIHoverMovementTransitionRule_Base
+  FAIInvestigableSettings
+  UAINavigationPhysicsMovementTransitionRule_Base
+  UAIPerceptionListenerInterface
+  UAIResourceInterface
+  UAISenseEvent
+  UAISightTargetInterface
+  FAITargetHandle
+  UASEAnimAugmentation
+  UASFunction_DWordArg
+  UASFunction_DWordReturn
+  UASFunction_FloatArg
+  UASFunction_FloatExtendedToDoubleReturn
+  UASFunction_FloatReturn
+  UASFunction_QWordArg
+  UAbilitySystemDebugHUDExtension
+  UAbilitySystemDebugHUDExtension_Attributes
+  UAbilitySystemDebugHUDExtension_BlockedAbilityTags
+  UAbilitySystemDebugHUDExtension_Tags
+  UAbilitySystemInterface
+  UAbilitySystemReplicationProxyInterface
+  UAcceptFriendRequestPushNotificationAction
+  UAcceptPartyInvitePushNotificationAction
+  UAccountBlockedModalPayload
+  UAccountCreatedModalPayload
+  FActiveGameplayEffectQuery
+  UActiveSoundUpdateInterface
+  UActivityArchetype
+  UActivityContainerBase
+  UActorBlackboardTransformExtension
+  UActorDescContainer
+  UActorFolder
+  UActorInstanceHandleInterface
+  UActorReplicationBridge
+  FActorSpawnerContainerConfig
+  FActorSpawnerRoundOption
+  FActorTransformCollection
+  UAddPatchToolBuilder
+  UAddPrimitiveToolBuilder
+  FAgentIdentity
+  UAimAssistCameraMagnetism
+  UAimingHydraulicDamperData
+  UAlignObjectsToolBuilder
+  UAllQuestFilter
+  UAlwaysRetriggerOnHold
+  UAmountSelectorNotificationPayload
+  FAnalogInputEvent
+  FAngelscriptAttributeChangedData
+  UAnimBlueprintClassSubsystem_PropertyAccess
+  FAnimBlueprintConstantData
+  FAnimBlueprintDebugData
+  UAnimBlueprintGeneratedStruct
+  FAnimBlueprintMutableData
+  UAnimClassInterface
+  FAnimComponentSpacePoseContext
+  UAnimCurveCompressionCodec_ACL
+  UAnimCurveCompressionCodec_UniformIndexable
+  UAnimCurveCompressionCodec_UniformlySampled
+  FAnimDataModelNotifPayload
+  FAnimEvaluateResult
+  FAnimExecutionContext
+  FAnimGroupInstance
+  FAnimInitializationContext
+  FAnimInstanceProxy
+  UAnimLayerInterface
+  FAnimLegIKData
+  FAnimNodeReference
+  FAnimNotifyContext
+  UAnimNotifyState_DisableRootMotion
+  UAnimNotify_PauseClothingSimulation
+  UAnimNotify_ResetClothingSimulation
+  UAnimNotify_ResetDynamics
+  UAnimNotify_ResumeClothingSimulation
+  FAnimPoseContext
+  FAnimSequencerInstanceProxy
+  FAnimSingleNodeInstanceProxy
+  UAnimStateMachineTypes
+  FAnimSubsystem
+  FAnimSubsystemInstance
+  FAnimSubsystemInstance_NodeRelevancy
+  FAnimSubsystem_CompiledPinExpressions
+  FAnimUpdateContext
+  UAnimationAssetExtensions
+  UAnimationBudgetAllocatorFactory
+  UAnimationDataModelNotifiesExtensions
+  FAnimationErrorStats
+  FAnimationFrameSnapshot
+  FAnimationPotentialTransition
+  FAnimationStateMachineReference
+  FAnimationStateResultReference
+  UAnswerClanInviteDelegate
+  UAnswerJoinClanApplicationDelegate
+  UAnyButtonInputBehavior
+  FApiGatewayDiscoveryBattlePassPageLock
+  FApiGatewayDiscoveryCleanSyncChangesetsRequest
+  FApiGatewayDiscoveryInventoryItem
+  FApiGatewayDiscoveryInventoryItemChangeAction
+  FApiGatewayDiscoveryQuestV2RewardV2
+  FApiGatewayDiscoveryServerDynamicCommentaryTextV2Params
+  FApiGatewayDiscoveryServerQuestV2RewardV2
+  FApiGatewayDiscoverySyncTenancyUserRequest
+  FApiGatewaySharedAdminPlayerActivityResetRequest
+  FApiGatewaySharedClaimClanTimelineMessageRequestPayload
+  FApiGatewaySharedClaimClanTimelineMessageResponsePayload
+  FApiGatewaySharedClanTimelineMessagePayload
+  FApiGatewaySharedDeleteFriendshipResponse
+  FApiGatewaySharedGetActiveFeatureFlagsRequest
+  FApiGatewaySharedGetNexonNISMSProductInfoRequest
+  FApiGatewaySharedGetPersistentPlayerKeysRequest
+  FApiGatewaySharedGetVoiceModerationTokenRequest
+  FApiGatewaySharedHeartBeatRequest
+  FApiGatewaySharedInboxMessagePayload
+  FApiGatewaySharedInviteToPartyResponse
+  FApiGatewaySharedKickFromPartyResponse
+  FApiGatewaySharedLeavePartyResponse
+  FApiGatewaySharedNotificationPayload
+  FApiGatewaySharedPlayerActivityAbandonMatchResponse
+  FApiGatewaySharedPlayerActivityCancelMatchmakingResponse
+  FApiGatewaySharedPlayerActivityRequest
+  FApiGatewaySharedSendChatMessageRequestV2
+  FApiGatewaySharedServerGetActiveFeatureFlagsRequest
+  FApiGatewaySharedServerIncreaseMatchSizeResponse
+  FApiGatewaySharedServerReportPlayerDisconnectResponse
+  FApiGatewaySharedServerUpdateBackfillStateResponse
+  FApiGatewaySharedSetRichPresenceResponse
+  FApiGatewaySharedSharedParameterizedMessageAttachment
+  FApiGatewaySharedSocialFrontendPartyEffectNotificationPayload
+  FApiGatewaySharedTriggerFrontendPartyEffectRequest
+  FApiGatewaySharedTweakablesRequest
+  FApiGatewaySharedUpdatePartyAttributesResponse
+  FApiGatewaySharedUpdatePartyDataResponse
+  FApiGatewaySharedUpdatePartyMemberDataResponse
+  UAppleImageInterface
+  FArmorSlot
+  UArrayProperty
+  UAssetBackedTarget
+  UAssetImportData
+  FAssetImportInfo
+  UAssetRegistryImpl
+  UAssetReleaseData
+  UAssignClanRoleNotificationPayload
+  UAssignedTargetTargetingSetting
+  UAsyncActionLoadPrimaryAssetBase
+  FAttributeFloatModifier
+  UAttributeModificationCalculationContext
+  UAudioComponentGroupExtension
+  FAudioEffectParameters
+  UAudioEndpointSettingsBase
+  UAudioGameplayVolumeProxy
+  UAudioGenerator
+  UAudioLinkSettingsAbstract
+  FAudioReverbEffect
+  UAudioSyncManagerBase
+  FAutobotActiveMoveToData
+  UAutobotBrainCluster
+  UAutobotBrainClusterInterface
+  UAutobotBrainClusterRoaming
+  UAutobotDebugCommand
+  UAutobotDebugCommandMoveTo
+  UAutobotDebugCommandPlaybackRecording
+  UAutobotModule
+  UAutobotModuleAiming
+  UAutobotModuleMovement
+  UAutobotSpawnRequest
+  UAutobotState
+  UAutobotStateCombat
+  UAutobotStateCombatLauncher
+  UAutobotStateCombatRifle
+  UAutobotStateInterface
+  UAutobotStateMachineInterface
+  UAutobotUtilityActionBase
+  UAutobotUtilitySystemInterface
+  UAutomaticLockOnTargetingState
+  UAvatar_CtrlRig_FrontEndMaster_C
+  UAvatar_CtrlRig_NameTag_C
+  UAvatar_CtrlRig_SolveIKs_C
+  UAxisAngleGizmoBuilder
+  UAxisPositionGizmoBuilder
+  ABP_BC_Mechanic_C
+  UBP_BackgroundCharacterAudioComponent_C
+  UBP_Battlepass_Decorator_C
+  ABP_BottleCandle_01_A_C
+  ABP_BottleCandle_01_B_C
+  UBP_CameraShake_HandHeld_Med_C
+  ABP_Candles_01_A_C
+  ABP_Candles_02_D_C
+  ABP_Candles_02_E_C
+  UBP_CelebrationFrontendHUDComponent_C
+  ABP_Cinematic_Customizable_Actor_C
+  ABP_Cmr_LampCeiling_01_A_C
+  ABP_ConsoleRound_Video_C
+  ABP_DebrisPile_03_B_C
+  ABP_Decal_BrokenTile_01_C
+  ABP_Decal_DamagePlasterPatch_Wall_01_C
+  ABP_Decal_DamagePlasterPatch_Wall_02_C
+  ABP_Decal_DamagePlasterPatch_Wall_03_C
+  ABP_Decal_MarbleLeak_01_C
+  ABP_Decal_Patch_Wall_01_C
+  ABP_DynamicShelf_01_C
+  ABP_FX_Crowd_C
+  ABP_FX_Crowd_SingleSpline_C
+  ABP_Football_AnimProp_C
+  ABP_FrontEndAmbienceActor_C
+  UBP_FrontEndCharacterAudioComponent_C
+  ABP_FrontEndPlayerController_C
+  UBP_FrontEndScreenRouter_C
+  ABP_FrontEndTremors_C
+  ABP_FrontendItemActor_C
+  ABP_FrontendVOActor_C
+  ABP_Goldfinch_01_C
+  ABP_HangingLightfixture_01_C
+  ABP_Hme_Aquarium_01_C
+  ABP_Lamp_Floodlight_01_C
+  ABP_LightGeo_Cube_Diffuse_01_C
+  ABP_LobbyRumors_C
+  ABP_MainMenuCameraPawn_C
+  ABP_NpcBackgroundSceneControl_Apollo_C
+  ABP_NpcBackgroundSceneControl_Base_C
+  ABP_NpcBackgroundSceneControl_Bilguun_C
+  ABP_NpcBackgroundSceneControl_Celeste_C
+  ABP_NpcBackgroundSceneControl_Lance_C
+  ABP_NpcBackgroundSceneControl_Shani_C
+  ABP_NpcBackgroundSceneControl_Tianwen_C
+  ABP_PioneerCustomizeActor_C
+  ABP_PioneerFrontendHUD_C
+  ABP_PioneerGameModeMainMenu_C
+  UBP_PioneerMenuAudioManagerComponent_C
+  ABP_PioneerWallActor_C
+  ABP_PipeCluster_C
+  UBP_PlayerNametagWidgetComponent_C
+  ABP_RaiderDenItem_Bed_01_C
+  ABP_RaiderDenItem_Bed_02_C
+  ABP_RaiderDenItem_Bed_03_C
+  ABP_RaiderDenItem_Bed_04_C
+  ABP_RaiderDenItem_Shelves_01_C
+  ABP_RaiderDenItem_Shelves_02_C
+  ABP_RaiderDenItem_Shelves_03_C
+  ABP_RaiderDenItem_Shelves_04_C
+  ABP_RaiderDenItem_Stash_01_C
+  ABP_RaiderDenItem_Stash_02_C
+  ABP_RaiderDenItem_Stash_03_C
+  ABP_RaiderDenItem_Stash_04_C
+  ABP_RaiderDenItem_Wardrobe_01_C
+  ABP_RaiderDenItem_Wardrobe_02_C
+  ABP_RaiderDenItem_Wardrobe_03_C
+  ABP_RaiderDenItem_Wardrobe_04_C
+  ABP_RaiderDenItem_WeaponDisplay_01_C
+  ABP_RaiderDenItem_WeaponDisplay_02_C
+  ABP_RaiderDenItem_WeaponDisplay_03_C
+  ABP_RaiderDenItem_WeaponDisplay_04_C
+  ABP_RaiderDen_ShelvesOverflow_01_C
+  ABP_RaiderDen_ShelvesOverflow_02_C
+  ABP_RaiderDen_ShelvesOverflow_03_C
+  ABP_RaiderDen_ShelvesOverflow_04_C
+  ABP_ResourceGenerator_01_C
+  ABP_Rsr_Lamp_03_A_C
+  ABP_SM_DebrisDraped_02_C
+  ABP_SM_DebrisDraped_03_C
+  ABP_SM_DebrisDraped_04_C
+  ABP_SM_DebrisDraped_05_C
+  ABP_SM_DebrisDraped_06_C
+  ABP_SM_Floor_Lamp_01_A_C
+  ABP_SM_WorkshopDebrisDraped_05_C
+  ABP_SM_WorkshopDebrisPileDraped_01_C
+  ABP_SM_WorkshopDebrisPileDraped_02_C
+  ABP_SM_WorkshopDebrisPileDraped_03_C
+  ABP_SM_WorkshopDebrisPileDraped_06_C
+  ABP_SM_WorkshopDebrisPile_01_C
+  ABP_SM_WorkshopDebrisPile_02_C
+  ABP_SM_WorkshopDebrisPile_03_C
+  ABP_SM_WorkshopDebrisPile_06_C
+  ABP_SM_WorkshopDebris_04_C
+  ABP_SM_WorkshopDebris_05_C
+  ABP_ScrappyFeedBowl_C
+  ABP_Scrappy_Rooster_C
+  ABP_SetGlobalNPC_C
+  ABP_SignExit_01_A_C
+  UBP_SpeakerComponent_Static_FrontendPA_C
+  UBP_SpeakerComponent_Static_Juanito_C
+  ABP_Tian_Door_C
+  ABP_Trader_Apollo_C
+  ABP_Trader_Celeste_C
+  ABP_Trader_Juanito_C
+  ABP_Trader_Lance_C
+  ABP_Trader_Shani_C
+  ABP_Trader_Tian_C
+  ABP_VoidSpace_Scene_C
+  ABP_WeaponIconCapture_C
+  ABP_WeatherManager_C
+  UBTAgentOrderHandle
+  UBTAgentOrder_TargetSelectionBase
+  UBTUtilitySelectionMethod
+  FBackendAnnnouncementUpdateListEntry
+  UBackendAnnouncementModalPayload
+  FBackgroundActorEffectsContainer
+  UBackgroundActorTooltipPackage
+  UBackgroundCameraEnablePanAndZoom
+  UBackgroundDialogueDataSetCurrentCharacter
+  UBackgroundDialogueDataSetCurrentQuest
+  UBackgroundDialogueDataSetCurrentTab
+  UBackgroundDialogueEvent
+  UBakeMeshAttributeMapsToolBuilder
+  UBakeMeshAttributeVertexToolBuilder
+  UBakeMultiMeshAttributeMapsToolBuilder
+  UBakeTransformToolBuilder
+  FBakedCustomAttributePerBoneData
+  FBakedFloatCustomAttribute
+  FBakedIntegerCustomAttribute
+  FBakedStringCustomAttribute
+  UBallisticMovementBehaviour
+  UBallisticMovementLineBehaviour_Example
+  UBallisticMovementSphereBehaviour_Example
+  FBallisticMovementSystem
+  UBaseCreateFromSelectedToolBuilder
+  UBaseMeshProcessingToolBuilder
+  FBattlePassViewModelCreationHelperParams
+  UBattlepassCollectionViewModel
+  UBattlepassCollectionViewModelV2
+  UBattlepassDetailsScreenViewModel
+  UBattlepassEntryTelemetryPayloadBuilder
+  UBattlepassEntryTelemetryPayloadBuilderV2
+  UBattlepassEntryViewModelV2
+  UBattlepassPageViewModel
+  UBattlepassPageViewModelV2
+  UBattlepassPurchaseNotificationPayload
+  UBattlepassRewardViewModel
+  UBattlepassRewardViewModelV2
+  UBattlepassViewModel
+  UBehaviorTreeTypes
+  FBlackBoardDeltaCompressionPtr
+  FBlackBoardVariableDeltaCompressionPtr
+  UBlackboardKeyType_Bool
+  UBlackboardKeyType_Name
+  FBlendFilter
+  FBlendListBaseReference
+  FBlendSpacePlayerReference
+  FBlendSpaceReference
+  UBlendableInterface
+  FBlendedTreeUpdateResult
+  FBlinkingLightConfig
+  FBlueprintDebugData
+  UBlueprintExtension
+  FBlueprintMacroCosmeticInfo
+  FBlueprintSessionResult
+  UBodyAnimationModuleData
+  FBodyInstanceAsyncPhysicsTickHandle
+  UBoneReferenceSkeletonProvider
+  FBoneShapeTypeWeights
+  FBookmark2DJumpToSettings
+  FBookmarkBaseJumpToSettings
+  FBookmarkJumpToSettings
+  FBoolNetSerializerConfig
+  UBoolProperty
+  UBootFlowErrorModalPayload
+  FBoundActorProxy
+  FBranchCookConfiguration
+  FBranchingPointNotifyPayload
+  FBreakEventCallbackWrapper
+  FBreakableFXPhysicsSettings
+  UBreakpoint
+  UBrowseClansChangePage
+  UBrushAdjusterInputBehavior
+  FBrushStampData
+  UBrushStampIndicatorBuilder
+  FBuildingDetailAssets
+  FBuildingDetailData
+  FBuildingDetailMapEntry
+  FBuildingDetailMaterialOverride
+  FBuildingDetailModifierAssets
+  UBuiltInAttributesExtensions
+  FBulletMultiTrailData
+  UBundleBreakdownViewModel
+  UButtonPressedTelemetryPayloadBuilder
+  UByteProperty
+  FCCContentWidgetData_Emote
+  FCCContentWidgetData_RaiderVoice
+  FCCDIKChainLink
+  FCPMSPartMaterialAssignment
+  UCSGMeshesToolBuilder
+  FCameraAnimationHandle
+  FCameraShakeUpdateResult
+  UCancelClanApplicationDelegate
+  UCapabilityStyleDriverExtensionProximityEffectAbility
+  FCaptureLostEvent
+  FCapturedPixels
+  UCelebrationEvent
+  UCenterOfRootConstructableObstructionAdapter
+  FCertRule
+  FChainArticulationNode
+  UChangeClanMemberRoleDelegate
+  UChangeClanWarningPayload
+  UChaosNotifyHandlerInterface
+  UChaosSolver
+  FCharacterAnimState
+  UCharacterAudioFoleyArms
+  FCharacterCreationScreenRandomizationSlotAndItemQueryData
+  FCharacterEvent
+  UCharacterExpressionWheelAssignmentController
+  UCharacterExpression_ActionSlotViewModel
+  UCharacterExpression_ActionViewModel
+  FCharacterMoveResponsePackedBits
+  FCharacterNetworkSerializationPackedBits
+  UCharacterObstructionAdapter
+  FCharacterServerMovePackedBits
+  FCircularPointCloudBuffer
+  UClanApplicantViewModel
+  UClanCreateDelegate
+  FClanCreationData
+  UClanCustomizationHelper
+  UClanCustomizationViewModel
+  UClanDetailsViewModel
+  UClanEntriesListViewModel
+  UClanEntryViewModel
+  UClanInteractionDelegateBase
+  UClanMemberViewModel
+  UClanUpdateDelegate
+  UClanViewModel
+  UClanWallMessageViewModel
+  UClanWallViewModel
+  UClansBrowseViewModel
+  UClassProperty
+  UClickDragToolBuilder
+  FClientTravelData
+  UClosePartyInvitePushNotificationAction
+  FClosestPhysicsObjectResult
+  UClothSharedConfigCommon
+  UClothSharedSimConfigBase
+  FClothTetherData
+  UClothingAssetCustomData
+  UClothingInteractor
+  UClothingSimulationFactory
+  UClothingSimulationFactoryNv
+  UCodexCollectionStencilTileEntryViewModel
+  UCodexObjectiveTrackerBuilder
+  UCodingStandardObject
+  FCodingStandardStruct
+  UCollectSurfacePathMechanic
+  UCollectionEntryContextualMenuListEntryPayload
+  UCollectionEntryContextualMenuListEntryPayload_LearnStencil
+  UCollectionEntryContextualMenuPayload
+  UCollectionEntryContextualMenuViewModel
+  UCombineMeshesToolBuilder
+  UCombinedTransformGizmoBuilder
+  UCombinedTransformGizmoContextObject
+  UComingFeaturesEntry
+  UCommonActionHandlerInterface
+  UCommonBoundActionButtonInterface
+  UCommonInputActionDataProcessor
+  UCommonMappingContextMetadataInterface
+  UCommunityDonationsViewModel
+  UCommunityEventPhaseChangeEvent
+  UCommunityOfferViewModel
+  FCompactIndexedHandleBase
+  UCompletedCadenceQuestFilter
+  UCompletedQuestFilter
+  UComplianceNotificationViewData
+  FCompressedRichCurve
+  UConfirmNotificationCrossplayOffPayload
+  FConstSharedStruct
+  FConstraintInstanceBase
+  FConstructableBoundsId
+  UConstructableBoundsOctree
+  UConstructableBoundsSpatialPartitioning
+  FConstructableCustomEffectState
+  UConstructableForceApplicator
+  UConstructableForceApplicatorConfiguration
+  UConstructableForceApplicatorTetherConfiguration
+  FConstructablePartTraceResults
+  FConstructableSocketRepIndexData
+  UConstructableStyleComponent
+  UConstructableStyleSharedMethods
+  UContentBundleDuplicateForPIEHelper
+  UContentBundleUnsavedActorMonitor
+  UContextualMenuPayload
+  UContractPrecondition
+  FControlRigAnimInstanceProxy
+  UControlRigEditorSettings
+  FControlRigExecuteContext
+  FControlRigLayerInstanceProxy
+  UControlRigSettings
+  FControlRigSpline
+  FControlRigSplineImpl
+  FControlRigValidationContext
+  UControlRigValidationPass
+  FControlShapeActorCreationParam
+  UControlledCameraTransition
+  UConvertMeshesToolBuilder
+  UConvertToPolygonsToolBuilder
+  FCookInfo
+  FCookResult
+  FCookTaggedDirectory
+  UCostPackageViewData
+  UCreateAccountModalPayload
+  UCreateDisplayNameModalPayload
+  UCriticalAudioDuckManagerBase
+  UCrowdAgentInterface
+  UCrowdManagerBase
+  FCrumblingEventCallbackWrapper
+  UCtrlRig_UpperArmDeformation_C
+  UCubeGridToolBuilder
+  UCurrencyExpirationEntryViewModel
+  UCurrencyExpirationWidgetViewModel
+  UCurveEdPresetCurve
+  FCurveKeyHandle
+  UCurveTable
+  FCustomAttribute
+  FCustomAttributePerBoneData
+  UCustomObstructionPoints
+  UCustomizationMeshContainer
+  UCustomizedSquadPlayer
+  UCustomizedSquadPlayerHide
+  UCutMeshWithMeshToolBuilder
+  FCyclicTransformControlData
+  UDPICustomScalingRule
+  UDQMCustomClassGroupDummy
+  FDamageTakenSecond
+  FDataCacheDuplicatedObjectData
+  UDataLayerLoadingPolicy
+  FDataRegistryLookup
+  FDataRegistrySourceItemId
+  UDataStream
+  UDataStreamManager
+  FDataflowConnection
+  FDataflowFaceSelection
+  FDataflowInput
+  FDataflowOutput
+  FDataflowSelection
+  FDataflowTransformSelection
+  FDataflowVertexSelection
+  UDatasmithAdditionalData
+  UDatasmithAssetImportData
+  UDatasmithCADImportSceneData
+  UDatasmithCustomActionBase
+  UDatasmithDeltaGenAssetImportData
+  FDatasmithImportInfo
+  UDatasmithMDLSceneImportData
+  UDatasmithObjectTemplate
+  UDatasmithOptionsBase
+  UDatasmithScene
+  UDatasmithSceneImportData
+  UDatasmithStaticMeshCADImportData
+  UDatasmithStaticMeshImportData
+  UDatasmithTranslatedSceneImportData
+  UDatasmithVREDAssetImportData
+  FDateTime
+  FDateTimeNetSerializerConfig
+  FDeathmatchItemAndQuantity
+  UDebugDrawHeightOverGroundHistoryData
+  UDebugDrawService
+  UDebugGarbageCollectionGraph
+  FDebuggingInfoForSingleFunction
+  UDefaultWebBrowserAdapter
+  FDefault__AISenseBlueprintListener
+  UDefault__ASClass
+  FDefault__ASStruct
+  UDefault__AnimBlueprintGeneratedClass
+  FDefault__AnimBlueprintGeneratedStruct
+  UDefault__BlueprintGeneratedClass
+  UDefault__Class
+  UDefault__ControlRigBlueprintGeneratedClass
+  UDefault__DynamicClass
+  UDefault__LinkerPlaceholderClass
+  FDefault__PropertyBag
+  UDefault__RigVMBlueprintGeneratedClass
+  UDefault__RigVMMemoryStorageGeneratorClass
+  UDefault__SMBlueprintGeneratedClass
+  UDefault__SMNodeBlueprintGeneratedClass
+  FDefault__ScriptStruct
+  FDefault__UserDefinedStruct
+  UDefault__WidgetBlueprintGeneratedClass
+  UDeformMeshPolygonsToolBuilder
+  UDeformableInterface
+  UDelayMomentumTowardTargetOnNewMovementModuleData
+  FDelegateHandleHolder
+  FDelegateHandleWrapper
+  UDelegateProperty
+  UDeleteGeometrySelectionCommand
+  UDepartureCelebrationEvent
+  UDepartureMissedNotificationWidgetPayload
+  UDeployableItemPlacementStrategy
+  UDesiredSpawnStack
+  FDestructibleBonePropertyOverrideSource
+  UDestructibleInterface
+  FDestructionGraphObjectPtr
+  FDestructionGraphPrimitiveComponentPtr
+  FDetailedEffectDamageDefinition
+  UDetailedNotificationObject
+  UDeveloperSettingsBackedByCVars
+  FDialoguePingableObjectResult
+  FDifficultyModifiers
+  UDirectReplicationHandlerComponentFactory
+  UDirtyFlag
+  UDisconnectGeometrySelectionCommand
+  FDiscordJoinSecret
+  FDiskSerializedPlayerRecording
+  UDisplaceMeshToolBuilder
+  UDistribution
+  UDormantEnemyDistanceQueryType
+  UDoubleGaussianTaskSelector
+  FDoubleNetSerializerConfig
+  UDoubleProperty
+  UDragAlignmentInteraction
+  UDragAlignmentMechanic
+  UDrawAndRevolveToolBuilder
+  UDrawPolyPathToolBuilder
+  UDrawPolygonToolBuilder
+  UDropItemListenerInterface
+  UDummyEndpointSettings
+  FDummySpacerCameraTypes
+  UDynamicClass
+  UDynamicLootSpawnAdapterInterface
+  UDynamicLootSpawnManager
+  UDynamicMeshCommitter
+  UDynamicMeshGenerator
+  UDynamicMeshProvider
+  UDynamicMeshReplacementChangeTarget
+  UDynamicMeshSculptToolBuilder
+  UDynamicNotificationPayload
+  UEHEInputBoundsData
+  UEHEInputData
+  UEHEInputMeshData
+  UEHEInputSplineData
+  UEQSQueryResultSourceInterface
+  UEdGraphSchema
+  UEditMeshPolygonsActionModeToolBuilder
+  UEditMeshPolygonsSelectionModeToolBuilder
+  UEditMeshPolygonsToolBuilder
+  UEditNormalsToolBuilder
+  UEditPivotToolBuilder
+  UEditUVIslandsToolBuilder
+  UEditableGameplayTagQueryExpression
+  UEmbarkAINavLinkAssetUserData
+  UEmbarkAIPerceivableInterface
+  FEmbarkAnimBlueprintDebugData
+  FEmbarkAnimInstanceProxy_Base
+  UEmbarkAnimationBudgetAllocatorFactory
+  FEmbarkAntiHyperExtension_IKChainsWorker
+  UEmbarkAssetManagerSettings
+  UEmbarkBTUtilityLibrary
+  FEmbarkBlockedOctTreePositionInfo
+  FEmbarkBlockedOctTreePositions
+  FEmbarkBlockedVaultables
+  FEmbarkCachedRuntimeCodeExecution
+  UEmbarkCharacterStateInterpolatorDataBase
+  UEmbarkClothingInteractor
+  UEmbarkClothingSimulationFactory
+  UEmbarkCompositeFacetTarget
+  UEmbarkConductor_TickCohort_DuringPhysics
+  UEmbarkConductor_TickCohort_LastDemotable
+  UEmbarkConductor_TickCohort_PostPhysics
+  UEmbarkConductor_TickCohort_PostUpdateWork
+  UEmbarkConductor_TickCohort_PrePhysics
+  UEmbarkContextNavigationTabViewData
+  FEmbarkConvexVolume
+  UEmbarkCrossLayerAnimationProperties
+  UEmbarkDebugGarbageCollectionGraph
+  UEmbarkDependentDelegateTask
+  UEmbarkDependentTask
+  UEmbarkDependentTaskQueue
+  UEmbarkDestructionStrainGraphSubsystem
+  FEmbarkDistanceQueryKeySet
+  FEmbarkDistanceQueryOwnedHandle
+  FEmbarkDuplicationLog
+  FEmbarkDuplicationLogCallstack
+  UEmbarkDynamicsCollision
+  UEmbarkDynamicsEulerIntegrationUtils
+  UEmbarkDynamicsExactDamper
+  UEmbarkEngineStatSubsystem
+  UEmbarkEnvironmentInsigatorSubsystemFake
+  UEmbarkExecutionSequence
+  UEmbarkExecutionSequenceStep
+  FEmbarkExecutionSequenceStepDefinition
+  FEmbarkFireHeatTransferAreaState
+  FEmbarkFireObjectState
+  UEmbarkHpaAgentSize
+  UEmbarkHpaAgentSize_Large
+  UEmbarkHpaAgentSize_Medium
+  UEmbarkHpaAgentSize_Small
+  FEmbarkInputIntentQueue
+  FEmbarkInputRoutingEventCollection
+  UEmbarkMergeScatterRuntimeCellTransformer
+  FEmbarkMovementBlockedFloorsContainer
+  UEmbarkNetworkJitterInterface
+  UEmbarkObjectInspectorListEntryWidgetViewData
+  FEmbarkOctreeDataHandle
+  FEmbarkOctreeNavigationPosition
+  FEmbarkOctreeNavigationQueryTask
+  UEmbarkPlayerStateDebugNameInterface
+  FEmbarkProjectionData
+  UEmbarkRBDSimulationSubsystem
+  FEmbarkRecastDebugNavLinkHeader
+  UEmbarkReplayGameInstanceInterface
+  UEmbarkReplayGameViewportClientInterface
+  FEmbarkSOD_DebugGraph
+  FEmbarkScriptStruct
+  FEmbarkServerPerformanceBudgetScope
+  FEmbarkServersideReplicatedInputBoolHandle
+  FEmbarkServersideReplicatedInputHandleBase
+  FEmbarkServersideReplicatedInputRotatorHandle
+  FEmbarkServersideReplicatedInputUint8Handle
+  FEmbarkSkelMeshSetTickEnabledScope
+  UEmbarkSlateTransitionWidgetInterface
+  FEmbarkSortedRelevantActorsArrayWrapperEntry
+  FEmbarkStatManagerData
+  UEmbarkStateMachineTestTransition
+  FEmbarkStreamingBlockOnLoadScope
+  FEmbarkStreamingDontBlockOnLoadScope
+  UEmbarkTeamAgentInterface
+  UEmbarkTestWorkloadSubsystem
+  UEmbarkThemedWidgetInterface
+  UEmbarkTweakableOverrideWidgetViewData
+  FEmbarkUserId
+  FEmbarkWidgetAnimationIdNames
+  FEmbarkWidgetProjectionData
+  FEmbarkWindowWrapper
+  UEmbarkWorldAssociatedObject
+  UEmbarkWorldPartitionRuntimeCellTransformerGCOptimizer
+  FEmitterCompiledScriptPair
+  FEmoteQuickReplyServerData
+  UEmptyClanMemberViewModel
+  FEmptyPayload
+  FEmptyResponse
+  FEncounteredStateMachineStack
+  UEndOfRoundEventViewModel
+  UEndOfRoundXPLogEntryViewModel
+  UEngineBaseTypes
+  UEngineElementsLibrary
+  UEngineHandlerComponentFactory
+  FEngineServicePing
+  UEngineTypes
+  FEnhancedInputHandles
+  UEnumProperty
+  UEnvQueryContext
+  UEnvQueryContext_Item
+  UEnvQueryContext_Querier
+  UEnvQueryDebugHelpers
+  UEnvQueryItemType
+  UEnvQueryItemType_Actor
+  UEnvQueryItemType_ActorBase
+  UEnvQueryItemType_Direction
+  UEnvQueryItemType_Point
+  UEnvQueryItemType_VectorBase
+  UEnvQueryTypes
+  FError
+  UErrorNotificationPayload
+  UErrorStack
+  UEventListenerBase
+  FEventReply
+  UEventWatcher
+  UExampleClass
+  UExampleController
+  UExampleObject
+  UExampleViewModel
+  UExampleViewModelConsumer
+  UExpLogTaskSelector
+  UExpTaskSelector
+  UExpeditionRewardsClaimedEvent
+  FExplodeStyleInfoPair
+  FExpressionToEquipData
+  UExtendedNPSBackendAnnouncementViewModel
+  FExternalSpatialAccelerationPayload
+  UExtractCodexObjectiveTracker
+  UExtractCollisionGeometryToolBuilder
+  UExtractQuestObjectiveTracker
+  FExtractionPointEventEORD
+  UExtrudeMeshSelectionToolBuilder
+  FFABRIKChainLink
+  FFakeInventoryServiceInventoryData
+  UFakeLinearBufferStateInterpolator
+  UFallbackServiceLoadout
+  FFallbackStruct
+  UFatSourceObject
+  UFeatureFlagCollectionCondition
+  UFeatureFlagCondition
+  UFieldSystem
+  UFilterOutNetObjectFilter
+  UFixedFrameRateCustomTimeStep
+  FFloatModifierOverrideList
+  FFloatNetSerializerConfig
+  UFloatProperty
+  FFloatSpringState
+  FFlowPriorityBucket
+  FFocusEvent
+  UFontBulkData
+  UFontFaceInterface
+  UFontProviderInterface
+  UForceApplicator
+  FForceCollectorActorInfo
+  UForceMagnitudeSpecification
+  FForeignControlPointData
+  FForeignSplineSegmentData
+  FForeignWorldSplineData
+  FFracturedDestructibleMeshComponentPtr
+  FFracturedDestructionListenerComponentPtr
+  FFreezablePerPlatformInt
+  UFrontEndAnimationData
+  UFrontEndRadialWheelEntryViewModel
+  UFrontEndTremors_C
+  FFrontendCameraBlendSettings
+  UFrontendDeepLinkHandler
+  FFrontendVONPC
+  FGaitHeightAnalysisResult
+  UGaitLimbArticulationModuleData
+  UGaitRotationalHydraulicDamperData
+  FGalleryFloorSettings
+  FGalleryTextSettings
+  UGameModeLocationMarkerSettings
+  FGameModePlayerInitializationStepDefinition
+  UGameModePlayerInitializer
+  UGameRoundReport
+  UGameServerCompositeInitStep
+  UGameServerInitServicesIpAddress
+  UGameServerInitSessionSeed
+  UGameServerInitStep
+  UGameServerInitStepCustomSquadSettings
+  UGameServerInitStepDevInstanceKey
+  UGameServerInitStepFlags
+  UGameServerInitStepGameServerParams
+  UGameServerInitStepManifest
+  UGameServerInitStepQueryVoiceChannelStep
+  UGameServerInitStepSquads
+  FGamepadPresetOverrideV1
+  UGamepadPresetsManager
+  FGameplayAbilityRepAnimMontageNetSerializerConfig
+  FGameplayAbilityTargetData
+  FGameplayAbilityTargetDataHandle
+  FGameplayAbilityTargetingLocationInfoNetSerializerConfig
+  UGameplayCueTranslator
+  UGameplayCueTranslator_Test
+  FGameplayEffectContextHandle
+  FGameplayEffectContextHandleNetSerializerConfig
+  FGameplayEffectContextNetSerializerConfig
+  FGameplayEffectCustomExecutionParameters
+  FGameplayEffectExecutionParameters
+  FGameplayEffectSpecHandle
+  UGameplayEffectUIData
+  FGameplayEffectVersion
+  FGameplayResourceSet
+  FGameplayTagContainerNetSerializerConfig
+  FGameplayTagCreationWidgetHelper
+  FGameplayTagNetSerializerConfig
+  FGameplayTagNode
+  FGameplayTargetDataFilterHandle
+  UGameplayTaskOwnerInterface
+  UGeneralEngineSettings
+  UGeneratedClusters
+  FGeneratedMovieSceneKeyStruct
+  UGeneratorBlueprintScreenPayload
+  UGeneratorQuickNavViewModel
+  UGeneratorSlotViewData
+  UGeneratorViewData
+  UGenericCharacterCustomizationPanelViewModel
+  UGenericTeamAgentInterface
+  FGeometry
+  FGeometryCacheMeshBatchInfo
+  FGeometryCacheMeshData
+  FGeometryCacheVertexInfo
+  FGeometryCollectionDebugDrawWarningMessage
+  UGeometryCollectionExternalRenderInterface
+  FGeometryCollectionRepData
+  UGeometrySelectionEditCommand
+  UGeometrySelectionEditCommandArguments
+  UGeometrySelectionEditCommandResult
+  UGizmoBaseFloatParameterSource
+  UGizmoBaseTransformSource
+  UGizmoBaseVec2ParameterSource
+  UGizmoLambdaHitTarget
+  UGizmoLambdaStateTarget
+  UGizmoNilStateTarget
+  UGizmoRenderTarget
+  FGizmoSelectData
+  UGizmoViewContext
+  UGlassDebrisAudio
+  FGoalBone
+  FGrabRemovalInteractionData
+  FGrabbingForceContext
+  UGracePeriodForServerShutDownStep
+  UGroundControlApprovalAssetUserData
+  FGroundControlComponentContacts
+  FGroundControlContact
+  FGroundTraceDistances
+  FGuidNetSerializerConfig
+  FGyroSettings
+  UHLODBuilder
+  UHLODBuilderSettings
+  UHLODProxyDesc
+  FHLODSubActor
+  UHandlerComponentFactory
+  UHarmonicSpringSuspensionData
+  UHiddenQuestFilter
+  FHitResultNetSerializerConfig
+  FHiveCreateCheckpointParams
+  FHiveEmptyRequest
+  FHiveEmptyResponse
+  FHiveListBuildProvidersRequest
+  FHiveListCheckpointsParams
+  FHiveResult
+  UHiveRpcClientBase
+  FHiveSuccess
+  UHoleFillToolBuilder
+  AHomeAnimation_C
+  AHome_Lighting_C
+  AHome_Tables_C
+  UHoudiniAssetStateEvents
+  FHoudiniCurveInfo
+  UHoudiniEngineCopyPropertiesInterface
+  UHoudiniEngineEditorSettings
+  FHoudiniGeoInfo
+  FHoudiniLandscapeSplineSegmentData
+  FHoudiniMeshSocket
+  FHoudiniObjectInfo
+  FHoudiniPartInfo
+  FHoudiniVolumeInfo
+  FHpaNavDataHandle
+  FHpaNavigationQueryData
+  FHpaNavigationQueryTask
+  FHpaVertex
+  FHpaVoxelDataSlice
+  UIGameStageGraph
+  FIKChain
+  FIKChainLink
+  FIKRigGoalContainer
+  FIKRigInputSkeleton
+  UIPioneerOnlineGameRoundDevelopmentModel
+  FISMClientInstanceManagerData
+  FISMComponentData
+  UISMPartitionInstanceManager
+  UISMPartitionInstanceManagerProvider
+  UIUILocalPlayerSubsystemManager
+  UIUINewThingsManager
+  UIUINewThingsSource
+  FIceMovementProperties
+  FImgMediaSourceCustomizationSequenceProxy
+  UImportantToggleSettingInterface
+  UInLoginQueueModalPayload
+  FIndexedHandleBase
+  FInertializationBoneDiff
+  FInertializationPose
+  FInertializationPoseDiff
+  FInferenceAssetTaskPair
+  UIngameInventoryMutationStrategy
+  FInitialInferAgentData
+  UInitiateSearch
+  FInjectedInputArray
+  UInputActionBufferStrategy
+  FInputActionValue
+  UInputBehavior
+  UInputBehaviorSource
+  FInputClampState
+  UInputCoreTypes
+  FInputEvent
+  UInputModifierScaleByDeltaTime
+  UInputModifierSmooth
+  UInputModifierToWorldSpace
+  FInputScaleBiasClampState
+  UInstancedPlacemenClientSettings
+  FInstancedStaticMeshMappingInfo
+  FInstancedStruct
+  FInstancedStructContainer
+  UInt16Property
+  UInt64Property
+  UInt8Property
+  UIntProperty
+  FInteractableObservation
+  UInteractionMechanic
+  FInteractionPromptUIConfig
+  FInteractionSoundSettings
+  UInteractiveCommand
+  UInteractiveCommandArguments
+  UInteractiveCommandResult
+  UInteractiveGizmoBuilder
+  UInteractiveToolActivity
+  UInteractiveToolBuilder
+  UInteractiveToolCameraFocusAPI
+  UInteractiveToolEditorGizmoAPI
+  UInteractiveToolExclusiveToolAPI
+  UInteractiveToolNestedAcceptCancelAPI
+  UInteractiveToolWithToolTargetsBuilder
+  UInterchangeAnimationPayloadInterface
+  UInterchangeBaseMaterialFactoryNode
+  UInterchangeBlockedTexturePayloadInterface
+  UInterchangeDirectionalLightNode
+  UInterchangeMeshPayloadInterface
+  UInterchangeMeshUtilities
+  UInterchangeSceneImportAsset
+  UInterchangeSceneImportAssetFactoryNode
+  UInterchangeSlicedTexturePayloadInterface
+  UInterchangeTexture2DArrayNode
+  UInterchangeTextureBlurNode
+  UInterchangeTextureCubeArrayFactoryNode
+  UInterchangeTextureCubeArrayNode
+  UInterchangeTextureCubeFactoryNode
+  UInterchangeTextureCubeNode
+  UInterchangeTextureLightProfileNode
+  UInterchangeTextureLightProfilePayloadInterface
+  UInterchangeTexturePayloadInterface
+  UInterchangeTextureWriter
+  UInterchangeVariantSetPayloadInterface
+  UInterchangeVolumeTextureFactoryNode
+  UInterchangeVolumeTextureNode
+  UInterchangeWriterBase
+  UInterface
+  UInterfaceProperty
+  UInterface_ActorSubobject
+  UInterface_AnimCurveMetaData
+  UInterface_AssetUserData
+  UInterface_AsyncCompilation
+  UInterface_CollisionDataProvider
+  UInterface_PostProcessVolume
+  UInterface_PreviewMeshProvider
+  UIntervalGizmoBuilder
+  UInvalidLoadoutDelegate
+  FInventoryCostItemCandidate
+  UInventoryDragDropPayload
+  FInventoryEquipment
+  UInventoryFakeListViewData
+  UInventoryItem3dViewModel
+  UInventoryItemAssignmentInterface
+  UInventoryItemContextualMenuPayload
+  UInventoryItemContextualMenuViewData
+  UInventoryItemInspectTabSkinViewModel
+  UInventoryQuickSlotItemCategory
+  UInventorySlotInteractionDelegateCreatorBase
+  UInventorySlotInteractionDelegateCreator_Simple
+  UInventorySlotPreviewViewData
+  UIrisObjectReferencePackageMap
+  UIsGameplayWorldCondition
+  FItemBaseModificationSlot
+  FItemContainerSlotStackConstHandle
+  FItemContainerSlotStackHandle
+  FItemContainerStackHandle
+  FItemListItem
+  UItemSharedData
+  UItemSkinPurchaseObject
+  UItemSkinTileViewItem
+  FItemValueInfo
+  UItemValueSelectionNotificationPayload
+  FJiraAvatarUrls
+  FJiraCreateIssueParams
+  UJoinClanDelegate
+  UJoinPartyUpDelegate
+  UJsonUtilitiesDummyObject
+  UKeyAsModifierInputBehavior
+  FKeyConsumptionOptions
+  FKeyEvent
+  FKeyHandleLookupTable
+  FKeyHandleMap
+  FKeybindingChord
+  UKickReasonModalPayload
+  ALI_ExpeditionRoom_01_C
+  ULODSyncInterface
+  AL_ExpeditionRoom_01_C
+  AL_Workshop_01_A_C
+  FLandscapeEditorLayerSettings
+  ULandscapeHLODBuilder
+  FLandscapeImportLayerInfo
+  FLandscapeLayerBrush
+  ULandscapeSplineInterface
+  ULandscapeTextureStorageProviderFactory
+  FLatentActionManager
+  ULatticeDeformerToolBuilder
+  FLayeredBoneBlendReference
+  ULazyObjectProperty
+  FLegIndexes
+  ULevelInstanceEditorObject
+  ULevelInstanceEditorPivotInterface
+  ULevelSequenceBurnInInitSettings
+  FLevelSequenceLegacyObjectReference
+  FLevelSequenceObjectReferenceMap
+  ULevelStreamingProfilingSubsystem
+  ULevelUpAnnouncementPayload
+  ULevelUpCelebrationEvent
+  ULevelUpRewardEvent
+  ULevelVariantSetsFunctionDirector
+  ULightMapVirtualTexture
+  FLimbLink
+  FLimbSolver
+  ULinearBufferStateInterpolator
+  ULinearMomentumData
+  ULinearMomentumPidData
+  ULinkAccountModalPayload
+  FLinkedAnimGraphReference
+  ULinkerPlaceholderClass
+  ULinkerPlaceholderExportObject
+  ULinkerPlaceholderFunction
+  ULipsyncControl
+  UListViewDesignerPreviewItem
+  ULiveEventEndedEvent
+  ULiveEventEndedModalPayload
+  FLiveEventExchanges
+  FLiveEventFilter
+  ULiveEventMoreInfoModalPayload
+  ULiveEventPhaseChangeModalPayload
+  ULoadingAnimationNotificationPayload
+  FLoadingTip
+  ULocalInputBehaviorSource
+  FLocalMatchmakingSettings
+  ULocalMessage
+  ULocalMouseHoverBehavior
+  ULocalizedElectromagneticStormAIGroup
+  ULocalizedElectromagneticStormPlayerGroup
+  ULocationBasedNetObjectPrioritizer
+  ULuckFilter
+  ULuckPawnFilter
+  UMABP_Avatar_Deformation_Skeleton_C
+  UMABP_Head_Celeste_Cin_Base_C
+  UMABP_Head_Face_01_Pio_Base_C
+  UMABP_Head_Face_02_Pio_Base_C
+  UMABP_Head_Face_03_Pio_Base_C
+  UMABP_Head_Face_05_Pio_Base_C
+  UMABP_Head_Face_06_Pio_Base_C
+  UMABP_Head_Face_07_Pio_Base_C
+  UMABP_Head_Face_08_Pio_Base_C
+  UMABP_Head_Face_09_Pio_Base_C
+  UMABP_Head_Face_11_Pio_Base_C
+  UMABP_Head_Face_12_Pio_Base_C
+  UMABP_Head_Face_13_Pio_Base_C
+  UMABP_Head_Face_15_Pio_Base_C
+  UMABP_Head_Face_18_Pio_Base_C
+  UMABP_Head_Face_19_Pio_Base_C
+  UMABP_Lance_Boxer_FullBody_C
+  UMABP_Sport_BaseballHelmet_C
+  UMLAngularConstraintEffectorState
+  UMLAreaInfo
+  UMLAreaSlotAllocator
+  UMLEffectorState
+  UMLGasActiveEffect
+  UMLGrappleHookEffectorState
+  FMLInferenceInput
+  FMLInferenceOutput
+  FMLInferenceOutputBoolSlot
+  FMLInferenceOutputFloatSlot
+  FMLInferenceOutputReader
+  UMLObservedSkeletalComponentsConfig
+  UMLPhysicsMaterialEffectorState
+  UMLRandomForceApplier
+  UMLRandomOrientationApplier
+  FMLSensorGridPoint
+  UMLSpawnData
+  FMRMeshConfiguration
+  AMainMenu_C
+  FManagedArrayCollection
+  FMapAreaInfo
+  FMapExtractionPointMarkerList
+  UMapInspectScreenPayload
+  UMapProperty
+  UMasteryEndOfSeasonCelebrationCompleteDelegate
+  UMasteryEndOfSeasonCelebrationViewModel
+  UMasteryEndOfSeasonNotificationPayload
+  UMasteryEndOfWeekCelebrationCompleteDelegate
+  UMasteryEndOfWeekCelebrationViewModel
+  UMasteryEndOfWeekNotificationPayload
+  UMasteryExplanationPayload
+  UMasteryObjectiveStreakInteractionsDelegate
+  UMasteryObjectiveTrackerBuilder
+  UMasteryRankRewardPreviewViewData
+  UMasterySeasonLeagueTableEntryViewModel
+  UMasterySeasonRewardsViewModel
+  UMaterialFunctionInterfaceEditorOnlyData
+  FMaterialGalleryMesh
+  UMaterialInterfaceEditorOnlyData
+  UMaterialProvider
+  UMediaPlateAssetUserData
+  UMediaPlayerProxyInterface
+  UMediaSourceRendererInterface
+  UMediaTitlesConnector
+  UMediaTitlesPlayer
+  UMeshAttributePaintToolBuilder
+  UMeshCommandChangeTarget
+  UMeshDeformer
+  UMeshDeformerInstance
+  UMeshDeformerInstanceSettings
+  UMeshDescriptionBaseBulkData
+  UMeshDescriptionCommitter
+  UMeshDescriptionProvider
+  UMeshGroupPaintToolBuilder
+  UMeshInspectorToolBuilder
+  UMeshReplacementCommandChangeTarget
+  UMeshSelectionToolBuilder
+  UMeshSpaceDeformerToolBuilder
+  UMeshSurfacePointMeshEditingToolBuilder
+  UMeshSurfacePointToolBuilder
+  UMeshVertexCommandChangeTarget
+  UMeshVertexPaintToolBuilder
+  UMeshVertexSculptToolBuilder
+  UMetaData
+  UMetaSoundDocumentInterface
+  FMetasoundFrontendClassStyle
+  FMetasoundFrontendClassStyleDisplay
+  FMetasoundFrontendInterfaceStyle
+  FMetasoundFrontendNodeStyle
+  FMetasoundFrontendNodeStyleDisplay
+  FMetasoundFrontendVertexMetadata
+  FMinimalGameplayCueReplicationProxyNetSerializerConfig
+  FMinimalReplicationTagCountMapNetSerializerConfig
+  UMirrorToolBuilder
+  UMockBlackboardTransformExtension
+  FModelInfo
+  UModifierType
+  UModifierType_Meta
+  UModifyGeometrySelectionCommand
+  UModifyGeometrySelectionCommand_Contract
+  UModifyGeometrySelectionCommand_Expand
+  UModifyGeometrySelectionCommand_ExpandToConnected
+  UModifyGeometrySelectionCommand_Invert
+  UModifyGeometrySelectionCommand_InvertConnected
+  FMortarProjectileGameplayAbilityTaskInput
+  FMotionEvent
+  UMouseHoverBehavior
+  UMouseWheelInputBehavior
+  UMovieGraphDataSourceBase
+  UMovieGraphRendererBase
+  UMovieGraphTimeStepBase
+  FMoviePipelineCameraCutInfo
+  UMoviePipelineCollectionQuery
+  UMovieSceneBindingOwnerInterface
+  UMovieSceneBlenderSystemSupport
+  UMovieSceneCachedTrack
+  UMovieSceneCameraShakeEvaluator
+  UMovieSceneCaptureInterface
+  FMovieSceneChannel
+  UMovieSceneChannelOverrideProvider
+  UMovieSceneConsoleVariableTrackInterface
+  UMovieSceneConstrainedSection
+  UMovieSceneDeterminismSource
+  FMovieSceneEmptyStruct
+  UMovieSceneEntityProvider
+  FMovieSceneEntitySystemGraphNodes
+  FMovieSceneEvalTemplateBase
+  FMovieSceneEvalTemplatePtr
+  FMovieSceneEvaluationFieldEntityTree
+  UMovieSceneEvaluationHook
+  FMovieSceneEvaluationInstanceKey
+  FMovieSceneEventParameters
+  FMovieSceneFrameRange
+  FMovieSceneKeyHandleMap
+  UMovieSceneKeyProxy
+  FMovieSceneKeyStruct
+  UMovieSceneMetaDataInterface
+  UMovieSceneNodeGroup
+  UMovieSceneNodeGroupCollection
+  UMovieSceneParameterSectionExtender
+  UMovieScenePlaybackClient
+  UMovieScenePreAnimatedStateSystemInterface
+  UMovieSceneScriptingActualFloatKey
+  UMovieSceneScriptingDoubleAsFloatKey
+  UMovieSceneScriptingKey
+  FMovieSceneSegment
+  FMovieSceneSequenceInstanceData
+  FMovieSceneSequenceInstanceDataPtr
+  UMovieSceneSequencePlayerObserver
+  UMovieSceneSequenceTickManager
+  UMovieSceneSequenceTickManagerClient
+  FMovieSceneSkeletalAnimRootMotionTrackParams
+  FMovieSceneSubSequenceTree
+  FMovieSceneSubSequenceTreeEntry
+  FMovieSceneTrackImplementation
+  FMovieSceneTrackImplementationPtr
+  UMovieSceneTrackTemplateProducer
+  UMovieSceneValueDecomposer
+  UMultiClickSequenceInputBehavior
+  UMultiSelectionMeshEditingToolBuilder
+  UMulticastDelegateProperty
+  UMulticastDelegatePropertyWrapper
+  UMulticastInlineDelegateProperty
+  UMulticastInlineDelegatePropertyWrapper
+  UMulticastSparseDelegateProperty
+  UMultipleChoiceOptionToggleDelegate
+  UMultipleChoiceOptionViewModel
+  UMultipleChoiceQuestionController
+  UMultipleChoiceQuestionViewModel
+  UNNEModelData
+  UNNERuntime
+  UNNERuntimeCPU
+  UNNERuntimeGPU
+  UNNERuntimeRDG
+  UNPCSelectFrontDeepLinkHandler
+  UNPCViewData
+  UNPXGenericPioneerHintData
+  UNPXHintBaseData
+  FNXPCapturedCefBuffer
+  FNXPWebJSCallbackBase
+  FNXPWebJSFunction
+  FNXPWebJSResponse
+  FNameNetSerializerConfig
+  UNameProperty
+  UNamedSlotInterface
+  UNavAgentInterface
+  UNavAreaBase
+  FNavAvoidanceData
+  UNavEdgeProviderInterface
+  FNavGraphEdge
+  UNavLinkCustomInterface
+  UNavLinkHostInterface
+  UNavNodeInterface
+  UNavPathObserverInterface
+  UNavRelevantInterface
+  UNavigationDataInterface
+  FNavigationEvent
+  UNavigationPathGenerator
+  UNavigationSystemBase
+  UNetBlobHandler
+  FNetConnectionTrafficCounters
+  UNetObjectBlobHandler
+  UNetObjectConnectionFilter
+  UNetObjectCountLimiter
+  UNetObjectFilter
+  UNetObjectGridFilter
+  UNetObjectGridFragmentLocFilter
+  UNetObjectGridWorldLocFilter
+  UNetObjectPrioritizer
+  UNetObjectPrioritizerConfig
+  UNetRPCHandler
+  FNetSerializerConfig
+  UNetTokenDataStream
+  UNetworkPredictionInterface
+  UNiagaraConvertInPlaceUtilityBase
+  FNiagaraCulledComponentInfo
+  UNiagaraDataInterfacePhysicsField
+  UNiagaraEditorDataBase
+  UNiagaraEditorParametersAdapterBase
+  UNiagaraEventReceiverEmitterAction
+  FNiagaraInlineDynamicInputFormatToken
+  UNiagaraMessageDataBase
+  FNiagaraMessageStore
+  FNiagaraNumeric
+  UNiagaraParameterDefinitionsBase
+  FNiagaraParameterMap
+  UNiagaraPhysicsAssetDICollectorInterface
+  UNiagaraRenderableMeshInterface
+  FNiagaraRequestSimpleClientInfoMessage
+  FNiagaraResolvedUserDataInterfaceBinding
+  UNiagaraScratchPadContainer
+  UNiagaraScriptSourceBase
+  UNiagaraSimCacheCustomStorageInterface
+  UNiagaraValidationRule
+  FNiagaraWildcard
+  UNoInputBufferingStrategy
+  UNoOpInventoryMutationStrategy
+  UNodeAndChannelMappings
+  UNodeMappingProviderInterface
+  FNodeToCodeAssociation
+  UNopNetObjectFilter
+  FNopNetSerializerConfig
+  UNotificationStack
+  UNotifyFieldValueChanged
+  UNullDropItemListenerInterface
+  UNullHLODBuilder
+  UNumericProperty
+  FObjectNetSerializerConfig
+  UObjectProperty
+  UObjectPropertyBase
+  UObjectReachabilityStressData
+  UObjectRedirector
+  FObjectRelativeLocation
+  UObjectReplicationBridge
+  FObjectSCatterCurvatureSettings
+  FObjectScatterCurveInput
+  FObjectScatterLayer
+  FObjectScatterOcclusionSettings
+  FObjectScatterOverrideSettings
+  FObjectScatterPlacementSettings
+  FObjectScatterSettings
+  FObjectScatterSlopeSettings
+  UObservationSet
+  FObservationSetEntry
+  UOddsTaskSelector
+  UOfferRewardsClaimedEvent
+  UOfferServicePlayerOffer
+  UOfferServicePlayerOfferByItem
+  UOfferServicePlayerTransaction
+  UOfferViewData
+  UOffsetMeshSelectionToolBuilder
+  UOffsetMeshToolBuilder
+  UOnboardingModalPayload
+  FOnboardingPrerequisite
+  UOnboardingRelevantQuestFilter
+  UOnboardingSurveyNavigationPayload
+  UOnlineBlueprintCallProxyBase
+  FOnlinePartyRepDataBase
+  UOnlinePersistenceInterface
+  UOnlineServicesEngineInterfaceImpl
+  UOptionallyCookableAsset
+  FOutlineSettings
+  FOutpostRoomNavigationData
+  UOutpostTileData
+  UOverlapsConverter
+  UOverlays
+  UOwnerQuestFilter
+  FPBIKSolver
+  UPLRBootScreen
+  FPLRCursorState
+  UPLRDrawCommandsBundle
+  UPLRGameBase
+  UPLRGameScreen
+  UPLRHide
+  FPLRItemRegistry
+  UPLRMenuScreen
+  UPLRMusicAlbumSelectDelegate
+  UPLRMusicAlbumViewModel
+  UPLRMusicPlayerEqualizerScreen
+  UPLRMusicPlayerTrackDetailsViewModel
+  UPLRMusicPlayerTracklistScreen
+  UPLRMusicPlayerTracklistViewModel
+  UPLRMusicTrackInteractionDelegate
+  UPLRMusicTrackNextDelegate
+  UPLRMusicTrackPlayDelegate
+  UPLRMusicTrackPreviousDelegate
+  UPLRMusicTrackSelectDelegate
+  UPLRMusicTrackStopDelegate
+  UPLRMusicTrackViewModel
+  UPLRRunnerGame
+  UPLRScreenBase
+  UPLRShow
+  FPackedInt32NetSerializerConfig
+  FPackedInt64NetSerializerConfig
+  FPackedUint32NetSerializerConfig
+  FPackedUint64NetSerializerConfig
+  FPaintContext
+  FParameterDefinitionsSubscription
+  FPartEffectServiceFilter
+  UPartialNetObjectAttachmentHandler
+  FParticleEmitterReplayFrame
+  UParticleModuleEventSendToGame
+  FParticleSettings
+  FParticleSystemLOD
+  FParticleSystemReplayFrame
+  UPartyInvitationFilter
+  UPathFollowingAgentInterface
+  UPathFollowingManager
+  UPatternToolBuilder
+  FPedningStopReplicationItem
+  UPendingPurchasePreviewController
+  UPendingPurchasePreviewOverlayPayload
+  UPendingPurchasePreviewViewModel
+  FPendulumDodgeRollMetrics
+  FPendulumInputs
+  FPerBoneModifier
+  UPerThrusterBalancingModuleData
+  UPersistentDynamicMeshSource
+  UPersistentMeshSelection
+  UPersistentPlayerKeysDevEntryWidgetItem
+  UPhotoListViewModel
+  UPhotoViewModel
+  UPhysicalMaterialPropertyBase
+  UPhysicsComponent
+  UPhysicsDataSource
+  UPhysicsInspectorToolBuilder
+  FPhysicsSpreadRepData
+  FPioPendulumLocationQueryArray
+  UPioneerAchievementDispatcher
+  UPioneerAchievementDispatcherARCDamage
+  UPioneerAchievementDispatcherARCDestruction
+  UPioneerAchievementDispatcherDBNOExtract
+  UPioneerAchievementDispatcherDefeatBastion
+  UPioneerAchievementDispatcherDefeatQueen
+  UPioneerAchievementDispatcherDefeatRocketeer
+  UPioneerAchievementDispatcherDefeatSentinelWithRaiderTool
+  UPioneerAchievementDispatcherDefeatSnitchWithStitcher
+  UPioneerAchievementDispatcherDownRaiderWithGrenade
+  UPioneerAchievementDispatcherExtractWithLittleTimeLeft
+  UPioneerAchievementDispatcherExtractWithStranger
+  UPioneerAchievementDispatcherExtractWithoutSquad
+  UPioneerAchievementDispatcherExtractionAmount
+  UPioneerAchievementDispatcherHatchExtract
+  UPioneerAchievementDispatcherHaveAmountOfWeaponModsEquipped
+  UPioneerAchievementDispatcherHaveAmountOfWeaponModsEquippedFE
+  UPioneerAchievementDispatcherInstallFirstStation
+  UPioneerAchievementDispatcherKnockedOutInExtractionPoint
+  UPioneerAchievementDispatcherLongShot
+  UPioneerAchievementDispatcherPracticeRangeDamage
+  UPioneerAchievementDispatcherRaiderKill
+  UPioneerAchievementDispatcherRaiderKillWithRaiderTool
+  UPioneerAchievementDispatcherReviveRaiderOutsideOfSquadWithDefib
+  UPioneerAchievementDispatcherReviveSquadmates
+  UPioneerAchievementDispatcherRocketeerRideDamage
+  UPioneerAchievementDispatcherSearchContainers
+  UPioneerAchievementDispatcherShootThrusterOffWasp
+  UPioneerAchievementDispatcherStationUpgradeMultiple
+  UPioneerAchievementDispatcherTwoWeaponsOfLvl
+  UPioneerAchievementDispatcherUpgradeStationToLvl
+  UPioneerAchievementDispatcherUpgradeWeaponToLvl
+  UPioneerAchievementDispatcherVisitLockedRoom
+  UPioneerAchievementDispatcherVisitPracticeRange
+  UPioneerAchievementDispatcherVisitTopOfLaunchTower
+  UPioneerAchievementDispatcherWolfpackMultikill
+  UPioneerAchievementServerPlayerState
+  FPioneerAdminMutateInventoryMutation
+  FPioneerAdminPlayerStatScope
+  UPioneerAutobotModuleAiming
+  UPioneerAutobotModuleAiming_Client
+  UPioneerAutobotModuleAiming_Server
+  UPioneerAutobotModuleInventory
+  UPioneerAutobotModuleInventory_Client
+  UPioneerAutobotModuleInventory_Server
+  UPioneerAutobotModuleMovement
+  UPioneerAutobotModuleMovement_Server
+  UPioneerAutobotSpawnRequest
+  UPioneerBattlepassPurchaseDelegate
+  UPioneerBattlepassPurchaseDelegateV2
+  UPioneerBattlepassRewardPurchaseDelegate
+  FPioneerBuildingWall
+  UPioneerCharacterAudioCrawl
+  UPioneerCharacterAudioFoleyEquipment
+  UPioneerCharacterAudioRoll
+  UPioneerCharacterAudioSpeedWind
+  UPioneerCodexObjectiveTracker
+  UPioneerCodexServerPlayerState
+  UPioneerCodexTextEntryDefinitionParameterInitializationClientVisitor
+  UPioneerCodexTextEntryDefinitionParameterInitializationServerVisitor
+  UPioneerConstructableAndWorldItemLuckFilter
+  UPioneerConstructableDispersionCircleShape
+  UPioneerConstructableDispersionStateInterface
+  UPioneerConstructableDispersionTestBase
+  UPioneerConstructableDispersionTestProbability
+  FPioneerConstructablePartHistorySnapshot
+  UPioneerCustomizedCharacterController
+  UPioneerCustomizedCharacterViewModel
+  UPioneerDebugSettings
+  UPioneerForceMagnitudeSpecification
+  UPioneerGameServerInitStepGameMode
+  UPioneerGameServerInitStepMap
+  UPioneerGameServerInitStepMatchId
+  UPioneerGameServerInitStepMatchmakingConfig
+  UPioneerGameServerInitStepScenarioId
+  UPioneerGameServerInitStepSquads
+  FPioneerItemRecycleTable
+  UPioneerMasteryObjectiveTracker
+  FPioneerNPXHintConditionContext
+  FPioneerNavigationBarButtonData
+  UPioneerNpxFalseCondition
+  UPioneerNpxHasQuestCondition
+  UPioneerNpxIsMapOpenCondition
+  FPioneerOfferIndexTable
+  FPioneerOnlineCancelPendingInventoryItemUpgradeResponse
+  FPioneerOnlineCommitItemByIdentity
+  FPioneerOnlineCost
+  FPioneerOnlineDepartExpeditionResponse
+  FPioneerOnlineItemConfig
+  FPioneerOnlineListPendingNexonPurchasesRequest
+  FPioneerOnlineMutateInventoryMutation
+  FPioneerOnlineOperation
+  FPioneerOnlinePlayerStatScope
+  FPioneerOnlineProduct
+  FPioneerOnlineProgressionNotification
+  FPioneerOnlinePublishPartyInventoryChangedRequest
+  FPioneerOnlineSyncTenancyUserRequest
+  FPioneerOnlineSyncTenancyUserResponse
+  UPioneerPlayerServerQuestState
+  UPioneerPlayerStatsDefinition_FieldCraftedItem
+  UPioneerPlayerStatsEventBase
+  UPioneerPlayerStatsEvent_BoughtItem
+  UPioneerPlayerStatsEvent_CompletedQuest
+  UPioneerPlayerStatsEvent_CompletedWorldActivity
+  UPioneerPlayerStatsEvent_CraftedItem
+  UPioneerPlayerStatsEvent_Damaged
+  UPioneerPlayerStatsEvent_DamagedBy
+  UPioneerPlayerStatsEvent_DamagedByItem
+  UPioneerPlayerStatsEvent_DamagedWithItem
+  UPioneerPlayerStatsEvent_Downed
+  UPioneerPlayerStatsEvent_DownedBy
+  UPioneerPlayerStatsEvent_DownedByItem
+  UPioneerPlayerStatsEvent_DownedWithItem
+  UPioneerPlayerStatsEvent_Healed
+  UPioneerPlayerStatsEvent_HealedBy
+  UPioneerPlayerStatsEvent_HealedByItem
+  UPioneerPlayerStatsEvent_HealedWithItem
+  UPioneerPlayerStatsEvent_Killed
+  UPioneerPlayerStatsEvent_KilledBy
+  UPioneerPlayerStatsEvent_KilledByItem
+  UPioneerPlayerStatsEvent_KilledWithItem
+  UPioneerPlayerStatsEvent_LootedContainer
+  UPioneerPlayerStatsEvent_LootedItem
+  UPioneerPlayerStatsEvent_MasteryPoints
+  UPioneerPlayerStatsEvent_RecycledItem
+  UPioneerPlayerStatsEvent_Revived
+  UPioneerPlayerStatsEvent_RevivedBy
+  UPioneerPlayerStatsEvent_RoundBeganWithItemValue
+  UPioneerPlayerStatsEvent_RoundDurationMs
+  UPioneerPlayerStatsEvent_RoundFinishedWithItemValue
+  UPioneerPlayerStatsEvent_RoundLost
+  UPioneerPlayerStatsEvent_RoundPlayed
+  UPioneerPlayerStatsEvent_RoundWon
+  UPioneerPlayerStatsEvent_RoundsPlayed
+  UPioneerPlayerStatsEvent_ScrappedItem
+  UPioneerPlayerStatsEvent_UpgradedItem
+  UPioneerPlayerStatsEvent_UsedConsumable
+  UPioneerPlayerStatsEvent_Xp
+  FPioneerPlayerXPSubsystemPlayerDBNOHistory
+  UPioneerQuestObjectiveDefinitionParameterInitializationClientVisitor
+  UPioneerQuestObjectiveDefinitionParameterInitializationServerVisitor
+  UPioneerQuestObjectiveDefinitionParameterInitializationVisitor
+  UPioneerQuestObjectiveGroupDefinition
+  UPioneerQuestObjectiveGroupPlayerState
+  UPioneerQuestObjective_Activity
+  UPioneerQuestObjective_Buy
+  UPioneerQuestObjective_CompleteSpecificQuest
+  UPioneerQuestObjective_Craft
+  UPioneerQuestObjective_DamageInstance
+  UPioneerQuestObjective_HealInstance
+  UPioneerQuestObjective_MaxDamage
+  UPioneerQuestObjective_MultiKill
+  UPioneerQuestObjective_PlayRound
+  UPioneerQuestObjective_ReceiveDamage
+  UPioneerQuestObjective_Recycle
+  UPioneerQuestObjective_Sell
+  UPioneerQuestObjective_Use
+  UPioneerSelectItem
+  FPioneerServerItemConfig
+  FPioneerServerMutateInventoryMutation
+  FPioneerServerPlayerStatScope
+  FPioneerServerUpdateMasteryObjectivesResponse
+  FPioneerServerUpdateStatsForEndOfRoundResponse
+  UPioneerSurveyModalPayload
+  UPioneerSurveyQuestion
+  UPioneerSurveyQuestionTransition
+  UPioneerSurveyViewModel
+  UPioneerXPEventBase
+  UPioneerXPEvent_Buy
+  UPioneerXPEvent_Craft
+  UPioneerXPEvent_DamageEnemy
+  UPioneerXPEvent_DamagePlayer
+  UPioneerXPEvent_Extract
+  UPioneerXPEvent_Interact
+  UPioneerXPEvent_KillAssistEnemy
+  UPioneerXPEvent_KillAssistPlayer
+  UPioneerXPEvent_KillEnemy
+  UPioneerXPEvent_KillPlayer
+  UPioneerXPEvent_QuestObjective
+  UPioneerXPEvent_Sell
+  UPioneerXPEvent_Survive
+  APioneer_Sky_C
+  UPlaneCutToolBuilder
+  UPlaneDistanceFromHitMechanic
+  UPlanePositionGizmoBuilder
+  UPlayRoundCodexObjectiveTracker
+  UPlayRoundQuestObjectiveTracker
+  FPlayerArray
+  UPlayerBatchedInitStep
+  UPlayerCardCustomizationController
+  UPlayerCardCustomizationPartViewModel
+  FPlayerCardPartsForSlotWrapper
+  UPlayerCardViewModel
+  UPlayerDensityTrackerDQMGroup
+  UPlayerForceApplicator
+  UPlayerForceApplicatorConfiguration
+  UPlayerInitStep
+  UPlayerInitStepAssignSquad
+  UPlayerInitStepDelegated
+  UPlayerInitStepProximityVoiceChannel
+  UPlayerInitStepSquadVoiceChannel
+  UPlayerInitSyncGameModeInfo
+  UPlayerInitSyncPlayerState
+  UPlayerRecorder
+  UPlayerRecordingListViewItem
+  UPlayerRoundViewModel
+  UPlayerRoundsViewModel
+  UPlayerStatViewModel
+  UPlayerStatsViewModel
+  UPlaytestInventoryHandlingAction
+  UPlaytestInventoryHandlingOptionViewModel
+  UPlaytestInventoryHandlingViewModel
+  UPlaytestInventoryHandling_Confirm
+  FPointerEvent
+  FPointerToUberGraphFrame
+  FPolymorphicArrayStructNetSerializerConfig
+  FPolymorphicStructNetSerializerConfig
+  UPolys
+  UPoseWatch
+  UPoseWatchElement
+  UPoseWatchFolder
+  UPoseWatchPoseElement
+  FPredictionKeyNetSerializerConfig
+  UPreloadingShadersWarningPayload
+  UPremiumCurrencyOverlayViewModel
+  UPremiumCurrencyPurchaseViewModel
+  UPremiumCurrencyStoreWidgetViewModel
+  FPreparedTaskGroupConfig
+  UPreviewCollectionInterface
+  UPriceViewModel
+  UPrimitiveComponentBackedTarget
+  UPrimitiveComponentToolTarget
+  UPrimitiveComponentToolTargetFactory
+  UProceduralAnimationObject
+  FProceduralBurstActivation
+  FProceduralGaitEndEffector
+  UProceduralGaitLeg
+  UProductCelebrationController
+  UProductCelebrationViewData
+  UProductCelebrationViewModel
+  UProductEntryButtonTelemetryBuilder
+  UProductEntryViewModel
+  UProductPreviewViewModel
+  UProductTileViewModel
+  UProductViewData
+  UProjectToTargetToolBuilder
+  UProperty
+  FPropertyBagContainerTypes
+  FPropertyBagItem
+  UPropertyBagMissingObject
+  FPropertyBagMissingStruct
+  FPropertyData
+  UPropertyWrapper
+  FProtoMessageBP
+  UProximityVoipStatics
+  UPurchaseButtonViewData
+  UPurchaseNotificationWidgetPayload
+  UPurchasePreviewController
+  UPurchasePreviewNavData
+  UPurchasePreviewViewModel
+  UPushNotificationAction
+  UPushNotificationCondition
+  UPushNotificationViewData
+  UQuadSplineTaskSelector
+  FQuantizedCollisionInfo
+  FQuaternionSpringState
+  FQuestCategoryAssociationData
+  UQuestIDFilter
+  UQuestInstanceFilter
+  UQuestInstancesWrapper
+  UQuestObjectiveCurrentAmountPopulator
+  FQuestObjectiveCurrentProgress
+  UQuestObjectiveDescriptionGenerator
+  UQuestObjectiveExtractionStateMachine
+  UQuestObjectiveIconPopulator
+  UQuestObjectiveOnlineClientServicePopulator
+  UQuestObjectiveState
+  UQuestObjectiveStateMachine
+  UQuestObjectiveTrackerBuilder
+  FQuestObjectiveVoiceOverInfo
+  UQuestPanelController
+  FQuestScreenNavigationData
+  UQuestState
+  FQueuedSpawn
+  UQuickCraftModalPayload
+  UQuickCraftRequiredItemViewModel
+  UQuickCraftResourceSuggestionViewModel
+  UQuickNavigationListEntryViewData
+  URVOAvoidanceInterface
+  URadialWheelEntryViewModel
+  URaiderDenBackgroundViewModel
+  URaiderDenItemSlotViewModel
+  URaiderProjectRewardsNotificationPayload
+  URaiderVoiceTileViewItem
+  FRandomOffsetTransform
+  URandomSequence
+  URankChangeCelebrationEvent
+  FReactiveHullCharacterState
+  FRecentAgentSpatialInfo
+  FRecentDamageTaken
+  URecentInteractionViewModel
+  URecipeTrackerBackend_Test
+  URecipeTrackerEntryItemViewModel
+  URecipeTrackerEntryViewModel
+  FRecipeTrackerGetEntryDelegate
+  URecipeTrackerViewModel
+  URecipeTrackingCancelDelegate
+  URecipeTrackingEntryDelegate
+  URecipeTrackingNavigateDelegate
+  URecomputeUVsToolBuilder
+  UReconnectAvailableNotificationPayload
+  URectangleMarqueeInteraction
+  URegisterPickupListenerInterface
+  FReleaseList
+  FReleaseTag
+  FReleases
+  URemeshMeshToolBuilder
+  FRemovalEventCallbackWrapper
+  URemoveOccludedTrianglesToolBuilder
+  FRepMovementNetSerializerConfig
+  URepairNotificationWidgetPayload
+  FReplicatedLegGroupTickData
+  FReplicatedProjectile
+  UReplicationBridge
+  UReplicationConnectionDriver
+  UReplicationDataStream
+  UReplicationDriver
+  UReportClanNotificationPayload
+  UReportPlayerCategoryToggleDelegate
+  UReportPlayerNotificationPayload
+  UReporterBase
+  UReporterGraph
+  URepositionableTransformGizmoBuilder
+  URequestPartyUpDelegate
+  UResearchOfferViewData
+  URestartTakeoverCelebrationDeepLinkHandler
+  URetriangulateGeometrySelectionCommand
+  URetriggerOnHoldAndReleaseUntilSuccess
+  URetriggerOnHoldUntilSuccess
+  UReverbPluginSourceSettingsBase
+  URevolveBoundaryToolBuilder
+  URevolveSplineToolBuilder
+  FRewardQuerier
+  URichTextBlockDecorator
+  FRigControlModifiedContext
+  FRigDispatchFactory
+  FRigDispatch_AnimAttributeBase
+  FRigDispatch_FromString
+  FRigDispatch_GetAnimAttribute
+  FRigDispatch_GetMetadata
+  FRigDispatch_GetUserData
+  FRigDispatch_MetadataBase
+  FRigDispatch_SetAnimAttribute
+  FRigDispatch_SetMetadata
+  FRigDispatch_ToString
+  FRigElementParentConstraint
+  FRigEventContext
+  FRigHierarchyRef
+  FRigUnit
+  FRigUnit_BonesData
+  FRigUnit_CollectionBase
+  FRigUnit_ControlRigSplineBase
+  FRigUnit_DebugBase
+  FRigUnit_DynamicHierarchyBase
+  FRigUnit_EmbarkVectorDeltaAimBones_CachedBones
+  FRigUnit_FullbodyIK_WorkData
+  FRigUnit_HierarchyBase
+  FRigUnit_HighlevelBase
+  FRigUnit_ItemBase
+  FRigUnit_MultiFABRIK_WorkData
+  FRigVMBaseOp
+  FRigVMBinaryOp
+  FRigVMBreakpoint
+  FRigVMChangeTypeOp
+  FRigVMComparisonOp
+  FRigVMCopyOp
+  FRigVMDebugInfo
+  FRigVMDecorator
+  FRigVMDispatchFactory
+  FRigVMDispatch_ArrayAdd
+  FRigVMDispatch_ArrayAppend
+  FRigVMDispatch_ArrayBase
+  FRigVMDispatch_ArrayBaseMutable
+  FRigVMDispatch_ArrayClone
+  FRigVMDispatch_ArrayDifference
+  FRigVMDispatch_ArrayFind
+  FRigVMDispatch_ArrayGetAtIndex
+  FRigVMDispatch_ArrayGetNum
+  FRigVMDispatch_ArrayInsert
+  FRigVMDispatch_ArrayIntersection
+  FRigVMDispatch_ArrayIterator
+  FRigVMDispatch_ArrayMake
+  FRigVMDispatch_ArrayRemove
+  FRigVMDispatch_ArrayReset
+  FRigVMDispatch_ArrayReverse
+  FRigVMDispatch_ArraySetAtIndex
+  FRigVMDispatch_ArraySetNum
+  FRigVMDispatch_ArrayUnion
+  FRigVMDispatch_BreakStruct
+  FRigVMDispatch_Constant
+  FRigVMDispatch_CoreBase
+  FRigVMDispatch_CoreEquals
+  FRigVMDispatch_CoreNotEquals
+  FRigVMDispatch_If
+  FRigVMDispatch_MakeStruct
+  FRigVMDispatch_Print
+  FRigVMDispatch_SelectInt32
+  FRigVMDispatch_SwitchInt32
+  URigVMEditorSettings
+  FRigVMExecuteContext
+  FRigVMExecuteOp
+  FRigVMExternalVariable
+  FRigVMExternalVariableDef
+  FRigVMFunction_AccumulateBase
+  FRigVMFunction_AnimBase
+  FRigVMFunction_ControlFlowBase
+  FRigVMFunction_DebugBase
+  FRigVMFunction_MathBase
+  FRigVMFunction_MathBoolBase
+  FRigVMFunction_MathColorBase
+  FRigVMFunction_MathDoubleBase
+  FRigVMFunction_MathFloatBase
+  FRigVMFunction_MathIntBase
+  FRigVMFunction_MathMatrixBase
+  FRigVMFunction_MathQuaternionBase
+  FRigVMFunction_MathRBFInterpolateBase
+  FRigVMFunction_MathRBFInterpolateQuatWorkData
+  FRigVMFunction_MathRBFInterpolateVectorWorkData
+  FRigVMFunction_MathTransformBase
+  FRigVMFunction_MathVectorBase
+  FRigVMFunction_NameBase
+  FRigVMFunction_SimBase
+  FRigVMFunction_StringBase
+  URigVMGraphFunctionHost
+  FRigVMInvokeEntryOp
+  FRigVMJumpIfOp
+  FRigVMJumpOp
+  FRigVMJumpToBranchOp
+  FRigVMPredicateBranch
+  FRigVMQuaternaryOp
+  FRigVMQuinaryOp
+  FRigVMSenaryOp
+  FRigVMSlice
+  FRigVMStruct
+  FRigVMTernaryOp
+  FRigVMUnaryOp
+  FRootMotionSourceGroupNetSerializerConfig
+  FRotatorAsByteNetSerializerConfig
+  FRotatorAsShortNetSerializerConfig
+  FRotatorNetSerializerConfig
+  URuntimeBalancingData
+  FRuntimeCellTransformerInstance
+  URuntimeOptionsBase
+  URuntimePartition
+  FRuntimePartitionDesc
+  URuntimePartitionLevelStreaming
+  URuntimePartitionPersistent
+  FSMConnectionValidator
+  FSMDebugStateMachine
+  USMInstanceElementIdMapTransactor
+  USMInstanceInterface
+  USMInstanceManager
+  USMInstanceManagerProvider
+  FSMNodeWidgetInfo
+  USMStateMachineInterface
+  FSMTextDisplayWidgetInfo
+  FSODSpringPlotInterface
+  UScalableSphereGizmoBuilder
+  UScalableSphereGizmoInputBehavior
+  FScavengeableDebrisDefinition
+  UScene
+  USceneDescription
+  USceneSnappingManager
+  FSceneViewExtensionIsActiveFunctor
+  FScopedAllowDefaultPlayerController
+  FScopedFeatureFlagOverride
+  FScopedPerfPrintCounter
+  UScrapNotificationWidgetPayload
+  FScriptSubsystemCollectionBase
+  FScriptTypedElementHandle
+  FScriptTypedElementListProxy
+  UScriptedQuest
+  USeamSculptToolBuilder
+  USeasonEndCelebrationEvent
+  USectionViewModel
+  USelectClanDelegate
+  USelectionSet
+  USelfUnionMeshesToolBuilder
+  USellNotificationPayload
+  FSequenceEvaluatorReference
+  FSequencePlayerReference
+  FSequenceTickManagerWidgetData
+  USequencerAnimationSupport
+  USequentialPartialNetBlobHandler
+  UServerEventTestBase
+  UServerWorldTimeHandlerComponentFactory
+  FSessionServiceLogSubscribe
+  FSessionServiceLogUnsubscribe
+  USetCollisionGeometryToolBuilder
+  USetProperty
+  USettingsFrontendDeepLinkHandler
+  USharedGaitModuleData
+  USharedMetaDataHelper
+  USharedPartyModel
+  FSharedStruct
+  UShutdownNotificationPayload
+  USignInModalPayload
+  USimBaseClassForwarder
+  USimpleCollisionEditorToolBuilder
+  FSimpleDestructibleMeshComponentPtr
+  FSimpleIndexedHandleBase
+  USingleClickToolBuilder
+  USingleKeyCaptureBehavior
+  USingleSelectionMeshEditingToolBuilder
+  USingleSpringSuspensionData
+  USingleTargetWithSelectionToolBuilder
+  FSkeletalControlReference
+  USkeletalMeshBackedTarget
+  USkeletalMeshEditorData
+  FSkeletalMeshSamplingLODBuiltData
+  FSkeletalMeshSamplingRegionBuiltData
+  USkillPurchaseHandle
+  FSkillTreeNodeInfo
+  FSkinViewModelArrayWrapper
+  USlateTextureAtlasInterface
+  USlateTypes
+  FSlateWidgetStyle
+  USlateWidgetStyleContainerBase
+  USlateWidgetStyleContainerInterface
+  FSlopeWarpingFootData
+  FSmartNameContainer
+  FSmartNameMapping
+  USmartTargetingState
+  USmoothMeshToolBuilder
+  USnackbarCelebrationEvent
+  USocialChatChannel
+  USocialChatRoom
+  USocialDebugTools
+  USocialPartyChatRoom
+  USocialPlayerContextualMenuPayload
+  USocialPlayerContextualMenuViewData
+  USocialReadOnlyChatChannel
+  USocialUser
+  FSoftClassPathNetSerializerConfig
+  USoftClassProperty
+  FSoftObjectNetSerializerConfig
+  FSoftObjectPathNetSerializerConfig
+  USoftObjectProperty
+  USoftReferenceStatics
+  FSoundClassEditorData
+  USoundModulationGenerator
+  USoundModulatorBase
+  FSoundNodeEditorData
+  USoundParameterControllerInterface
+  USoundfieldEffectSettingsBase
+  USoundfieldEncodingSettingsBase
+  USoundfieldEndpointSettingsBase
+  USourceDataOverridePluginSourceSettingsBase
+  USpatialCurveDistanceMechanic
+  FSpatialHashRuntimeGrid
+  USpawnActorInterface
+  USpawnItemListenerInterface
+  USpawnPointSelectorScoringFunction
+  FSpawnedLoopingChildDestroyedEffects
+  FSpawnedThrusterEffectData
+  FSpecificEquipUnequipTransition
+  USphereNetObjectPrioritizer
+  USphereWithOwnerBoostNetObjectPrioritizer
+  FSphericalRegion
+  FSplineMeshCornerSegment
+  FSplineMeshDeformationSettings
+  FSplineMeshLayer
+  FSplineMeshLayerStyleOverrides
+  FSplineMeshLightingSettings
+  FSplineMeshSegment
+  FSplineMeshSocketAttachment
+  FSplineMeshSpacingSettings
+  USplineMetadata
+  FSplineSegmentWeightedCornerMesh
+  FSplineSegmentWeightedMesh
+  USplitMeshesToolBuilder
+  USpotMetaDataCollector
+  USpotMetaDataCollector_CurrentLanguageAndLocale
+  USpotMetaDataCollector_PioneerSelectedLighting
+  USpotMetaDataCollector_PioneerServerName
+  FSpringPlot
+  USpringSuspensionData
+  FSquadMatchSessionState
+  FStaggeredPartShaderPropagationList
+  UStandardDynamicLootSpawnerAdapter
+  FStartMidEndIndexes
+  FStartMidEndTransforms
+  UStashUpgradeNotificationWidgetPayload
+  UStashUpgradeOfferViewData
+  UStateInterpolatorFake
+  UStateInterpolatorFakeChild
+  UStateInterpolatorFakeEmpty1
+  UStateInterpolatorFakeEmpty2
+  UStateInterpolatorReplicationEventActorInterface
+  FStateMachineDebugData
+  FStateMachineStateDebugData
+  FStateMachineTempState
+  UStaticLootLimiterManager
+  UStaticLootSpawnLocationManager
+  UStaticLootSpawnManager
+  UStaticLootSpawnerManagerInterface
+  UStaticMeshBackedTarget
+  FStaticMeshComponentLODInfo
+  UStaticMeshDescriptionBulkData
+  UStatsDrawerSelectItem
+  UStatusQuestFilter
+  USteamAuthComponentModuleInterface
+  FSteeringData
+  UStereoLayerShape
+  UStereoLayerShapeCubemap
+  UStereoLayerShapeQuad
+  UStoreBundleDeepLinkHandler
+  UStoreFrontDeepLinkHandler
+  UStoreViewModel
+  UStrProperty
+  FStreamableTexture
+  FStreamableTextureInstance
+  FStreamedAudioPlatformData
+  FStringNetSerializerConfig
+  UStringQueryExpr
+  UStringQueryExpr_Binary
+  UStringQueryExpr_Literal
+  UStringQueryExpr_Unary
+  FStructNetSerializerConfig
+  UStructProperty
+  FStructReference
+  FStyleTheme
+  FSubItemConstIterator
+  FSubItemIterator
+  FSubItemSlotConstIterator
+  FSubItemSlotIterator
+  USubsystemInputSinglePress
+  USubsystemInputToggle
+  FSwingFrame
+  FTableRowBase
+  FTagSoundPair
+  FTagSpecificCameraState
+  UTakeoverAnnouncementsCelebrationEvent
+  UTakeoverAnnouncementsControllerEntry
+  UTakeoverAnnouncementsViewModel
+  UTakeoverAnnouncementsViewModelInternals
+  UTaskSelectorBase
+  FTenancyUserId
+  UTestItemBase
+  UTestTypedElementInterfaceA_ImplTyped
+  UTestTypedElementInterfaceA_ImplUntyped
+  UTestTypedElementInterfaceBAndC_Typed
+  UTextBuffer
+  UTextProperty
+  UTextureAllMipDataProviderFactory
+  UTextureMipDataProviderFactory
+  FTexturePlatformData
+  FTextureSource
+  UThrusterCapacityScalingData
+  UThumbnailInfo
+  FTickPrerequisite
+  UTickableAttributeSetInterface
+  FTimedDataChannelSampleTime
+  UTimedTaskSelector
+  FTimespan
+  UToolActivityHost
+  UToolContextTransactionProvider
+  UToolFrameworkComponent
+  UToolMenuBase
+  UToolTarget
+  UToolTargetFactory
+  UTraceModuleData
+  FTraceScope
+  FTrackRenderData
+  FTrackedCollidingBone
+  FTrailblazerTargetData
+  UTransferMeshToolBuilder
+  FTransformAndVelocityBBVariable
+  UTransformMeshesToolBuilder
+  UTriangleTraceModuleData
+  UTriangulateSplinesToolBuilder
+  UTriggerableSharedData
+  UTryTriggerInputWithBufferTime
+  UTryTriggerWhenActiveWithBufferTime
+  FTweakableDefault
+  UTweakableObject
+  FTypedElementClassTypeInfoColumn
+  UTypedElementCounterInterface
+  FTypedElementDataStorageColumn
+  UTypedElementDataStorageCompatibilityInterface
+  UTypedElementDataStorageFactory
+  UTypedElementDataStorageInterface
+  FTypedElementDataStorageTag
+  UTypedElementDataStorageUiInterface
+  FTypedElementExternalObjectColumn
+  FTypedElementPackageLoadedPathColumn
+  FTypedElementRowReferenceColumn
+  FTypedElementScriptStructTypeInfoColumn
+  FTypedElementSelectionColumn
+  FTypedElementSlateWidgetReferenceColumn
+  FTypedElementSlateWidgetReferenceDeletesRowTag
+  FTypedElementSyncBackToWorldTag
+  FTypedElementSyncFromWorldTag
+  FTypedElementUObjectColumn
+  FTypedElementWidgetConstructor
+  UUICustomInventoryItemFilterByAssetIdDelegate
+  UUICustomInventoryItemFilterByAssetIdsDelegate
+  UUICustomInventoryItemFilterByInstanceIdDelegate
+  UUICustomInventoryItemFilterByQueryPredicate
+  UUICustomInventoryItemFilterDelegateBase
+  UUICustomInventoryItemFilterNonFullStacksDelegate
+  UUIErrorCodeGenerator
+  UUIErrorCodeGenerator_AntiCheat
+  UUIErrorCodeGenerator_BackendReason
+  UUIErrorCodeGenerator_EmbarkIDFlow
+  UUIErrorCodeGenerator_ExitReason
+  UUIErrorCodeGenerator_Inventory
+  UUIErrorCodeGenerator_Matchmaking
+  UUIErrorCodeGenerator_Network
+  UUIErrorCodeGenerator_OnlineError
+  UUIErrorCodeGenerator_ServiceSync
+  UUIErrorCodeGenerator_Store
+  UUIErrorCodeGenerator_Voip
+  FUIExtractionPointStatusData
+  UUIGymStartScreenViewModel
+  UUIGymTileViewTestsScreenController
+  UUIInventoryServiceItemFilterDelegateBase
+  UUIInventoryServiceItemFilterDelegate_ItemDataAssetTagQuery
+  UUIInventoryServiceItemFilterDelegate_ItemDataAssetType
+  UUIItemPingDelegate
+  UUIVoipErrorDelegate
+  UUInt16Property
+  UUInt32Property
+  UUInt64Property
+  UUVLayoutToolBuilder
+  UUVProjectionToolBuilder
+  UUniformTaskSelector
+  FUniqueNetIdReplNetSerializerConfig
+  FUniqueNetIdWrapper
+  FUnitQuat4dNetSerializerConfig
+  FUnitQuat4fNetSerializerConfig
+  FUnitQuatNetSerializerConfig
+  UUnlockFeatureCelebrationEvent
+  UUnlockMapCelebrationEvent
+  UUnlockNpcCelebrationEvent
+  UUpdateAccountModalPayload
+  UUpdateDisplayNameModalPayload
+  UUpdateEmailModalPayload
+  UUpgradeItemCelebrationEvent
+  UUsedPointAwareSpawnPointSelectorScoringFunction
+  UUserWidgetExtension
+  FVector3dNetSerializerConfig
+  FVector3fNetSerializerConfig
+  FVectorNetQuantize100NetSerializerConfig
+  FVectorNetQuantize10NetSerializerConfig
+  FVectorNetQuantizeNetSerializerConfig
+  FVectorNetQuantizeNormalNetSerializerConfig
+  FVectorNetSerializerConfig
+  FVectorSpringState
+  FVersionedNiagaraScriptData
+  UVideoListViewModel
+  UVideoViewModel
+  UVideoViewModelShowGenericVideoDelegate
+  UVideoViewModelShowMapUnlockVideoDelegate
+  UVideoViewModelShowNpcUnlockVideoDelegate
+  UViewModeUtils
+  UVirtualTexture
+  UVisualLoggerAutomationTests
+  UVisualLoggerDebugSnapshotInterface
+  UVisualLoggerExtension
+  UVoiceConversionSpeakerAssetFactory
+  UVoiceDuckManagerBase
+  UVoidAscendedCraftingCameraPreviewSettings
+  UVoidCameraPreviewSettings
+  UVoidCodexCameraPreviewSettings
+  UVoidItemInspectCameraPreviewSettings
+  UVoidSpaceController_Base
+  UVoidSpaceController_Customization
+  UVoidSpaceController_InventoryItem
+  UVoidSpacePreviewData
+  UVoidSpacePreviewData_Customization
+  UVoidSpacePreviewData_Inventory
+  UVoidStoreCameraPreviewSettings
+  UVolumeToMeshToolBuilder
+  UVoxelBlendMeshesToolBuilder
+  UVoxelMorphologyMeshesToolBuilder
+  UVoxelSolidifyMeshesToolBuilder
+  UWBP_ApplicantInteractionEntry_C
+  UWBP_AscendedCraftingAscensionSlot_C
+  UWBP_AscendedCraftingNodeInfoPane_C
+  UWBP_AscendedCraftingTreeLines_C
+  UWBP_AscendedCraftingWeaponPath_C
+  UWBP_BackgroundLogoWidget_C
+  UWBP_BattlePassScreenV2_C
+  UWBP_BattlepassBundlePresentation_C
+  UWBP_BattlepassDetailsScreen_C
+  UWBP_BattlepassEntryV2_C
+  UWBP_BattlepassEntry_C
+  UWBP_BattlepassGrid_C
+  UWBP_BattlepassInfoWidget_C
+  UWBP_BattlepassMarkerEntry_C
+  UWBP_BattlepassPageListEntry_C
+  UWBP_BattlepassPresentationTemplate_C
+  UWBP_BattlepassPreviewButton_C
+  UWBP_BattlepassProgressBar_C
+  UWBP_BattlepassPurchaseButton_C
+  UWBP_BattlepassRewardDetailsPanel_C
+  UWBP_BattlepassRewardEntry_C
+  UWBP_BattlepassRewardPurchase_C
+  UWBP_BattlepassReward_C
+  UWBP_BattlepassScreen_C
+  UWBP_BattlepassSingleItemPresentation_C
+  UWBP_BattlepassSkinPresentation_C
+  UWBP_BattlepassTitle_C
+  UWBP_BattlepassWeaponPresentation_C
+  UWBP_BlackMarketChallenges_C
+  UWBP_BlackMarketScreen_C
+  UWBP_BleedOutImage_C
+  UWBP_BundleBreakdownWidget_C
+  UWBP_BundlePreview_C
+  UWBP_CharacterCustomizationExpressionListEntry_C
+  UWBP_CharacterCustomizationNamedOption_C
+  UWBP_CharacterCustomizationNamedOption_OnDarkBackground_C
+  UWBP_CharacterCustomizationNamedOptionsSelector_C
+  UWBP_CharacterCustomizationNamedOptionsSelector_OnDarkBackground_C
+  UWBP_CharacterCustomizationPanelBattlePass_C
+  UWBP_CharacterCustomizationPanel_C
+  UWBP_CharacterCustomizationQuickNavList_C
+  UWBP_CharacterCustomizationScreenTabbed_C
+  UWBP_CharacterCustomizationSwatchOption_C
+  UWBP_CharacterCustomizationSwatchOptionsSelector_C
+  UWBP_CharacterCustomizationSwatchOptionsSelector_OnDarkBackground_C
+  UWBP_CharacterCustomization_Browser_Expressions_C
+  UWBP_CharacterCustomization_EmoteBrowser_C
+  UWBP_CharacterCustomization_ExpressionWheelAssignmentScreen_C
+  UWBP_CharacterCustomization_ExpressionWheelEntry_C
+  UWBP_CharacterCustomization_ExpressionWheel_C
+  UWBP_CharacterCustomization_PanelActions_C
+  UWBP_CharacterCustomization_Panel_Banner_BattlePass_C
+  UWBP_CharacterCustomization_Panel_Banner_LevelUp_C
+  UWBP_CharacterCustomization_Panel_Banner_LiveEvent_C
+  UWBP_CharacterCustomization_Panel_Banner_MasteryRank_C
+  UWBP_CharacterCustomization_Panel_Banner_Quest_C
+  UWBP_CharacterCustomization_Panel_Banner_RaiderProject_C
+  UWBP_CharacterCustomization_Panel_Banner_StoreBundle_C
+  UWBP_CharacterCustomization_Panel_FocusRequestButton_C
+  UWBP_CharacterCustomization_RaiderVoice_Content_C
+  UWBP_CharacterCustomization_RaiderVoice_PlayIcon_C
+  UWBP_CharacterCustomization_RaiderVoice_TileEntry_C
+  UWBP_CharacterCustomization_SidebarContent_C
+  UWBP_CharacterCustomization_SkinListEntry_Square_C
+  UWBP_CharacterCustomization_SkinListEntry_Tall_C
+  UWBP_CharacterCustomization_SkinSlotBrowser_C
+  UWBP_CharacterCustomization_SkinTileView_Square_C
+  UWBP_CharacterCustomization_SkinTileView_Tall_C
+  UWBP_CharacterCustomization_Tab_Appearance_C
+  UWBP_CharacterCustomization_Tab_Companion_C
+  UWBP_CharacterCustomization_Tab_Expression_C
+  UWBP_CharacterCustomization_Tab_Style_C
+  UWBP_CircularBackplateWithIcon_C
+  UWBP_CircularSkillTreeNodeLevel_C
+  UWBP_CircularSkillTreeNode_C
+  UWBP_CircularTexturedBackplateWithIcon_C
+  UWBP_ClanBrandingTab_C
+  UWBP_ClanCard_C
+  UWBP_ClanComboBox_C
+  UWBP_ClanCreateScreen_C
+  UWBP_ClanCustomizationInfo_C
+  UWBP_ClanCustomizationItemDescription_C
+  UWBP_ClanCustomizationItemGrid_C
+  UWBP_ClanCustomizationItemWidget_C
+  UWBP_ClanCustomizationQuickNavTabList_C
+  UWBP_ClanCustomizationTile_C
+  UWBP_ClanEntryScreen_C
+  UWBP_ClanGeneralTab_C
+  UWBP_ClanHomeCustomizationTab_C
+  UWBP_ClanHomePreferencesTab_C
+  UWBP_ClanHomeScreen_C
+  UWBP_ClanIdentityTab_C
+  UWBP_ClanInfo_C
+  UWBP_ClanMemberEntry_C
+  UWBP_ClanMember_C
+  UWBP_ClanMembersTab_C
+  UWBP_ClanNotificationTip_C
+  UWBP_ClanPreferencesTab_C
+  UWBP_ClanWallEntry_C
+  UWBP_ClanWall_C
+  UWBP_ClansBrowseListEntry_C
+  UWBP_ClansBrowsePaginatorButton_C
+  UWBP_ClansBrowseScreen_C
+  UWBP_ClanuserRoleCard_C
+  UWBP_CodexCollectionEntry_Stencil_C
+  UWBP_CodexCollectionScreen_C
+  UWBP_CodexCollectionTab_Blueprints_C
+  UWBP_CodexCollectionTab_Stencils_C
+  UWBP_CodexMarkdownBlockQuoteWidget_C
+  UWBP_CodexMarkdownLinkTooltipWidget_C
+  UWBP_CodexMarkdownLinkWidget_C
+  UWBP_CodexScreenWidget_C
+  UWBP_CollectionsCategoryEntry_C
+  UWBP_CreditsScreen_C
+  UWBP_CreditsVideoOverlay_01_C
+  UWBP_CreditsVideoOverlay_02_C
+  UWBP_CreditsVideoOverlay_03_C
+  UWBP_CurrencyExpirationEntry_C
+  UWBP_CurrencyExpirationWidget_C
+  UWBP_DEV_PersistentPlayerKeyEntry_C
+  UWBP_DEV_PersistentPlayerKeyScreen_C
+  UWBP_DescendScreen_C
+  UWBP_DottedProgressBar_C
+  UWBP_EditPlayerCardScreen_C
+  UWBP_EventLinearRewardsScreen_C
+  UWBP_ExchangeRateWidget_C
+  UWBP_ExpeditionBonusPCCafe_C
+  UWBP_ExpeditionDepartureProgressionEntry_C
+  UWBP_ExpeditionDepartureProgressionReward_C
+  UWBP_ExpeditionDepartureProgression_C
+  UWBP_Expedition_Accordion_C
+  UWBP_Expedition_CatchUpInformation_C
+  UWBP_FTUECharacterCreationScreen_C
+  UWBP_FTUEOptionsScreen_C
+  UWBP_FeaturedSection_C
+  UWBP_GeneratorQuickNavList_C
+  UWBP_GeneratorScreenCraftTab_C
+  UWBP_GeneratorScreenDetailTab_C
+  UWBP_GeneratorScreenResearchCraftTab_C
+  UWBP_GeneratorScreenStudyTab_C
+  UWBP_GeneratorScreenTabbed_C
+  UWBP_GeneratorScreenUpgradeTab_C
+  UWBP_HighlightStatsEntryWidget_C
+  UWBP_HighlightStatsWidget_C
+  UWBP_InboxDescription_C
+  UWBP_InboxMessagePreviewEntry_C
+  UWBP_InboxMessage_C
+  UWBP_InboxScreen_C
+  UWBP_InventoryFakeListEntryWidget_C
+  UWBP_InventoryFakeScreen_C
+  UWBP_InventoryItemCounter_C
+  UWBP_InventoryItemInspectScreen_C
+  UWBP_InventoryItemInspectTabAscendedCrafting_C
+  UWBP_InventoryItemInspectTabInspect_C
+  UWBP_InventoryItemInspectTabSkin_C
+  UWBP_ItemCelebrationScreen_C
+  UWBP_ItemEffectUpgradeInfoList_C
+  UWBP_ItemEffectUpgradeInfo_C
+  UWBP_ItemSkinTileEntry_C
+  UWBP_ItemUpgradePreview_C
+  UWBP_ItemUpgradeRequirement_C
+  UWBP_LeaderboardPlayerCard_C
+  UWBP_LeaderboardPlayerEntry_C
+  UWBP_LeaderboardPlayerRankWidget_C
+  UWBP_LeaderboardTable_C
+  UWBP_LeaderboardsScreen_C
+  UWBP_LinearGradientMask_C
+  UWBP_LinearRewardProgression_C
+  UWBP_LiveEventDetailsScreen_C
+  UWBP_LiveEventExplanationScreen_C
+  UWBP_LiveEventLoadingWidget_C
+  UWBP_LiveEventMarkerEntry_C
+  UWBP_LiveEventOffer_C
+  UWBP_LiveEventProgressBar_C
+  UWBP_LiveEventRewardEntry_C
+  UWBP_MapSelectionScreenV2_C
+  UWBP_MasteryBaseScreen_C
+  UWBP_MasteryInactiveObjectiveWidget_C
+  UWBP_MasteryMilestoneRewardPreviewButton_C
+  UWBP_MasteryMilestoneRewardPreviewTooltip_C
+  UWBP_MasteryObjectiveWidget_C
+  UWBP_MasteryRaidsScreen_C
+  UWBP_MasterySeasonRewardsEntry_C
+  UWBP_MasterySeasonRewardsScreen_C
+  UWBP_MembersBarButton_C
+  UWBP_MilestonesListEntry_C
+  UWBP_MovieTitlesContainer_C
+  UWBP_NPCQuestsScreen_C
+  UWBP_NPCQuickNavigationList_C
+  UWBP_NPCScreenBase_C
+  UWBP_NPCSelectionEntry_C
+  UWBP_NPCSelectionScreen_C
+  UWBP_NPCStashScreen_C
+  UWBP_NPCTooltip_C
+  UWBP_NPCTradeScreen_C
+  UWBP_NameTooltipWidget_C
+  UWBP_NewInventoryContainerHeader_C
+  UWBP_ObjectiveDetails_C
+  UWBP_ObjectiveRewardPreviewWidget_C
+  UWBP_OutpostDecorationScreen_C
+  UWBP_OutpostExpandScreen_C
+  UWBP_OutpostInspectScreen_C
+  UWBP_OutpostInstallScreen_C
+  UWBP_OutpostOverviewScreen_C
+  UWBP_OutpostRoomScreen_C
+  UWBP_OutpostTileWidget_C
+  UWBP_PLRScreen_C
+  UWBP_PhotoNeighbourPreview_Next_C
+  UWBP_PhotoNeighbourPreview_Previous_C
+  UWBP_PioneerButton_C
+  UWBP_PioneerQuickNavigationList_C
+  UWBP_PlayerCardTitlePartBrowserWidget_C
+  UWBP_PlayerCardVisualPartBrowserWidget_C
+  UWBP_PlayerNametag_C
+  UWBP_PlayerProfileCustomizationListEntryWidget_C
+  UWBP_PlayerProfileCustomizationTitleEntryWidget_C
+  UWBP_PlayerProfileScreen_C
+  UWBP_PlayerRankWidget_C
+  UWBP_PlayerStatsTabWidget_C
+  UWBP_PremiumCurrencyCard_C
+  UWBP_PremiumCurrencyStoreScreen_C
+  UWBP_PremiumCurrencyStoreWidget_C
+  UWBP_ProductEntry_C
+  UWBP_PromotionGroupIconWidget_C
+  UWBP_QuestDebugEntry_C
+  UWBP_QuestDebugScreen_C
+  UWBP_QuestDescription_C
+  UWBP_QuestObjectiveEntry_C
+  UWBP_QuestObjectives_C
+  UWBP_QuestsQuickNavigationList_C
+  UWBP_RaiderDenButton_C
+  UWBP_RaiderDen_Screen_C
+  UWBP_RaiderProjectExplanationPaginationEntry_C
+  UWBP_RaiderProjectExplanationScreen_Expedition_C
+  UWBP_RaiderProjectExplanationScreen_Generic_C
+  UWBP_RaiderProjectExplanationScreen_Seasonal_C
+  UWBP_RaiderProjectGoalListEntry_C
+  UWBP_RaiderProjectListEntry_C
+  UWBP_RaiderProjectScreen_Expedition_C
+  UWBP_RaiderProjectScreen_Generic_C
+  UWBP_RaiderProjectScreen_Seasonal_C
+  UWBP_RaiderProject_Explanation_Page_C
+  UWBP_RaiderProject_GoalInteraction_Amount_C
+  UWBP_RaiderProject_GoalInteraction_Quest_C
+  UWBP_RaiderProject_GoalInteraction_Value_C
+  UWBP_RaiderProject_ItemGroupIconEntry_C
+  UWBP_RaiderProject_ListEntry_Part_C
+  UWBP_RaiderProject_ValueGoalIconList_C
+  UWBP_RaiderProjectsScreen_C
+  UWBP_RankOverviewEntryWidget_C
+  UWBP_RankOverviewPaginationWidget_C
+  UWBP_RankRewardEntryWidget_C
+  UWBP_RanksScreen_C
+  UWBP_RecordsCategoryEmptySlotWidget_C
+  UWBP_RecordsCategoryEntryWidget_C
+  UWBP_RecordsEmptySlotWidget_C
+  UWBP_RecordsEntryPreviewWidget_C
+  UWBP_RecordsEntryScreenWidget_C
+  UWBP_RecordsEntryViewWidget_C
+  UWBP_RecordsVideoButton_C
+  UWBP_ResourceGeneratorCollectTab_C
+  UWBP_ResourceGeneratorDetailTab_C
+  UWBP_ResourceGeneratorDonateQueueWidget_C
+  UWBP_ResourceGeneratorDonateTab_C
+  UWBP_ResourceGeneratorFeedRewardTile_C
+  UWBP_ResourceGeneratorInventoryItemTooltipWidget_C
+  UWBP_ResourceGeneratorItemSlot_C
+  UWBP_ResourceGeneratorQueueEntryWidget_C
+  UWBP_ResourceGeneratorScrapTileWidget_C
+  UWBP_ResourceGeneratorScreen_C
+  UWBP_ResourceGeneratorTooltipBonusEntryWidget_C
+  UWBP_RewardCrateCategoryWidget_C
+  UWBP_RoundHistoryEntryWidget_C
+  UWBP_RoundHistoryWidget_C
+  UWBP_RoundedBoxStriped_C
+  UWBP_ScrollBarPart_C
+  UWBP_SkillTreeLineDrawer_C
+  UWBP_SkillTreeMapScreen_C
+  UWBP_SkillTreeMap_C
+  UWBP_Social_QuickActionButton_C
+  UWBP_StartInformationBasicAnnouncementTemplate_C
+  UWBP_StartInformationScreen_C
+  UWBP_StashUpgradeOfferTile_C
+  UWBP_StatsDrawerEntryWidget_C
+  UWBP_StatsDrawerWidget_C
+  UWBP_StoreNewLabel_C
+  UWBP_StoreSection_C
+  UWBP_Store_C
+  UWBP_StreamingVideoScreen_C
+  UWBP_TopBarClanNameInfo_C
+  UWBP_TwoToneGradientWidget_C
+  UWBP_UpgradeBranch_C
+  UWBP_UpgradeLevelIcon_C
+  UWBP_UpgradeLevelIcons_C
+  UWBP_UpgradeNodeEntry_C
+  UWBP_VerticalProgressionSlider_C
+  UWBP_VerticalRewardProgression_C
+  UWBP_VideoScreen_C
+  UWBP_WorkshopScreen_C
+  UWBP_WorkshopSlotTile_C
+  UWBP_WorldBookCategoryListEntryWidget_C
+  UWBP_WorldBookEmptySlotWidget_C
+  UWBP_WorldBookEntryMediaWidget_C
+  UWBP_WorldBookEntryPaginationWidget_C
+  UWBP_WorldBookEntryScreenWidget_C
+  UWBP_WorldBookListEntryWidget_C
+  UWBP_WorldBookMediaCarouselNavButtonWidget_C
+  UWBP_WorldBookMediaCarouselWidget_C
+  UWBP_WorldBookPreviewEntryWidget_C
+  UWBP_WorldBookRelatedEntryPreviewWidget_C
+  UWBP_WorldBookTabWidget_C
+  UWBP_WorldBookTextBlockWidget_C
+  UWBP_WorldBookTextEntryWidget_C
+  UWBP_WorldBookTextSelectionWidget_C
+  UWBP_WorldBookTopBarWidget_C
+  UWBP_members_LocalPlayer_C
+  UWaveformTransformationBase
+  FWeakObjectNetSerializerConfig
+  UWeakObjectProperty
+  FWeaponModData
+  FWebJSCallbackBase
+  FWebJSFunction
+  FWebJSResponse
+  UWebUrlNotificationPayload
+  UWeldMeshEdgesToolBuilder
+  UWidgetBaseBehavior
+  UWidgetBinaryStateRegistration
+  UWidgetBlueprintGeneratedClassExtension
+  UWidgetCheckedStateRegistration
+  UWidgetDisabledStateRegistration
+  UWidgetEnumStateRegistration
+  FWidgetEventField
+  UWidgetFieldNotificationExtension
+  UWidgetHoveredStateRegistration
+  UWidgetLockedStateRegistration
+  UWidgetPressedStateRegistration
+  UWidgetSelectedStateRegistration
+  FWidgetStateBitfield
+  UWidgetStateSettings
+  UWithdrawJoinClanInviteDelegate
+  FWorkItemTallyBase
+  UWorkshopRecipeScreenPayload
+  UWorkshopSlotTileViewData
+  UWorkshopViewModel
+  UWorldBookCategoryViewModel
+  UWorldBookEntryMediaViewModel
+  UWorldBookEntryTextBlockViewModel
+  UWorldBookEntryViewModel
+  UWorldBookItemBaseViewModel
+  UWorldBookSubCategoryViewModel
+  UWorldBookTopBarNavigationItem
+  UWorldBookViewModel
+  UWorldCollisionStatics
+  UWorldItemForceApplicator
+  FWorldPartitionActorFilter
+  UWorldPartitionActorLoaderInterface
+  UWorldPartitionCell
+  UWorldPartitionEditorHash
+  UWorldPartitionEditorLoaderAdapter
+  UWorldPartitionEditorPerProjectUserSettings
+  UWorldPartitionEditorSpatialHash
+  UWorldPartitionHLODModifier
+  UWorldPartitionHLODProvider
+  UWorldPartitionHLODSourceActors
+  UWorldPartitionHLODSourceActorsFromCell
+  UWorldPartitionHLODSourceActorsFromLevel
+  UWorldPartitionLightingScenarioUtils
+  UWorldPartitionObjectResolver
+  FWorldPartitionPerWorldSettings
+  FWorldPartitionRuntimeCellObjectMapping
+  UWorldPartitionRuntimeCellTransformer
+  UWorldPartitionRuntimeCellTransformerISM
+  UWorldPartitionRuntimeCellTransformerLog
+  FWorldPartitionRuntimeSpatialHashGridPreviewer
+
+== Types with missing fields (13) ==
+  RigVMMemory_Work  missing 635:
+    - DISPATCH_RigVMDispatch_SelectInt32_1_Values_0  (foreign offset 0xCFC)
+    - DISPATCH_RigVMDispatch_SelectInt32_1_Values_1  (foreign offset 0xD30)
+    - DISPATCH_RigVMDispatch_SelectInt32_2_1_Values_1  (foreign offset 0x328)
+    - DISPATCH_RigVMDispatch_SelectInt32_2_Values_1  (foreign offset 0x2A8)
+    - DISPATCH_RigVMDispatch_SelectInt32_4_1_Values_0  (foreign offset 0xBAC)
+    - DISPATCH_RigVMDispatch_SelectInt32_4_1_Values_1  (foreign offset 0xBE0)
+    - DISPATCH_RigVMDispatch_SelectInt32_4_Values_0  (foreign offset 0x37C)
+    - DISPATCH_RigVMDispatch_SelectInt32_4_Values_1  (foreign offset 0x3B0)
+    - DISPATCH_RigVMDispatch_SelectInt32_5_Values_0  (foreign offset 0xD14)
+    - ExtendRaiderToolTelescope___ExtendRaiderToolTelescope_GetCurveValue_1_CachedCurveIndex  (foreign offset 0x218)
+    - ExtendRaiderToolTelescope___ExtendRaiderToolTelescope_GetCurveValue_1_Valid  (foreign offset 0x214)
+    - ExtendRaiderToolTelescope___ExtendRaiderToolTelescope_GetCurveValue_1_Value  (foreign offset 0x210)
+    - ExtendRaiderToolTelescope___ExtendRaiderToolTelescope_Set_Transform_CachedIndex  (foreign offset 0x228)
+    - RigVMModel___Add_1_A  (foreign offset 0x4D0)
+    - RigVMModel___Add_1_B  (foreign offset 0x4F0)
+    - RigVMModel___Add_1_Result  (foreign offset 0x4A0)
+    - RigVMModel___Add_2_Result  (foreign offset 0xC8)
+    - RigVMModel___Add_3_1_Result  (foreign offset 0xA8)
+    - RigVMModel___Add_3_B  (foreign offset 0xC00)
+    - RigVMModel___Add_3_Result  (foreign offset 0xBF0)
+    - RigVMModel___Add_4_1_Result  (foreign offset 0xBB0)
+    - RigVMModel___Add_4_Result  (foreign offset 0x380)
+    - RigVMModel___Add_6_A  (foreign offset 0xC40)
+    - RigVMModel___Add_6_B  (foreign offset 0xC50)
+    - RigVMModel___Add_6_Result  (foreign offset 0xC30)
+    - RigVMModel___Add_B  (foreign offset 0x110)
+    - RigVMModel___AimBoneMath_1_PrimaryCachedSpace  (foreign offset 0xA28)
+    - RigVMModel___AimBoneMath_1_SecondaryCachedSpace  (foreign offset 0xA38)
+    - RigVMModel___AimBoneMath_1_bIsInitialized  (foreign offset 0xA48)
+    - RigVMModel___AimBoneMath_3_1_1_PrimaryCachedSpace  (foreign offset 0x2D38)
+    - RigVMModel___AimBoneMath_3_1_1_SecondaryCachedSpace  (foreign offset 0x2D48)
+    - RigVMModel___AimBoneMath_3_1_1_bIsInitialized  (foreign offset 0x2D58)
+    - RigVMModel___AimBoneMath_3_1_PrimaryCachedSpace  (foreign offset 0x3278)
+    - RigVMModel___AimBoneMath_3_1_SecondaryCachedSpace  (foreign offset 0x3288)
+    - RigVMModel___AimBoneMath_3_1_bIsInitialized  (foreign offset 0x3298)
+    - RigVMModel___AimBoneMath_3_2_PrimaryCachedSpace  (foreign offset 0x2B70)
+    - RigVMModel___AimBoneMath_3_2_SecondaryCachedSpace  (foreign offset 0x2B80)
+    - RigVMModel___AimBoneMath_3_2_bIsInitialized  (foreign offset 0x2B90)
+    - RigVMModel___AimBoneMath_3_PrimaryCachedSpace  (foreign offset 0x30B0)
+    - RigVMModel___AimBoneMath_3_SecondaryCachedSpace  (foreign offset 0x30C0)
+    ... and 595 more
+  AnimBlueprintGeneratedConstantData  missing 287:
+    - __ArrayProperty_3907  (foreign offset 0x8)
+    - __ArrayProperty_3938  (foreign offset 0xE8)
+    - __ArrayProperty_3939  (foreign offset 0xF8)
+    - __ArrayProperty_3953  (foreign offset 0x158)
+    - __ArrayProperty_3960  (foreign offset 0x190)
+    - __ArrayProperty_3968  (foreign offset 0x1C8)
+    - __ArrayProperty_4136  (foreign offset 0x8)
+    - __ArrayProperty_4143  (foreign offset 0x48)
+    - __ArrayProperty_4144  (foreign offset 0x58)
+    - __ArrayProperty_4189  (foreign offset 0x198)
+    - __ArrayProperty_4196  (foreign offset 0x1D0)
+    - __ArrayProperty_4204  (foreign offset 0x208)
+    - __ArrayProperty_44  (foreign offset 0x30)
+    - __ArrayProperty_780  (foreign offset 0xC0)
+    - __ArrayProperty_797  (foreign offset 0x130)
+    - __BoolProperty_102  (foreign offset 0x64)
+    - __BoolProperty_20  (foreign offset 0x38)
+    - __BoolProperty_211  (foreign offset 0x70)
+    - __BoolProperty_215  (foreign offset 0xA8)
+    - __BoolProperty_24  (foreign offset 0x40)
+    - __BoolProperty_259  (foreign offset 0x70)
+    - __BoolProperty_263  (foreign offset 0xA8)
+    - __BoolProperty_3965  (foreign offset 0x1C0)
+    - __BoolProperty_3971  (foreign offset 0x208)
+    - __BoolProperty_41  (foreign offset 0x28)
+    - __BoolProperty_4201  (foreign offset 0x200)
+    - __BoolProperty_4207  (foreign offset 0x248)
+    - __BoolProperty_51  (foreign offset 0x4C)
+    - __BoolProperty_799  (foreign offset 0x160)
+    - __BoolProperty_803  (foreign offset 0x198)
+    - __BoolProperty_99  (foreign offset 0x30)
+    - __ByteProperty_104  (foreign offset 0x66)
+    - __ByteProperty_217  (foreign offset 0xAA)
+    - __ByteProperty_22  (foreign offset 0x3A)
+    - __ByteProperty_26  (foreign offset 0x42)
+    - __ByteProperty_265  (foreign offset 0xAA)
+    - __ByteProperty_29  (foreign offset 0x70)
+    - __ByteProperty_3975  (foreign offset 0x21C)
+    - __ByteProperty_4209  (foreign offset 0x24A)
+    - __ByteProperty_53  (foreign offset 0x4E)
+    ... and 247 more
+  RigVMMemory_Literal  missing 277:
+    - DISPATCH_RigVMDispatch_SelectInt32_2_Values_1__Const  (foreign offset 0x278)
+    - DISPATCH_RigVMDispatch_SelectInt32_3_Values_0__Const  (foreign offset 0x254)
+    - DISPATCH_RigVMDispatch_SelectInt32_3_Values_1__Const  (foreign offset 0x258)
+    - ExtendRaiderToolTelescope___ExtendRaiderToolTelescope_GetCurveValue_1_Curve__Const  (foreign offset 0x1B0)
+    - ExtendRaiderToolTelescope___ExtendRaiderToolTelescope_Set_Transform_Space__Const  (foreign offset 0x148)
+    - ExtendRaiderToolTelescope___ExtendRaiderToolTelescope_Set_Transform_bInitial__Const  (foreign offset 0x149)
+    - ExtendRaiderToolTelescope___ExtendRaiderToolTelescope_Set_Transform_bPropagateToChildren__Const  (foreign offset 0x1B8)
+    - RigVMModel___AimBoneMath_Weight__Const  (foreign offset 0x240)
+    - RigVMModel___AlphaInterp_1_1_1_1_InterpSpeedDecreasing__Const  (foreign offset 0x1BC)
+    - RigVMModel___AlphaInterp_1_1_2_InterpSpeedDecreasing__Const  (foreign offset 0x24C)
+    - RigVMModel___AlphaInterp_1_1_InterpSpeedDecreasing__Const  (foreign offset 0x1A0)
+    - RigVMModel___AlphaInterp_1_1_InterpSpeedIncreasing__Const  (foreign offset 0x19C)
+    - RigVMModel___AlphaInterp_1_1_bMapRange__Const  (foreign offset 0x190)
+    - RigVMModel___AlphaInterp_1_2_InterpSpeedDecreasing__Const  (foreign offset 0x274)
+    - RigVMModel___AlphaInterp_1_2_InterpSpeedIncreasing__Const  (foreign offset 0x270)
+    - RigVMModel___AlphaInterp_1_3_1_InterpSpeedDecreasing__Const  (foreign offset 0x1B8)
+    - RigVMModel___AlphaInterp_1_3_InterpSpeedDecreasing__Const  (foreign offset 0x1AC)
+    - RigVMModel___AlphaInterp_1_InterpSpeedIncreasing__Const  (foreign offset 0x29C)
+    - RigVMModel___AlphaInterp_2_1_1_InterpSpeedDecreasing__Const  (foreign offset 0x1B0)
+    - RigVMModel___AlphaInterp_2_InterpSpeedDecreasing__Const  (foreign offset 0x1F4)
+    - RigVMModel___AlphaInterp_3_InterpSpeedDecreasing__Const  (foreign offset 0x268)
+    - RigVMModel___AlphaInterp_InterpSpeedDecreasing__Const  (foreign offset 0x294)
+    - RigVMModel___Clamp_1_Maximum__Const  (foreign offset 0x2F0)
+    - RigVMModel___Clamp_Maximum__Const  (foreign offset 0x2E0)
+    - RigVMModel___CollectionItems_Items__Const  (foreign offset 0x2B8)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_1_1_1_1_1_1_1_1_1_True__Const  (foreign offset 0x238)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_1_1_1_1_1_1_1_1_True__Const  (foreign offset 0x220)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_1_1_1_1_1_1_1_2_False__Const  (foreign offset 0x240)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_1_1_1_1_1_1_1_2_True__Const  (foreign offset 0x23C)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_1_1_1_1_1_1_1_False__Const  (foreign offset 0x228)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_1_1_1_1_1_1_1_True__Const  (foreign offset 0x224)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_1_1_1_1_False__Const  (foreign offset 0xE0)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_1_1_1_1_True__Const  (foreign offset 0xDC)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_1_1_1_2_True__Const  (foreign offset 0x270)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_1_True__Const  (foreign offset 0x390)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_3_False__Const  (foreign offset 0x14C)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_3_True__Const  (foreign offset 0x148)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_False__Const  (foreign offset 0x150)
+    - RigVMModel___DISPATCH_RigVMDispatch_If_True__Const  (foreign offset 0x2D0)
+    - RigVMModel___Divide_B__Const  (foreign offset 0x4E0)
+    ... and 237 more
+  AnimBlueprintGeneratedMutableData  missing 19:
+    - __ArrayProperty  (foreign offset 0x8)
+    - __ArrayProperty_1  (foreign offset 0x20)
+    - __BoolProperty_0  (foreign offset 0x2)
+    - __ByteProperty_0  (foreign offset 0x18)
+    - __ByteProperty_2  (foreign offset 0x30)
+    - __FloatProperty_0  (foreign offset 0x8)
+    - __FloatProperty_41  (foreign offset 0xCC)
+    - __FloatProperty_42  (foreign offset 0xD0)
+    - __FloatProperty_43  (foreign offset 0xD4)
+    - __FloatProperty_44  (foreign offset 0xD8)
+    - __FloatProperty_45  (foreign offset 0xDC)
+    - __FloatProperty_46  (foreign offset 0xE0)
+    - __FloatProperty_47  (foreign offset 0xE4)
+    - __FloatProperty_48  (foreign offset 0xE8)
+    - __FloatProperty_49  (foreign offset 0xEC)
+    - __FloatProperty_50  (foreign offset 0xF0)
+    - __FloatProperty_51  (foreign offset 0xE8)
+    - __FloatProperty_52  (foreign offset 0xEC)
+    - __FloatProperty_53  (foreign offset 0xF0)
+  RigControlValueStorage  missing 16:
+    - Float00_2  (foreign offset 0x40)
+    - Float01_2  (foreign offset 0x44)
+    - Float02_2  (foreign offset 0x48)
+    - Float03_2  (foreign offset 0x4C)
+    - Float10_2  (foreign offset 0x50)
+    - Float11_2  (foreign offset 0x54)
+    - Float12_2  (foreign offset 0x58)
+    - Float13_2  (foreign offset 0x5C)
+    - Float20_2  (foreign offset 0x60)
+    - Float21_2  (foreign offset 0x64)
+    - Float22_2  (foreign offset 0x68)
+    - Float23_2  (foreign offset 0x6C)
+    - Float30_2  (foreign offset 0x70)
+    - Float31_2  (foreign offset 0x74)
+    - Float32_2  (foreign offset 0x78)
+    - Float33_2  (foreign offset 0x7C)
+  JiraIssueFields  missing 4:
+    - Customfield_10011  (foreign offset 0x230)
+    - Customfield_10013  (foreign offset 0x240)
+    - Customfield_10014  (foreign offset 0x250)
+    - Customfield_10065  (foreign offset 0x220)
+  AISensingStatusTransition  missing 2:
+    - Filter  (foreign offset 0x0)
+    - Values  (foreign offset 0x8)
+  ApprovedStyleClasses  missing 2:
+    - Native_ApprovedComponentBaseTypes_Client  (foreign offset 0xC8)
+    - Native_ApprovedComponentBaseTypes_Server  (foreign offset 0xB8)
+  ComponentAssembler_ApprovedClasses  missing 2:
+    - Native_ApprovedComponentBaseTypes_Client  (foreign offset 0xC8)
+    - Native_ApprovedComponentBaseTypes_Server  (foreign offset 0xB8)
+  ConstructableComponentAssembler_ApprovedClasses  missing 2:
+    - Native_ApprovedComponentBaseTypes_Client  (foreign offset 0xC8)
+    - Native_ApprovedComponentBaseTypes_Server  (foreign offset 0xB8)
+  InboxMessageWidget  missing 2:
+    - HeaderImages2_1  (foreign offset 0x3B0)
+    - HeaderImages3_1  (foreign offset 0x400)
+  LightsOutPuzzle  missing 1:
+    - LightState_4  (foreign offset 0x578)
+  SessionModifier  missing 1:
+    - OptionalMagnitude  (foreign offset 0x8)
+
+== Offset mismatches (186) ==
+  RigVMMemory_Work:
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_RigUnit_GetTransform_5_2_1_2_1_CachedIndex  foreign=0xDF0  ours=0x6990
+    RigVMModel___GetCurveValue_1_Value  foreign=0x1A8  ours=0xC4
+    RigVMModel___GetCurveValue_1_1_Value  foreign=0x214  ours=0xE4
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_MathTransformLerp_1_T  foreign=0x3B0  ours=0x5F50
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_MathFloatAdd_Result  foreign=0x43C  ours=0x5FDC
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_MathTransformLerp_1_1_2_1_T  foreign=0x430  ours=0x5FD0
+    RigVMModel___Subtract_Result  foreign=0xCC  ours=0x13B0
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_MathFloatAbs_2_1_1_Result  foreign=0x119C  ours=0x6D3C
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_MathFloatAbs_1_1_1_Value  foreign=0xF00  ours=0x6AA0
+    RigVMModel___GetTransform_1_CachedIndex  foreign=0x280  ours=0x1420
+    RigVMModel___GetTransform_CachedIndex  foreign=0x170  ours=0x2C0
+    RigVMModel___GetCurveValue_2_CachedCurveIndex  foreign=0xE8  ours=0x1398
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_MathTransformLerp_1_1_T  foreign=0x9E0  ours=0x6580
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_MathFloatAdd_1_1_Result  foreign=0xE08  ours=0x69A8
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_EmbarkCircleIK_1_1_1_bNeedsInit  foreign=0x1408  ours=0x6FA8
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_RigUnit_GetTransform_5_2_1_1_1_1_1_CachedIndex  foreign=0x5C0  ours=0x6160
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_MathFloatAbs_1_Value  foreign=0x540  ours=0x60E0
+    RigVMModel___GetCurveValue_2_Valid  foreign=0xE4  ours=0x1394
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_RigUnit_GetTransform_5_2_1_1_1_1_2_1_CachedIndex  foreign=0xEF0  ours=0x6A90
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_RigUnit_GetTransform_5_2_1_4_CachedIndex  foreign=0x2B0  ours=0x5E50
+  AnimBlueprintGeneratedMutableData:
+    __FloatProperty_32  foreign=0xA8  ours=0x1B8
+    __FloatProperty_23  foreign=0x84  ours=0x14C
+    __FloatProperty_24  foreign=0x88  ours=0x154
+    __FloatProperty_19  foreign=0x74  ours=0x10C
+    __FloatProperty_13  foreign=0x5C  ours=0xB8
+    __BoolProperty_4  foreign=0x32  ours=0xE8
+    __FloatProperty_11  foreign=0x54  ours=0xA4
+    __BoolProperty_5  foreign=0x33  ours=0x148
+    __FloatProperty_17  foreign=0x6C  ours=0xF8
+    __FloatProperty_35  foreign=0xB4  ours=0x1E0
+    __FloatProperty_12  foreign=0x58  ours=0xA8
+    __FloatProperty  foreign=0x4  ours=0x10
+    __FloatProperty_9  foreign=0x4C  ours=0x90
+    __FloatProperty_14  foreign=0x60  ours=0xD0
+    __FloatProperty_3  foreign=0x34  ours=0x40
+    __FloatProperty_7  foreign=0x44  ours=0x70
+    __FloatProperty_36  foreign=0xB8  ours=0x1E4
+    __FloatProperty_37  foreign=0xBC  ours=0x1F0
+    __FloatProperty_33  foreign=0xAC  ours=0x1C8
+    __FloatProperty_10  foreign=0x50  ours=0xA0
+  RigVMMemory_Literal:
+    RigVMModel___GetTransform_Space__Const  foreign=0x14C  ours=0x180
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_RigUnit_GetTransform_5_2_1_1_Space__Const  foreign=0x16C  ours=0x14EC
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_EmbarkCircleIK_1_1_1_EndBone__Const  foreign=0x2C8  ours=0x1648
+    RigVMModel___GetCurveValue_1_Curve__Const  foreign=0x1D4  ours=0xA8
+    RigVMModel___GetTransform_bInitial__Const  foreign=0x13C  ours=0x181
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_EmbarkCircleIK_EndBone__Const  foreign=0xB0  ours=0x1438
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_RigUnit_GetTransform_5_2_1_1_1_bInitial__Const  foreign=0x1C5  ours=0x1545
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_EmbarkCircleIK_1_MidBone__Const  foreign=0x1E8  ours=0x1568
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_EmbarkCircleIK_1_1_StartBone__Const  foreign=0x270  ours=0x15F0
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_EmbarkCircleIK_1_StartBone__Const  foreign=0x1E0  ours=0x1560
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_EmbarkCircleIK_1_1_EndBone__Const  foreign=0x280  ours=0x1600
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_EmbarkCircleIK_StartBone__Const  foreign=0xA0  ours=0x1428
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_MathFloatMul_2_B__Const  foreign=0x1C8  ours=0x1548
+    RigVMModel___GetCurveValue_1_1_Curve__Const  foreign=0x1EC  ours=0xB0
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_EmbarkCircleIK_1_1_1_MidBone__Const  foreign=0x2C0  ours=0x1640
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_EmbarkCircleIK_MidBone__Const  foreign=0xA8  ours=0x1430
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_RigUnit_GetTransform_5_2_1_1_bInitial__Const  foreign=0x16D  ours=0x14ED
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_EmbarkCircleIK_1_EndBone__Const  foreign=0x1F0  ours=0x1570
+    Avatar_CtrlRig_SolveIKs___Avatar_CtrlRig_SolveIKs_EmbarkCircleIK_1_1_1_StartBone__Const  foreign=0x2B8  ours=0x1638
+    RigVMModel___GetCurveValue_Curve__Const  foreign=0x1B8  ours=0xA0
+  AnimBlueprintGeneratedConstantData:
+    __NameProperty_46  foreign=0xC  ours=0x1B4
+    __NameProperty_27  foreign=0x44  ours=0xF8
+    __NameProperty_25  foreign=0x68  ours=0xE8
+    __NameProperty_20  foreign=0x4  ours=0xC0
+    __NameProperty_7  foreign=0x4  ours=0x48
+    __NameProperty_16  foreign=0x4  ours=0x9C
+    __NameProperty_24  foreign=0x60  ours=0xE0
+    __NameProperty_45  foreign=0x4  ours=0x1AC
+    __NameProperty_37  foreign=0x4  ours=0x148
+    __NameProperty_19  foreign=0x4  ours=0xB8
+    __NameProperty_22  foreign=0x4  ours=0xD0
+    __NameProperty_54  foreign=0x50  ours=0x22C
+    __NameProperty_23  foreign=0xC  ours=0xD8
+    __NameProperty_55  foreign=0x58  ours=0x234
+    __NameProperty_38  foreign=0xC  ours=0x150
+    __NameProperty_8  foreign=0xC  ours=0x54
+    __NameProperty_17  foreign=0xC  ours=0xA4
+  LightsOutPuzzle:
+    LightState_3  foreign=0x574  ours=0x578
+    LightState_1  foreign=0x56C  ours=0x570
+    LightState_2  foreign=0x570  ours=0x574
+
+== Enum coverage ==
+  both:            2752
+  only foreign:    224
+  only ours:       2
+
+== Enums with missing entries ==
+  EHardwareDeviceSupportedFeatures  missing 21: Acceleration, All, AudioBasedVibrations, Camera, CustomA, CustomB, CustomC, CustomD, EHardwareDeviceSupportedFeatures_MAX, ForceFeedback, Gamepad, Keypress, Lights, Microphone, MotionTracking, Orientation, Pointer, Touch, TriggerHaptics, Unspecified, Virtual
+  ESoundWaveFFTSize  missing 6: ESoundWaveFFTSize_MAX, Large, Medium, Small, VeryLarge, VerySmall
+  EApiGatewayDiscoveryServerDynamicCommentaryAudioOutputFormat  missing 5: EApiGatewayDiscoveryServerDynamicCommentaryAudioOutputFormat_MAX, mp3_44100, opus_48000, undefined, wav_pcm
+  EMediaSoundComponentFFTSize  missing 5: EMediaSoundComponentFFTSize_MAX, Large, Medium, Min, Small
+  EWaveTableResolution  missing 5: EWaveTableResolution_MAX, Maximum, None, Res, Res_Max
+  ERendererStencilMask  missing 3: ERSM, ERSM_Default, ERSM_MAX
+  ACLRotationFormat  missing 2: ACLRF_Quat, ACLRF_QuatDropW
+  EDatasmithImportLightmapMax  missing 2: LIGHTMAP, LIGHTMAP_MAX
+  EDatasmithImportLightmapMin  missing 2: LIGHTMAP, LIGHTMAP_MAX
+  EGLTFMaterialBakeSizePOT  missing 2: POT, POT_MAX
+  EHpaGraphSize  missing 2: Voxel, Voxel_MAX
+  ENDISkelMesh_GpuUniformSamplingFormat  missing 2: Limited_23, Limited_24
+  ACLVectorFormat  missing 1: ACLVF_Vector3
+  EBinkMediaPlayerBinkSoundTrack  missing 1: BMASM_Bink_Sound
+  EBinkMoviePlayerBinkSoundTrack  missing 1: MP_Bink_Sound
+  EHiveComputeType  missing 1: COMPUTE_TYPE_GPU_G4
+  EPixelFormat  missing 1: PF_PLATFORM_HDR
+  ERayTracingGroupCullingPriority  missing 1: CP
+  EWaveTableBitDepth  missing 1: PCM

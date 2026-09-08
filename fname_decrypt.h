@@ -675,11 +675,15 @@ public:
                 if (CiI == 0 || CiI >= 0x100000u || NumI != 0) continue;
                 std::string Si = DecryptNameString_V908(
                     ResolveNamePtr_V908((int32_t)CiI));
-                if (Si.empty() || Si.size() > 64) continue;
-                bool Alnum = true;
-                for (unsigned char C : Si)
-                    if (!std::isalnum(C) && C != '_') { Alnum = false; break; }
-                if (!Alnum) continue;
+                if (Si.empty() || Si.size() > 128) continue;
+                // Accept identifiers AND package paths (start with /). Both
+                // are legitimate FName targets.
+                bool Ok = true;
+                for (unsigned char C : Si) {
+                    if (!std::isalnum(C) && C != '_' && C != '/' && C != '.')
+                    { Ok = false; break; }
+                }
+                if (!Ok) continue;
                 if (CiI < BestCi) { BestCi = CiI; Best = I; BestS = Si; }
             }
             if (Best < 4) return BestS;
@@ -3468,13 +3472,26 @@ public:
         // the Outer chain with whichever decoder is live instead, and take
         // the first object whose name reads as a package path.
         if (m_v908Active || m_v818Active || m_v811Active || m_v808Active) {
+            // Metaclass singletons (Function, Class, ScriptStruct, ...) have
+            // an OuterSlotIndex that lands on the wrong slot on this build:
+            // the hash-predicted outer decodes to a pointer-shaped garbage
+            // value while the real UPackage pointer sits in a different slot.
+            // Sweep all 4 slot candidates and return the first one that names
+            // as a package path (/Script/CoreUObject, /Script/Engine, ...).
             uint64_t Cur = obj_ptr;
+            std::unordered_set<uint64_t> Visited;
             for (int Depth = 0; Depth < 24; ++Depth) {
-                uint64_t Next = GetOuterPtr(Cur);
-                if (!Next || Next == Cur) break;
-                std::string N = GetName(Next);
-                if (!N.empty() && N[0] == '/') return Next;
-                Cur = Next;
+                if (!Visited.insert(Cur).second) break;
+                auto Cands = GetAllClassCandidates(Cur);
+                uint64_t Best = 0;
+                for (uint64_t P : Cands) {
+                    if (!P || P == Cur) continue;
+                    std::string N = GetName(P);
+                    if (!N.empty() && N[0] == '/') return P;
+                    if (!Best && !N.empty()) Best = P;
+                }
+                if (!Best) break;
+                Cur = Best;
             }
             return 0;
         }

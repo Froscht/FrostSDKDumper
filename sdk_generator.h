@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <sstream>
 #include <fstream>
+#include <iomanip>
+#include <cstdlib>
 #include <cstdio>
 #ifdef _WIN32
 #include <direct.h>
@@ -36,7 +38,74 @@ struct PropertyRecord {
     uint8_t     bool_byte_mask = 0;  // FBoolProperty ByteMask (0x01..0x80)
     uint8_t     bool_field_size = 0; // FBoolProperty FieldSize (1=bitfield, 4=native)
     int         chain_index = -1;    // position in FProperty linked list (serialization order)
+    uint64_t    prop_flags = 0;      // FProperty::PropertyFlags (@ +0xC0) — UE EPropertyFlags bitfield
 };
+
+inline std::string FormatPropertyFlags(uint64_t f) {
+    if (!f) return std::string();
+    struct FlagEntry { uint64_t bit; const char* name; };
+    static const FlagEntry kFlags[] = {
+        {0x0000000000000001ULL, "Edit"},
+        {0x0000000000000002ULL, "ConstParm"},
+        {0x0000000000000004ULL, "BlueprintVisible"},
+        {0x0000000000000008ULL, "ExportObject"},
+        {0x0000000000000010ULL, "BlueprintReadOnly"},
+        {0x0000000000000020ULL, "Net"},
+        {0x0000000000000040ULL, "EditFixedSize"},
+        {0x0000000000000080ULL, "Parm"},
+        {0x0000000000000100ULL, "OutParm"},
+        {0x0000000000000200ULL, "ZeroConstructor"},
+        {0x0000000000000400ULL, "ReturnParm"},
+        {0x0000000000000800ULL, "DisableEditOnTemplate"},
+        {0x0000000000001000ULL, "NonNullable"},
+        {0x0000000000002000ULL, "Transient"},
+        {0x0000000000004000ULL, "Config"},
+        {0x0000000000008000ULL, "RequiredParm"},
+        {0x0000000000010000ULL, "DisableEditOnInstance"},
+        {0x0000000000020000ULL, "EditConst"},
+        {0x0000000000040000ULL, "GlobalConfig"},
+        {0x0000000000080000ULL, "InstancedReference"},
+        {0x0000000000200000ULL, "DuplicateTransient"},
+        {0x0000000001000000ULL, "SaveGame"},
+        {0x0000000002000000ULL, "NoClear"},
+        {0x0000000008000000ULL, "ReferenceParm"},
+        {0x0000000010000000ULL, "BlueprintAssignable"},
+        {0x0000000020000000ULL, "Deprecated"},
+        {0x0000000040000000ULL, "IsPlainOldData"},
+        {0x0000000080000000ULL, "RepSkip"},
+        {0x0000000100000000ULL, "RepNotify"},
+        {0x0000000200000000ULL, "Interp"},
+        {0x0000000400000000ULL, "NonTransactional"},
+        {0x0000000800000000ULL, "EditorOnly"},
+        {0x0000001000000000ULL, "NoDestructor"},
+        {0x0000004000000000ULL, "AutoWeak"},
+        {0x0000008000000000ULL, "ContainsInstancedReference"},
+        {0x0000010000000000ULL, "AssetRegistrySearchable"},
+        {0x0000020000000000ULL, "SimpleDisplay"},
+        {0x0000040000000000ULL, "AdvancedDisplay"},
+        {0x0000080000000000ULL, "Protected"},
+        {0x0000100000000000ULL, "BlueprintCallable"},
+        {0x0000200000000000ULL, "BlueprintAuthorityOnly"},
+        {0x0000400000000000ULL, "TextExportTransient"},
+        {0x0000800000000000ULL, "NonPIEDuplicateTransient"},
+        {0x0001000000000000ULL, "ExposeOnSpawn"},
+        {0x0002000000000000ULL, "PersistentInstance"},
+        {0x0004000000000000ULL, "UObjectWrapper"},
+        {0x0008000000000000ULL, "HasGetValueTypeHash"},
+        {0x0010000000000000ULL, "NativeAccessSpecifierPublic"},
+        {0x0020000000000000ULL, "NativeAccessSpecifierProtected"},
+        {0x0040000000000000ULL, "NativeAccessSpecifierPrivate"},
+        {0x0080000000000000ULL, "SkipSerialization"},
+    };
+    std::string out;
+    for (const auto& e : kFlags) {
+        if (f & e.bit) {
+            if (!out.empty()) out += ", ";
+            out += e.name;
+        }
+    }
+    return out;
+}
 
 struct FunctionRecord {
     std::string                name;
@@ -1685,6 +1754,7 @@ public:
             // ElementSize and ArrayDim stored directly in FProperty (patch 20260414)
             pr.elem_size = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::ElementSize);
             pr.array_dim = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::ArrayDim);
+            pr.prop_flags = Read<uint64_t>(ff + ArcDecrypt::Offsets::FProperty::PropertyFlags);
 
             // Validate property: reject obviously garbage entries
             // Property offsets rarely exceed 0x10000 (64KB). Array dims rarely > 256.
@@ -2417,8 +2487,22 @@ public:
         }
         oss << "namespace " << rec.name << " {\n";
         std::unordered_map<std::string, int> NameCount;
+        const bool EmitPadding = std::getenv("FROST_NO_PADDING") == nullptr;
+        uint32_t PrevEnd = 0;
+        bool ChainStarted = false;
+        int PadIdx = 0;
         for (const auto* prp : GoodProps) {
             const auto& pr = *prp;
+            if (EmitPadding && ChainStarted && pr.offset > PrevEnd && pr.offset < 0x10000) {
+                uint32_t PadBytes = pr.offset - PrevEnd;
+                std::ostringstream pnm;
+                pnm << "Pad_" << std::setw(4) << std::setfill('0') << std::hex << std::uppercase
+                    << PrevEnd << "_" << std::dec << PadIdx++;
+                std::string pn = pnm.str();
+                if (pn.size() < 40) pn.append(40 - pn.size(), ' ');
+                oss << "constexpr uint32_t " << pn << " = 0x" << std::hex << PrevEnd
+                    << ";  // uint8_t[0x" << std::hex << PadBytes << "] // (Padding)\n";
+            }
             std::string type_decl;
             if (pr.array_dim > 1)
                 type_decl = pr.type_name + "[" + std::to_string(pr.array_dim) + "]";
@@ -2435,6 +2519,13 @@ public:
                 name_padded.append(40 - name_padded.size(), ' ');
             oss << "constexpr uint32_t " << name_padded << " = 0x" << std::hex << pr.offset << ";";
             oss << "  // " << type_decl;
+            {
+                uint32_t ThisSize = pr.elem_size ? pr.elem_size : 0;
+                if (pr.array_dim > 1) ThisSize *= pr.array_dim;
+                uint32_t ThisEnd = pr.is_bool ? pr.offset + 1 : pr.offset + ThisSize;
+                if (ThisEnd > PrevEnd) PrevEnd = ThisEnd;
+                ChainStarted = true;
+            }
             if (pr.is_bool && pr.bool_byte_mask) {
                 oss << " // mask=0x" << std::hex << (unsigned)pr.bool_byte_mask;
                 if (pr.bool_field_size == 4)
@@ -2444,6 +2535,10 @@ public:
                 oss << " // size=0x" << std::hex << pr.elem_size;
             if (pr.chain_index >= 0)
                 oss << " // ci=" << std::dec << pr.chain_index;
+            if (pr.prop_flags) {
+                std::string fs = FormatPropertyFlags(pr.prop_flags);
+                if (!fs.empty()) oss << " // flags=(" << fs << ")";
+            }
             oss << "\n";
         }
         if (!rec.natives.empty()) {
