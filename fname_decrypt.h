@@ -642,11 +642,45 @@ public:
         // in that case DecryptNameString_V908 will return empty and the caller
         // falls through to older pipelines.
         uint64_t F = GetObjFNameV908(ObjPtr);
-        std::string S = DecryptNameString_V908(
-            ResolveNamePtr_V908((int32_t)(F & 0xFFFFFFFFu)));
-        uint32_t Number = (uint32_t)(F >> 32);
-        if (S.empty() || Number == 0) return S;
-        return S + "_" + std::to_string(Number - 1);
+        auto TryDecode = [&](uint64_t Fn) -> std::string {
+            std::string S = DecryptNameString_V908(
+                ResolveNamePtr_V908((int32_t)(Fn & 0xFFFFFFFFu)));
+            uint32_t Number = (uint32_t)(Fn >> 32);
+            if (S.empty() || Number == 0) return S;
+            return S + "_" + std::to_string(Number - 1);
+        };
+        std::string S = TryDecode(F);
+        // Metaclass singletons (Class, ScriptStruct, Enum, Function, and the
+        // Actor-family root UClasses) have a hash-derived NameSlotIndex that
+        // picks the WRONG slot on this build — the predicted name slot holds
+        // a decoded pointer (CI=0x7FFF Number=huge) while the real FName sits
+        // in a DIFFERENT slot. When the primary decode looks pointer-shaped
+        // (CI=0x7FFF, Number=big), sweep the other three slots for a slot
+        // whose decoded {CI, Number=0} resolves to a plausible narrow name.
+        uint32_t Ci  = (uint32_t)(F & 0xFFFFFFFFu);
+        uint32_t Num = (uint32_t)(F >> 32);
+        bool LooksLikePtr = (Ci == 0x7FFFu && Num > 0x10000u);
+        if (S.empty() || LooksLikePtr) {
+            uint32_t Best = 4;
+            std::string BestS;
+            uint32_t BestCi = 0xFFFFFFFFu;
+            for (uint32_t I = 0; I < 4; ++I) {
+                uint64_t Fi = DecodeObjSlot16_V908(ObjPtr, I);
+                uint32_t CiI  = (uint32_t)(Fi & 0xFFFFFFFFu);
+                uint32_t NumI = (uint32_t)(Fi >> 32);
+                if (CiI == 0 || CiI >= 0x100000u || NumI != 0) continue;
+                std::string Si = DecryptNameString_V908(
+                    ResolveNamePtr_V908((int32_t)CiI));
+                if (Si.empty() || Si.size() > 64) continue;
+                bool Alnum = true;
+                for (unsigned char C : Si)
+                    if (!std::isalnum(C) && C != '_') { Alnum = false; break; }
+                if (!Alnum) continue;
+                if (CiI < BestCi) { BestCi = CiI; Best = I; BestS = Si; }
+            }
+            if (Best < 4) return BestS;
+        }
+        return S;
     }
 
     uint64_t DecodeObjSlotPtrV908(uint64_t ObjPtr, uint32_t /*SlotRel*/, uint32_t Which) const {
