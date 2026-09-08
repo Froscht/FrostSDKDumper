@@ -664,7 +664,12 @@ public:
         // wrong-slot pick — real names have Number=0. Sweep the other slots
         // for a proper base name in that case too.
         bool LooksBogus = LooksLikePtr || (Ci == 0 && Num > 0x1000u);
-        if (S.empty() || LooksBogus) {
+        // Also try fallback when primary is CI=0 (== "None"): many singletons
+        // whose "real" NameSlot happens to be at a non-hash-predicted slot get
+        // a CI=0 primary but have a real name elsewhere (e.g. UPackages named
+        // /Script/Engine where the /-prefixed name lives at another slot).
+        bool PrimaryIsNone = (Ci == 0 && Num == 0);
+        if (S.empty() || LooksBogus || PrimaryIsNone) {
             uint32_t Best = 4;
             std::string BestS;
             uint32_t BestCi = 0xFFFFFFFFu;
@@ -3472,12 +3477,12 @@ public:
         // the Outer chain with whichever decoder is live instead, and take
         // the first object whose name reads as a package path.
         if (m_v908Active || m_v818Active || m_v811Active || m_v808Active) {
-            // Metaclass singletons (Function, Class, ScriptStruct, ...) have
-            // an OuterSlotIndex that lands on the wrong slot on this build:
-            // the hash-predicted outer decodes to a pointer-shaped garbage
-            // value while the real UPackage pointer sits in a different slot.
-            // Sweep all 4 slot candidates and return the first one that names
-            // as a package path (/Script/CoreUObject, /Script/Engine, ...).
+            // Metaclass singletons (Function, Class, ScriptStruct, Actor, ...)
+            // have a hash-picked OuterSlotIndex that lands on the wrong slot:
+            // the predicted outer decodes to pointer-shaped garbage while the
+            // real UPackage pointer sits in a different slot. Walk all 4 slot
+            // candidates and return the first whose name is a package path
+            // (/Script/CoreUObject, /Script/Engine, ...).
             uint64_t Cur = obj_ptr;
             std::unordered_set<uint64_t> Visited;
             for (int Depth = 0; Depth < 24; ++Depth) {
