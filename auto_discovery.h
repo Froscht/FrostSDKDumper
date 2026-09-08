@@ -4409,27 +4409,39 @@ inline std::string DecryptWide(const std::vector<uint8_t>& Cipher, int Length,
                                const uint16_t* Table, int BaseIdx)
 {
     namespace V = ArcDecrypt::v20260908;
+    // Wide entries in real UE data are almost always short. A garbage header
+    // (from a wrong-slot pick or bogus pointer resolution) still passes the
+    // 10-bit length parse and reads up to ~500 wide chars of junk. Anything
+    // past 128 chars here is far past what real UE wide names ever hit; reject.
+    if (Length <= 0 || Length > 128) return {};
     std::string Out;
     Out.reserve(Length);
     uint32_t Key = (uint32_t)Length + V::KEY_INIT_ADD;
     int I = 0;
+    int NonAscii = 0;
+    auto Pump = [&](uint16_t W) {
+        char C = (char)(W & 0xFF);
+        if ((W & 0xFF00u) != 0 || (uint8_t)C >= 0x80u) ++NonAscii;
+        Out.push_back(C);
+    };
     for (; I + 1 < Length && ((I + 1) * 2 + 1) < (int)Cipher.size(); I += 2) {
         uint32_t Idx1 = Key & V::KEY_INDEX_MASK;
         uint32_t Idx2 = (Key - 1u) & V::KEY_INDEX_MASK;
         uint16_t C1 = (uint16_t)(Cipher[I * 2]           | ((uint16_t)Cipher[I * 2 + 1]           << 8));
         uint16_t C2 = (uint16_t)(Cipher[(I + 1) * 2]     | ((uint16_t)Cipher[(I + 1) * 2 + 1]     << 8));
-        uint16_t W1 = (uint16_t)(C1 ^ Table[Idx1 + BaseIdx]);
-        uint16_t W2 = (uint16_t)(C2 ^ Table[Idx2 + BaseIdx]);
-        Out.push_back((char)(W1 & 0xFF));
-        Out.push_back((char)(W2 & 0xFF));
+        Pump((uint16_t)(C1 ^ Table[Idx1 + BaseIdx]));
+        Pump((uint16_t)(C2 ^ Table[Idx2 + BaseIdx]));
         Key += V::KEY_STEP_PAIR;
     }
     if (I < Length && (I * 2 + 1) < (int)Cipher.size()) {
         uint32_t Idx = Key & V::KEY_INDEX_MASK;
         uint16_t C = (uint16_t)(Cipher[I * 2] | ((uint16_t)Cipher[I * 2 + 1] << 8));
-        uint16_t W = (uint16_t)(C ^ Table[Idx + BaseIdx]);
-        Out.push_back((char)(W & 0xFF));
+        Pump((uint16_t)(C ^ Table[Idx + BaseIdx]));
     }
+    // Reject junk: real UE names are pure ASCII identifier chars. A wrong-
+    // header decode routinely comes out ~90% high-byte. 20% is a very safe
+    // upper bound for any legitimate wide UE name.
+    if (!Out.empty() && NonAscii * 5 > (int)Out.size()) return {};
     return Out;
 }
 

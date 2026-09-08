@@ -4777,7 +4777,7 @@ public:
         // Native (unreflected) fields, last: it needs the final record set and
         // the reclass verdicts, and it is the only pass that reads live
         // instances rather than reflection data.
-        if (std::getenv("FROST_NO_NATIVE_FIELDS") == nullptr) {
+        if (std::getenv("FROST_NATIVE_FIELDS") != nullptr) {
             BuildClassInstanceIndex(object_ptrs);
             BuildSubclassIndex(result.structs);
             size_t WithNatives = 0, Total = 0;

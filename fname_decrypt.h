@@ -506,6 +506,7 @@ public:
             ResolveNamePtr_V818((int32_t)(F & 0xFFFFFFFFu)));
         uint32_t Number = (uint32_t)(F >> 32);
         if (S.empty() || Number == 0) return S;
+        if (Number > 0x100000u) return S;
         return S + "_" + std::to_string(Number - 1);
     }
 
@@ -647,6 +648,7 @@ public:
                 ResolveNamePtr_V908((int32_t)(Fn & 0xFFFFFFFFu)));
             uint32_t Number = (uint32_t)(Fn >> 32);
             if (S.empty() || Number == 0) return S;
+            if (Number > 0x100000u) return S;
             return S + "_" + std::to_string(Number - 1);
         };
         std::string S = TryDecode(F);
@@ -3217,6 +3219,10 @@ public:
     // UE's own ToString appends `_(Number - 1)`.
     static std::string ApplyNameNumber(const std::string& Base, uint32_t Number) {
         if (Base.empty() || Number == 0) return Base;
+        // Real UE instance numbers stay well under a million. Anything larger is
+        // Number-half garbage (wrong-slot pick or pointer-bit leak) and would
+        // append ten-digit noise like "_2147443732" to a valid name.
+        if (Number > 0x100000u) return Base;
         return Base + "_" + std::to_string(Number - 1);
     }
 
@@ -3611,13 +3617,30 @@ private:
         return true;
     }
 
-    // Lenient: mostly-printable ASCII (≥75% printable).
+    // Lenient: mostly-printable ASCII (≥75% printable). Additionally, reject
+    // decodes dominated by characters that never appear in real UE names —
+    // '?', '"', '$', '@', '!', '^', '{', '}', '\\', '|', '`', '~' — because a
+    // wrong-slot decode routinely produces long runs of those when the
+    // XOR-key differences happen to land in punctuation. UE identifiers are
+    // [A-Za-z0-9_/.:-] plus space/paren/brace in package/asset paths, so >10%
+    // of the "junk-only" set means the decode is not a real name.
     static bool IsLenientName(const std::string& s) {
         if (s.empty() || s.size() > 256) return false;
-        int bad = 0;
-        for (unsigned char c : s)
-            if (c < 32 || c > 126) ++bad;
-        return bad * 4 <= static_cast<int>(s.size());
+        int bad = 0, junk = 0;
+        for (unsigned char c : s) {
+            if (c < 32 || c > 126) { ++bad; continue; }
+            switch (c) {
+                case '?': case '"': case '$': case '@': case '!':
+                case '^': case '{': case '}': case '\\': case '|':
+                case '`': case '~':
+                    ++junk;
+                    break;
+                default: break;
+            }
+        }
+        if (bad * 4 > static_cast<int>(s.size())) return false;
+        if (junk * 10 > static_cast<int>(s.size())) return false;
+        return true;
     }
 
     uint64_t       m_base;

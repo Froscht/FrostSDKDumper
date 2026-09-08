@@ -352,7 +352,9 @@ ULevel                 +0x108 TArray<UObject*>   (Actors, live num=564 max=744)
 APlayerCameraManager   +0x3EC ?                  (LockedFOV)
                        +0x3F4 ?                  (LockedOrthoWidth)
 ```
-`FROST_NO_NATIVE_FIELDS=1` turns the pass off.
+`FROST_NATIVE_FIELDS=1` turns the pass on (off by default: names are
+unrecoverable, offsets and types are — many consumers only want reflected
+UPROPERTY-style output).
 
 **The names are NOT recoverable and no attempt is made to guess them.** They
 exist nowhere in the binary. Deriving them from UE source field order is how
