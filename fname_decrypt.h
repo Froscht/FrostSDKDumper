@@ -3429,7 +3429,7 @@ public:
         // synthesising "/Script/<ClassName>" from the type's own name. Walk
         // the Outer chain with whichever decoder is live instead, and take
         // the first object whose name reads as a package path.
-        if (m_v818Active || m_v811Active || m_v808Active) {
+        if (m_v908Active || m_v818Active || m_v811Active || m_v808Active) {
             uint64_t Cur = obj_ptr;
             for (int Depth = 0; Depth < 24; ++Depth) {
                 uint64_t Next = GetOuterPtr(Cur);
