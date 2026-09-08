@@ -660,7 +660,11 @@ public:
         uint32_t Ci  = (uint32_t)(F & 0xFFFFFFFFu);
         uint32_t Num = (uint32_t)(F >> 32);
         bool LooksLikePtr = (Ci == 0x7FFFu && Num > 0x10000u);
-        if (S.empty() || LooksLikePtr) {
+        // Primary decode giving "None_{big_number}" is also almost always a
+        // wrong-slot pick — real names have Number=0. Sweep the other slots
+        // for a proper base name in that case too.
+        bool LooksBogus = LooksLikePtr || (Ci == 0 && Num > 0x1000u);
+        if (S.empty() || LooksBogus) {
             uint32_t Best = 4;
             std::string BestS;
             uint32_t BestCi = 0xFFFFFFFFu;
