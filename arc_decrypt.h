@@ -1865,11 +1865,14 @@ namespace v20260908 {
     constexpr uint64_t FFIELD_NEXT_OFF       = 0x108ULL;
 
     // FProperty layout.
+    // PropertyFlags at +0xA0 verified live (produces 4 distinct u64 values
+    // across 5 sampled properties whereas +0xC0 gives the same repeating
+    // 0x0E0E020206060202 byte pattern for every field).
+    constexpr uint64_t FPROP_PROPFLAGS_OFF   = 0xA0ULL;
     constexpr uint64_t FPROP_OFFSETINT_OFF   = 0xB0ULL;
     constexpr uint32_t FPROP_OFFSET_XOR      = 0xC2CEEE92u;
     constexpr uint64_t FPROP_ELEMSIZE_OFF    = 0xB8ULL;
     constexpr uint64_t FPROP_ARRAYDIM_OFF    = 0xBCULL;
-    constexpr uint64_t FPROP_PROPFLAGS_OFF   = 0xC0ULL;
     constexpr uint64_t FPROP_SIZEOF          = 0x100ULL;
 
     // FBoolProperty extended slot (base is 0x118, not sizeof).
