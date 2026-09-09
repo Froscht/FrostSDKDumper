@@ -4445,9 +4445,10 @@ inline std::string DecryptWide(const std::vector<uint8_t>& Cipher, int Length,
     return Out;
 }
 
-// UObject::GetFName slot hash. NOTE: this pipeline SUBTRACTS ADD rather than
-// adding — the disasm shows `step1 = P * ROL32(Lo, 13) - ADD` etc. The final
-// index is `((u8)v3 ^ (u8)((v3 + 209796) >> 16)) & 3`.
+// UObject::GetFName slot hash. Verified against sub_14043AF90 in IDA:
+// step1 = P * ROL32(Lo, 13) + ADD  (ADD is 0x993B3384, ADDitive not sub).
+// Then ROL22 → P*step + Hi + ADD → ROL13 → P*step + ADD → SHR10 → P*step.
+// Final index: `((u8)v3 ^ (u8)((v3 + 0x33384) >> 16)) & 3`.
 inline uint32_t SlotHash(uint64_t ObjPtr) {
     namespace V = ArcDecrypt::v20260908;
     uint64_t Seed = ObjPtr + V::UOBJ_NAME_SEED_OFF;
@@ -4456,12 +4457,10 @@ inline uint32_t SlotHash(uint64_t ObjPtr) {
     const uint32_t P = V::UOBJ_SLOT_HASH_PRIME;
     const uint32_t A = V::UOBJ_SLOT_HASH_ADD;
 
-    uint32_t step1 = P * Rotl32(Lo, V::UOBJ_SLOT_ROL_A) - A;
-    uint32_t step2 = P * Rotl32(step1, V::UOBJ_SLOT_ROL_B);
-    uint32_t step3 = Rotl32(Hi + step2 - A, V::UOBJ_SLOT_ROL_C);
-    uint32_t T     = P * step3 - A;
-    uint32_t v3    = P * (T >> V::UOBJ_SLOT_SHR);
-    return v3;
+    uint32_t h = Rotl32(Lo, V::UOBJ_SLOT_ROL_A) * P + A;
+    h = Rotl32(h, V::UOBJ_SLOT_ROL_B) * P + Hi + A;
+    h = Rotl32(h, V::UOBJ_SLOT_ROL_C) * P + A;
+    return (h >> V::UOBJ_SLOT_SHR) * P;
 }
 
 inline uint32_t NameSlotIndex(uint64_t ObjPtr) {

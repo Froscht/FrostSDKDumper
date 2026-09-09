@@ -1822,7 +1822,7 @@ namespace v20260908 {
     constexpr uint64_t UOBJ_NAME_SLOT_BASE   = 0x20ULL;
     constexpr uint64_t UOBJ_NAME_SLOT_STRIDE = 0x20ULL;
     constexpr uint32_t UOBJ_SLOT_HASH_PRIME  = 0x01000193u;
-    constexpr uint32_t UOBJ_SLOT_HASH_ADD    = 0x99C193C4u; // -1724173436
+    constexpr uint32_t UOBJ_SLOT_HASH_ADD    = 0x993B3384u; // ADDitive (not sub)
     constexpr uint32_t UOBJ_SLOT_IDX_ADD     = 209796u;      // 0x33384
     constexpr int      UOBJ_SLOT_ROL_A       = 13;
     constexpr int      UOBJ_SLOT_ROL_B       = 22;
