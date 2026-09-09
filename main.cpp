@@ -3666,15 +3666,36 @@ public:
             addr_to_name.reserve(obj_count);
             addr_to_fullname.reserve(obj_count);
             object_ptrs.reserve(obj_count);
+            const uint64_t ImgSize = AutoDiscovery::g_DiscoveredBounds.ImageSize;
+            const uint64_t ModHi   = ImgSize ? (MODULE_BASE + ImgSize) : 0;
+            uint64_t Filtered = 0;
             for (int32_t i = 0; i < obj_count; ++i) {
                 uint64_t obj_ptr = m_gobj.GetObjectPtr(i);
                 if (!obj_ptr) continue;
-                object_ptrs.push_back({i, obj_ptr});
-                std::string full = m_fname.GetName(obj_ptr);
-                if (full.empty()) {
-                    int32_t Ci = m_fname.DecryptFFieldNameCI(obj_ptr - 8);
-                    if (Ci > 1) full = m_fname.CompIndexToNameLenient(Ci);
+                // Filter FField-family allocations misclassified as UObjects.
+                // On v908 the raw object array contains ~14% FField-family
+                // entries (FStructProperty/FObjectProperty/FBoolProperty
+                // vtables inside the module range) plus another ~12% with
+                // zero or out-of-module vtables — dead slots or heap noise.
+                // Passing them into the SDK loop stamps them as
+                // /Script/Unknown.<garbage> records. Real UObject vtables
+                // sit in the module image; FField vtables also sit in-
+                // module but the SDK loop's type-cast-flags / is_class
+                // paths correctly reject them, so a bounds check is enough
+                // to keep the tail from silently growing.
+                uint64_t Vt = 0;
+                if (!m_reader.Read(obj_ptr, &Vt, sizeof(uint64_t)) || Vt == 0) {
+                    ++Filtered; continue;
                 }
+                if (ModHi && (Vt < MODULE_BASE || Vt >= ModHi)) {
+                    ++Filtered; continue;
+                }
+                object_ptrs.push_back({i, obj_ptr});
+                // Name resolution — UObject slot only. The `obj_ptr - 8`
+                // FField-NamePrivate fallback used to run here was reading
+                // FField allocations *as* UObjects, and every name it
+                // recovered fed a bogus record into /Script/Unknown.
+                std::string full = m_fname.GetName(obj_ptr);
                 if (!full.empty()) {
                     bool Plausible = full.size() <= 256;
                     if (Plausible) {
@@ -3691,6 +3712,8 @@ public:
                 if (i % 10000 == 0)
                     std::cout << "\r[*] Scanning: " << i << "/" << obj_count << "  " << std::flush;
             }
+            std::printf("\n[+] Filtered %llu FField/dead-vtable entries out of the raw object array\n",
+                (unsigned long long)Filtered);
         }
         std::printf("[+] Name map: %zu entries\n", addr_to_name.size());
 

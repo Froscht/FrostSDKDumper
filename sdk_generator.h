@@ -1414,6 +1414,54 @@ public:
             [](const PropertyRecord& a, const PropertyRecord& b){ return a.offset < b.offset; });
         return result;
     }
+    // ── UEnum entry-array layout ─────────────────────────────────────────
+    // Classic UE:  TArray<TPair<FName,int64>> at +Names,
+    //              stride 16, {ci@0, num@4, val@8}, count @Names+8, max @Names+12.
+    // v20260908:   SoA at +Names,
+    //              KeysPtr @+0xB0 & ~1 (stride 8 {ci@0, num@4}),
+    //              ValsPtr @+0xB8 & ~1 (stride 8 int64),
+    //              Num     @+0xC0 (no separate Max).
+    // Pointers on v908 carry a low-bit tag that must be stripped.
+    struct EnumLayout {
+        uint64_t keys_ptr = 0;
+        uint64_t vals_ptr = 0;
+        uint32_t count    = 0;
+        uint32_t max      = 0;
+        uint32_t stride   = 16;
+        bool     valid    = false;
+    };
+    EnumLayout ReadEnumLayout(uint64_t obj_ptr) {
+        EnumLayout L{};
+        const uint64_t Names = ArcDecrypt::Offsets::UEnum::Names;
+        if (m_fname.IsV908Active()) {
+            L.keys_ptr = Read<uint64_t>(obj_ptr + Names)     & ~1ULL;
+            L.vals_ptr = Read<uint64_t>(obj_ptr + Names + 8) & ~1ULL;
+            L.count    = Read<uint32_t>(obj_ptr + Names + 16);
+            L.max      = L.count;
+            L.stride   = 8;
+        } else {
+            L.keys_ptr = Read<uint64_t>(obj_ptr + Names);
+            L.vals_ptr = L.keys_ptr;
+            L.count    = Read<uint32_t>(obj_ptr + Names + 8);
+            L.max      = Read<uint32_t>(obj_ptr + Names + 12);
+            L.stride   = 16;
+        }
+        L.valid = (L.keys_ptr > 0x10000 && L.keys_ptr < 0x7FFFFFFFFFFFULL &&
+                   L.count > 0 && L.count < 512 &&
+                   L.max >= L.count && L.max < 512);
+        if (L.valid && m_fname.IsV908Active()) {
+            L.valid = (L.vals_ptr > 0x10000 && L.vals_ptr < 0x7FFFFFFFFFFFULL);
+        }
+        return L;
+    }
+    int32_t  EnumEntryCI (const EnumLayout& L, uint32_t i) { return Read<int32_t>(L.keys_ptr + (uint64_t)i * L.stride); }
+    uint32_t EnumEntryNum(const EnumLayout& L, uint32_t i) { return Read<uint32_t>(L.keys_ptr + (uint64_t)i * L.stride + 4); }
+    int64_t  EnumEntryVal(const EnumLayout& L, uint32_t i) {
+        return m_fname.IsV908Active()
+            ? Read<int64_t>(L.vals_ptr + (uint64_t)i * 8)
+            : Read<int64_t>(L.vals_ptr + (uint64_t)i * 16 + 8);
+    }
+
     std::string GetNameTheia(uint64_t obj_ptr) {
         if (!obj_ptr || obj_ptr < 0x10000 || obj_ptr >= 0x7FFFFFFFFFFFULL) return {};
         std::string n = m_fname.GetName(obj_ptr);
@@ -1523,13 +1571,8 @@ public:
                 uint64_t evtbl = Read<uint64_t>(en);
                 bool VtOk = evtbl >= MODULE_BASE + 0x1000 && evtbl < MODULE_BASE + 0xE9D0000ULL;
                 if (VtOk) {
-                    uint64_t NamesPtr = Read<uint64_t>(en + ArcDecrypt::Offsets::UEnum::Names);
-                    uint32_t NamesCnt = Read<uint32_t>(en + ArcDecrypt::Offsets::UEnum::Names + 8);
-                    uint32_t NamesMax = Read<uint32_t>(en + ArcDecrypt::Offsets::UEnum::Names + 12);
-                    bool LooksLikeEnum = (NamesPtr > 0x10000 && NamesPtr < 0x7FFFFFFFFFFFULL &&
-                                          NamesCnt > 0 && NamesCnt < 512 &&
-                                          NamesMax >= NamesCnt && NamesMax < 512);
-                    if (LooksLikeEnum) m_known_enums.insert(en);
+                    EnumLayout L = ReadEnumLayout(en);
+                    if (L.valid) m_known_enums.insert(en);
                 }
                 std::string n = GetNameTheia(en);
                 if (!n.empty() && IsPlausibleUEName(n)) { type_name = n; return; }
@@ -1634,8 +1677,15 @@ public:
                     return false;
                 };
                 bool slot_present =
-                    AnyNonZero(ArcDecrypt::Offsets::FField::NameEncrypted) ||
-                    AnyNonZero(0x30);
+                    AnyNonZero(ArcDecrypt::Offsets::FField::NameEncrypted);
+                // The +0x30 fallback was needed on CL-1177678 when NamePrivate
+                // auto-discovery could drift. On v908 NamePrivate is verified
+                // at +0x90 and the +0x30 probe lands on Niagara UNiagaraScript
+                // instance bytes that pass a plausibility check, then walk one
+                // step into random memory and emit as Prop_CI0_Off0xC2CEEE92.
+                // Only trust the +0x30 fallback when v908 is inactive.
+                if (!slot_present && !m_fname.IsV908Active())
+                    slot_present = AnyNonZero(0x30);
                 if (!slot_present) { m_lastChainBreak = "NamePrivate all-zero"; break; }
 
                 uint64_t ff_owner = Read<uint64_t>(ff + ArcDecrypt::Offsets::FField::Owner);
@@ -1659,10 +1709,16 @@ public:
             if (pr.name.empty()) {
                 int32_t fci = m_fname.DecryptFFieldNameCI(ff);
                 // CI's chunk_offset = (ci >> 8) & 0xFFFF00. Anything past the
-                // live FNamePool's allocated range (~0x6A0000 on 20260421) is
-                // either runtime-only or a walk overshoot — drop the entry.
+                // live FNamePool's allocated range is either runtime-only
+                // or a walk overshoot — drop the entry. Historic threshold
+                // was 0x6A0000 (~110M CIs), which let BP-transient FNames
+                // that live in the editor's own pool through and produced
+                // ~1500 Prop_CI records per dump. Live pool uses roughly
+                // 1-2M entries → chunk_off caps near 0x200000 in practice;
+                // 0x600000 keeps ample headroom without waving through
+                // the noise past the tail.
                 uint64_t chunk_off = (static_cast<uint64_t>(fci) >> 8) & 0xFFFF00ULL;
-                if (chunk_off > 0x6A0000ULL) break;
+                if (chunk_off > 0x600000ULL) break;
                 uint32_t stored_off2 = Read<uint32_t>(ff + ArcDecrypt::Offsets::FProperty::Offset_Internal);
                 uint32_t off2 = ArcDecrypt::Patch20260421::DecryptPropertyOffsetNew(stored_off2);
                 char buf[64];
@@ -3868,21 +3924,15 @@ public:
             // Path C: structural heuristic for enums/structs.
             bool is_type_by_ref_early = allTypeAddrs.count(obj_ptr) > 0;
             if (!is_enum && !is_scriptstruct && !m_known_structs.count(obj_ptr)) {
-                uint64_t names_ptr = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names);
-                uint32_t names_cnt = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 8);
-                uint32_t names_max = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 12);
+                EnumLayout L = ReadEnumLayout(obj_ptr);
                 bool is_cdo = short_name.rfind("Default__", 0) == 0;
-                if (!is_cdo &&
-                    names_ptr > 0x10000 && names_ptr < 0x7FFFFFFFFFFFULL &&
-                    names_cnt > 0 && names_cnt < 256 &&
-                    names_max >= names_cnt && names_max < 256) {
+                if (!is_cdo && L.valid && L.count < 256 && L.max < 256) {
                     bool plausible = true;
-                    uint32_t probe_n = names_cnt < 16 ? names_cnt : 16;
+                    uint32_t probe_n = L.count < 16 ? L.count : 16;
                     for (uint32_t j = 0; j < probe_n; ++j) {
-                        uint64_t ep   = names_ptr + (uint64_t)j * 16;
-                        int32_t  ci   = Read<int32_t>(ep + 0);
-                        uint32_t num  = Read<uint32_t>(ep + 4);
-                        int64_t  val  = Read<int64_t>(ep + 8);
+                        int32_t  ci   = EnumEntryCI (L, j);
+                        uint32_t num  = EnumEntryNum(L, j);
+                        int64_t  val  = EnumEntryVal(L, j);
                         if (!(ci > 0 && (uint32_t)ci < 0x1FFFFFFFu) ||
                             num >= 0x100 ||
                             !(val > -0x10000 && val < 0x10000)) {
@@ -3890,8 +3940,8 @@ public:
                             break;
                         }
                     }
-                    if (plausible && names_cnt == 1 &&
-                        Read<int64_t>(names_ptr + 8) != 0) {
+                    if (plausible && L.count == 1 &&
+                        EnumEntryVal(L, 0) != 0) {
                         plausible = false;
                     }
                     if (plausible) {
@@ -3959,9 +4009,7 @@ public:
 
             // ─── UEnum ────────────────────────────────────────────────────────
             if (is_enum) {
-                uint64_t names_ptr = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names);
-                uint32_t names_cnt = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 8);
-                uint32_t names_max = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UEnum::Names + 12);
+                EnumLayout L = ReadEnumLayout(obj_ptr);
 
                 // Even objects classified as enum by Path A (class candidate
                 // matches enumAddrs) can be misclassified — GetAllClassCandidates
@@ -3970,17 +4018,14 @@ public:
                 // Apply the same shape gate as Path C: validate entries' value
                 // ranges and reject single-entry pseudo-enums with non-zero vals.
                 bool shape_ok = false;
-                if (names_ptr > 0x10000 && names_ptr < 0x7FFFFFFFFFFFULL &&
-                    names_cnt > 0 && names_cnt < 256 &&
-                    names_max >= names_cnt && names_max < 256) {
+                if (L.valid && L.count < 256 && L.max < 256) {
                     shape_ok = true;
-                    uint32_t probe_n = names_cnt < 16 ? names_cnt : 16;
+                    uint32_t probe_n = L.count < 16 ? L.count : 16;
                     uint32_t resolved = 0;
                     for (uint32_t j = 0; j < probe_n; ++j) {
-                        uint64_t ep   = names_ptr + (uint64_t)j * 16;
-                        int32_t  ci   = Read<int32_t>(ep + 0);
-                        uint32_t num  = Read<uint32_t>(ep + 4);
-                        int64_t  val  = Read<int64_t>(ep + 8);
+                        int32_t  ci   = EnumEntryCI (L, j);
+                        uint32_t num  = EnumEntryNum(L, j);
+                        int64_t  val  = EnumEntryVal(L, j);
                         if (!(ci > 0 && (uint32_t)ci < 0x1FFFFFFFu) ||
                             num >= 0x100 ||
                             !(val > -0x10000 && val < 0x10000)) {
@@ -3988,31 +4033,15 @@ public:
                             break;
                         }
                         // Real enum entries' CIs all resolve via the name pool.
-                        // Misclassified data assets (UClass +0xB0 = SuperStruct
-                        // ptr; AnimNotifyState_SetGameplayTags has 5 slots with
-                        // only one valid CI) typically have most entries fail.
                         std::string ev = m_fname.CompIndexToNameLenient(ci);
                         if (!ev.empty() && ev.find('?') == std::string::npos) {
                             ++resolved;
                         }
                     }
                     if (shape_ok) {
-                        // Require ALL probed entries to resolve via the FName
-                        // pool. Real enums hit 100% (CL-1177146 FName lookup is
-                        // reliable); pseudo-enums (UClass/UAngelscriptClass +0xB0
-                        // = SuperStruct ptr; CDA76AC0 had cnt=2 with one slot
-                        // resolving "Camera.State" and another with garbage CI)
-                        // fail. The 50% threshold tried earlier let CDA76AC0
-                        // through because need=(2+1)/2=1 was satisfied by the
-                        // single chance hit.
                         if (resolved < probe_n) shape_ok = false;
                     }
-                    // Reject single-entry "enums" — real enums almost always
-                    // have ≥ 2 entries (Type::None / EXyz_MAX pair etc.).
-                    // 1-entry pseudo-enums are nearly all misclassifications
-                    // (UClass +0xB0 = SuperStruct ptr happens to point at a
-                    // heap region with one resolvable FName slot by chance).
-                    if (shape_ok && names_cnt < 1) {
+                    if (shape_ok && L.count < 1) {
                         shape_ok = false;
                     }
                 }
@@ -4039,11 +4068,10 @@ public:
                 erec.package = pkg;
 
                 if (shape_ok) {
-                    for (uint32_t j = 0; j < names_cnt; ++j) {
-                        uint64_t ep  = names_ptr + (uint64_t)j * 16;
-                        int32_t  ci  = Read<int32_t>(ep + 0);
-                        uint32_t num = Read<uint32_t>(ep + 4);
-                        int64_t  val = Read<int64_t>(ep + 8);
+                    for (uint32_t j = 0; j < L.count; ++j) {
+                        int32_t  ci  = EnumEntryCI (L, j);
+                        uint32_t num = EnumEntryNum(L, j);
+                        int64_t  val = EnumEntryVal(L, j);
                         std::string ev = m_fname.CompIndexToNameNumbered(ci, num);
                         if (ev.empty()) continue;
                         if (ev.find('?') != std::string::npos) continue;
