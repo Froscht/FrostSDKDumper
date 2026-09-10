@@ -620,8 +620,14 @@ public:
             Sh.FField908Next        = 0xE8;
             Sh.FField908Owner       = 0x40;
             Sh.UStruct908Super      = 0x128;
-            Sh.Layout908Resolved    = true;  // block ApplyOffsets908 re-assert
-            std::printf("[sabotage] v908 struct layout wrecked\n");
+            // Do NOT set Layout908Resolved — leaving it false lets
+            // ApplyOffsets908 restore compiled defaults from
+            // ArcDecrypt::v20260908::FFIELD_*_OFF / USTRUCT_*_OFF, which is
+            // the actual recovery path for layout on this build (there is
+            // no runtime probe yet; ProbeAndAdopt908Layout is a stub). This
+            // matches the v818 rule: sabotage that has no dedicated
+            // recovery extractor recovers via the Apply-gate.
+            std::printf("[sabotage] v908 struct layout wrecked (recovers via ApplyOffsets908)\n");
         }
     }
 
