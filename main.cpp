@@ -707,12 +707,21 @@ public:
         // ── FName pipeline ────────────────────────────────────────────────
         {
             auto Sites = AutoResolve818::FindChunkOffSites(m_sigScanner, Bd);
+            std::printf("[ar908] %zu ChunkOff sites\n", Sites.size());
+            int NExtract = 0, NAdopt = 0;
+            std::unordered_map<std::string, int> RejHist;
+            bool Adopted = false;
             for (uint64_t S : Sites) {
                 auto P = AR::ExtractFNamePipeline908(m_sigScanner, Bd, S);
-                if (!P.Valid) continue;
+                if (!P.Valid) {
+                    RejHist[P.Reject ? P.Reject : "(unspecified)"]++;
+                    continue;
+                }
+                ++NExtract;
                 auto A = AR::AdoptFNamePipeline908(Bd, P,
                     [this]() { return m_fname.TryV908(false); });
                 if (!A.Valid) continue;
+                ++NAdopt;
                 if (P.PoolRva != V::RVA_GNAMEPOOL)
                     std::printf("[ar908]   DRIFT pool 0x%llX != compiled 0x%llX\n",
                         (unsigned long long)P.PoolRva, (unsigned long long)V::RVA_GNAMEPOOL);
@@ -720,7 +729,14 @@ public:
                     (unsigned long long)P.Rva, (unsigned long long)A.WindowRva);
                 Sh.Resolved908 = true;
                 ++Areas;
+                Adopted = true;
                 break;
+            }
+            if (!Adopted) {
+                std::printf("[ar908] FName pipeline: %d extracted, %d adopted\n",
+                    NExtract, NAdopt);
+                for (const auto& [Why, N] : RejHist)
+                    std::printf("[ar908]   %5d x %s\n", N, Why.c_str());
             }
         }
 
