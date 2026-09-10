@@ -2510,6 +2510,13 @@ public:
         // Skip namespaces that have nothing useful after filtering.
         if (GoodProps.empty() && GoodFns.empty() && rec.natives.empty()) return "";
 
+        // Sanity: a UStruct props_size > 1 MB is impossible — the largest
+        // engine types cap out in tens of KB. Anything larger is a mis-cast
+        // (FField list head or other non-UStruct whose PropertiesSize
+        // offset reads random bytes). Emit-side gate catches records that
+        // slipped past the classification-pass filters.
+        if (rec.props_size > 0x100000u) return "";
+
         // If the record's own name is decode garbage — heavy on characters
         // that UE identifiers never carry ('?', '"', '$', '@', '!', '^', '{',
         // '}', '\\', '|', '`', '~') — substitute a synthetic address-based
