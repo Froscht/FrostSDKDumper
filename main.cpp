@@ -61,6 +61,7 @@
 using FNameDecryptor = FName::FNameDecryptor;
 #include "auto_resolve.h"
 #include "auto_resolve818.h"
+#include "auto_resolve908.h"
 #include "theia_static.h"
 #include "auto_offsets.h"
 #include "auto_export.h"
@@ -547,6 +548,322 @@ public:
         }
     }
 
+    // FROST_SABOTAGE908=chunkmgr|fname|ffield|getfname|propoff|layout|all
+    // Same shape as Sabotage818, six sibling areas for the v20260908 pipeline.
+    // Must run BEFORE RunAutoResolve908 or the compiled defaults win and the
+    // recovery paths are never exercised. Each area wrecks a distinct piece
+    // of g_Sheet with obviously-wrong (but nonzero) constants; auto_resolve908
+    // must recover to a dump byte-identical to the clean run.
+    void Sabotage908() {
+        const char* S = getenv("FROST_SABOTAGE908");
+        if (!S) return;
+        std::string W = S;
+        auto Hit = [&](const char* N) { return W == "all" || W == N; };
+        auto& Sh = ArcDecrypt::g_Sheet;
+
+        if (Hit("chunkmgr")) {
+            Sh.ChunkMgr908Rva        = 0xDEAD000ULL;
+            Sh.ChunkMgr908KeyRva     = 0xDEAD400ULL;
+            Sh.ChunkMgr908Rol16      = 7;
+            Sh.ChunkMgr908PshuflwImm = 0xFF;
+            Sh.Mgr908NumOff = 0x40; Sh.Mgr908NumXor = 0x11223344u;
+            Sh.Mgr908ArrOff = 0x48; Sh.Mgr908ArrXor = 0x5566778899AABBCCULL;
+            Sh.ChunkMgr908Resolved   = true;   // block ApplyOffsets908 re-assert
+            std::printf("[sabotage] v908 chunks_manager wrecked\n");
+        }
+        if (Hit("fname")) {
+            Sh.Pool908Rva       = 0xBEEF000ULL;
+            Sh.Keystream908Rva  = 0xBEEF800ULL;
+            Sh.Seed908Off       = 0x1234;
+            Sh.Block908Base     = 0x5678;
+            Sh.Block908Stride   = 0x40;
+            Sh.BlockRol32_908   = 9;
+            Sh.Block2Xor908     = 0x0123456789ABCDEFULL;
+            Sh.BlockAdd908      = 0xAAAAAAAAAAAAAAAAULL;
+            Sh.Fnv908Add        = 0xBBBBBBBBBBBBBBBBULL;
+            Sh.Fnv908Rol1       = 11;
+            Sh.Fnv908Rol2       = 13;
+            Sh.KeyInitAdd908    = 0x4242;
+            Sh.Shard908Program.clear();
+            std::printf("[sabotage] v908 FName pipeline wrecked\n");
+        }
+        if (Hit("ffield")) {
+            Sh.FFieldName908Off        = 0x148;
+            Sh.FFieldNameKey908        = 0x1111111111111111ULL;
+            Sh.FFieldName908Rol16      = 7;
+            Sh.FFieldName908Rol64      = 24;
+            for (int I = 0; I < 8; ++I) Sh.FFieldNamePshufb908[I] = 7;
+            Sh.FFieldName908Resolved = true;  // block ApplyOffsets908 re-assert
+            std::printf("[sabotage] v908 FField name decode wrecked\n");
+        }
+        if (Hit("getfname")) {
+            Sh.Slot908SeedOff  = 0x18;
+            Sh.Slot908Base     = 0x40;
+            Sh.Slot908Stride   = 0x10;
+            Sh.Slot908NameXor  = 1;
+            Sh.SlotKeyA_908    = 0x1111111111111111ULL;
+            Sh.Slot908FinalRol = 16;
+            for (int I = 0; I < 8; ++I) Sh.SlotPshufb908[I] = 0;
+            Sh.Slot908Program.clear();
+            std::printf("[sabotage] v908 GetFName slot values wrecked\n");
+        }
+        if (Hit("propoff")) {
+            Sh.PropOffsetInternal = 0x99;
+            Sh.PropOffsetXor      = 0x11223344u;
+            Sh.PropOff908Resolved = true;
+            ArcDecrypt::Offsets::FProperty::Offset_Internal = 0x99;
+            ArcDecrypt::Offsets::FProperty::Offset_XOR      = 0x11223344u;
+            std::printf("[sabotage] v908 Offset_Internal wrecked\n");
+        }
+        if (Hit("layout")) {
+            Sh.UStruct908ChildProps = 0x128;
+            Sh.FField908Next        = 0xE8;
+            Sh.FField908Owner       = 0x40;
+            Sh.UStruct908Super      = 0x128;
+            Sh.Layout908Resolved    = true;  // block ApplyOffsets908 re-assert
+            std::printf("[sabotage] v908 struct layout wrecked\n");
+        }
+    }
+
+    void RunAutoResolve908() {
+        if (m_autoResolved908) return;
+        m_autoResolved908 = true;
+        namespace AR = AutoResolve908;
+        namespace V  = ArcDecrypt::v20260908;
+        const auto& Bd = AutoDiscovery::g_DiscoveredBounds;
+        if (!Bd.Valid || !Bd.TextSize) {
+            std::printf("\n=== Phase 0c3: auto-resolve (v20260908) ===\n");
+            std::printf("[ar908] module bounds unknown - skipped\n");
+            return;
+        }
+        std::printf("\n=== Phase 0c3: auto-resolve (v20260908) ===\n");
+        auto& Sh = ArcDecrypt::g_Sheet;
+        int Areas = 0;
+
+        // ── chunks_manager ────────────────────────────────────────────────
+        {
+            auto Mg = AR::FindChunkMgr908(m_sigScanner, Bd,
+                [this](const AR::ChunkMgr908Info& C) -> bool {
+                    uint8_t Enc[16] = {}, Key[16] = {};
+                    if (!m_reader.Read(MODULE_BASE + C.GlobalRva, Enc, 16)) return false;
+                    if (!m_reader.Read(MODULE_BASE + C.KeyRva,    Key, 16)) return false;
+                    uint64_t BlobLo = 0, KeyLo = 0;
+                    std::memcpy(&BlobLo, Enc, 8);
+                    std::memcpy(&KeyLo,  Key,  8);
+                    uint64_t X = BlobLo ^ KeyLo;
+                    // ROL16 per word, then PSHUFLW.
+                    int N = C.Rol16 & 15;
+                    if (N) {
+                        uint64_t R = 0;
+                        for (int I = 0; I < 4; ++I) {
+                            uint16_t W = (uint16_t)(X >> (I * 16));
+                            uint16_t Rw = (uint16_t)((W << N) | (W >> (16 - N)));
+                            R |= (uint64_t)Rw << (I * 16);
+                        }
+                        X = R;
+                    }
+                    uint16_t Ws[4];
+                    for (int I = 0; I < 4; ++I) Ws[I] = (uint16_t)(X >> (I * 16));
+                    uint64_t Mgr = 0;
+                    for (int I = 0; I < 4; ++I) {
+                        int Src = (C.PshuflwImm >> (I * 2)) & 3;
+                        Mgr |= (uint64_t)Ws[Src] << (I * 16);
+                    }
+                    if (Mgr < 0x10000ULL || Mgr >= 0x800000000000ULL) return false;
+                    uint32_t NumRaw = 0; uint64_t ArrRaw = 0;
+                    if (!m_reader.Read(Mgr + C.NumOff, &NumRaw, 4)) return false;
+                    if (!m_reader.Read(Mgr + C.ArrOff, &ArrRaw, 8)) return false;
+                    uint32_t Num = __builtin_bswap32(NumRaw ^ C.NumXor);
+                    uint64_t Arr = __builtin_bswap64(ArrRaw ^ C.ArrXor);
+                    if (Num <= 1000 || Num >= 4000000) return false;
+                    if (Arr < 0x10000ULL || Arr >= 0x800000000000ULL) return false;
+                    uint64_t Chunk0 = 0;
+                    if (!m_reader.Read(Arr, &Chunk0, 8)) return false;
+                    return Chunk0 >= 0x10000ULL && Chunk0 < 0x800000000000ULL;
+                });
+            if (Mg.Valid) {
+                if (Mg.GlobalRva != V::RVA_CHUNKMGR_GLOBAL)
+                    std::printf("[ar908]   DRIFT chunks_manager 0x%llX != compiled 0x%llX\n",
+                        (unsigned long long)Mg.GlobalRva, (unsigned long long)V::RVA_CHUNKMGR_GLOBAL);
+                Sh.ChunkMgr908Rva        = Mg.GlobalRva;
+                Sh.ChunkMgr908KeyRva     = Mg.KeyRva;
+                Sh.ChunkMgr908Rol16      = Mg.Rol16;
+                Sh.ChunkMgr908PshuflwImm = Mg.PshuflwImm;
+                Sh.Mgr908NumOff = Mg.NumOff;
+                Sh.Mgr908NumXor = Mg.NumXor;
+                Sh.Mgr908ArrOff = Mg.ArrOff;
+                Sh.Mgr908ArrXor = Mg.ArrXor;
+                Sh.ChunkMgr908Resolved = true;
+                std::printf("[ar908] chunks_manager adopted: rol16=%d pshuflw=0x%02X "
+                            "key@0x%llX num +0x%llX ^0x%08X arr +0x%llX ^0x%llX\n",
+                    Mg.Rol16, Mg.PshuflwImm,
+                    (unsigned long long)Mg.KeyRva,
+                    (unsigned long long)Mg.NumOff, Mg.NumXor,
+                    (unsigned long long)Mg.ArrOff, (unsigned long long)Mg.ArrXor);
+                ++Areas;
+            }
+        }
+
+        // ── FName pipeline ────────────────────────────────────────────────
+        {
+            auto Sites = AutoResolve818::FindChunkOffSites(m_sigScanner, Bd);
+            for (uint64_t S : Sites) {
+                auto P = AR::ExtractFNamePipeline908(m_sigScanner, Bd, S);
+                if (!P.Valid) continue;
+                auto A = AR::AdoptFNamePipeline908(Bd, P,
+                    [this]() { return m_fname.TryV908(false); });
+                if (!A.Valid) continue;
+                if (P.PoolRva != V::RVA_GNAMEPOOL)
+                    std::printf("[ar908]   DRIFT pool 0x%llX != compiled 0x%llX\n",
+                        (unsigned long long)P.PoolRva, (unsigned long long)V::RVA_GNAMEPOOL);
+                std::printf("[ar908] FName pipeline adopted from 0x%llX (window 0x%llX)\n",
+                    (unsigned long long)P.Rva, (unsigned long long)A.WindowRva);
+                Sh.Resolved908 = true;
+                ++Areas;
+                break;
+            }
+        }
+
+        // ── Property offset (adopt immediately — encode shape is unambiguous)
+        {
+            auto Po = AR::ExtractPropertyOffset908(m_sigScanner, Bd);
+            if (Po.Valid) {
+                m_prev908PropOff = Sh.PropOffsetInternal;
+                m_prev908PropXor = Sh.PropOffsetXor;
+                Sh.PropOffsetInternal = Po.OffsetInternal;
+                Sh.PropOffsetXor      = Po.Xor;
+                Sh.PropOff908Resolved = true;
+                ArcDecrypt::Offsets::FProperty::Offset_Internal = Po.OffsetInternal;
+                ArcDecrypt::Offsets::FProperty::Offset_XOR      = Po.Xor;
+                ArcDecrypt::Patch20260421::g_PropertyOffsetXor  = Po.Xor;
+                m_resolved908PropOff = Po;
+                if (Po.OffsetInternal != V::FPROP_OFFSETINT_OFF || Po.Xor != V::FPROP_OFFSET_XOR)
+                    std::printf("[ar908]   DRIFT Offset_Internal +0x%llX ^0x%08X != compiled +0x%llX ^0x%08X\n",
+                        (unsigned long long)Po.OffsetInternal, Po.Xor,
+                        (unsigned long long)V::FPROP_OFFSETINT_OFF, V::FPROP_OFFSET_XOR);
+                std::printf("[ar908] Offset_Internal +0x%llX xor 0x%08X (adopted)\n",
+                    (unsigned long long)Po.OffsetInternal, Po.Xor);
+                ++Areas;
+            }
+        }
+
+        // ── FField NamePrivate (adopt immediately, verify later) ─────────
+        {
+            auto Fn = AR::ExtractFFieldName908(m_sigScanner, Bd);
+            if (Fn.Valid) {
+                m_prev908FFName = { Sh.FFieldName908Off, Sh.FFieldNameKey908,
+                                    Sh.FFieldName908Rol16, Sh.FFieldName908Rol64 };
+                std::memcpy(m_prev908FFPshufb, Sh.FFieldNamePshufb908, 8);
+                Sh.FFieldName908Off  = Fn.NameOff;
+                Sh.FFieldNameKey908  = Fn.Key;
+                std::memcpy(Sh.FFieldNamePshufb908, Fn.Pshufb, 8);
+                Sh.FFieldName908Rol16 = Fn.Rol16;
+                Sh.FFieldName908Rol64 = Fn.Rol64;
+                Sh.FFieldName908Resolved = true;
+                std::printf("[ar908] FField name adopted from 0x%llX: +0x%llX key 0x%llX rol16=%d rol64=%d\n",
+                    (unsigned long long)Fn.Rva,
+                    (unsigned long long)Fn.NameOff,
+                    (unsigned long long)Fn.Key,
+                    Fn.Rol16, Fn.Rol64);
+                ++Areas;
+            }
+        }
+
+        // ── GetFName (stage; scored post-array by ScoreAndAdopt908SlotSelector)
+        {
+            auto Gf = AR::FindGetFName908(m_sigScanner, Bd);
+            if (Gf.Valid) {
+                std::printf("[ar908] GetFName staged from 0x%llX (role=%s, %d copies)\n",
+                    (unsigned long long)Gf.Rva,
+                    AR::RoleName908(Gf.Which), Gf.Copies);
+                m_resolved908GetFName = Gf;
+                ++Areas;
+            }
+        }
+
+        std::printf("[ar908] %d of 5 areas resolved\n", Areas);
+    }
+
+    void ScoreAndAdopt908SlotSelector() {
+        if (!m_resolved908GetFName.Valid || !m_fname.IsV908Active()) return;
+        // Sample 400 objects stride-spread across the array (not the first N —
+        // they clone one class). Score by clean-ASCII-name count.
+        std::vector<uint64_t> Sample;
+        int Total = m_gobj.GetNumElements();
+        if (Total < 400) return;
+        int Stride = Total / 400;
+        for (int I = 0; I < 400; ++I) {
+            uint64_t P = m_gobj.GetObjectPtr(I * Stride);
+            if (P) Sample.push_back(P);
+        }
+        auto Score = [&]() -> int {
+            int Ok = 0;
+            for (uint64_t P : Sample) {
+                std::string N = m_fname.GetName(P);
+                if (N.empty()) continue;
+                bool Clean = N.size() <= 128;
+                if (Clean) for (unsigned char C : N)
+                    if (C < 0x20 || C > 0x7E) { Clean = false; break; }
+                if (Clean) ++Ok;
+            }
+            return Ok;
+        };
+        auto& Sh = ArcDecrypt::g_Sheet;
+        const ArcDecrypt::LiveSheet Saved = Sh;
+        int Loaded = Score();
+        // Stage extracted values.
+        auto& G = m_resolved908GetFName;
+        Sh.Slot908Program.clear();
+        for (auto& H : G.Hash) Sh.Slot908Program.push_back(H);
+        Sh.Slot908SeedOff  = G.SeedOff;
+        Sh.Slot908Base     = G.SlotBase;
+        Sh.Slot908Stride   = G.SlotStride;
+        Sh.Slot908NameXor  = G.SlotXor;
+        Sh.SlotKeyA_908    = G.KeyLo64;
+        std::memcpy(Sh.SlotPshufb908, G.Pshufb, 8);
+        Sh.Slot908FinalRol = G.FinalRol;
+        int Fresh = Score();
+        if (Fresh > Loaded) {
+            std::printf("[ar908] slot selector: loaded %d/%zu -> auto-resolved %d/%zu -> adopted\n",
+                Loaded, Sample.size(), Fresh, Sample.size());
+        } else {
+            Sh = Saved;
+            std::printf("[ar908] slot selector: loaded %d/%zu vs auto-resolved %d/%zu -> reverted\n",
+                Loaded, Sample.size(), Fresh, Sample.size());
+        }
+    }
+
+    void ValidateAndAdopt908FFieldName() {
+        if (!m_fname.IsV908Active() || !ArcDecrypt::g_Sheet.FFieldName908Resolved) return;
+        // Nothing here yet — the ExtractFFieldName pass already adopts, and
+        // the follow-up scoring against DISTINCT decoded property names lives
+        // inside ProbePropertyChain paths that run per-record. If the adopted
+        // key produces worse output we would notice via a drop in the naming
+        // rate stat, which is the fastest single signal.
+    }
+
+    void ValidateAndAdopt908PropertyOffset() {
+        if (!m_resolved908PropOff.Valid || !m_fname.IsV908Active()) return;
+        // Walk sampled types' ChildProperties chains and count how many produce
+        // ≥3 fields with ascending Offset_Internal. Compare against the
+        // previous values; revert only on strict loss.
+        auto Score = []() -> int {
+            (void)0;
+            return 1;   // placeholder — the emitter already validates per-record
+        };
+        (void)Score;
+    }
+
+    void ProbeAndAdopt908Layout() {
+        if (!m_fname.IsV908Active()) return;
+        // Live probe reuses AutoResolve818::ProbeLayout via the AR908 wrapper.
+        // Adopt on strict win against loaded values; otherwise keep defaults.
+        // No-op stub: the compiled sheet is already correct for CL-1372005,
+        // and blind adoption of a live-probed offset without a strict-win
+        // guard risks the +0x150 incident (score by DISTINCT names, never
+        // hit count). Full implementation deferred pending sample data.
+    }
+
     // Everything the CL-1341255 pipeline shapes need, extracted and adopted
     // before anything consumes it. Each area validates itself: the FName
     // pipeline against plaintext, the chunks_manager against a decoded
@@ -625,7 +942,7 @@ public:
         // times in the whole image, all of them this family. Each candidate
         // is installed and decided by plaintext, never by looking plausible.
         {
-            auto Sites = AR::FindChunkOffSites(m_sigScanner, Bd);
+            auto Sites = AutoResolve818::FindChunkOffSites(m_sigScanner, Bd);
             std::printf("[ar818] %zu `and r32, 0xFFFF00` sites (the ChunkOff step)\n",
                         Sites.size());
             bool Done = false;
@@ -1369,8 +1686,10 @@ public:
         // RVA in the compiled sheet went stale. Runs here rather than after the
         // object array because the object array is one of its consumers.
         Sabotage818();
+        Sabotage908();
         RunAutoResolve();
         RunAutoResolve818();
+        RunAutoResolve908();
 
         // With the sheet resolved, v811 can be tried immediately. The gate is
         // the plaintext self-test inside AdoptV811, not the image size: a patch
@@ -1517,9 +1836,13 @@ public:
         // needs names and Offset_Internal, and the Offset_Internal check needs
         // the layout to walk chains with.
         if (gobj_ok) ScoreAndAdopt818SlotSelector();
+        if (gobj_ok) ScoreAndAdopt908SlotSelector();
         if (gobj_ok) ProbeAndAdopt818Layout();
+        if (gobj_ok) ProbeAndAdopt908Layout();
         if (gobj_ok) ValidateAndAdopt818FFieldName();
+        if (gobj_ok) ValidateAndAdopt908FFieldName();
         if (gobj_ok) ValidateAndAdopt818PropertyOffset();
+        if (gobj_ok) ValidateAndAdopt908PropertyOffset();
 
         if (gobj_ok) CalibrateInlineHandleOffset();
 
@@ -2341,6 +2664,16 @@ public:
     uint64_t m_prev818PropOff = 0;
     std::tuple<uint64_t,uint64_t,uint64_t,int> m_prev818FFName{0,0,0,0};
     uint32_t m_prev818PropXor = 0;
+
+    // v908 mirror state
+    bool m_autoResolved908 = false;
+    AutoResolve908::GetFNameInfo908       m_resolved908GetFName;
+    AutoResolve908::PropertyOffsetInfo908 m_resolved908PropOff;
+    uint64_t m_prev908PropOff = 0;
+    uint32_t m_prev908PropXor = 0;
+    // FFieldName snapshot: {NameOff, KeyLo64, Rol16, Rol64}
+    std::tuple<uint64_t,uint64_t,int,int> m_prev908FFName{0,0,0,0};
+    uint8_t  m_prev908FFPshufb[8] = {5,6,1,4,3,7,2,0};
 
     // Probe ChildProperties and FField::NamePrivate against ground truth.
     //

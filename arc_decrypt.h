@@ -2086,6 +2086,8 @@ struct LiveSheet {
         v20260908::RVA_KEYSTREAM + (uint64_t)v20260908::KEYSTREAM_BASE_INDEX * 2;
     uint64_t ChunkMgr908Rva      = v20260908::RVA_CHUNKMGR_GLOBAL;
     uint64_t ChunkMgr908KeyRva   = v20260908::RVA_CHUNKMGR_KEY;
+    int      ChunkMgr908Rol16      = v20260908::CHUNKMGR_ROL16;
+    int      ChunkMgr908PshuflwImm = v20260908::CHUNKMGR_PSHUFLW_IMM;
     uint32_t Mgr908NumOff        = (uint32_t)v20260908::MGR_NUMELEMENTS_OFF;
     uint32_t Mgr908NumXor        = v20260908::MGR_NUMELEMENTS_XOR;
     uint64_t Mgr908ArrOff        = v20260908::MGR_CHUNKARRAY_OFF;
@@ -2258,8 +2260,29 @@ inline void ApplyOffsets818() {
 inline void ApplyOffsets908() {
     namespace V = v20260908;
     namespace Off = Offsets;
+
+    // FFieldName block: only re-assert the compiled defaults if auto-resolve
+    // has not already adopted extracted values. Otherwise the second Apply
+    // call (post auto_offsets) silently clobbers the resolver's work.
+    if (!g_Sheet.FFieldName908Resolved) {
+        g_Sheet.FFieldName908Off    = V::FFIELD_NAME_OFF;
+        g_Sheet.FFieldNameKey908    = V::FFIELD_NAME_XOR_KEY;
+        g_Sheet.FFieldName908Rol16  = V::FFIELD_NAME_ROL16;
+        g_Sheet.FFieldName908Rol64  = V::FFIELD_NAME_ROL64;
+        static const uint8_t DefaultFFieldPshuf[8] = { 5, 6, 1, 4, 3, 7, 2, 0 };
+        std::memcpy(g_Sheet.FFieldNamePshufb908, DefaultFFieldPshuf, 8);
+    }
     Off::FField::NamePrivate        = g_Sheet.FFieldName908Off;
     Off::FField::NameEncrypted      = g_Sheet.FFieldName908Off;
+
+    // Layout block: gate on Layout908Resolved so live-probed offsets survive.
+    if (!g_Sheet.Layout908Resolved) {
+        g_Sheet.FField908Next       = V::FFIELD_NEXT_OFF;
+        g_Sheet.FField908Owner      = V::FFIELD_OWNER_OFF;
+        g_Sheet.FField908Class      = V::FFIELD_CLASS_OFF;
+        g_Sheet.UStruct908ChildProps= V::USTRUCT_CHILDPROPS;
+        g_Sheet.UStruct908Super     = V::USTRUCT_SUPER_OFF;
+    }
     Off::FField::Next               = g_Sheet.FField908Next;
     Off::FField::Owner              = g_Sheet.FField908Owner;
     Off::FField::ClassPrivate       = g_Sheet.FField908Class;
@@ -2276,6 +2299,18 @@ inline void ApplyOffsets908() {
     }
     Off::FProperty::Offset_Internal = g_Sheet.PropOffsetInternal;
     Off::FProperty::Offset_XOR      = g_Sheet.PropOffsetXor;
+
+    // ChunkMgr block: gate on ChunkMgr908Resolved.
+    if (!g_Sheet.ChunkMgr908Resolved) {
+        g_Sheet.ChunkMgr908Rva        = V::RVA_CHUNKMGR_GLOBAL;
+        g_Sheet.ChunkMgr908KeyRva     = V::RVA_CHUNKMGR_KEY;
+        g_Sheet.ChunkMgr908Rol16      = V::CHUNKMGR_ROL16;
+        g_Sheet.ChunkMgr908PshuflwImm = V::CHUNKMGR_PSHUFLW_IMM;
+        g_Sheet.Mgr908NumOff          = (uint32_t)V::MGR_NUMELEMENTS_OFF;
+        g_Sheet.Mgr908NumXor          = V::MGR_NUMELEMENTS_XOR;
+        g_Sheet.Mgr908ArrOff          = V::MGR_CHUNKARRAY_OFF;
+        g_Sheet.Mgr908ArrXor          = V::MGR_CHUNKARRAY_XOR;
+    }
     Off::FBoolProperty::FieldSize   = V::FBOOLPROP_FIELDSIZE;
     Off::FBoolProperty::ByteOffset  = V::FBOOLPROP_BYTEOFFSET;
     Off::FBoolProperty::ByteMask    = V::FBOOLPROP_BYTEMASK;
