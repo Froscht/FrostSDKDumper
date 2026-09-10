@@ -2248,11 +2248,13 @@ public:
 
     void BuildClassInstanceIndex(const std::vector<std::pair<int32_t, uint64_t>>& ObjectPtrs) {
         size_t Indexed = 0;
+        size_t ClsNull = 0, ClsOutOfRange = 0, ClsCdo = 0;
         for (const auto& [Idx, Obj] : ObjectPtrs) {
             (void)Idx;
             if (!Obj) continue;
             uint64_t Cls = m_fname.GetClassPtrAuto(Obj);
-            if (Cls < 0x10000ULL || Cls >= 0x800000000000ULL) continue;
+            if (!Cls) { ++ClsNull; continue; }
+            if (Cls < 0x10000ULL || Cls >= 0x800000000000ULL) { ++ClsOutOfRange; continue; }
             auto& V = m_class_instances[Cls];
             if (V.size() >= kMaxInstances) continue;
             // CDOs carry constructor defaults, mostly zero, which is the worst
@@ -2262,12 +2264,14 @@ public:
                 auto It = m_addr_to_name->find(Obj);
                 if (It != m_addr_to_name->end()) Nm = &It->second;
             }
-            if (Nm && Nm->rfind("Default__", 0) == 0) continue;
+            if (Nm && Nm->rfind("Default__", 0) == 0) { ++ClsCdo; continue; }
             V.push_back(Obj);
             ++Indexed;
         }
-        std::printf("[sdk-native] instance index: %zu classes, %zu instances\n",
-                    m_class_instances.size(), Indexed);
+        std::printf("[sdk-native] instance index: %zu classes, %zu instances "
+                    "(skipped: %zu null-class, %zu out-of-range, %zu CDO)\n",
+                    m_class_instances.size(), Indexed,
+                    ClsNull, ClsOutOfRange, ClsCdo);
     }
 
     bool LooksLikeHeapPtr(uint64_t P) const {
