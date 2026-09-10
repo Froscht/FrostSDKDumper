@@ -2517,6 +2517,16 @@ public:
         // slipped past the classification-pass filters.
         if (rec.props_size > 0x100000u) return "";
 
+        // "None"-name records with zero size and unknown package are objects
+        // whose FName decoded to the sentinel `None` (CompIndex 0). They
+        // carry no properties of their own — the numeric suffix comes from
+        // FName::Number which is unique per instance. Emitting them stamps
+        // hundreds of `/Script/Unknown.None_NNNN` blocks that only add noise.
+        if (rec.props_size == 0 &&
+            rec.package == "Unknown" &&
+            rec.name.rfind("None_", 0) == 0)
+            return "";
+
         // If the record's own name is decode garbage — heavy on characters
         // that UE identifiers never carry ('?', '"', '$', '@', '!', '^', '{',
         // '}', '\\', '|', '`', '~') — substitute a synthetic address-based
