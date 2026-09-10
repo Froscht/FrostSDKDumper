@@ -2534,13 +2534,21 @@ public:
         // that describe compiler-generated Blueprint node scopes — not
         // engine or game reflection data. Drop by default; opt in with
         // FROST_KEEP_BP_TRANSIENT=1 to see them.
+        //
+        // FROST_STRICT_UNKNOWN=1 additionally drops every record whose
+        // package resolves to Unknown AND whose props_size is zero —
+        // gives a very clean output but loses ~250k properties from real
+        // struct fragments whose outer walk failed. Off by default.
         {
-            static const bool KeepBp = std::getenv("FROST_KEEP_BP_TRANSIENT") != nullptr;
+            static const bool KeepBp        = std::getenv("FROST_KEEP_BP_TRANSIENT") != nullptr;
+            static const bool StrictUnknown = std::getenv("FROST_STRICT_UNKNOWN")    != nullptr;
             if (!KeepBp && rec.package == "Unknown") {
                 const std::string& N = rec.name;
                 if (N.rfind("K2Node_",  0) == 0 ||
                     N.rfind("CallFunc_",0) == 0 ||
                     N.rfind("Cast_",    0) == 0)
+                    return "";
+                if (StrictUnknown && rec.props_size == 0)
                     return "";
             }
         }
