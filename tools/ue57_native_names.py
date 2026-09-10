@@ -34,7 +34,7 @@ Usage:
         --out SDK_Output.named.txt
 """
 from __future__ import annotations
-import argparse, os, re, sys, json
+import argparse, os, re, sys, json, gzip
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -424,38 +424,57 @@ def emit_named_sdk(sdk_path: str, out_path: str, types: Dict[str, SourceType]):
         f.writelines(result)
     sys.stderr.write(f'[ue57] matched {matched_classes} classes, named {named}/{scanned} native fields\n')
 
+def load_cache(path: str) -> Dict[str, SourceType]:
+    opener = gzip.open if path.endswith('.gz') else open
+    with opener(path, 'rt') as f:
+        raw = json.load(f)
+    types: Dict[str, SourceType] = {}
+    for name, entry in raw.items():
+        st = SourceType(name, entry['parent'])
+        st.members = [
+            SourceMember(m['name'], m['type'], m['uprop'])
+            for m in entry['members']]
+        types[name] = st
+    return types
+
+def save_cache(path: str, types: Dict[str, SourceType]):
+    opener = gzip.open if path.endswith('.gz') else open
+    with opener(path, 'wt') as f:
+        json.dump({
+            n: {
+                'parent': t.parent,
+                'members': [{'name': m.name, 'type': m.type, 'uprop': m.is_uproperty}
+                            for m in t.members],
+            }
+            for n, t in types.items()
+        }, f)
+
 def main():
+    # Default cache path sits next to the script and is checked in — a
+    # filtered UE 5.7 snapshot (~326 KB gzipped, engine classes with at
+    # least one UPROPERTY anchor). Overlay works without the UE source
+    # tree as long as the cache exists.
+    default_cache = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'ue57_types.json.gz')
+
     ap = argparse.ArgumentParser()
-    ap.add_argument('--ue', required=True, help='UnrealEngine-5.7 root')
+    ap.add_argument('--ue', help='UnrealEngine-5.7 root (only needed if cache is missing)')
     ap.add_argument('--sdk', required=True, help='SDK_Output.txt path')
     ap.add_argument('--out', required=True, help='output path for annotated SDK')
-    ap.add_argument('--cache', help='optional JSON cache of parsed types')
+    ap.add_argument('--cache', default=default_cache,
+                    help='JSON cache of parsed types (.json or .json.gz)')
     args = ap.parse_args()
 
-    types = None
-    if args.cache and os.path.exists(args.cache):
-        with open(args.cache, 'r') as f:
-            raw = json.load(f)
-        types = {}
-        for name, entry in raw.items():
-            st = SourceType(name, entry['parent'])
-            st.members = [
-                SourceMember(m['name'], m['type'], m['uprop'])
-                for m in entry['members']]
-            types[name] = st
-        sys.stderr.write(f'[ue57] loaded {len(types)} types from cache\n')
+    if os.path.exists(args.cache):
+        types = load_cache(args.cache)
+        sys.stderr.write(f'[ue57] loaded {len(types)} types from {args.cache}\n')
     else:
+        if not args.ue:
+            sys.stderr.write(f'[ue57] cache {args.cache} not found and --ue not given\n')
+            sys.exit(1)
         types = build_index(args.ue)
-        if args.cache:
-            with open(args.cache, 'w') as f:
-                json.dump({
-                    n: {
-                        'parent': t.parent,
-                        'members': [{'name': m.name, 'type': m.type, 'uprop': m.is_uproperty}
-                                    for m in t.members],
-                    }
-                    for n, t in types.items()
-                }, f)
+        save_cache(args.cache, types)
+        sys.stderr.write(f'[ue57] wrote cache to {args.cache}\n')
 
     emit_named_sdk(args.sdk, args.out, types)
 
