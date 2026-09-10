@@ -2527,6 +2527,24 @@ public:
             rec.name.rfind("None_", 0) == 0)
             return "";
 
+        // Blueprint-editor-transient objects (K2Node_*, CallFunc_*, etc.)
+        // whose names live only in the editor's FName pool. On a shipping
+        // build the outer chain terminates without hitting a real UPackage,
+        // so the record lands under /Script/Unknown with property lists
+        // that describe compiler-generated Blueprint node scopes — not
+        // engine or game reflection data. Drop by default; opt in with
+        // FROST_KEEP_BP_TRANSIENT=1 to see them.
+        {
+            static const bool KeepBp = std::getenv("FROST_KEEP_BP_TRANSIENT") != nullptr;
+            if (!KeepBp && rec.package == "Unknown") {
+                const std::string& N = rec.name;
+                if (N.rfind("K2Node_",  0) == 0 ||
+                    N.rfind("CallFunc_",0) == 0 ||
+                    N.rfind("Cast_",    0) == 0)
+                    return "";
+            }
+        }
+
         // If the record's own name is decode garbage — heavy on characters
         // that UE identifiers never carry ('?', '"', '$', '@', '!', '^', '{',
         // '}', '\\', '|', '`', '~') — substitute a synthetic address-based
