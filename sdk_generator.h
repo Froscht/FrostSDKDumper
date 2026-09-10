@@ -3815,7 +3815,7 @@ public:
         // An object is a type if: (a) it's in allTypeAddrs (used as class ptr by others),
         // OR (b) GetClassPrivate returns classAddr/ssAddr/enumAddr/validClassTypes.
         std::unordered_set<uint64_t> processed_enums;
-        uint32_t SkipNull = 0, SkipSeen = 0, SkipSlash = 0, SkipFunc = 0, SkipCdo = 0, SkipNoName = 0;
+        uint32_t SkipNull = 0, SkipSeen = 0, SkipSlash = 0, SkipFunc = 0, SkipCdo = 0, SkipNoName = 0, SkipBadSize = 0;
         uint32_t LoopTotal = 0;
         for (const auto& [idx, obj_ptr] : object_ptrs) {
             ++LoopTotal;
@@ -4106,6 +4106,13 @@ public:
                 rec.is_class = is_class;
             }
             rec.props_size = Read<uint32_t>(obj_ptr + ArcDecrypt::Offsets::UStruct::PropertiesSize);
+            // Sanity: real UStructs never exceed a few hundred KB. A 2 GB
+            // "size" is what non-UStruct objects (FField list heads with
+            // module-range vtables that pass the vtable filter) read at the
+            // PropertiesSize offset. Drop those records so they don't stamp
+            // /Script/Unknown.<name> blocks with 2 GB size headers and
+            // gigabyte-wide "namespace" tables.
+            if (rec.props_size > 0x100000u) { ++SkipBadSize; continue; }
 
             // SuperStruct
             rec.super_addr = Read<uint64_t>(obj_ptr + ArcDecrypt::Offsets::UStruct::SuperStruct);
@@ -4283,8 +4290,8 @@ public:
             for (const auto& R : result.structs) { if (R.is_class) ++PreRcClass; else ++PreRcStruct; }
             std::printf("[sdk-cast] instances dropped (metaclass has no CASTCLASS bit): %u\n",
             g_InstanceDropped);
-        std::printf("[sdk] Loop stats: total=%u null/seen=%u slash=%u func=%u cdo=%u\n",
-                LoopTotal, SkipNull, SkipSlash, SkipFunc, SkipCdo);
+        std::printf("[sdk] Loop stats: total=%u null/seen=%u slash=%u func=%u cdo=%u bad_size=%u\n",
+                LoopTotal, SkipNull, SkipSlash, SkipFunc, SkipCdo, SkipBadSize);
             std::printf("[sdk] After main loop: %zu class, %zu struct, m_known_structs=%zu m_known_enums=%zu\n",
                 PreRcClass, PreRcStruct, m_known_structs.size(), m_known_enums.size());
 
