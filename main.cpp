@@ -878,12 +878,73 @@ public:
 
     void ProbeAndAdopt908Layout() {
         if (!m_fname.IsV908Active()) return;
-        // Live probe reuses AutoResolve818::ProbeLayout via the AR908 wrapper.
-        // Adopt on strict win against loaded values; otherwise keep defaults.
-        // No-op stub: the compiled sheet is already correct for CL-1372005,
-        // and blind adoption of a live-probed offset without a strict-win
-        // guard risks the +0x150 incident (score by DISTINCT names, never
-        // hit count). Full implementation deferred pending sample data.
+        namespace Off = ArcDecrypt::Offsets;
+        auto& Sh = ArcDecrypt::g_Sheet;
+
+        const auto& Seeds = m_gobj.GetSeedObjects();
+        if (Seeds.size() < 512) return;
+        std::vector<uint64_t> Types;
+        size_t Step = Seeds.size() / 4000 + 1;
+        for (size_t I = 0; I < Seeds.size() && Types.size() < 300; I += Step) {
+            uint64_t Cls = m_fname.GetClassPtrAuto(Seeds[I]);
+            if (!Cls) continue;
+            std::string CN = m_fname.GetName(Cls);
+            if (CN == "Class" || CN == "ScriptStruct") Types.push_back(Seeds[I]);
+        }
+        if (Types.size() < 40) {
+            std::printf("[ar908] layout probe: only %zu type objects sampled - skipped\n",
+                        Types.size());
+            return;
+        }
+
+        auto FieldName = [this](uint64_t F) -> std::string {
+            int32_t Ci = m_fname.DecryptFFieldNameCI(F);
+            if (Ci <= 0) return {};
+            return m_fname.CompIndexToName(Ci);
+        };
+        auto PropOffset = [this](uint64_t F) -> uint32_t {
+            uint32_t Raw = 0;
+            if (!m_reader.Read(F + ArcDecrypt::g_Sheet.PropOffsetInternal, &Raw, 4))
+                return 0xFFFFFFFFu;
+            return __builtin_bswap32(Raw) ^ ArcDecrypt::g_Sheet.PropOffsetXor;
+        };
+        auto IsType = [this](uint64_t P) -> bool {
+            uint64_t Cls = m_fname.GetClassPtrAuto(P);
+            if (!Cls) return false;
+            std::string CN = m_fname.GetName(Cls);
+            return CN == "Class" || CN == "ScriptStruct" || CN == "Function";
+        };
+
+        auto Probe = AutoResolve818::ProbeLayout(m_reader, Types, FieldName,
+                                                 PropOffset, IsType);
+        if (!Probe.Valid) {
+            std::printf("[ar908] layout probe inconclusive - keeping loaded offsets\n");
+            return;
+        }
+        std::printf("[ar908] layout probe: ChildProperties +0x%llX (%d distinct names), "
+                    "Next +0x%llX (%d chains), Owner +0x%llX, SuperStruct +0x%llX\n",
+            (unsigned long long)Probe.ChildProps, Probe.Distinct,
+            (unsigned long long)Probe.Next, Probe.ChainCount,
+            (unsigned long long)Probe.Owner, (unsigned long long)Probe.Super);
+
+        struct { const char* N; uint64_t Got; uint64_t* Slot; uint64_t* Live; } Ad[] = {
+            { "ChildProperties", Probe.ChildProps, &Sh.UStruct908ChildProps, &Off::UStruct::ChildProperties },
+            { "FField::Next",    Probe.Next,       &Sh.FField908Next,        &Off::FField::Next },
+            { "FField::Owner",   Probe.Owner,      &Sh.FField908Owner,       &Off::FField::Owner },
+            { "SuperStruct",     Probe.Super,      &Sh.UStruct908Super,      &Off::UStruct::SuperStruct },
+        };
+        int Changed = 0;
+        for (const auto& A : Ad) {
+            if (!A.Got || A.Got == *A.Slot) continue;
+            std::printf("[ar908]   DRIFT %-16s probed +0x%llX != loaded +0x%llX - adopting\n",
+                A.N, (unsigned long long)A.Got, (unsigned long long)*A.Slot);
+            *A.Slot = A.Got;
+            *A.Live = A.Got;
+            ++Changed;
+        }
+        Sh.Layout908Resolved = true;
+        if (!Changed)
+            std::printf("[ar908] layout probe agrees with the loaded offsets\n");
     }
 
     // Everything the CL-1341255 pipeline shapes need, extracted and adopted
