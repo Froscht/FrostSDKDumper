@@ -43,6 +43,11 @@ FBoolProperty extended slot at +0xE0  (v908-specific; v818 was +0x118)
 UStruct::SuperStruct  +0xA8  ChildProperties +0x108
 UEnum::Names layout is SoA on v908 (see below).
 FUObjectItem stride 24, obj+8, InternalIndex +0x90
+
+GWorld (UWORLD_BASE_RVA)         RVA 0x10967B98  (was 0xE782D78 on v818)
+  double-deref: [rva] -> wrapper -> [wrapper+0] = UWorld
+  Wrapper vtable @ VA 0x14DD21510 (RVA 0xDD21510) — durable anchor
+  Hashtable lookup helper       RVA 0x3B62750 (World_HashTableLookup_v908)
 ```
 
 ### UEnum::Names on v908: struct-of-arrays, not TArray<TPair>

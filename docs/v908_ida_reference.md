@@ -27,6 +27,15 @@ Fixed_steam.exe, base 0x140000000. Anchors that survive Theia obfuscation for pa
 
 ### GWorld itself (double-deref)
 - **Status**: not renamed — the direct GWorld pointer wrapper is reached only through `World_HashTableLookup_v908`; there is no standalone accessor with a stable string or FNV anchor visible on this build. NewESP calls `World_HashTableLookup_v908(key)` where the key comes from the calling actor and the returned value's `+0` qword is the UWorld pointer (i.e. the "double-deref" documented in CLAUDE.md).
+- **UWORLD_BASE_RVA**: `0x10967B98` (live-verified 2026-09-08). Chain: `Read(base + 0x10967B98)` → intermediary wrapper → `Read(ptr + 0x00)` = UWorld.
+    - Previous patch v818 baseline was `0xE782D78`.
+    - Intermediary wrapper carries a vtable at VA `0x14DD21510` (RVA `0xDD21510`) — this is the strongest durable anchor for the *intermediary* on v908; any xref to that vtable RVA hits one of the wrapper accessor sites.
+- **Signature (intermediary wrapper vtable ref)**: `48 8B 05 ?? ?? ?? ??  48 8D 15 10 15 DD 14` (mov rax,[rip+X] ; lea rdx,[intermediary_vtable]) is the shape to grep for.
+    - Byte-level pattern for the vtable-load half: `48 8D ?? 10 15 DD ??` (lea r64,[rip+X] where X resolves to `0xDD21510`).
+- **Xref fallbacks (in order of durability)**:
+    1. Xrefs to the vtable at RVA `0xDD21510` — 6-8 sites, all in the world-wrapper family.
+    2. Xrefs to `g_WorldHT_Entries` at RVA `0x10967B98` — every intermediary read goes through it.
+    3. `World_HashTableLookup_v908` at RVA `0x3B62750` — 7 callers, of which `sub_143B61CE0`, `sub_143DB9580` and `sub_144674E90` are the ones NewESP reaches.
 
 ### UGameInstance TLS decrypt
 - **Status**: not located — none of `GameInstance` / `UGameInstance` / `PlayerController` remain as strings on this build (Theia stripped them), and the TLS-based decrypt (stage A at TLS+0xEE0, chain-through 8 blocks × 0x90 with the func at vtable+0x48) hides behind register-based `gs:[58h]` accesses that hash-collide with thousands of TLS reads elsewhere in the image. Signature-scanning this out of `.text` needs a runtime probe (uprobe on the decrypt callee) which is out of scope for a static rename pass.
