@@ -1033,14 +1033,36 @@ anchors.
 
 ### Confidence
 
-**Not located** on the static image. The two structural candidates
-(`sub_14059B310` and, distantly, `sub_140599000`) are unranked because
-neither passes an independent ProcessEvent-only fingerprint (FUNC_Native
-flag test + call through `UFunction::Func` + FFrame allocation). Do NOT
-adopt either as ProcessEvent until dynamic verification (breakpoint on
-a known BP call, capture the top-of-stack native function) confirms.
+**RESOLVED 2026-09-13** — the full BP dispatch family was captured via
+the in-process `frost_mcp` route (Wine-mod / LD_PRELOAD, path documented
+below) and the results were paste-in-place ready:
 
-### Dynamic resolve attempt (2026-09-12) — FAILED
+| Symbol                                        | VA          | RVA      |
+|-----------------------------------------------|:-----------:|:--------:|
+| `UObject::ProcessEvent`                       | 0x1405C18C0 | 0x5C18C0 |
+| `UObject::ProcessInternal`                    | 0x1405CEFA0 | 0x5CEFA0 |
+| `FFrame::Step`                                | 0x1405C1BF0 | 0x5C1BF0 |
+| `FFrame::PrintScriptCallstack`                | 0x1405C13D0 | 0x5C13D0 |
+| `FBlueprintCoreDelegates::ThrowScriptException` | 0x1405C1180 | 0x5C1180 |
+| `UFunction::Invoke`                           | 0x1405C1D50 | 0x5C1D50 |
+| EX_Bytecode call-thunk (opcode)               | 0x1405C8970 | 0x5C8970 |
+| EX_Bytecode call-decrypt                      | 0x1405C8890 | 0x5C8890 |
+
+All eight are now defined as `RVA_*` constants in
+`arc_decrypt.h::v20260908` and the LiveSheet slot
+`UObjProcessEvent908Rva` picks up `RVA_UOBJECT_PROCESSEVENT` on init.
+
+**Nexon anti-tamper caveat on this build:** every function in this
+family walks the caller's return address back to the PE header and
+soft-rejects any return path outside the game module (`0x140001000 ..
+0x14D4B2000`). Trampolines / hooks installed externally that live
+outside that range drop the call into a **telemetry-fallback path**
+which eventually flags the process — see `arc_decrypt.h` comment on
+`RVA_UOBJECT_PROCESSEVENT`. Place trampolines inside the module's
+.text hole set (the vtable pass in `sdk_generator.h` already maps the
+free byte spans).
+
+### Dynamic resolve attempt (2026-09-12) — external primitives FAILED, in-process worked
 
 The obvious dynamic path — set a per-thread HW execution breakpoint on
 any function known to fire from ProcessEvent, read `[rsp]` on hit, walk
@@ -1085,11 +1107,40 @@ Consequences for future resolve attempts:
   ProcessEvent — the top of any UFunction dispatch caller chain is
   inside PE), **kernel-mode PTE flip** to convert the memfd mapping to
   private COW before instrumentation, or **modifying Wine** to hand
-  out per-process private views. All out of scope for the current
-  external-reader design.
+  out per-process private views. The in-process route is what actually
+  landed the resolve on 2026-09-13 — see below.
 
 `tools/find_processevent.py` is kept in-tree, but its top-of-file
 docstring now warns that HWBP EXEC does not fire on this target and
 that the tool is only useful on a build where the game does NOT run
 under Wine or on a kernel where `MAP_SHARED` DR delivery works.
+
+### In-process resolve (2026-09-13) — SUCCESS
+
+The route that worked: `frost_mcp` (in-process TCP MCP server compiled
+either into Wine's ntdll.so or as an LD_PRELOAD shim, source under
+`/media/frost/Coding Stuf/Linux/Wine-NTDLL/`). Because it runs inside
+the game process, it can:
+
+1. `mprotect(page, R|W|X)` the target text page — Wine's memfd
+   `MAP_SHARED r-xs` mapping accepts in-process mprotect promotion
+   (external processes can't get COW; the process itself can).
+2. Write `0xCC` at the anchor address via `/proc/self/mem` — the
+   external `PTRACE_POKETEXT` route fails here because it goes back
+   to the read-only memfd file, but from inside the process the
+   promoted page is now writable and private.
+3. Install a SIGTRAP handler (already patched into
+   `signal_x86_64.c` for theia_aes_trap) that captures full register
+   state on hit, reads `[rsp]` for the ProcessEvent return address,
+   then walks backwards for the prologue.
+4. Send captures back over TCP to a driver script that clusters
+   return addresses, filters to the ones with `sub rsp, imm32 >= 0x400`
+   preceded by push-r64 sequences, and reports the ProcessEvent RVA.
+
+The whole family (8 symbols) was recovered in one pass. Enable with
+Steam launch options:
+
+```
+FROST_MCP=1 LD_PRELOAD=/media/frost/Coding\ Stuf/Linux/Wine-NTDLL/frost_mcp.so %command%
+```
 

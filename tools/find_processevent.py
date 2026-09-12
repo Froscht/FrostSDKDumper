@@ -1,5 +1,13 @@
 """Locate UObject::ProcessEvent by observing a live BP callsite.
 
+STATUS (2026-09-13): on v20260908 the RVA is 0x5C18C0 (VA 0x1405C18C0),
+resolved via the in-process `frost_mcp` route (Wine mod / LD_PRELOAD
+under `/media/frost/Coding Stuf/Linux/Wine-NTDLL/`), NOT via this
+external HWBP script. This tool is retained as a reference
+implementation for future patches on builds where external HWBP EXEC
+actually fires (see WARNING below).
+
+
 WARNING (2026-09-12/13): tested against ARC Raiders v20260908 running
 under Proton/Wine — no external-process instrumentation primitive on
 the game's `.text` works:

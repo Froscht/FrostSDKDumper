@@ -176,11 +176,18 @@ static IdmapStats WriteIdmap(
     //    a zero RVA (e.g. UObject::ProcessEvent on v908 until dynamically
     //    resolved) is skipped by Emit() so the plugin does not stamp a wrong
     //    name on address 0.
-    if (Emit(Sheet.Pool908Rva,              "GNames"))                Stats.GlobalEntries++;
-    if (Emit(Sheet.ChunkMgr908Rva,          "GObjects"))              Stats.GlobalEntries++;
-    if (Emit(Sheet.FNameToString908Rva,     "FName__ToString"))       Stats.GlobalEntries++;
-    if (Emit(Sheet.FNameAppendString908Rva, "FName__AppendString"))   Stats.GlobalEntries++;
-    if (Emit(Sheet.UObjProcessEvent908Rva,  "UObject__ProcessEvent")) Stats.GlobalEntries++;
+    if (Emit(Sheet.Pool908Rva,                 "GNames"))                             Stats.GlobalEntries++;
+    if (Emit(Sheet.ChunkMgr908Rva,             "GObjects"))                           Stats.GlobalEntries++;
+    if (Emit(Sheet.FNameToString908Rva,        "FName__ToString"))                    Stats.GlobalEntries++;
+    if (Emit(Sheet.FNameAppendString908Rva,    "FName__AppendString"))                Stats.GlobalEntries++;
+    if (Emit(Sheet.UObjProcessEvent908Rva,     "UObject__ProcessEvent"))              Stats.GlobalEntries++;
+    if (Emit(Sheet.UObjProcessInternal908Rva,  "UObject__ProcessInternal"))           Stats.GlobalEntries++;
+    if (Emit(Sheet.FFrameStep908Rva,           "FFrame__Step"))                       Stats.GlobalEntries++;
+    if (Emit(Sheet.FFramePrintCallstack908Rva, "FFrame__PrintScriptCallstack"))       Stats.GlobalEntries++;
+    if (Emit(Sheet.BPThrowException908Rva,     "FBlueprintCoreDelegates__ThrowScriptException")) Stats.GlobalEntries++;
+    if (Emit(Sheet.UFunctionInvoke908Rva,      "UFunction__Invoke"))                  Stats.GlobalEntries++;
+    if (Emit(Sheet.ExBytecodeCallThunk908Rva,  "EX_Bytecode_CallThunk"))              Stats.GlobalEntries++;
+    if (Emit(Sheet.ExBytecodeCallDecrypt908Rva,"EX_Bytecode_CallDecrypt"))            Stats.GlobalEntries++;
 
     Stats.TotalEntries = Stats.VTableEntries + Stats.ExecFunctionEntries + Stats.GlobalEntries;
 

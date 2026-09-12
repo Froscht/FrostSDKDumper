@@ -1905,10 +1905,25 @@ namespace v20260908 {
     // is the decrypt INNER, not ToString — kept for source compatibility.
     constexpr uint64_t RVA_FNAME_TOSTRING_REAL     = 0x2D71F0ULL;
     constexpr uint64_t RVA_FNAME_APPENDSTRING_REAL = 0x2D7470ULL;
-    // ProcessEvent could not be located statically on v908 (Theia stripped every
-    // known anchor string; see docs/v908_ida_reference.md ## UObject::ProcessEvent).
-    // Left at 0 until a dynamic (uprobe on Blueprint call) resolve lands.
-    constexpr uint64_t RVA_UOBJECT_PROCESSEVENT = 0ULL;
+    // ProcessEvent + BP dispatch family, resolved 2026-09-13 via in-process
+    // BP capture (frost_mcp Wine mod — external HWBP/uprobe/PTRACE-INT3 all
+    // inert on Wine memfd MAP_SHARED r-xs; see docs/v908_ida_reference.md
+    // ## UObject::ProcessEvent (v908)).
+    constexpr uint64_t RVA_UOBJECT_PROCESSEVENT     = 0x5C18C0ULL;
+    constexpr uint64_t RVA_UOBJECT_PROCESSINTERNAL  = 0x5CEFA0ULL;
+    constexpr uint64_t RVA_FFRAME_STEP              = 0x5C1BF0ULL;
+    constexpr uint64_t RVA_FFRAME_PRINTSCRIPTSTACK  = 0x5C13D0ULL;
+    constexpr uint64_t RVA_FBLUEPRINT_THROWEXCEPT   = 0x5C1180ULL;
+    constexpr uint64_t RVA_UFUNCTION_INVOKE         = 0x5C1D50ULL;
+    constexpr uint64_t RVA_EX_BYTECODE_CALL_THUNK   = 0x5C8970ULL;
+    constexpr uint64_t RVA_EX_BYTECODE_CALL_DECRYPT = 0x5C8890ULL;
+    // Nexon anti-tamper on this build: every ProcessEvent-adjacent function
+    // walks the caller's return address back to the PE header and rejects any
+    // return path outside the game module (0x140001000..0x14D4B2000). Any hook
+    // or trampoline installed by an SDK helper MUST live inside that range;
+    // out-of-range hooks fall into a telemetry / soft-tamper reporting path
+    // that eventually flags the process. Use the .text hole hunt in
+    // sdk_generator's vtable pass to place trampolines.
 } // namespace v20260908
 
 
@@ -2094,9 +2109,16 @@ struct LiveSheet {
     //     path falls back to the 818 shape (and will fail) until Auto-Resolve
     //     supplies the v908 decode.
     uint64_t Pool908Rva          = v20260908::RVA_GNAMEPOOL;
-    uint64_t FNameToString908Rva     = v20260908::RVA_FNAME_TOSTRING_REAL;
-    uint64_t FNameAppendString908Rva = v20260908::RVA_FNAME_APPENDSTRING_REAL;
-    uint64_t UObjProcessEvent908Rva  = v20260908::RVA_UOBJECT_PROCESSEVENT;
+    uint64_t FNameToString908Rva        = v20260908::RVA_FNAME_TOSTRING_REAL;
+    uint64_t FNameAppendString908Rva    = v20260908::RVA_FNAME_APPENDSTRING_REAL;
+    uint64_t UObjProcessEvent908Rva     = v20260908::RVA_UOBJECT_PROCESSEVENT;
+    uint64_t UObjProcessInternal908Rva  = v20260908::RVA_UOBJECT_PROCESSINTERNAL;
+    uint64_t FFrameStep908Rva           = v20260908::RVA_FFRAME_STEP;
+    uint64_t FFramePrintCallstack908Rva = v20260908::RVA_FFRAME_PRINTSCRIPTSTACK;
+    uint64_t BPThrowException908Rva     = v20260908::RVA_FBLUEPRINT_THROWEXCEPT;
+    uint64_t UFunctionInvoke908Rva      = v20260908::RVA_UFUNCTION_INVOKE;
+    uint64_t ExBytecodeCallThunk908Rva  = v20260908::RVA_EX_BYTECODE_CALL_THUNK;
+    uint64_t ExBytecodeCallDecrypt908Rva= v20260908::RVA_EX_BYTECODE_CALL_DECRYPT;
     // Keystream window: KEYSTREAM_RVA + KEYSTREAM_BASE_INDEX*2 bytes.
     uint64_t Keystream908Rva     =
         v20260908::RVA_KEYSTREAM + (uint64_t)v20260908::KEYSTREAM_BASE_INDEX * 2;
