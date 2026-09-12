@@ -67,6 +67,7 @@ using FNameDecryptor = FName::FNameDecryptor;
 #include "auto_export.h"
 #include "config_loader.h"
 #include "sdk_generator.h"
+#include "usmap_writer.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PE binary path — glob ARC binary files in the dumper directory and pick the
@@ -4313,6 +4314,9 @@ public:
         if (SDKGen::Generator::kEmitDumper7) {
             gen.EmitDumper7(sdk, ".");
         }
+
+        UsmapWriter::WriteUsmap(sdk, "SDK_Output.usmap");
+        std::cout << "[+] Wrote SDK_Output.usmap\n";
 
         DumpBoneArrays(object_ptrs, addr_to_name, addr_to_fullname);
     }
