@@ -558,3 +558,80 @@ Additional anchor: chunk-decode SIMD fingerprint `66 0F 71 D1 03 66 0F 71 F0 0D`
 | `g_WorldWrapperVtable` | `0xDD21510` | Intermediary wrapper vtable |
 | FField NamePrivate XOR key | `0xD4DF960` | `0x0D58B9970DD2BBAF` |
 | FField NamePrivate PSHUFB mask | `0xD4DF950` | `{5,6,1,4,3,7,2,0}` |
+
+
+## Data-reference anchors (xrefs verified 2026-09-12)
+
+Every named global that Dumper/ESP relies on, with a live count of its
+xrefs and a note on how durable the anchor is. Use `mcp__ida-multi-mcp__
+xrefs_to` on the RVA — walk any xref's function and you land inside the
+family. The bigger the xref count, the more likely the anchor survives a
+Theia rekey (each xref is a physical call site the compiler emitted).
+
+| Global | RVA | Xrefs | Anchor durability |
+|---|---|---|---|
+| `g_ChunksManagerKey_A_v908` | `0xD4B22B0` | ~48+ | **STRONGEST** — the chunks_manager decrypt inlines everywhere, and the key ref is a durable rip-lea. All 5 GC accessors + ~40 other GObj sites touch it. |
+| `g_FFieldNameKey_v908` | `0xD4DF960` | ~40+ | Very strong — every FField NamePrivate decode does a rip-relative PXOR against this. Fastest way to relocate the entire FField family. |
+| `g_FFieldNamePshufb_v908` | `0xD4DF950` | ~40+ | Same as above; used together in the pshufb+pxor pair. |
+| `g_WorldWrapperVtable_v908` | `0xDD21510` | **1** | Precise but fragile — the single xref (`World_WrapperCtor_v908`) is the wrapper install site. Perfect anchor while it exists; if Theia decides to isolate that ctor, we lose it. |
+| `g_WorldHT_Entries_v908` | `0x10967B98` | ~7 | Strong — every world lookup rip-refs this. Also the hardcoded `UWORLD_BASE_RVA` in NewESP's `arc_offsets.h`. |
+| `g_GNamePool_v908` | `0x10AB5DC0` | 0 (static) | Runtime-decrypted page — IDA cannot see xrefs to it. **Anchor via `and r32, 0xFFFF00`** in the FName resolver instead. |
+| `g_Keystream_v908` | `0x1095926C` | 0 (static) | Same reason. Anchor via a rip-lea in `FName_DecryptString_v908` whose displacement points into `.rdata` here. |
+| `g_ChunksManagerBlob_v908` | `0x10D853F0` | 0 (static) | Same. Anchor via the SIMD ROL16 fingerprint `66 0F 71 D1 03 66 0F 71 F0 0D` — every access site fingerprints it. |
+
+The three zero-xref globals sit in `.data` pages that Theia decrypts at
+load time. IDA's static analysis of the on-disk image cannot see the
+runtime refs. That's the reason the doc leans on byte-signature scans
+in those cases — no data-xref path exists to walk them.
+
+## Immediate-value scans (durable — never rekeyed by Theia)
+
+These constants are algorithmic requirements: an FNV32 needs its prime,
+a slot hash needs its salt, an offset encode needs its XOR. Theia does
+not rewrite them across patches — only Epic does, and only when the
+underlying algorithm changes. So they are the last-resort anchor when
+every string is gone and every rip-lea target has moved.
+
+### Constants worth grepping on patch day
+
+| Constant | Value (little-endian bytes) | Where it appears | Yield on v908 |
+|---|---|---|---|
+| FNV32 prime | `93 01 00 01` (imul imm32 form: `69 ?? 93 01 00 01`) | Every UObject slot hash, every shard hash | ~62k full-image hits; ~1500 accessor-shape functions after `and r32, 3` prefilter (see `auto_resolve908.h::FindGetFName908`) |
+| FNV64 prime | `B3 01 00 00 00 01 00 00` (movabs form) | FNV64 fold inside FName resolver | ~2-4 hits per patch, all in the resolver family |
+| Slot-hash ADD (v908) | `84 33 3B 99` (imm32 `0x993B3384`) | `UObject_GetFName_v908` body — 3 occurrences | 3 hits, all in one function. **Root-cause anchor for the v908 wide-string trap.** |
+| Slot-idx ADD | `84 33 03 00` (imm32 `0x33384`) | Final `add r32, imm ; shr` fold in GetFName | 1 hit inside GetFName |
+| Property offset XOR | `92 EE CE C2` (imm32 `0xC2CEEE92`) | `FProperty_SetupOffset_v908` encode idiom | 1 hit — the SetupOffset encode is 1-hit durable across all 13 tested builds |
+| Chunks_mgr NumElements XOR | `A1 7A 49 BD` (imm32 `0xBD497AA1`) | Bswap+xor immediately after NumElements load | 1-2 hits, both in GObj family |
+| FField NamePrivate XOR | `AF BB D2 0D 97 B9 58 0D` (imm64 `0x0D58B9970DD2BBAF`) | XOR key at RVA `0xD4DF960` — either as movabs load OR as rip-relative source | 0 movabs hits (it's a `.data` const), ~40+ rip-refs |
+| Theia PRNG kAdd | `AA 62 00 40` (imm32 `0x400062AA`) | Inside `Theia_ConstructU_PRNG_v908`, part of `add r32, imm32 ; rol r32, 0x15` | 1 hit |
+| Wrap constants (6-move prologue) | `mov edx,-47 ; mov r8d,47 ; mov r9d,5 ; mov r10d,-13 ; mov r11d,13 ; mov ebp,209` | Setup prologue in `Theia_ConstructU_PRNG_v908` | 1 hit (RVA `0x61E328`) |
+
+### Practical procedure on patch day
+
+1. Sig-scan for `93 01 00 01` (FNV32 prime). Take every hit; prefilter to
+   functions carrying `and r32, 3` (`83 E0..E7 03`) within the next 256
+   bytes. On v908 this reduces from ~62k raw hits to ~1500 candidates.
+2. Within each candidate, look for a slot-hash `add r32, imm32` where
+   `imm32` is the SUBTRACTIVE-form Theia constant — that's the new
+   equivalent of `0x993B3384`. Read it off the disasm and update the
+   compiled sheet.
+3. Sig-scan for the SetupOffset idiom `0F B7 ? ? 35 ? ? ? ? 0F C8`. It
+   is 1-hit durable; the imm32 after `35` is the new `FPROP_OFFSET_XOR`
+   and the `mov [reg+disp32], r32` immediately after gives the new
+   `FPROP_OFFSETINT_OFF`.
+4. Sig-scan for the ROL16(13) fingerprint `66 0F 71 D1 03 66 0F 71 F0 0D`.
+   Every hit is a chunks_manager decode site. Read the preceding
+   `movdqa xmm, [rip+X]` — X is the new blob RVA. The following `pxor
+   xmm, [rip+Y]` — Y is the new key RVA.
+5. Sig-scan for the FField NamePrivate key's rip-relative use pattern
+   `48 8D 05 ? ? ? ?` where the target sits in `.rdata` and gets XORed
+   with an xmm value inside a function that also does `pshufb`. On
+   v908, the target is `0xD4DF960`.
+6. `Theia_ConstructU_PRNG_v908` is anchored by the wrap-constant
+   prologue — search `.text` for the exact 24-byte sequence of six
+   `mov reg, imm32` instructions.
+
+Once all six anchors resolve, the compiled sheet in `arc_decrypt.h` +
+`arc_offsets.h` (for NewESP) can be regenerated by hand from the
+extracted values, and the sabotage-verify matrix from CLAUDE.md
+proves the new sheet works before shipping.
