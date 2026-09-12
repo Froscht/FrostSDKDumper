@@ -29,11 +29,19 @@ Fixed_steam.exe, base 0x140000000. Anchors that survive Theia obfuscation for pa
 - **Status**: not renamed — the direct GWorld pointer wrapper is reached only through `World_HashTableLookup_v908`; there is no standalone accessor with a stable string or FNV anchor visible on this build. NewESP calls `World_HashTableLookup_v908(key)` where the key comes from the calling actor and the returned value's `+0` qword is the UWorld pointer (i.e. the "double-deref" documented in CLAUDE.md).
 - **UWORLD_BASE_RVA**: `0x10967B98` (live-verified 2026-09-08). Chain: `Read(base + 0x10967B98)` → intermediary wrapper → `Read(ptr + 0x00)` = UWorld.
     - Previous patch v818 baseline was `0xE782D78`.
-    - Intermediary wrapper carries a vtable at VA `0x14DD21510` (RVA `0xDD21510`) — this is the strongest durable anchor for the *intermediary* on v908; any xref to that vtable RVA hits one of the wrapper accessor sites.
-- **Signature (intermediary wrapper vtable ref)**: `48 8B 05 ?? ?? ?? ??  48 8D 15 10 15 DD 14` (mov rax,[rip+X] ; lea rdx,[intermediary_vtable]) is the shape to grep for.
-    - Byte-level pattern for the vtable-load half: `48 8D ?? 10 15 DD ??` (lea r64,[rip+X] where X resolves to `0xDD21510`).
+    - Intermediary wrapper carries a vtable at VA `0x14DD21510` (RVA `0xDD21510`) — strongest durable anchor for the wrapper on v908. The vtable has **exactly 1 xref** in the whole image, from the wrapper's constructor. That constructor is the only place the vtable is stamped into an instance, so a single successful xref lookup lands you at the wrapper family root.
+- **Renamed**: `World_WrapperCtor_v908` @ RVA `0x8C4E20` (VA `0x1448C4E20`) — the wrapper constructor that installs the vtable.
+- **Signatures (IDA `generate_signature`, both unique):**
+    - `World_WrapperCtor_v908` @ RVA `0x8C4E20` (53 bytes):
+        ```
+        41 56 56 57 53 48 83 EC ? 0F 29 7C 24 ? 0F 29 74 24 ? 48 89 CE E8 ? ? ? ? 48 8D 05 ? ? ? ? 48 89 06 48 8D 05 ? ? ? ? 48 89 86 ? ? ? ? C6 86
+        ```
+    - Vtable install site inside the ctor @ RVA `0x8C4E3B` (44 bytes):
+        ```
+        48 8D 05 ? ? ? ? 48 89 06 48 8D 05 ? ? ? ? 48 89 86 ? ? ? ? C6 86 ? ? ? ? ? 48 C7 86 ? ? ? ? ? ? ? ? C6 86
+        ```
 - **Xref fallbacks (in order of durability)**:
-    1. Xrefs to the vtable at RVA `0xDD21510` — 6-8 sites, all in the world-wrapper family.
+    1. Xrefs to the vtable at RVA `0xDD21510` — exactly 1 site (`World_WrapperCtor_v908`); use `mcp__ida-multi-mcp__xrefs_to` if the signature drifts.
     2. Xrefs to `g_WorldHT_Entries` at RVA `0x10967B98` — every intermediary read goes through it.
     3. `World_HashTableLookup_v908` at RVA `0x3B62750` — 7 callers, of which `sub_143B61CE0`, `sub_143DB9580` and `sub_144674E90` are the ones NewESP reaches.
 
@@ -468,3 +476,85 @@ If everything above breaks in one patch, in this order:
 3. Read the `add r32, imm32` following the `imul r32,r32,0x1000193` inside the body: the imm32 is the new kAdd.
 4. The `rol r32, imm8` immediately after gives the new rotate.
 5. Everything else survives (key-mask 0x1F, wrap constants) unless Epic redesigns the alphabet — the alphabet is UE-source, not Theia, so it does not move on rekeys.
+
+
+## Complete signature table for next-patch resolve
+
+All entries verified with `mcp__ida-multi-mcp__generate_signature` against
+IDA instance `pfoz` on 2026-09-12 — every signature marked `unique: true`
+with exactly one hit inside the whole image at the recorded RVA.
+
+Workflow on the next patch:
+
+1. Open the new image in a fresh IDA instance.
+2. For each function, sig-scan with the byte pattern in this table. If
+   one hit — rename to the same v90N name (or v9NN for the new patch)
+   and re-generate the signature to catch it up.
+3. If no hit — the signature drifted. Read the "Xref fallback" column
+   and follow it. Every entry has an xref anchor that survives because
+   it either sits on a data reference (durable across recompiles) or on
+   a durable UE-source string.
+4. Once a function is re-located, its new address goes back into the
+   dumper's compiled sheet (`arc_decrypt.h`) and its RVA into
+   `arc_offsets.h` if any consumer reads it directly.
+
+### FName pipeline
+
+| Function | v908 RVA | Byte signature (IDA fmt) | Xref fallback |
+|---|---|---|---|
+| `FName_DecryptString_v908` | `0x2BF200` | `41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC ? ? ? ? 48 89 D7 48 8B 05 ? ? ? ? 48 31 E0 48 89 84 24 ? ? ? ? 83 79 ? ? 74` | Xrefs to keystream RVA `0x1095926C`. Anchor on `and reg, 0x3F` + rip-lea into `.rdata` in the same body. |
+| `FName_ResolverCore_v908` | `0x2DA260` | `41 56 56 57 53 48 83 EC ? 0F 29 74 24 ? 49 89 D6 41 0F B6 00` | `and r32, 0xFFFF00` (byte forms `25 00 FF FF 00`, `81 ?? 00 FF FF 00`, `41 81 ?? 00 FF FF 00`) — 4-6 hits total; the resolver family is where all of them cluster. |
+| `FName_ResolverWrapper_v908` | `0x2DA4A0` | `41 56 41 55 56 57 53 48 81 EC ? ? ? ? 49 89 D6` | Called from `FName_ResolverCore_v908`; xref backwards. |
+
+### UObject slot pipeline
+
+| Function | v908 RVA | Byte signature | Xref fallback |
+|---|---|---|---|
+| `UObject_GetFName_v908` | `0x43AF90` | `41 56 56 57 53 48 81 EC ? ? ? ? 66 44 0F 7F 84 24 ? ? ? ? 66 0F 7F 7C 24 ? 0F 29 74 24 ? 44 89 CF` | Vtable slots at `.data` `0x14D4EC640` + `0x14D50D3B0`; slot-hash constant `0x993B3384` occurs 3× in the body. AngelScript binding string `"FName GetName() const"` in .rdata, 2 rip-refs. |
+
+### FField / FProperty
+
+| Function | v908 RVA | Byte signature | Xref fallback |
+|---|---|---|---|
+| `FField_GetFNameForScript_v908` | `0x387AB0` | `56 57 53 48 83 EC ? 4C 89 C3 48 89 D7 48 89 CE 48 8D 15` | Xrefs to `FField NamePrivate` key at RVA `0xD4DF960` (XOR const `0x0D58B9970DD2BBAF`); PSHUFB mask at `0xD4DF950`. |
+| `FProperty_SetupOffset_v908` | `0x53E840` | (too long as full function — use encode idiom at `0x53ECC8` below) | The encode idiom is unique and 1-hit on every build tested. |
+| SetupOffset encode idiom | `0x53ECC8` | `0F B7 47 ? 35 ? ? ? ? 0F C8` | Immediately after: `mov [reg+0xB0], eax`; imm32 is `0xC2CEEE92`. That triple is the 1-hit anchor. |
+
+### GObjectArray / chunks_manager
+
+| Function | v908 RVA | Byte signature | Xref fallback |
+|---|---|---|---|
+| `GObj_ProcessSubgraphRecursive_v908` | `0x37E850` | `41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC ? 66 0F 7F 7C 24 ? 66 0F 7F 74 24 ? 48 89 D7 48 89 CE 48 8D 8A` | Xrefs to chunks_manager blob `0x10D853F0`. |
+| `GObj_MarkObjectUnreachable_v908` | `0x3A57B7` | `48 83 EC ? 48 89 44 24 ? 56 57 48 83 EC ? 48 BF` | Same. |
+| `GObj_IsMarkedUnreachable_v908` | `0x43D46A` | `48 8B CB 56 53 55 56` | Called by many GC sites; xref to the chunks_manager blob. |
+| `GObj_ProcessGCPurgeList_v908` | `0x449130` | `41 57 41 56 41 55 41 54 56 57 53 48 81 EC ? ? ? ? 66 0F 7F B4 24 ? ? ? ? 41 89 C8` | Same. |
+| `GObj_GC_GatherUnreachable_v908` | `0x44C7C0` | `41 57 41 56 56 57 53 48 81 EC ? ? ? ? 66 44 0F 7F 84 24 ? ? ? ? 66 0F 7F BC 24 ? ? ? ? 0F 29 B4 24 ? ? ? ? 89 CF` | Same. |
+
+Additional anchor: chunk-decode SIMD fingerprint `66 0F 71 D1 03 66 0F 71 F0 0D` — a PSLLW+PSRLW pair that is the ROL16(13) step. Occurs at every chunks_manager access site.
+
+### Theia static / ConstructU*
+
+| Function | v908 RVA | Byte signature | Xref fallback |
+|---|---|---|---|
+| `Theia_ConstructU_PRNG_v908` | `0x61E1E0` | `41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC ? ? ? ? 0F 29 BC 24 ? ? ? ? 66 0F 7F B4 24 ? ? ? ? 48 89 D6 48 89 CF` | Six-move wrap-constant prologue at RVA `0x61E328` (`mov edx,-47 ; mov r8d,47 ; mov r9d,5 ; mov r10d,-13 ; mov r11d,13 ; mov ebp,209`). ~40 `Z_Construct_UPackage_*` trampolines call this. |
+
+### GWorld / world hashtable
+
+| Function | v908 RVA | Byte signature | Xref fallback |
+|---|---|---|---|
+| `World_HashTableLookup_v908` | `0x3B62750` | `8B 05 ? ? ? ? 3B 05 ? ? ? ? 0F 84 ? ? ? ? 48 89 C8 48 C1 E8 ? 89 C2 C1 EA ? 31 C2 69 C2 ? ? ? ? 89 C2 C1 EA ? 31 C2 69 C2 ? ? ? ? 89 C2 C1 EA ? 31 C2 48 8B 05 ? ? ? ? 48 85 C0 4C 8D 05 ? ? ? ? 4C 0F 45 C0 8B 05 ? ? ? ? FF C8 21 D0 45 8B 04 80 41 83 F8 ? 74` | Xrefs to `g_WorldHT_Entries` RVA `0x10967B98`. |
+| `World_WrapperCtor_v908` | `0x8C4E20` | `41 56 56 57 53 48 83 EC ? 0F 29 7C 24 ? 0F 29 74 24 ? 48 89 CE E8 ? ? ? ? 48 8D 05 ? ? ? ? 48 89 06 48 8D 05 ? ? ? ? 48 89 86 ? ? ? ? C6 86` | The only xref to wrapper vtable RVA `0xDD21510` is inside this ctor at `+0x1B`. |
+
+### Global anchors (data references)
+
+| Symbol | v908 RVA | What it is |
+|---|---|---|
+| `g_GNamePool` | `0x10AB5DC0` | FNamePool base |
+| `g_Keystream` | `0x1095926C` | Keystream table start (decrypt window at `+0xF0` = u16 idx 120) |
+| `g_ChunksManagerBlob` | `0x10D853F0` | Encrypted chunks_manager blob |
+| `g_ChunksManagerKey_A` | `0xD4B22B0` | ROL16-XOR key |
+| `g_ChunksManagerKey_B` | `0xD4BD610` | Auxiliary |
+| `g_UWorldBase` | `0x10967B98` | World hashtable entries (UWORLD_BASE_RVA) |
+| `g_WorldWrapperVtable` | `0xDD21510` | Intermediary wrapper vtable |
+| FField NamePrivate XOR key | `0xD4DF960` | `0x0D58B9970DD2BBAF` |
+| FField NamePrivate PSHUFB mask | `0xD4DF950` | `{5,6,1,4,3,7,2,0}` |
