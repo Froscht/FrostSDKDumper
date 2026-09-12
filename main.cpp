@@ -68,6 +68,7 @@ using FNameDecryptor = FName::FNameDecryptor;
 #include "config_loader.h"
 #include "sdk_generator.h"
 #include "usmap_writer.h"
+#include "idmap_writer.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PE binary path — glob ARC binary files in the dumper directory and pick the
@@ -4317,6 +4318,23 @@ public:
 
         UsmapWriter::WriteUsmap(sdk, "SDK_Output.usmap");
         std::cout << "[+] Wrote SDK_Output.usmap\n";
+
+        {
+            auto IdmapStats = IdmapWriter::WriteIdmap(
+                sdk,
+                gen.m_vtable_to_type,
+                AutoDiscovery::g_DiscoveredVTables,
+                ArcDecrypt::g_Sheet,
+                "SDK_Output.idmap");
+            std::printf("[+] Wrote SDK_Output.idmap (%zu entries: %zu vtables, %zu exec fns, %zu globals; %zu bytes)\n",
+                IdmapStats.TotalEntries,
+                IdmapStats.VTableEntries,
+                IdmapStats.ExecFunctionEntries,
+                IdmapStats.GlobalEntries,
+                IdmapStats.BytesWritten);
+            IdmapWriter::WriteReadMe("ReadMe.txt");
+            std::cout << "[+] Wrote ReadMe.txt (mapping-file format doc)\n";
+        }
 
         DumpBoneArrays(object_ptrs, addr_to_name, addr_to_fullname);
     }
