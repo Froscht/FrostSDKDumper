@@ -6,7 +6,116 @@ External SDK dumper for ARC Raiders (Unreal Engine 5, Theia-obfuscated). Reads g
 Build: `g++ -std=c++17 -O2 -march=native -mavx2 -msse4.1 -I KernelDriver/include -o FrostDumper main.cpp build/Zydis.o -lcapstone -lunicorn -lm`
 Run: `sudo ./build_and_run.sh [PID]`
 
-## Current Patch: Steam build 24710327 / CL-1341255 (2026-08-18)
+## Current Patch: Steam build 25163933 / CL-1372005 (2026-09-08)
+Image size **0x14091000**, game version 1.45.x, UE 5.7. IDA instance `pfoz`
+(fixed_steam.exe, base 0x140000000). Full IDA renames + signatures +
+xref fallbacks live in `docs/v908_ida_reference.md`.
+**FULLY REVERSED AND LIVE-VERIFIED** — sabotage matrix all six areas
+(chunkmgr / fname / ffield / getfname / propoff / layout) recover to
+≥100% of the clean-run property count from every wrecked state.
+
+### Root cause of the wide-string garbage on this patch
+The UObject slot-hash `ADD` constant. Meiner initial pipeline had
+`- 0x99C193C4`; the actual IDA disasm at `sub_14043AF90 @ 0x14043B05B..
+0x14043B0BE` is `+ 0x993B3384` (ADDitive, and a *different* constant —
+sign-flip alone gets 0x664E6C3C, not 0x993B3384). Wrong ADD picked the
+wrong slot on most objects, so the low 32 bits were half of a decoded
+pointer instead of a CI, and names resolved to garbage that read like a
+wide-decode bug but was slot-selection all along. Fix at commit
+`d0356c0`; wrong-slot picks went from ~7000 to ~30.
+
+### Verified constant sheet (v20260908)
+```
+GNamePool          RVA 0x10AB5DC0
+FName resolver     RVA 0x2DA260   (family @ 0x2DA4A0, decrypt @ 0x2BF200)
+Keystream table    RVA 0x1095926C  (decrypt window at +0xF0 = u16 idx 120)
+KEY_INIT_ADD       0x2E0     KEY_STEP_PAIR   0x67E
+chunks_manager     RVA 0x10D853F0   (key blob RVA 0xD4B22B0)
+UObject::GetFName  RVA 0x43AF90
+Slot decoder leaf  inlined (no separate sub)
+Static Theia PRNG  RVA 0x61E1E0     kAdd 0x400062AA rot 0x15
+Slot hash ADD      0x993B3384 (ADDitive)     Slot IDX ADD  0x33384
+FField NamePrivate offset +0x90, XOR key 0x0D58B9970DD2BBAF,
+                    PSHUFB {5,6,1,4,3,7,2,0}, ROL16(13), ROL64(32).
+FProperty::Offset_Internal +0xB0 ^ 0xC2CEEE92
+FProperty::PropertyFlags   +0xA0
+FBoolProperty extended slot at +0xE0  (v908-specific; v818 was +0x118)
+UStruct::SuperStruct  +0xA8  ChildProperties +0x108
+UEnum::Names layout is SoA on v908 (see below).
+FUObjectItem stride 24, obj+8, InternalIndex +0x90
+```
+
+### UEnum::Names on v908: struct-of-arrays, not TArray<TPair>
+Theia replaced the classic layout with:
+```
++0xB0  KeysPtr  (low bit tagged, strip with & ~1), stride 8 {ci, num}
++0xB8  ValsPtr  (low bit tagged, strip with & ~1), stride 8 int64
++0xC0  Num      (u32, no separate Max)
+```
+sdk_generator.h has an `EnumLayout` abstraction that hides this from
+callers. Fix at `a97df6d`. Enum body count 0 → 15050 entries.
+
+### Emit-side filters (all opt-in-controllable)
+- Size-sanity: `props_size > 1 MB` records are FField list heads with
+  module-range vtables that pass the vtable filter but read random
+  bytes at PropertiesSize. Dropped unconditionally.
+- `None_NNNN` records with size 0 and package "Unknown" — objects whose
+  FName decoded to sentinel None; carry no data of their own. Dropped
+  unconditionally.
+- BP-editor-transient (`K2Node_*`, `CallFunc_*`, `Cast_*` in the
+  "Unknown" package) — editor-only FName pool; on a shipping build the
+  outer walk terminates without hitting a real UPackage. Dropped by
+  default; opt in with `FROST_KEEP_BP_TRANSIENT=1`.
+- Aggressive: all `props_size == 0 && package == "Unknown"` — extends the
+  BP-transient drop to every mis-classified fragment. Costs ~250k real
+  properties; off by default, opt in with `FROST_STRICT_UNKNOWN=1`.
+
+Cumulative `/Script/Unknown` reduction on the live dump: 9641 → 228
+(98%) at defaults, → 16 (99.8%) under `FROST_STRICT_UNKNOWN=1`.
+
+### Sabotage-verify matrix (all six areas green)
+`FROST_SABOTAGE908=chunkmgr|fname|ffield|getfname|propoff|layout|all`
+wrecks the compiled defaults before auto_resolve908 runs. Every area
+must recover to the same clean-run property count.
+
+|Sabotage | Properties | vs clean |
+|--------|-----------:|:--------:|
+|clean   | 1075671    | ref      |
+|chunkmgr| 1124564    | 104%     |
+|fname   | 1119180    | 104%     |
+|ffield  | 1118356    | 104%     |
+|getfname| 1119152    | 104%     |
+|propoff | 1119472    | 104%     |
+|layout  | 1118777    | 104%     |
+|all     | 1119331    | 104%     |
+
+Fname-recovery notes: the extractor rejects every ChunkOff site on v908
+with "no block XOR constant" / "no PADDD add constant" — the constants
+reach the decode window through xmm registers whose sources sit
+outside the prologue tracker's view. `AdoptFNamePipeline908` falls back
+to `v20260908::*` compiled defaults for those fields when the extractor
+returns zero. Fix at `f948273`.
+
+Layout-recovery notes: `ProbeAndAdopt908Layout` runs the same live probe
+as v818 (score by DISTINCT names, chain-walk ascending offsets, tagged
+back-pointer for Owner). When it declines to adopt (fewer type-object
+samples than the threshold), the sabotage recovers via `ApplyOffsets908`
+restoring compiled defaults — `Sh.Layout908Resolved` is NOT set by
+sabotage for this reason. Fix at `2df44c0` + probe at `14e09a7`.
+
+### Native-fields UE 5.7 name overlay
+`tools/ue57_native_names.py` matches SDK `Native_0xNNN` holes against
+member names in the UE 5.7 headers. Ships with a 326 KB gzip'd cache of
+4068 engine classes that have at least one UPROPERTY anchor; no UE
+source tree required after the initial cache write. Run with:
+```
+python3 tools/ue57_native_names.py --sdk SDK_Output.txt --out SDK_Output.named.txt
+```
+Match hits 138 native fields on the current dump (all engine classes:
+USoundWave, UPhysicsAsset, ULevel, APlayerCameraManager…). Game-specific
+Pioneer classes have no matching UE source and stay as `Native_0xNNN`.
+
+## Previous Patch: Steam build 24710327 / CL-1341255 (2026-08-18)
 Image size **0x116E7000**, game version 1.42.x. Offline work used the EasyDump
 image `pioneer_steam_1.42.x-CL-1341255_2026_08_18__11_32_82pct.exe` (flat, so
 file offset == RVA); IDA instance `vv9q`, **base 0x140000000**.
