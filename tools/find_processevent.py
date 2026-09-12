@@ -1,14 +1,21 @@
 """Locate UObject::ProcessEvent by observing a live BP callsite.
 
-WARNING (2026-09-12): tested against ARC Raiders v20260908 running under
-Proton/Wine — HWBP EXEC on `.text` pages does NOT fire. Wine maps the
-game's executable from `/memfd:wine-mapping` as `MAP_SHARED r-xs` and
-the per-CPU DR registers are silently inert on that mapping (same class
-of failure as uprobes, documented in the project CLAUDE.md). See
-`docs/v908_ida_reference.md ## UObject::ProcessEvent (v908) # Dynamic
-resolve attempt` for the confirming test. This script only works on a
-build where the game runs natively OR on a kernel where MAP_SHARED HWBP
-delivery works. Kept in-tree as a reference implementation.
+WARNING (2026-09-12/13): tested against ARC Raiders v20260908 running
+under Proton/Wine — no external-process instrumentation primitive on
+the game's `.text` works:
+  * HWBP EXEC: 165/188 per-thread breakpoints armed, ZERO captures
+    over 20-40 s on FName::AppendString and UObject::GetFName (both
+    fire thousands of times per second in-game). Per-CPU DR registers
+    are silently inert on `MAP_SHARED r-xs` memfd pages on this kernel.
+  * PTRACE INT3 (gdb attach + `break *0x1402D7470`): refused with
+    `Cannot insert breakpoint. Cannot access memory` — the mapping is
+    read-only-SHARED, so `PTRACE_POKETEXT` writes reflect to the
+    unwritable memfd file.
+  * Uprobes: previously documented as inert on the same mapping.
+See `docs/v908_ida_reference.md ## UObject::ProcessEvent (v908) #
+Dynamic resolve attempt` for the confirming tests. This script is kept
+in-tree as a reference implementation for future builds that run
+natively OR on a kernel where MAP_SHARED HWBP delivery works.
 
 
 Dynamic resolve for v20260908/CL-1372005 — Theia stripped every static anchor

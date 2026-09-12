@@ -1070,18 +1070,23 @@ Consequences for future resolve attempts:
   built on that primitive is dead in this environment.
 - HWBP WRITE/READWRITE on `.data` (e.g. GObjectArray fields) is a
   different code path in the CPU and MAY still work — not tried yet.
-- The remaining viable dynamic route is **ptrace-based `int3` byte
-  patching** of the `.text` page in the target's page table (private
-  COW copy), which bypasses the `MAP_SHARED` DR problem. That needs a
-  small helper that opens `/proc/<pid>/mem`, writes `0xCC` at the
-  target RVA on the target process's cow copy, and either catches
-  SIGTRAP via `PTRACE_ATTACH` or lets the process crash-and-restore
-  via a SEH filter. Nothing in this tree does that today.
-- A cleaner alternative: **link the resolver INTO the game** via a DLL
-  side-load or a hooked import. That runs C++ in-process and can
-  observe ProcessEvent's callers directly (the top of the caller stack
-  chain from any UFunction dispatch is inside ProcessEvent). Out of
-  scope for the current sudo-only external-reader design.
+- **ptrace INT3 byte-patching also fails.** Tested via `gdb --batch`
+  attaching to PID 632331 (a fresh live ARC session) and setting a
+  software breakpoint at `0x1402D7470` (FName::AppendString). gdb
+  reported `Cannot insert breakpoint 1. Cannot access memory at
+  address 0x1402d7470`. The mapping is `r-xs` MAP_SHARED backed by the
+  Wine memfd — writes via `PTRACE_POKETEXT` / `/proc/<pid>/mem` would
+  reflect to the shared memfd file, which is read-only, so the kernel
+  refuses the write outright. Same class of failure: no per-process
+  COW copy exists, so no primitive that needs to modify the text page
+  (int3 patch, HWBP DR, uprobe overwrite) can work externally.
+- The remaining viable dynamic routes all require running code inside
+  the process: **DLL side-load / hooked import** (runs C++ next to
+  ProcessEvent — the top of any UFunction dispatch caller chain is
+  inside PE), **kernel-mode PTE flip** to convert the memfd mapping to
+  private COW before instrumentation, or **modifying Wine** to hand
+  out per-process private views. All out of scope for the current
+  external-reader design.
 
 `tools/find_processevent.py` is kept in-tree, but its top-of-file
 docstring now warns that HWBP EXEC does not fire on this target and
