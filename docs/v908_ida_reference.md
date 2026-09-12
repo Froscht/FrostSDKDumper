@@ -1040,3 +1040,51 @@ flag test + call through `UFunction::Func` + FFrame allocation). Do NOT
 adopt either as ProcessEvent until dynamic verification (breakpoint on
 a known BP call, capture the top-of-stack native function) confirms.
 
+### Dynamic resolve attempt (2026-09-12) — FAILED
+
+The obvious dynamic path — set a per-thread HW execution breakpoint on
+any function known to fire from ProcessEvent, read `[rsp]` on hit, walk
+back to prologue — was tried against a live ARC session (PID 620956,
+Steam build 25163933). Two anchors were probed, both known to be
+executed thousands of times per second in-game:
+
+| Anchor RVA | Function | Threads hooked | Captures over 20-40s |
+|-----------:|:---------|---------------:|---------------------:|
+| 0x2D7470   | FName::AppendString | 188 | **0** |
+| 0x43AF90   | UObject::GetFName   | 165 | **0** |
+
+The memreader kernel driver correctly registered the breakpoint on
+every thread of the target process (`register_user_hw_breakpoint` per
+LWP), but not a single BP fired.
+
+This matches the class of failure documented for uprobes on the same
+target: **Wine maps the game's `.text` from `/memfd:wine-mapping` as
+`r-xs` (`MAP_SHARED`) and the per-CPU DR registers do not fire on
+that mapping.** Both uprobe rewrites AND hardware execution breakpoints
+are silently inert on Wine `memfd` executable pages on this kernel.
+
+Consequences for future resolve attempts:
+
+- HWBP EXEC anywhere in `.text` (including on any UFunction's
+  `NativeFunc` target) will not fire. Any dynamic ProcessEvent recovery
+  built on that primitive is dead in this environment.
+- HWBP WRITE/READWRITE on `.data` (e.g. GObjectArray fields) is a
+  different code path in the CPU and MAY still work — not tried yet.
+- The remaining viable dynamic route is **ptrace-based `int3` byte
+  patching** of the `.text` page in the target's page table (private
+  COW copy), which bypasses the `MAP_SHARED` DR problem. That needs a
+  small helper that opens `/proc/<pid>/mem`, writes `0xCC` at the
+  target RVA on the target process's cow copy, and either catches
+  SIGTRAP via `PTRACE_ATTACH` or lets the process crash-and-restore
+  via a SEH filter. Nothing in this tree does that today.
+- A cleaner alternative: **link the resolver INTO the game** via a DLL
+  side-load or a hooked import. That runs C++ in-process and can
+  observe ProcessEvent's callers directly (the top of the caller stack
+  chain from any UFunction dispatch is inside ProcessEvent). Out of
+  scope for the current sudo-only external-reader design.
+
+`tools/find_processevent.py` is kept in-tree, but its top-of-file
+docstring now warns that HWBP EXEC does not fire on this target and
+that the tool is only useful on a build where the game does NOT run
+under Wine or on a kernel where `MAP_SHARED` DR delivery works.
+
