@@ -21,6 +21,7 @@
 
 #include <iostream>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <vector>
 #include <string>
@@ -4316,8 +4317,16 @@ public:
             gen.EmitDumper7(sdk, ".");
         }
 
+        // Dumper-7 style layout: FrostDump/{CppSDK,IDAMappings}/... so the
+        // IDAExecFunctionsImporter plugin's folder picker accepts the output
+        // out-of-the-box. Also keep the legacy loose copies in cwd for scripts
+        // that already read them.
+        {
+            std::filesystem::create_directories("FrostDump/IDAMappings");
+        }
         UsmapWriter::WriteUsmap(sdk, "SDK_Output.usmap");
-        std::cout << "[+] Wrote SDK_Output.usmap\n";
+        UsmapWriter::WriteUsmap(sdk, "FrostDump/IDAMappings/SDK_Output.usmap");
+        std::cout << "[+] Wrote SDK_Output.usmap (+ FrostDump/IDAMappings/)\n";
 
         {
             auto IdmapStats = IdmapWriter::WriteIdmap(
@@ -4326,6 +4335,12 @@ public:
                 AutoDiscovery::g_DiscoveredVTables,
                 ArcDecrypt::g_Sheet,
                 "SDK_Output.idmap");
+            IdmapWriter::WriteIdmap(
+                sdk,
+                gen.m_vtable_to_type,
+                AutoDiscovery::g_DiscoveredVTables,
+                ArcDecrypt::g_Sheet,
+                "FrostDump/IDAMappings/SDK_Output.idmap");
             std::printf("[+] Wrote SDK_Output.idmap (%zu entries: %zu vtables, %zu exec fns, %zu globals; %zu bytes)\n",
                 IdmapStats.TotalEntries,
                 IdmapStats.VTableEntries,
@@ -4333,7 +4348,9 @@ public:
                 IdmapStats.GlobalEntries,
                 IdmapStats.BytesWritten);
             IdmapWriter::WriteReadMe("ReadMe.txt");
+            IdmapWriter::WriteReadMe("FrostDump/ReadMe.txt");
             std::cout << "[+] Wrote ReadMe.txt (mapping-file format doc)\n";
+            std::cout << "[+] FrostDump/ ready for IDAExecFunctionsImporter (Ctrl+Alt+D, select FrostDump/)\n";
         }
 
         DumpBoneArrays(object_ptrs, addr_to_name, addr_to_fullname);
