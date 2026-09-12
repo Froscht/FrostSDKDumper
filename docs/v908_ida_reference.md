@@ -733,3 +733,310 @@ help re-locate them on patch day.
     3. `pshufb xmm, [rip + mask]` with mask `{6,3,1,7,0,2,4,5}`
     4. Final `ror r64, 3`
     That's a very distinctive 4-stage chain — sig-scan it and rename.
+
+
+## FName::ToString / AppendString (v908)
+
+The public FName-to-string emitters. All of them share the same prologue —
+`_mm_shufflelo_epi16(FName, 27)` → `ROL32(v, 25)` (pslld 25 | psrld 7) → XOR
+with `xmmword_14D4D38A0` — which prepares the 16-byte CI blob passed to
+`FName_ResolverWrapper_v908`. The wrapper returns an obfuscated raw pointer
+that the caller unwraps with `bswap64(raw ^ 0xB8821A3800000000)` (the third
+step of the pointer chain — the two earlier steps XOR to identity, so this
+`bswap` completes the round trip and hands back the true `FNameEntry*`).
+
+From there, three code paths diverge based on the sink type:
+- **FString&** — Reserve then Append helpers; decode goes through a stack
+  buffer + `sub_1400B5D90` bulk copy.
+- **FStringBuilderBase& (wide)** — grow-on-write directly into the builder's
+  `Data*/End*/Cap*` triple.
+- **FUtf8StringBuilderBase&** — same grow-on-write, but into a byte
+  builder with ANSI helpers and `"%d"` format.
+
+Also present: a length-only variant that walks the same decrypt path but
+never writes — used for FString/FStringBuilder pre-sizing.
+
+### Renamed functions
+
+| RVA | Old name | New name | Purpose |
+|---|---|---|---|
+| `0x2D71F0` | `sub_1402D71F0` | `FName_ToString_v908` | `FName::ToString(FString&)` — Reserve + append helpers, stack decode buffer |
+| `0x2D7370` | `sub_1402D7370` | `FName_ToString_StringBuilder_v908` | `FName::ToString(FStringBuilderBase<WIDECHAR>&)` — resets builder End then appends |
+| `0x2D7470` | `sub_1402D7470` | `FName_AppendString_v908` | `FName::AppendString(FStringBuilderBase<WIDECHAR>&)` — appends without reset (body is identical to `ToString_StringBuilder` minus the `End = Data` reset) |
+| `0x2D7570` | `sub_1402D7570` | `FName_AppendString_Utf8_v908` | `FName::AppendString(FUtf8StringBuilderBase&)` — byte-wide builder variant (uses `"%d"` and `sub_14028E230` for the number format instead of `L"%d"`) |
+| `0x2D7661` | `sub_1402D7661` | `FName_GetStringLength_v908` | `FName::GetStringLength()` — pre-sizing helper. Walks the decrypt path, returns `entry_len + (Number ? 2 + digits(Number-1) : 0)`; writes nothing |
+| `0x2D2000` | `sub_1402D2000` | `FName_AppendPlainNameString_Wide_v908` | The plain-name copy helper both wide builder emitters call; header parse + narrow-tap / SIMD-narrow / wide-tap / wide-SIMD decrypt into the builder's `End` slot, growing as needed. |
+
+The trio at `0x2D7370` / `0x2D7470` / `0x2D7570` differ only in three
+surface details:
+1. Whether the builder's `End` pointer is reset (`a2[1] = *a2`) before
+   appending — present in `ToString_StringBuilder`, absent in
+   `AppendString`. This is the ToString-vs-AppendString distinction on
+   FStringBuilder targets.
+2. Which plain-name helper is called — `FName_AppendPlainNameString_Wide_v908`
+   for the two wide variants, `sub_1402D26A0` for the Utf8 variant.
+3. Width of the `'_'` separator write (`WORD` vs `BYTE`) and format
+   string used for the number half (`L"%d"` via `sub_14028E4C0` vs
+   `"%d"` via `sub_14028E230`).
+
+### Byte signatures (all verified unique via `mcp__ida-multi-mcp__generate_signature` on 2026-09-12)
+
+| Function | RVA | Signature (IDA fmt) | Length | Occurrences |
+|---|---|---|---:|---:|
+| `FName_ToString_v908` | `0x2D71F0` | `41 57 41 56 41 55 56 57 53 48 81 EC ? ? ? ? 48 89 D7 49 89 CE` | 22 | 1 |
+| `FName_ToString_StringBuilder_v908` | `0x2D7370` | `41 56 41 55 56 57 53 48 83 EC ? 48 89 D7 49 89 CE 48 8B 05 ? ? ? ? 48 31 E0 48 89 44 24 ? 48 8B 02` | 35 | 1 |
+| `FName_AppendString_v908` | `0x2D7470` | `41 56 41 55 56 57 53 48 83 EC ? 48 89 D7 49 89 CE 48 8B 05 ? ? ? ? 48 31 E0 48 89 44 24 ? 66 0F 6E 01 F2 0F 70 C0 ? 66 0F 6F C8 66 0F 72 D1 ? 66 0F 72 F0 ? 66 0F EB C1 66 0F EF 05 ? ? ? ? 66 0F 7F 44 24 ? 48 8D 44 24 ? 48 89 44 24 ? 48 8D 4C 24 ? 48 8D 54 24 ? 4C 8D 44 24 ? E8 ? ? ? ? 48 B9 ? ? ? ? ? ? ? ? 48 33 4C 24 ? 48 0F C9 48 89 FA E8 ? ? ? ? 45 8B 46 ? 45 85 C0 74 ? 48 8B 47 ? 48 8D 48 ? 48 3B 4F ? 77 ? 48 8D 48 ? 48 89 4F ? 66 C7 00` | 163 | 1 |
+
+The 22-byte `ToString_v908` signature is the tightest of the three and the
+most durable — it captures only the prologue register saves and the
+initial `mov rdi, rdx ; mov r14, rcx` pattern that identifies the FString
+version. `AppendString_v908` is 163 bytes because the shape without the
+`a2[1] = *a2` reset means the disambiguator (the `mov rax, [rdx]`
+instruction present in `ToString_StringBuilder`) is missing, and the
+signature has to walk deep into the body to find something unique.
+
+### Xrefs (up to 10 each, for fallback anchoring)
+
+**`FName_ToString_v908` @ `0x2D71F0`** — heavy fan-in; sampled callers:
+- `0x1402BF239` in `FName_DecryptString_v908`
+- `0x1404375D5` in `sub_14043756B` (0x2DD)
+- `0x141EDE4F3` in `sub_141EDE2C0` (0x324)
+- `0x141F2C755` in `sub_141F2C5B0` (0x259)
+- `0x144252682` in `sub_144252570` (0x3EB)
+- `0x14428C955` in `sub_14428C920` (0x18B)
+- `0x14485A8B8` in `sub_144859010` (0x1B3B)
+- `0x1449CE7C6` in `sub_1449CE6A0` (0x31F)
+- `0x145F2213D` in `sub_145F21E00` (0x38B)
+
+**`FName_AppendString_v908` @ `0x2D7470`** — sampled callers:
+- `0x1401F29EC` and `0x1401F2A45` in `sub_1401F2980` (double xref, likely two overload lookups)
+- `0x14025FF48` in `sub_14025FC50`
+- `0x14036F01F` / `0x14036F051` in `sub_14036EF50` (also doubled)
+- `0x1403700BE` in `sub_14036FF70`
+- `0x140372C20` / `0x140372C4E` in `sub_140372BE0` (doubled)
+- `0x14037952A` in `sub_1403794D0`
+
+**`FName_ToString_StringBuilder_v908` @ `0x2D7370`** — sampled callers:
+- `0x14022230F` in `sub_1402220A0` (0x53E)
+- `0x14022DAC5` in `sub_14022D8B0` (0x662)
+- `0x140370229` / `0x1403703A1` in `sub_1403701A0` (doubled)
+- `0x1403FF984` in `sub_1403FF370`
+- `0x1405D6716` in `sub_1405D6690`
+- `0x1405EC55A` in `sub_1405EC390`
+- `0x1405FDFE5` in `sub_1405FDF20`
+- `0x1405FEA86` / `0x1405FEEEC` in `sub_1405FE770` (doubled)
+
+### Anchor cascade (fallback if every signature drifts)
+
+1. **Xrefs to `FName_ResolverWrapper_v908` @ `0x2DA4A0`** — there are exactly 15
+   direct callers. Filter to those that also read from the returned
+   pointer via `bswap64(v ^ 0xB8821A3800000000)` (byte pattern
+   `48 33 ?? ??` followed by `48 0F C8` — the XOR immediate is a
+   distinctive `movabs 0xB8821A3800000000`), then classify by:
+   - resets builder `End` (has `mov rax, [rdx] ; mov [rdx+8], rax` early) → `ToString(FStringBuilderBase&)`
+   - decodes to STACK buffer + calls a helper like `sub_1400B5D90` → `ToString(FString&)`
+   - decodes directly into `a2[1]` without reset → `AppendString(FStringBuilderBase&)`
+   - writes single BYTE separator + `"%d"` (not `L"%d"`) → Utf8 builder variant
+   - never writes, computes length only → `GetStringLength`
+2. **Xrefs to `xmmword_14D4D38A0`** — the SIMD blob transform constant is
+   loaded rip-relative by every FName->CI transform site. Filter to the
+   ones that immediately follow with a call to `FName_ResolverWrapper_v908`.
+3. **The `bswap64 ^ 0xB8821A3800000000` operand** as a movabs — the
+   constant `00 00 00 00 38 1A 82 B8` (little-endian) is the pointer
+   chain step-3 unwrap. Every FName-consumer function reaches it.
+   `find_bytes` on `48 B8 00 00 00 00 38 1A 82 B8` should return one
+   hit per FName-emitting family member.
+
+### Not renamed on this build
+
+- `FName::ToString()` returning `FString` by value — not present as a
+  standalone function on this build. Constructed inline at call sites
+  that immediately consume the string (call the FString&-taking
+  `FName_ToString_v908`, then move-construct into a return slot).
+- `FName::GetPlainNameString()` (no-arg overload) — inlined into
+  `FName_AppendPlainNameString_Wide_v908`.
+- `FName::AppendString(FAnsiStringBuilderBase&)` — not seen among the
+  15 wrapper callers; the Utf8 variant covers narrow output.
+
+### Confidence
+
+**High** on all six renames. The disambiguators are algorithmic:
+- The `a2[1] = *a2` reset uniquely separates `ToString(FStringBuilderBase&)`
+  from `AppendString(FStringBuilderBase&)` — that's Epic's canonical
+  distinction between the two overloads, present in unmodified UE source.
+- The FString-vs-FStringBuilder split is settled by helper call shape
+  (Reserve+Append helpers vs direct `End`-slot writes).
+- The Utf8 variant is settled by the format-string width (`"%d"` vs
+  `L"%d"`) and the single-BYTE `'_'` separator.
+- The GetStringLength variant is settled by the absence of any write,
+  plus the classic decimal-digit-counting loop `while (v /= 10)`.
+
+
+## UObject::ProcessEvent (v908)
+
+**Status: not conclusively located on this build.** Full string-anchor and
+structural sweeps run without a positive hit — see the "What was tried"
+subsection for the failed paths. Best remaining leads are enumerated at the
+bottom of this section for the next investigator to pick up.
+
+### Why the standard anchors fail on v908
+
+Every UE-source string that classically lives inside `UObject::ProcessEvent`
+has been stripped from this build:
+
+- `"Script call stack:\n"` — 0 hits (assertion when a BP callstack overflows)
+- `"Recursive call"` / `"Blueprint runaway"` — 0 hits
+- `"Attempted to call"`, `"uninitialized"`, `"stack overflow"` — 0 hits
+- `"ProcessEvent"`, `"UFunction"`, `"CallFunction"`, `"Ubergraph"`,
+  `"FFrame"`, `"FunctionCallspace"`, `"CallRemoteFunction"`,
+  `"CallScript"`, `"FunctionBind"`, `"execCall"`, `"GNatives"`,
+  `"Accessed None"`, `"Blueprint"` — 0 hits each
+
+Consequence: the primary anchor path (`find` on any ProcessEvent source
+string → xref-walk to the containing function) is dead on v908.
+
+### What was tried and where each attempt died
+
+1. **String anchors (5 strings, all mainline UE)** — 0 hits, as above.
+   Theia has stripped every ProcessEvent-adjacent literal.
+
+2. **Vtable walk from `UObject_GetFName_v908` (`0x43AF90`)**.
+   `GetFName` sits in exactly two vtables — `xmmword_14D4EC640` and
+   `xmmword_14D50D3B0` — at slot 8 (offset `+0x40`). Every other UObject
+   subclass vtable is on a runtime-decrypted page IDA cannot see. Both
+   captured vtables were dumped (2048 bytes each) and every non-stub slot
+   from 8..255 was checked for a ProcessEvent-shaped function (large stack
+   allocation, 2/3 register args, FUNC-flags test).
+   - **Slot 63 vt1** (`0x140599000`) — IDA does not recognise the block as
+     a function; raw bytes decode as a valid prologue
+     (`push r14;push rsi;push rdi;push rbp;push rbx;sub rsp,0x20;
+     mov rdi,rdx;mov rsi,rcx;call rel32; mov eax,[rip+X];
+     mov rdx,gs:[0x58]; ...`), but 0x1090 bytes of the head are held
+     as `dq` data. The function body IDA does recognise starts at
+     `0x14059A090` and is a SLOT-DECODER (uses the v908 GetFName slot
+     hash `0x993B3384` + FNV32 prime `0x1000193` on `rdx`) — this is a
+     name-lookup helper, not ProcessEvent.
+   - **Slot 65 vt1** (`0x140564D10`) — 23 instructions, calls `nullsub_1`,
+     appends into an array. Too small to be ProcessEvent.
+   - **Every other named vtable slot** (`0x14043AE20`, `0x14043A380`,
+     `0x14043B4A0`, `0x14043B5A0`, `0x14043B520`, `0x14043C280`,
+     `0x14043C300`, `0x14043C370`, `0x14043C630`, `0x14043C690`,
+     `0x14043DB70`, `0x14043DF60`, `0x14040F4A0`, `0x1405432B0`,
+     `0x140540010`, `0x1405404C0`, `0x14055F620`, `0x14055F7E0`,
+     `0x14053F5B0`, `0x14053F690`, `0x14053F6D0`, `0x14053F720`,
+     `0x14053F7E0`, `0x14063F790`) — all 4-500 bytes at most. None is
+     ProcessEvent-shaped.
+
+3. **FUNC_Native (`0x400`) flag test scan**. `test dword [rdx+disp32], 0x400`
+   as byte pattern `F7 42 ?? 00 04 00 00` → **1 hit** at `0x14CCA2FE3`
+   (OpenSSL `pcy_tree.c` — X.509 code, not UE). Same pattern rooted on
+   `rdx` displacement 32-bit (`F7 82 ?? ?? ?? ?? 00 04 00 00`) → 2 hits,
+   one is a small init helper reading `[rdx+0xB0]`, the other reads
+   `[rdx+0xD0]`; neither has a ProcessEvent-shaped body.
+   Conclusion: FunctionFlags is either at a Theia-mangled offset, or the
+   compiler emitted the test through a register (`mov ecx,[rdx+X]; test
+   ecx,0x400`) which is not distinctive enough to filter on.
+
+4. **Large stack allocation scan**. `sub rsp, imm32` with `imm32 >= 0x400`
+   returns 100+ hits per size band. Combined with security-cookie prologue
+   → still hundreds. Not filterable without a second anchor.
+
+5. **Virtual function call to `[rXx + 0x150]`** (the v818 UFunction Func
+   offset) — 280 hits, too generic; `[rXx + 0x140]` — 132 hits;
+   `[rXx + 0x160]` — 287 hits. Every UObject virtual dispatch at these
+   vtable slots reads the same way; no way to isolate the NativeFunc call
+   from other virtuals sharing the same disp.
+
+6. **Adjacent-in-source scan** (`.text 0x140599xxx`..`0x14059Bxxx`, the
+   cluster around slot-decoder helpers). Biggest candidates:
+   - `sub_14059A970` — 0x8BA bytes; but stack is `0x1C0`, reads small
+     offsets `+0x14 / +0x0C / +0x3C`, calls a virtual at `[rax+0x178]`
+     multiple times. This is a **serialize/patch** helper, not
+     ProcessEvent (ProcessEvent does NOT dispatch through
+     `[rax+0x178]` — it dispatches through `UFunction::Func`
+     directly, not a vtable).
+   - `sub_14059B310` — 0x50D bytes, stack `0x390` (912 bytes, in
+     the right ballpark), 9 XMM saves, takes `rcx,rdx`, calls
+     `FName_AppendString_v908` early. **Best static candidate**, but
+     the AppendString call is characteristic of an error-formatting
+     helper as much as ProcessEvent itself. Cannot confirm without
+     dynamic verification.
+
+### Structural obstacle: several .text pages are runtime-decrypted
+
+Multiple candidate vtable slots resolve to addresses IDA does not classify
+as functions (`lookup_funcs` returns `Not a function`) — `0x140599000`,
+`0x1404414B0`, `0x1404414E0`, `0x140441600`, `0x14063F190`,
+`0x14063F1A0..260`, `0x14063F790`. Raw byte reads show valid MSVC
+prologues, but IDA's static analysis stops at the page boundary. This
+matches the pattern documented in the chunks_manager section of this
+doc: parts of `.text` (specifically the runs at ~`0x140599000` and
+~`0x140441000`, plus the whole `0x14063F...` region) are on
+runtime-decrypted pages. **UObject::ProcessEvent may itself live on
+one of these pages**, which would explain the total absence of static
+anchors.
+
+### Best remaining leads (ordered by likelihood of success)
+
+1. **Dynamic instrumentation** — uprobe on any place that dispatches a
+   Blueprint call and step until the callee stabilises. The specific
+   probe: a small BP-only class (e.g. any `BP_*` actor's Tick), set a
+   breakpoint on its first `execXxx` thunk (found via a class's UFunction
+   `Func` pointer at UFunction+`FUNC_NATIVE_OFF`), and step out — the
+   parent frame is ProcessEvent. On Wine, uprobes are unreliable per
+   the CL-1325322 investigation notes, so a live IDA debugger attach is
+   preferable.
+
+2. **Dump the runtime-decrypted `.text` pages and re-import.**
+   `sub_14059B310` and `sub_140599000` both look like they could be
+   fragments of ProcessEvent or CallFunction; re-importing the pages
+   around `0x140441000-0x140442000`, `0x140599000-0x14059A000`, and
+   `0x14063F000-0x14063FA00` from a live process memory dump should
+   let IDA analyse them as functions. Then the ProcessEvent-shaped
+   candidate becomes reachable via `list_funcs` size sort.
+
+3. **GNatives[] table sig-scan.** UE's `GNatives[]` is a 256-entry
+   `.rdata` table of `execXxx` handlers used by `FFrame::Step`. On
+   builds that keep it, it's the fastest anchor for the bytecode
+   interpreter (`UObject::ProcessInternal`) which is called from
+   ProcessEvent. Search `.rdata` for a run of 256 contiguous 8-byte
+   values all pointing into `.text` — the "wide" (256*8=`0x800` byte)
+   table is very distinctive. If GNatives is present, its callers
+   (`FFrame::Step`, and beyond that ProcessInternal → ProcessEvent)
+   walk backward to the anchor.
+
+4. **AActor-derived vtable ProcessEvent slot compare.** AActor
+   overrides ProcessEvent to add a world-tearing-down check that
+   tail-calls `UObject::ProcessEvent`. Find any AActor-family vtable
+   (many are on the runtime-decrypted pages, so this depends on
+   step 2), locate the small wrapper function whose body is
+   `mov r?, [rcx + WORLD_OFFSET] ; test r?, r? ; jz L1 ;
+   test ... ; L1: jmp UObject::ProcessEvent`. The tail-jmp target IS
+   `UObject::ProcessEvent`.
+
+5. **Xref-density approach.** ProcessEvent is called from thousands of
+   generated `execXxx` thunks. If IDA is asked for callers of every
+   `sub_14059B???` in the UObject region and sorted by xref count, the
+   one with `>= 1000` xrefs (or `-1`, "too many") is ProcessEvent.
+   This needs a scripted enumeration; the current IDA-MCP `xrefs_to`
+   endpoint caps at 100 xrefs per call, so it's viable but only via
+   scripting the whole loop.
+
+### Not renamed on this build
+
+- `UObject::ProcessEvent` — see above.
+- `UObject::CallFunction`, `UObject::ProcessInternal`,
+  `UFunction::Invoke` — all in the same runtime-decrypted region or
+  behind the same missing string anchors.
+- `AActor::ProcessEvent` override — reachable only after AActor's
+  vtable is dumped from live memory.
+
+### Confidence
+
+**Not located** on the static image. The two structural candidates
+(`sub_14059B310` and, distantly, `sub_140599000`) are unranked because
+neither passes an independent ProcessEvent-only fingerprint (FUNC_Native
+flag test + call through `UFunction::Func` + FFrame allocation). Do NOT
+adopt either as ProcessEvent until dynamic verification (breakpoint on
+a known BP call, capture the top-of-stack native function) confirms.
+

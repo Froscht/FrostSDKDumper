@@ -1896,6 +1896,19 @@ namespace v20260908 {
     constexpr uint64_t UFUNCTION_NATIVEFUNC  = 0x150ULL;
     constexpr uint64_t UENUM_NAMES_OFF       = 0xB0ULL;
     constexpr uint64_t UENUM_NUM_OFF         = 0xB8ULL;
+
+    // FName emitters (see docs/v908_ida_reference.md ## FName::ToString / AppendString).
+    // FName::ToString(FString&) is the canonical decrypt-to-caller-buffer entry
+    // point; FName::AppendString(FStringBuilderBase&) is the same for
+    // FStringBuilder-based consumers. Both are self-contained and safe to hook
+    // or reference by RVA. NOTE: the older RVA_FNAME_TOSTRING (0x2BF200) above
+    // is the decrypt INNER, not ToString — kept for source compatibility.
+    constexpr uint64_t RVA_FNAME_TOSTRING_REAL     = 0x2D71F0ULL;
+    constexpr uint64_t RVA_FNAME_APPENDSTRING_REAL = 0x2D7470ULL;
+    // ProcessEvent could not be located statically on v908 (Theia stripped every
+    // known anchor string; see docs/v908_ida_reference.md ## UObject::ProcessEvent).
+    // Left at 0 until a dynamic (uprobe on Blueprint call) resolve lands.
+    constexpr uint64_t RVA_UOBJECT_PROCESSEVENT = 0ULL;
 } // namespace v20260908
 
 
@@ -2081,6 +2094,9 @@ struct LiveSheet {
     //     path falls back to the 818 shape (and will fail) until Auto-Resolve
     //     supplies the v908 decode.
     uint64_t Pool908Rva          = v20260908::RVA_GNAMEPOOL;
+    uint64_t FNameToString908Rva     = v20260908::RVA_FNAME_TOSTRING_REAL;
+    uint64_t FNameAppendString908Rva = v20260908::RVA_FNAME_APPENDSTRING_REAL;
+    uint64_t UObjProcessEvent908Rva  = v20260908::RVA_UOBJECT_PROCESSEVENT;
     // Keystream window: KEYSTREAM_RVA + KEYSTREAM_BASE_INDEX*2 bytes.
     uint64_t Keystream908Rva     =
         v20260908::RVA_KEYSTREAM + (uint64_t)v20260908::KEYSTREAM_BASE_INDEX * 2;

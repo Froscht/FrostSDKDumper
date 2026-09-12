@@ -173,10 +173,14 @@ static IdmapStats WriteIdmap(
     }
 
     // 4) Global symbols. Only what the dumper has actually resolved is emitted;
-    //    unresolved globals (FName::AppendString / UObject::ProcessEvent) are
-    //    left untouched so the plugin does not stamp a wrong name on them.
-    if (Emit(Sheet.Pool908Rva,     "GNames"))   Stats.GlobalEntries++;
-    if (Emit(Sheet.ChunkMgr908Rva, "GObjects")) Stats.GlobalEntries++;
+    //    a zero RVA (e.g. UObject::ProcessEvent on v908 until dynamically
+    //    resolved) is skipped by Emit() so the plugin does not stamp a wrong
+    //    name on address 0.
+    if (Emit(Sheet.Pool908Rva,              "GNames"))                Stats.GlobalEntries++;
+    if (Emit(Sheet.ChunkMgr908Rva,          "GObjects"))              Stats.GlobalEntries++;
+    if (Emit(Sheet.FNameToString908Rva,     "FName__ToString"))       Stats.GlobalEntries++;
+    if (Emit(Sheet.FNameAppendString908Rva, "FName__AppendString"))   Stats.GlobalEntries++;
+    if (Emit(Sheet.UObjProcessEvent908Rva,  "UObject__ProcessEvent")) Stats.GlobalEntries++;
 
     Stats.TotalEntries = Stats.VTableEntries + Stats.ExecFunctionEntries + Stats.GlobalEntries;
 
